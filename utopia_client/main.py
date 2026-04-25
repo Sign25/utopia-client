@@ -20,6 +20,7 @@ from . import __version__
 from .api import UtopiaAPI
 from .benchmark import estimate_population, run_full
 from .config import DEFAULT_SERVER, get_or_prompt, load_config, save_config
+from .ws_client import ColonyWSClient
 
 HEARTBEAT_SEC = 30.0
 COMMAND_POLL_SEC = 10.0
@@ -107,46 +108,56 @@ def cmd_run(args: argparse.Namespace) -> int:
     name = cfg["name"]
     logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
 
+    ws = ColonyWSClient(cfg["server"], cfg["token"], name, __version__)
+    ws.start()
+
     tick = 0
     last_heartbeat = 0.0
     last_poll = 0.0
     current_state = "idle"
     bench = cfg.get("benchmark", {})
 
-    while True:
-        now = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
 
-        # Опрос команды
-        if now - last_poll >= COMMAND_POLL_SEC:
-            cmd = api.fetch_command()
-            last_poll = now
-            if cmd:
-                desired = cmd.get("state", "idle")
-                if desired != current_state:
-                    logger.info("command: %s -> %s", current_state, desired)
-                # benchmark — выполняем сразу, состояние сбрасывает VPS на idle
-                if desired == "benchmark":
-                    logger.info("running benchmark…")
-                    result = _run_benchmark()
-                    cfg["benchmark"] = result
-                    save_config(cfg)
-                    bench = result
-                    if api.push_benchmark(result):
-                        logger.info("benchmark pushed: pop=%d gflops=%.2f",
-                                    result["estimated_population"],
-                                    result["cpu_gflops"])
-                    current_state = "idle"
-                else:
-                    current_state = desired
+            # Опрос команды
+            if now - last_poll >= COMMAND_POLL_SEC:
+                cmd = api.fetch_command()
+                last_poll = now
+                if cmd:
+                    desired = cmd.get("state", "idle")
+                    if desired != current_state:
+                        logger.info("command: %s -> %s", current_state, desired)
+                    # benchmark — выполняем сразу, состояние сбрасывает VPS на idle
+                    if desired == "benchmark":
+                        logger.info("running benchmark…")
+                        result = _run_benchmark()
+                        cfg["benchmark"] = result
+                        save_config(cfg)
+                        bench = result
+                        if api.push_benchmark(result):
+                            logger.info("benchmark pushed: pop=%d gflops=%.2f",
+                                        result["estimated_population"],
+                                        result["cpu_gflops"])
+                        current_state = "idle"
+                    else:
+                        current_state = desired
 
-        # Heartbeat
-        if now - last_heartbeat >= HEARTBEAT_SEC:
-            ok = _heartbeat(api, name, current_state, tick, bench)
-            logger.info("heartbeat tick=%d state=%s ok=%s", tick, current_state, ok)
-            tick += 1
-            last_heartbeat = now
+            # Heartbeat
+            if now - last_heartbeat >= HEARTBEAT_SEC:
+                ok = _heartbeat(api, name, current_state, tick, bench)
+                logger.info("heartbeat tick=%d state=%s ws=%s ok=%s",
+                            tick, current_state, ws.connected, ok)
+                tick += 1
+                last_heartbeat = now
 
-        time.sleep(1.0)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        logger.info("interrupted, stopping…")
+    finally:
+        ws.stop()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
