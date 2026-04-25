@@ -108,7 +108,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     name = cfg["name"]
     logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
 
-    ws = ColonyWSClient(cfg["server"], cfg["token"], name, __version__)
+    bench_initial = cfg.get("benchmark", {})
+    ws = ColonyWSClient(
+        cfg["server"], cfg["token"], name, __version__,
+        estimated_population=bench_initial.get("estimated_population", 0),
+    )
     ws.start()
 
     tick = 0

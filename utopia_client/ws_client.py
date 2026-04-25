@@ -29,7 +29,7 @@ class ColonyWSClient:
     """Держит WS к VPS в фоновом потоке."""
 
     def __init__(self, server: str, token: str, colony_name: str,
-                 client_version: str) -> None:
+                 client_version: str, estimated_population: int = 0) -> None:
         # https://divisci.com -> wss://divisci.com/ws/colony/client
         if server.startswith("https://"):
             base = "wss://" + server[len("https://"):]
@@ -41,6 +41,7 @@ class ColonyWSClient:
         self.token = token
         self.colony_name = colony_name
         self.client_version = client_version
+        self.estimated_population = int(estimated_population)
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -112,6 +113,7 @@ class ColonyWSClient:
                 "type": "hello",
                 "colony_name": self.colony_name,
                 "client_version": self.client_version,
+                "estimated_population": self.estimated_population,
                 "ts": int(time.time() * 1000),
             }))
 
