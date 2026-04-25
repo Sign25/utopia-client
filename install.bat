@@ -1,12 +1,10 @@
 @echo off
 REM ============================================================
-REM Utopia Client — Windows installer
-REM Ставит embedded Python 3.12 + pip + зависимости в %APPDATA%
-REM Использует абсолютные пути к системным утилитам — не зависит
-REM от пользовательского PATH (на части машин он урезан).
+REM Utopia Client - Windows installer
+REM Installs embedded Python 3.12 + pip + dependencies into %APPDATA%
+REM Uses absolute paths to system utilities to bypass broken PATH.
 REM ============================================================
 
-REM Пути к системным утилитам (Windows 10/11)
 set "SYS=%SystemRoot%\System32"
 set "CHCP=%SYS%\chcp.com"
 set "CURL=%SYS%\curl.exe"
@@ -24,24 +22,23 @@ set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHO
 set "GETPIP_URL=https://bootstrap.pypa.io/get-pip.py"
 
 echo === Utopia Client installer ===
-echo Папка установки: %INSTALL_DIR%
+echo Install dir: %INSTALL_DIR%
 echo.
 
-REM ---- Проверка обязательных утилит ----
 if not exist "%CURL%" (
-    echo [!] Не найден %CURL%
-    echo     Нужна Windows 10 1803+ или установите curl вручную.
+    echo [!] curl.exe not found at %CURL%
+    echo     Need Windows 10 1803+ or install curl manually.
     pause
     exit /b 1
 )
 if not exist "%TAR%" (
-    echo [!] Не найден %TAR%
-    echo     Нужна Windows 10 17063+ или установите tar вручную.
+    echo [!] tar.exe not found at %TAR%
+    echo     Need Windows 10 17063+ or install tar manually.
     pause
     exit /b 1
 )
 if not exist "%XCOPY%" (
-    echo [!] Не найден %XCOPY%
+    echo [!] xcopy.exe not found at %XCOPY%
     pause
     exit /b 1
 )
@@ -49,53 +46,51 @@ if not exist "%XCOPY%" (
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 cd /d "%INSTALL_DIR%"
 
-REM ---- Python embedded ----
-if not exist "python\python.exe" (
-    echo [1/5] Скачиваю Python %PYTHON_VERSION% embedded...
-    "%CURL%" -fsSL -o python.zip "%PYTHON_URL%" || goto :err
-    if not exist python mkdir python
-    "%TAR%" -xf python.zip -C python || goto :err
-    del /q python.zip
-    REM Включаем site-packages в embedded Python (перезаписываем _pth)
-    > "python\python%PYTHON_SHORT%._pth" (
-        echo python%PYTHON_SHORT%.zip
-        echo .
-        echo import site
-    )
-) else (
-    echo [1/5] Python уже установлен.
-)
+if exist "python\python.exe" goto :skip_python
+echo [1/5] Downloading Python %PYTHON_VERSION% embedded...
+"%CURL%" -fsSL -o python.zip "%PYTHON_URL%"
+if errorlevel 1 goto :err
+if not exist python mkdir python
+"%TAR%" -xf python.zip -C python
+if errorlevel 1 goto :err
+del /q python.zip
+> "python\python%PYTHON_SHORT%._pth" echo python%PYTHON_SHORT%.zip
+>>"python\python%PYTHON_SHORT%._pth" echo .
+>>"python\python%PYTHON_SHORT%._pth" echo import site
+goto :after_python
+:skip_python
+echo [1/5] Python already installed.
+:after_python
 
-REM ---- pip ----
-if not exist "python\Scripts\pip.exe" (
-    echo [2/5] Ставлю pip...
-    "%CURL%" -fsSL -o get-pip.py "%GETPIP_URL%" || goto :err
-    "%INSTALL_DIR%\python\python.exe" get-pip.py --no-warn-script-location || goto :err
-    del /q get-pip.py
-) else (
-    echo [2/5] pip уже установлен.
-)
+if exist "python\Scripts\pip.exe" goto :skip_pip
+echo [2/5] Installing pip...
+"%CURL%" -fsSL -o get-pip.py "%GETPIP_URL%"
+if errorlevel 1 goto :err
+"%INSTALL_DIR%\python\python.exe" get-pip.py --no-warn-script-location
+if errorlevel 1 goto :err
+del /q get-pip.py
+goto :after_pip
+:skip_pip
+echo [2/5] pip already installed.
+:after_pip
 
-REM ---- Зависимости ----
-echo [3/5] Ставлю зависимости (requests, websockets, psutil, numpy)...
-"%INSTALL_DIR%\python\python.exe" -m pip install --upgrade pip --quiet || goto :err
-"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" numpy --quiet || goto :err
+echo [3/5] Installing dependencies (requests, websockets, psutil, numpy)...
+"%INSTALL_DIR%\python\python.exe" -m pip install --upgrade pip --quiet
+if errorlevel 1 goto :err
+"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" numpy --quiet
+if errorlevel 1 goto :err
 
-REM ---- Код клиента ----
-echo [4/5] Копирую код клиента...
+echo [4/5] Copying client code...
 "%XCOPY%" /e /i /y "%~dp0utopia_client" "%INSTALL_DIR%\utopia_client" >nul
 
-REM ---- launcher ----
-echo [5/5] Создаю launcher...
-> "%INSTALL_DIR%\utopia-client.bat" (
-    echo @echo off
-    echo if exist "%%SystemRoot%%\System32\chcp.com" "%%SystemRoot%%\System32\chcp.com" 65001 ^>nul
-    echo "%INSTALL_DIR%\python\python.exe" -m utopia_client.main %%*
-)
+echo [5/5] Creating launcher...
+> "%INSTALL_DIR%\utopia-client.bat" echo @echo off
+>>"%INSTALL_DIR%\utopia-client.bat" echo if exist "%%SystemRoot%%\System32\chcp.com" "%%SystemRoot%%\System32\chcp.com" 65001 ^>nul
+>>"%INSTALL_DIR%\utopia-client.bat" echo "%INSTALL_DIR%\python\python.exe" -m utopia_client.main %%*
 
 echo.
-echo === Установка завершена ===
-echo Запуск:
+echo === Installation complete ===
+echo Run:
 echo   "%INSTALL_DIR%\utopia-client.bat" benchmark
 echo   "%INSTALL_DIR%\utopia-client.bat" run
 echo.
@@ -104,6 +99,6 @@ goto :eof
 
 :err
 echo.
-echo [!] Ошибка установки. Код %ERRORLEVEL%
+echo [!] Install failed. Code %ERRORLEVEL%
 pause
 exit /b 1
