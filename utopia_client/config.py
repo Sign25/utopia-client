@@ -29,8 +29,10 @@ def load_config() -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+        # utf-8-sig прозрачно глотает BOM, который Notepad иногда дописывает.
+        return json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception as e:
+        print(f"[config] не смог прочитать {p}: {e}")
         return {}
 
 
