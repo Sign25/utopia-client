@@ -103,7 +103,8 @@ def _run_benchmark() -> dict:
     return result
 
 
-def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int, bench: dict) -> bool:
+def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
+               bench: dict, n_alive: int = 0) -> bool:
     extra = {
         "client_version": __version__,
         "estimated_population": bench.get("estimated_population", 0),
@@ -113,7 +114,7 @@ def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int, bench: dict) -
     }
     return api.push_stats(
         name=name,
-        n_alive=0,
+        n_alive=n_alive,
         best_fitness=0.0,
         generation=0,
         world_tick=tick,
@@ -170,9 +171,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
-                ok = _heartbeat(api, name, current_state, tick, bench)
-                logger.info("heartbeat tick=%d state=%s ws=%s ok=%s",
-                            tick, current_state, ws.connected, ok)
+                n_alive = ws.n_alive_owned
+                ok = _heartbeat(api, name, current_state, tick, bench, n_alive)
+                logger.info("heartbeat tick=%d state=%s ws=%s n_alive=%d ok=%s",
+                            tick, current_state, ws.connected, n_alive, ok)
                 tick += 1
                 last_heartbeat = now
 

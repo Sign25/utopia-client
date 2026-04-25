@@ -50,6 +50,9 @@ class ColonyWSClient:
         self.connected: bool = False
         self.last_pong_ts: float = 0.0
         self.last_error: str = ""
+        # Личная статистика, обновляется из stats-сообщений P40
+        self.n_alive_owned: int = 0
+        self.last_stats_ts: float = 0.0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -152,11 +155,24 @@ class ColonyWSClient:
     async def _handle(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
         if msg_type == "welcome":
-            logger.info("welcome: world_tick=%s server_time=%s",
-                        msg.get("world_tick"), msg.get("server_time"))
+            n = msg.get("n_creatures")
+            if isinstance(n, int):
+                self.n_alive_owned = n
+            logger.info("welcome: world_tick=%s server_time=%s n_creatures=%s",
+                        msg.get("world_tick"), msg.get("server_time"), n)
             return
         if msg_type == "pong":
             self.last_pong_ts = time.time()
+            return
+        if msg_type == "stats":
+            n = msg.get("n_alive_owned", 0)
+            try:
+                self.n_alive_owned = int(n)
+            except (TypeError, ValueError):
+                self.n_alive_owned = 0
+            self.last_stats_ts = time.time()
+            logger.info("stats: n_alive_owned=%d world_tick=%s",
+                        self.n_alive_owned, msg.get("world_tick"))
             return
         # Прочее — F3 (actions/observations)
         logger.debug("unhandled msg type=%s", msg_type)
