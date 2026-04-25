@@ -46,6 +46,39 @@ class UtopiaAPI:
             logger.warning("push_stats error: %s", e)
             return False
 
+    def fetch_command(self) -> dict | None:
+        """Опросить желаемое состояние от VPS. None при ошибке."""
+        url = f"{self.server}/api/colony/command"
+        try:
+            r = requests.get(
+                url,
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("fetch_command HTTP %d: %s", r.status_code, r.text[:200])
+            return None
+        except Exception as e:
+            logger.warning("fetch_command error: %s", e)
+            return None
+
+    def push_benchmark(self, result: dict) -> bool:
+        url = f"{self.server}/api/colony/benchmark"
+        try:
+            r = requests.post(
+                url, json=result,
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return True
+            logger.warning("push_benchmark HTTP %d: %s", r.status_code, r.text[:200])
+            return False
+        except Exception as e:
+            logger.warning("push_benchmark error: %s", e)
+            return False
+
     def fetch_seed(self, dest_path: str) -> bool:
         url = f"{self.server}/api/seed"
         try:

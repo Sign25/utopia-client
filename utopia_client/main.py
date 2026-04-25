@@ -1,8 +1,11 @@
-"""Точка входа клиента: heartbeat + команды CLI.
+"""Точка входа клиента: daemon-петля + CLI.
 
-Пока минимум — heartbeat (POST stats каждые N секунд). Локального Мира
-здесь нет; это будет в следующих фазах. Heartbeat нужен, чтобы клиент
-появился в личном кабинете на divisci.com со статусом «live».
+В режиме `run` клиент опрашивает VPS: что делать (idle/benchmark/run).
+- idle      — heartbeat n_alive=0, status=idle
+- benchmark — замер CPU/RAM/GPU, push результат, ждём команду
+- run       — heartbeat status=running (локальной симуляции пока нет, Phase D)
+
+Команда меняется через UI на divisci.com → /me → кнопки.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from .benchmark import estimate_population, run_full
 from .config import DEFAULT_SERVER, get_or_prompt, load_config, save_config
 
 HEARTBEAT_SEC = 30.0
+COMMAND_POLL_SEC = 10.0
 
 logger = logging.getLogger("utopia_client")
 
@@ -59,42 +63,90 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = _ensure_config()
     print("Замер производительности…")
-    result = run_full()
-    n = estimate_population(result)
-    result["estimated_population"] = n
+    result = _run_benchmark()
     print(json.dumps(result, indent=2, ensure_ascii=False))
     cfg["benchmark"] = result
     save_config(cfg)
-    print(f"\nРекомендуемая популяция: {n} особей.")
-    print("Сохранено в конфиг.")
+    print(f"\nРекомендуемая популяция: {result['estimated_population']} особей.")
+    api = UtopiaAPI(cfg["server"], cfg["token"])
+    if api.push_benchmark(result):
+        print("Результат отправлен в Утопию.")
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    cfg = _ensure_config()
-    api = UtopiaAPI(cfg["server"], cfg["token"])
-    name = cfg["name"]
-    logger.info("starting heartbeat as colony=%s server=%s", name, cfg["server"])
-    bench = cfg.get("benchmark", {})
-    extra_static = {
+def _run_benchmark() -> dict:
+    result = run_full()
+    result["estimated_population"] = estimate_population(result)
+    result["client_version"] = __version__
+    result["measured_at"] = int(time.time())
+    return result
+
+
+def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int, bench: dict) -> bool:
+    extra = {
         "client_version": __version__,
         "estimated_population": bench.get("estimated_population", 0),
         "cpu_gflops": bench.get("cpu_gflops", 0.0),
         "gpu": bench.get("gpu", {"available": False}),
+        "status": status,
     }
+    return api.push_stats(
+        name=name,
+        n_alive=0,
+        best_fitness=0.0,
+        generation=0,
+        world_tick=tick,
+        extra=extra,
+    )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Daemon-петля: опрашивает команду от VPS и реагирует."""
+    cfg = _ensure_config()
+    api = UtopiaAPI(cfg["server"], cfg["token"])
+    name = cfg["name"]
+    logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
+
     tick = 0
+    last_heartbeat = 0.0
+    last_poll = 0.0
+    current_state = "idle"
+    bench = cfg.get("benchmark", {})
+
     while True:
-        ok = api.push_stats(
-            name=name,
-            n_alive=0,
-            best_fitness=0.0,
-            generation=0,
-            world_tick=tick,
-            extra={**extra_static, "status": "idle"},
-        )
-        logger.info("heartbeat tick=%d ok=%s", tick, ok)
-        tick += 1
-        time.sleep(HEARTBEAT_SEC)
+        now = time.monotonic()
+
+        # Опрос команды
+        if now - last_poll >= COMMAND_POLL_SEC:
+            cmd = api.fetch_command()
+            last_poll = now
+            if cmd:
+                desired = cmd.get("state", "idle")
+                if desired != current_state:
+                    logger.info("command: %s -> %s", current_state, desired)
+                # benchmark — выполняем сразу, состояние сбрасывает VPS на idle
+                if desired == "benchmark":
+                    logger.info("running benchmark…")
+                    result = _run_benchmark()
+                    cfg["benchmark"] = result
+                    save_config(cfg)
+                    bench = result
+                    if api.push_benchmark(result):
+                        logger.info("benchmark pushed: pop=%d gflops=%.2f",
+                                    result["estimated_population"],
+                                    result["cpu_gflops"])
+                    current_state = "idle"
+                else:
+                    current_state = desired
+
+        # Heartbeat
+        if now - last_heartbeat >= HEARTBEAT_SEC:
+            ok = _heartbeat(api, name, current_state, tick, bench)
+            logger.info("heartbeat tick=%d state=%s ok=%s", tick, current_state, ok)
+            tick += 1
+            last_heartbeat = now
+
+        time.sleep(1.0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
                                 description="Клиент распределённой эволюции NeuroCore")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="Запустить heartbeat")
+    sub.add_parser("run", help="Запустить daemon (опрос команды + heartbeat)")
     sub.add_parser("benchmark", help="Замерить ПК и оценить популяцию")
     sub.add_parser("config", help="Показать текущий конфиг")
     args = p.parse_args(argv)
