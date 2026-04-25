@@ -61,6 +61,26 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_token(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if not cfg.get("server"):
+        cfg["server"] = DEFAULT_SERVER
+    cfg["token"] = args.token.strip()
+    save_config(cfg)
+    print("Токен сохранён.")
+    return 0
+
+
+def cmd_set_name(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if not cfg.get("server"):
+        cfg["server"] = DEFAULT_SERVER
+    cfg["name"] = args.name.strip()
+    save_config(cfg)
+    print(f"Имя колонии: {cfg['name']}")
+    return 0
+
+
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = _ensure_config()
     print("Замер производительности…")
@@ -173,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="Запустить daemon (опрос команды + heartbeat)")
     sub.add_parser("benchmark", help="Замерить ПК и оценить популяцию")
     sub.add_parser("config", help="Показать текущий конфиг")
+    p_token = sub.add_parser("set-token", help="Записать push-токен в конфиг")
+    p_token.add_argument("token", help="Push-токен из Кабинета на divisci.com")
+    p_name = sub.add_parser("set-name", help="Записать имя колонии в конфиг")
+    p_name.add_argument("name", help="Короткое имя колонии (например home-3060ti)")
     args = p.parse_args(argv)
     if args.cmd == "run":
         return cmd_run(args)
@@ -180,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_benchmark(args)
     if args.cmd == "config":
         return cmd_config(args)
+    if args.cmd == "set-token":
+        return cmd_set_token(args)
+    if args.cmd == "set-name":
+        return cmd_set_name(args)
     return 1
 
 
