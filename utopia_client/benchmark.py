@@ -67,13 +67,14 @@ def run_full() -> dict:
 
 
 def estimate_population(score: dict) -> int:
-    """Грубая оценка max организмов под этот ПК.
+    """Реалистичный потолок особей в реалтайме (TPS ≥ 2).
 
-    Базис: 256 особей на 12 ГБ RAM при FP32 + 8 ГБ свободного.
-    Без GPU — половина.
+    Калибровка по P40: 12 особей → ~360 мс/тик. CPU forward на трансформерах
+    в 30-50× медленнее GPU FP32, поэтому без CUDA — единицы особей.
     """
-    ram = score["system"]["ram_gb"]
-    base = max(50, int(ram * 20))  # ~20 особей на ГБ RAM
-    if not score["gpu"].get("available"):
-        base //= 2
-    return base
+    gpu = score["gpu"]
+    if gpu.get("available"):
+        vram = gpu.get("vram_gb", 1)
+        return max(5, min(50, int(vram * 2)))   # ~2 особи на ГБ VRAM
+    gflops = score.get("cpu_gflops", 0.0)
+    return max(1, min(5, int(gflops / 100)))    # ~1 особь на 100 GFLOPS
