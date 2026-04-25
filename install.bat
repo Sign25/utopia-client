@@ -54,13 +54,17 @@ if not exist python mkdir python
 "%TAR%" -xf python.zip -C python
 if errorlevel 1 goto :err
 del /q python.zip
-> "python\python%PYTHON_SHORT%._pth" echo python%PYTHON_SHORT%.zip
->>"python\python%PYTHON_SHORT%._pth" echo .
->>"python\python%PYTHON_SHORT%._pth" echo import site
 goto :after_python
 :skip_python
 echo [1/5] Python already installed.
 :after_python
+
+REM Always (re)write the _pth file so the installer is idempotent.
+REM ".." adds %INSTALL_DIR% to sys.path so utopia_client package is found.
+> "python\python%PYTHON_SHORT%._pth" echo python%PYTHON_SHORT%.zip
+>>"python\python%PYTHON_SHORT%._pth" echo .
+>>"python\python%PYTHON_SHORT%._pth" echo ..
+>>"python\python%PYTHON_SHORT%._pth" echo import site
 
 if exist "python\Scripts\pip.exe" goto :skip_pip
 echo [2/5] Installing pip...
@@ -86,6 +90,7 @@ echo [4/5] Copying client code...
 echo [5/5] Creating launcher...
 > "%INSTALL_DIR%\utopia-client.bat" echo @echo off
 >>"%INSTALL_DIR%\utopia-client.bat" echo if exist "%%SystemRoot%%\System32\chcp.com" "%%SystemRoot%%\System32\chcp.com" 65001 ^>nul
+>>"%INSTALL_DIR%\utopia-client.bat" echo cd /d "%INSTALL_DIR%"
 >>"%INSTALL_DIR%\utopia-client.bat" echo "%INSTALL_DIR%\python\python.exe" -m utopia_client.main %%*
 
 echo.
