@@ -195,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="Запустить daemon (опрос команды + heartbeat)")
     sub.add_parser("benchmark", help="Замерить ПК и оценить популяцию")
     sub.add_parser("config", help="Показать текущий конфиг")
+    sub.add_parser("bench-gpu", help="Phase F3.0: forward StemCell на CUDA, ms/tps")
     p_token = sub.add_parser("set-token", help="Записать push-токен в конфиг")
     p_token.add_argument("token", help="Push-токен из Кабинета на divisci.com")
     p_name = sub.add_parser("set-name", help="Записать имя колонии в конфиг")
@@ -210,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_token(args)
     if args.cmd == "set-name":
         return cmd_set_name(args)
+    if args.cmd == "bench-gpu":
+        from .gpu_bench import cmd_bench_gpu
+        return cmd_bench_gpu(args)
     return 1
 
 
