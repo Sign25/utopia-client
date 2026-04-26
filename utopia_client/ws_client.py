@@ -46,6 +46,9 @@ class ColonyWSClient:
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
+        # threading.Event — кросс-поточный флаг, выставляется немедленно в stop().
+        # Защита от race: stop() вызван до инициализации _loop/_stop_event в _run().
+        self._stop_flag = threading.Event()
         self._ws = None
         self.connected: bool = False
         self.last_pong_ts: float = 0.0
@@ -62,8 +65,12 @@ class ColonyWSClient:
         self._thread.start()
 
     def stop(self) -> None:
+        self._stop_flag.set()
         if self._loop and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+            try:
+                self._loop.call_soon_threadsafe(self._stop_event.set)
+            except RuntimeError:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
@@ -77,6 +84,9 @@ class ColonyWSClient:
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        # Если stop() успел сработать до этой точки — выходим сразу.
+        if self._stop_flag.is_set():
+            return
         backoff = INITIAL_BACKOFF_SEC
         while not self._stop_event.is_set():
             try:
