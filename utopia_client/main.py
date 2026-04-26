@@ -188,6 +188,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
+    print(f"=== Utopia Client v{__version__} ===")
     p = argparse.ArgumentParser(prog="utopia-client",
                                 description="Клиент распределённой эволюции NeuroCore")
     p.add_argument("--version", action="version", version=__version__)
