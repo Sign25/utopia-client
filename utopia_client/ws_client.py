@@ -56,6 +56,7 @@ class ColonyWSClient:
         # Личная статистика, обновляется из stats-сообщений P40
         self.n_alive_owned: int = 0
         self.last_stats_ts: float = 0.0
+        self.last_world_tick: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -168,8 +169,11 @@ class ColonyWSClient:
             n = msg.get("n_creatures")
             if isinstance(n, int):
                 self.n_alive_owned = n
+            wt = msg.get("world_tick")
+            if isinstance(wt, int):
+                self.last_world_tick = wt
             logger.info("welcome: world_tick=%s server_time=%s n_creatures=%s",
-                        msg.get("world_tick"), msg.get("server_time"), n)
+                        wt, msg.get("server_time"), n)
             return
         if msg_type == "pong":
             self.last_pong_ts = time.time()
@@ -180,9 +184,12 @@ class ColonyWSClient:
                 self.n_alive_owned = int(n)
             except (TypeError, ValueError):
                 self.n_alive_owned = 0
+            wt = msg.get("world_tick")
+            if isinstance(wt, int):
+                self.last_world_tick = wt
             self.last_stats_ts = time.time()
             logger.info("stats: n_alive_owned=%d world_tick=%s",
-                        self.n_alive_owned, msg.get("world_tick"))
+                        self.n_alive_owned, wt)
             return
         # Прочее — F3 (actions/observations)
         logger.debug("unhandled msg type=%s", msg_type)

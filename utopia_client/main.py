@@ -136,7 +136,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     ws.start()
 
-    tick = 0
     last_heartbeat = 0.0
     last_poll = 0.0
     current_state = "idle"
@@ -172,10 +171,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
                 n_alive = ws.n_alive_owned
-                ok = _heartbeat(api, name, current_state, tick, bench, n_alive)
-                logger.info("heartbeat tick=%d state=%s ws=%s n_alive=%d ok=%s",
-                            tick, current_state, ws.connected, n_alive, ok)
-                tick += 1
+                world_tick = ws.last_world_tick
+                ok = _heartbeat(api, name, current_state, world_tick, bench, n_alive)
+                logger.info("heartbeat world_tick=%d state=%s ws=%s n_alive=%d ok=%s",
+                            world_tick, current_state, ws.connected, n_alive, ok)
                 last_heartbeat = now
 
             time.sleep(1.0)
