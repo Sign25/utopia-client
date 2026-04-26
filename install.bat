@@ -89,7 +89,11 @@ if errorlevel 1 (
 )
 
 echo [4/6] Installing requirements (включая neurocore[client] из git)...
-"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" numpy --quiet
+REM hatchling нужен в основной среде, чтобы neurocore собрался без build isolation
+REM (embedded Python + изолированная сборка ломаются на python._pth).
+"%INSTALL_DIR%\python\python.exe" -m pip install hatchling numpy --quiet
+if errorlevel 1 goto :err
+"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" --no-build-isolation --quiet
 if errorlevel 1 goto :err
 
 echo [5/6] Copying client code...
