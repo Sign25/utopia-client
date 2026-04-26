@@ -57,6 +57,11 @@ class ColonyWSClient:
         self.n_alive_owned: int = 0
         self.last_stats_ts: float = 0.0
         self.last_world_tick: int = 0
+        # Phase F3.0 echo-loop: один фоновый таск шлёт фейковый tick_summary.
+        self._echo_task: Optional[asyncio.Task] = None
+        self._echo_seq: int = 0
+        self._echo_snapshots_received: int = 0
+        self._echo_last_snap_ts_p40_ns: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -205,5 +210,91 @@ class ColonyWSClient:
             logger.info("stats: n_alive_owned=%d world_tick=%s",
                         self.n_alive_owned, wt)
             return
+        if msg_type == "echo_request":
+            await self._handle_echo_request(msg)
+            return
+        if msg_type == "world_snapshot":
+            self._echo_snapshots_received += 1
+            ts = msg.get("ts_p40_ns")
+            if isinstance(ts, int):
+                self._echo_last_snap_ts_p40_ns = ts
+            logger.info("echo: world_snapshot seq=%s tick=%s",
+                        msg.get("seq"), msg.get("world_tick"))
+            return
         # Прочее — F3 (actions/observations)
         logger.debug("unhandled msg type=%s", msg_type)
+
+    async def _handle_echo_request(self, msg: dict) -> None:
+        action = msg.get("action", "")
+        if action == "stop":
+            await self._stop_echo()
+            logger.info("echo: stop")
+            return
+        if action == "start":
+            duration = int(msg.get("duration_sec", 60) or 60)
+            interval_ms = int(msg.get("summary_interval_ms", 1000) or 1000)
+            fake_n = int(msg.get("fake_n", 50) or 50)
+            await self._stop_echo()
+            self._echo_seq = 0
+            self._echo_task = asyncio.create_task(
+                self._echo_send_loop(duration, interval_ms, fake_n))
+            logger.info("echo: start dur=%ds interval=%dms n=%d",
+                        duration, interval_ms, fake_n)
+
+    async def _stop_echo(self) -> None:
+        task = self._echo_task
+        self._echo_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _echo_send_loop(self, duration_sec: int, interval_ms: int,
+                              fake_n: int) -> None:
+        """Phase F3.0: шлёт фейковый tick_summary раз в interval_ms.
+
+        Каждый summary — fake_n записей по ~80 байт (energy/age/pos/action/score).
+        В ts_p40_ns_echo возвращаем последний полученный ts из world_snapshot —
+        P40 считает round-trip latency.
+        """
+        import random
+        deadline = time.monotonic() + duration_sec
+        interval = max(0.05, interval_ms / 1000.0)
+        try:
+            while time.monotonic() < deadline:
+                ws = self._ws
+                if ws is None:
+                    return
+                self._echo_seq += 1
+                summaries = [
+                    {
+                        "cid": f"c{i:04d}",
+                        "e": round(random.random(), 3),
+                        "a": random.randint(0, 1000),
+                        "x": random.randint(0, 31),
+                        "y": random.randint(0, 31),
+                        "act": random.randint(0, 7),
+                        "score": round(random.random(), 3),
+                    }
+                    for i in range(fake_n)
+                ]
+                payload = {
+                    "type": "tick_summary",
+                    "world_tick": self.last_world_tick,
+                    "client_seq": self._echo_seq,
+                    "ts_p40_ns_echo": self._echo_last_snap_ts_p40_ns,
+                    "summaries": summaries,
+                }
+                try:
+                    await ws.send(json.dumps(payload, separators=(",", ":")))
+                except Exception as e:
+                    logger.warning("echo send failed: %s", e)
+                    return
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+        finally:
+            logger.info("echo: send loop finished seq=%d", self._echo_seq)
