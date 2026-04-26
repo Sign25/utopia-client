@@ -178,6 +178,20 @@ class ColonyWSClient:
         if msg_type == "pong":
             self.last_pong_ts = time.time()
             return
+        if msg_type == "ping_probe":
+            # Phase F3.0: эхо для замера RTT P40↔клиент. Не подмешиваем
+            # своё время — P40 считает RTT по своему монотонному часу.
+            ws = self._ws
+            if ws is not None:
+                try:
+                    await ws.send(json.dumps({
+                        "type": "pong_probe",
+                        "probe_id": msg.get("probe_id"),
+                        "ts_p40_ns": msg.get("ts_p40_ns"),
+                    }))
+                except Exception:
+                    pass
+            return
         if msg_type == "stats":
             n = msg.get("n_alive_owned", 0)
             try:
