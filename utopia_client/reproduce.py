@@ -71,14 +71,18 @@ def pack_zstd_b64(payload: dict) -> str:
 
 
 def unpack_zstd_b64(b64: str):
-    """base64 → zstd → torch.load(payload)."""
+    """base64 → zstd → torch.load(payload).
+
+    weights_only=True — payload содержит только tensors/dicts/strs (state_dict),
+    защита от ACE если канал к P40 будет скомпрометирован.
+    """
     import torch
     import zstandard as zstd
 
     compressed = base64.b64decode(b64)
     dctx = zstd.ZstdDecompressor()
     raw = dctx.decompress(compressed)
-    return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
+    return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
 
 
 def build_reproduce_envelope(parent_cid: str, organism, *,
