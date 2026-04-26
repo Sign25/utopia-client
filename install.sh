@@ -36,8 +36,10 @@ fi
 source venv/bin/activate
 
 # ---- Зависимости ----
-echo "[3/4] Ставлю зависимости..."
+echo "[3/4] Ставлю PyTorch (CPU/GPU — autodetect через системный pip-индекс)..."
 pip install --upgrade pip --quiet
+pip install torch --quiet
+echo "    + основные зависимости (включая neurocore[client] из git)..."
 pip install -r "${SCRIPT_DIR}/requirements.txt" numpy --quiet
 
 # ---- Код клиента ----

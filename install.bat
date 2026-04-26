@@ -78,19 +78,19 @@ goto :after_pip
 echo [2/5] pip already installed.
 :after_pip
 
-echo [3/6] Installing dependencies (requests, websockets, psutil, numpy)...
+echo [3/6] Upgrading pip + installing PyTorch CUDA 12.1 (~2.5 GB, может быть долго)...
 "%INSTALL_DIR%\python\python.exe" -m pip install --upgrade pip --quiet
 if errorlevel 1 goto :err
-"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" numpy --quiet
-if errorlevel 1 goto :err
-
-echo [4/6] Installing PyTorch with CUDA 12.1 support (~2.5 GB, may take a while)...
 "%INSTALL_DIR%\python\python.exe" -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 (
-    echo [!] PyTorch CUDA install failed, falling back to CPU-only torch...
+    echo [!] PyTorch CUDA install failed, fallback to CPU-only torch...
     "%INSTALL_DIR%\python\python.exe" -m pip install torch --quiet
     if errorlevel 1 goto :err
 )
+
+echo [4/6] Installing requirements (включая neurocore[client] из git)...
+"%INSTALL_DIR%\python\python.exe" -m pip install -r "%~dp0requirements.txt" numpy --quiet
+if errorlevel 1 goto :err
 
 echo [5/6] Copying client code...
 "%XCOPY%" /e /i /y "%~dp0utopia_client" "%INSTALL_DIR%\utopia_client" >nul

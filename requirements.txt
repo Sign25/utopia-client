@@ -1,3 +1,11 @@
+# Сетевая часть клиента (HTTP/WS, бенчмарк, упаковка).
 requests>=2.32.0
 websockets>=13.0
 psutil>=6.0.0
+
+# F3.4: compute-ядро Утопии — берём из git, exclude server-deps через extra [client].
+# Содержит core.workbench, environment.world, storage.norg, render.*.
+# Тащит torch/numpy/scipy/pydantic/zstandard.
+# В install.bat прописана отдельная установка PyTorch CUDA 12.1 ДО этой строки —
+# чтобы pip не подтянул CPU-сборку из обычного PyPI.
+neurocore[client] @ git+https://github.com/DiviSci/NeuroCore.git@main
