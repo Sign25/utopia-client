@@ -23,7 +23,7 @@ def organism(tmp_path, monkeypatch):
     import importlib
     from environment import seed_loader as ns_loader
     importlib.reload(ns_loader)
-    ns_loader.ensure_seed(preset="tardigrade")
+    ns_loader.ensure_seed(preset="nexus")
 
     client_seed = tmp_path / "client_seed.norg"
     client_seed.write_bytes(seed_path.read_bytes())

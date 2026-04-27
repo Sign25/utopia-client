@@ -37,7 +37,7 @@ def seed_file(tmp_path, monkeypatch):
     from environment import seed_loader as ns_loader
 
     importlib.reload(ns_loader)
-    ns_loader.ensure_seed(preset="tardigrade")
+    ns_loader.ensure_seed(preset="nexus")
     monkeypatch.setenv("UTOPIA_SEED_PATH", str(tmp_path / "client_seed.norg"))
     # Скопируем в client cache, чтобы клиент-loader не лез к API.
     client_seed = tmp_path / "client_seed.norg"

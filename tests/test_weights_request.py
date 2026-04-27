@@ -25,7 +25,7 @@ def seed_file(tmp_path, monkeypatch):
     import importlib
     from environment import seed_loader as ns_loader
     importlib.reload(ns_loader)
-    ns_loader.ensure_seed(preset="tardigrade")
+    ns_loader.ensure_seed(preset="nexus")
 
     monkeypatch.setenv("UTOPIA_SEED_PATH", str(tmp_path / "client_seed.norg"))
     monkeypatch.setenv("UTOPIA_COLONIES_DIR", str(tmp_path / "colonies"))
