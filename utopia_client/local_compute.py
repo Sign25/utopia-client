@@ -55,6 +55,8 @@ class LocalColonyCompute:
         self.organisms: dict = {}            # cid → CompositeOrganism
         self.action_selectors: dict = {}     # cid → ActionSelector
         self.hebbian: dict = {}              # cid → HebbianController | None
+        # Phase F3.2.b: метрика — сколько раз обновили Hebbian.
+        self.hebbian_updates: int = 0
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -111,11 +113,14 @@ class LocalColonyCompute:
 
     # ── Tick ─────────────────────────────────────────────────────────────
 
-    def handle_tick(self, obs_per_cid: dict) -> dict:
-        """Forward + ActionSelector для всех зарегистрированных cid.
+    def handle_tick(self, obs_per_cid: dict,
+                    events_per_cid: Optional[dict] = None) -> dict:
+        """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
             obs_per_cid: {cid: np.ndarray[80] float32} — env-наблюдения от P40.
+            events_per_cid: {cid: {ate, killed, damage_taken, delta_energy}} —
+                события прошлого тика. Если None — Hebbian update пропускается.
 
         Returns:
             {cid: {"action": int, "target_id": Optional[str]}} — готово к
@@ -150,10 +155,43 @@ class LocalColonyCompute:
                 selector = self.action_selectors[cid]
                 action = int(selector.select(logits, n_actions=N_ACTIONS))
                 out[cid] = {"action": action, "target_id": None}
+
+                # Phase F3.2.b: Hebbian update по локальному R3 reward.
+                # immediate-only — medium/long требуют state (ema, repro
+                # tracking) и помечены как долг.
+                if heb is not None and events_per_cid is not None:
+                    event = events_per_cid.get(cid)
+                    if event is not None:
+                        r_imm = self._compute_immediate_reward(event)
+                        try:
+                            heb.update(logits,
+                                       {"immediate": r_imm,
+                                        "medium": 0.0, "long": 0.0})
+                            self.hebbian_updates += 1
+                        except Exception as e:
+                            logger.debug("hebbian update %s: %s", cid, e)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
         return out
+
+    @staticmethod
+    def _compute_immediate_reward(event: dict) -> float:
+        """R3 immediate из событий тика. Вес как на P40 (Phase H1+):
+
+            r_imm = δenergy·0.05 + 1·ate + 5·killed − 0.1·damage
+
+        В реальной среде значения примерно: ate +1.0, killed +5.0,
+        обычный метаболизм δenergy≈-0.05 → r_imm≈0 (нейтрально).
+        """
+        delta_energy = float(event.get("delta_energy", 0.0))
+        ate = bool(event.get("ate", False))
+        killed = bool(event.get("killed", False))
+        damage_taken = float(event.get("damage_taken", 0.0))
+        return (delta_energy * 0.05
+                + (1.0 if ate else 0.0)
+                + (5.0 if killed else 0.0)
+                - damage_taken * 0.1)
 
     # ── Internals ────────────────────────────────────────────────────────
 

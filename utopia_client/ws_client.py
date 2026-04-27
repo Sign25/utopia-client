@@ -364,6 +364,7 @@ class ColonyWSClient:
         if self.compute is None or not creatures:
             return
         obs_per_cid: dict = {}
+        events_per_cid: dict = {}
         for c in creatures:
             cid = c.get("cid")
             obs = c.get("obs")
@@ -373,10 +374,20 @@ class ColonyWSClient:
                 obs_per_cid[str(cid)] = np.asarray(obs, dtype=np.float32)
             except Exception as e:
                 logger.debug("obs parse %s: %s", cid, e)
+                continue
+            # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
+            # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
+            events_per_cid[str(cid)] = {
+                "ate": bool(c.get("ate", False)),
+                "killed": bool(c.get("killed", False)),
+                "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
+                "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
+            }
         if not obs_per_cid:
             return
         try:
-            actions = self.compute.handle_tick(obs_per_cid)
+            actions = self.compute.handle_tick(obs_per_cid,
+                                                events_per_cid=events_per_cid)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return
