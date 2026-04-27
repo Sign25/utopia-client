@@ -72,6 +72,9 @@ class ColonyWSClient:
         # Метрики obs/actions
         self._obs_batches_received: int = 0
         self._actions_batches_sent: int = 0
+        # Phase F3.3.a: счётчик отправленных weights_dump.
+        self._weights_dumps_sent: int = 0
+        self._weights_requests_received: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -255,6 +258,10 @@ class ColonyWSClient:
         if msg_type == "obs_batch":
             await self._handle_obs_batch(msg)
             return
+        # ── Phase F3.3.a: pull-on-demand weights ────────────────────────
+        if msg_type == "weights_request":
+            await self._handle_weights_request(msg)
+            return
         # Прочее — F3 (force_death, world_event, newborn_ack — F3.4+)
         logger.debug("unhandled msg type=%s", msg_type)
 
@@ -436,6 +443,61 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+
+    # ── Phase F3.3.a: weights_request → weights_dump ─────────────────────
+
+    async def _handle_weights_request(self, msg: dict) -> None:
+        """P40 запросил актуальные веса конкретной нашей особи.
+
+        Сериализуем `compute.save_state(cid)` через torch.save → b64 → отдаём
+        одним сообщением. Чанкование оставлено на будущее (для тихоходки
+        ~7-15 КБ raw, b64 + envelope < 50 КБ — fits 512 KB ws-лимит).
+        """
+        import base64
+        import io
+        cid = str(msg.get("cid", ""))
+        request_id = msg.get("request_id")
+        ws = self._ws
+        if ws is None:
+            return
+        self._weights_requests_received += 1
+
+        async def _reject(reason: str) -> None:
+            try:
+                await ws.send(json.dumps({
+                    "type": "weights_dump",
+                    "cid": cid, "request_id": request_id,
+                    "ok": False, "reason": reason,
+                }))
+            except Exception as e:
+                logger.warning("weights_dump reject send failed: %s", e)
+
+        if not cid or self.compute is None:
+            await _reject("no_compute")
+            return
+        payload = self.compute.save_state(cid)
+        if payload is None:
+            await _reject("unknown_cid")
+            return
+        try:
+            import torch
+            buf = io.BytesIO()
+            torch.save(payload, buf)
+            blob = buf.getvalue()
+        except Exception as e:
+            logger.warning("weights_dump serialize %s failed: %s", cid, e)
+            await _reject(f"serialize_error: {type(e).__name__}")
+            return
+        try:
+            await ws.send(json.dumps({
+                "type": "weights_dump",
+                "cid": cid, "request_id": request_id,
+                "ok": True,
+                "blob_b64": base64.b64encode(blob).decode("ascii"),
+            }))
+            self._weights_dumps_sent += 1
+        except Exception as e:
+            logger.warning("weights_dump send failed: %s", e)
 
     async def _handle_echo_request(self, msg: dict) -> None:
         action = msg.get("action", "")
