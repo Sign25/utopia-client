@@ -175,6 +175,63 @@ class LocalColonyCompute:
                 out[cid] = {"action": STAY, "target_id": None}
         return out
 
+    # ── Phase F3.2.c: персистенция Hebbian-state на диск ────────────────
+
+    def save_state(self, cid: str) -> Optional[dict]:
+        """Собрать payload для torch.save: формат идентичен P40 `_save_member_pt`,
+        чтобы при загрузке можно было прогнать через `organism_from_weights`.
+
+        Возвращает None, если особь неизвестна.
+        """
+        org = self.organisms.get(cid)
+        if org is None:
+            return None
+        payload: dict = {}
+        if hasattr(org, "tissues"):
+            try:
+                payload["tissues_state_dict"] = {
+                    tid: t.state_dict() for tid, t in org.tissues.items()
+                }
+            except Exception as e:
+                logger.warning("save_state %s tissues: %s", cid, e)
+                return None
+        heb = self.hebbian.get(cid)
+        if heb is not None and hasattr(heb, "state_dict"):
+            try:
+                payload["hebbian"] = heb.state_dict()
+            except Exception as e:
+                logger.debug("save_state %s hebbian: %s", cid, e)
+        sel = self.action_selectors.get(cid)
+        if sel is not None and hasattr(sel, "state_dict"):
+            try:
+                payload["selector"] = sel.state_dict()
+            except Exception as e:
+                logger.debug("save_state %s selector: %s", cid, e)
+        return payload
+
+    def save_all_states(self, dir_path) -> int:
+        """Сохранить state всех зарегистрированных особей в `dir_path/{cid}.pt`.
+
+        Возвращает число успешно сохранённых файлов. Каталог создаётся при
+        отсутствии. Ошибки сериализации отдельных особей логируются и не
+        прерывают остальные.
+        """
+        from pathlib import Path
+        torch = self._torch
+        dir_path = Path(dir_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for cid in list(self.organisms.keys()):
+            payload = self.save_state(cid)
+            if not payload:
+                continue
+            try:
+                torch.save(payload, dir_path / f"{cid}.pt")
+                n += 1
+            except Exception as e:
+                logger.warning("save_state %s torch.save failed: %s", cid, e)
+        return n
+
     @staticmethod
     def _compute_immediate_reward(event: dict) -> float:
         """R3 immediate из событий тика. Вес как на P40 (Phase H1+):

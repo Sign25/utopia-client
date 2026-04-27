@@ -36,6 +36,21 @@ def seed_cached() -> bool:
     return _DEFAULT_SEED_PATH.exists() and _DEFAULT_SEED_PATH.stat().st_size > 0
 
 
+# Phase F3.2.c: локальный кеш Hebbian-state особей колонии.
+def colony_state_dir(colony_name: str) -> Path:
+    """Каталог локальных state-файлов особей колонии (Hebbian + tissues + selector).
+
+    Override через env `UTOPIA_COLONIES_DIR`. Имя колонии = subdir.
+    """
+    base = Path(os.getenv("UTOPIA_COLONIES_DIR",
+                          str(Path.home() / ".utopia-client" / "colonies")))
+    return base / colony_name
+
+
+def creature_state_path(colony_name: str, cid: str) -> Path:
+    return colony_state_dir(colony_name) / f"{cid}.pt"
+
+
 def ensure_seed(api: "UtopiaAPI", *, force: bool = False) -> Optional[Path]:
     """Скачать seed.norg в локальный кеш (если ещё нет / force=True).
 

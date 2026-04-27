@@ -90,6 +90,16 @@ class ColonyWSClient:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        # Phase F3.2.c: после join — поток compute больше не трогает; безопасно
+        # сериализовать Hebbian-state особей в локальный кеш колонии.
+        if self.compute is not None:
+            try:
+                from .seed_loader import colony_state_dir
+                n = self.compute.save_all_states(
+                    colony_state_dir(self.colony_name))
+                logger.info("local-state saved: %d creatures", n)
+            except Exception as e:
+                logger.warning("save_all_states failed: %s", e)
 
     def _thread_main(self) -> None:
         try:
@@ -316,23 +326,40 @@ class ColonyWSClient:
             logger.warning("finalize %s: compute unavailable", cid)
             self._seed_failed += 1
             return
-        weights = b"".join(chunks)
+        # Phase F3.2.c: source-приоритет — local-cache (Hebbian-обученные) над
+        # P40-seed. Битый local → fallback на P40-bytes (без потери особи).
+        p40_bytes = b"".join(chunks)
+        sources: list[tuple[str, bytes]] = []
         try:
-            from .seed_loader import organism_from_weights, seed_cache_path
-            org, payload = organism_from_weights(weights, seed_cache_path())
-            self.compute.add_creature(
-                cid, org,
-                hebbian_enabled=True,
-                learning_rate=float(meta.get("learning_rate", 1e-4)),
-                trace_decay=float(meta.get("trace_decay", 0.9)),
-            )
-            self.compute.apply_inherited_state(cid, payload)
-            self._seed_accepted += 1
-            logger.info("seed accepted cid=%s seed_id=%d bytes=%d",
-                        cid, seed_id, len(weights))
+            from .seed_loader import creature_state_path
+            local_path = creature_state_path(self.colony_name, cid)
+            if local_path.exists() and local_path.stat().st_size > 0:
+                sources.append(("local-cache", local_path.read_bytes()))
         except Exception as e:
+            logger.warning("local read %s failed: %s", cid, e)
+        sources.append(("p40-seed", p40_bytes))
+
+        from .seed_loader import organism_from_weights, seed_cache_path
+        loaded = False
+        for src, weights in sources:
+            try:
+                org, payload = organism_from_weights(weights, seed_cache_path())
+                self.compute.add_creature(
+                    cid, org,
+                    hebbian_enabled=True,
+                    learning_rate=float(meta.get("learning_rate", 1e-4)),
+                    trace_decay=float(meta.get("trace_decay", 0.9)),
+                )
+                self.compute.apply_inherited_state(cid, payload)
+                self._seed_accepted += 1
+                logger.info("seed accepted cid=%s seed_id=%d bytes=%d source=%s",
+                            cid, seed_id, len(weights), src)
+                loaded = True
+                break
+            except Exception as e:
+                logger.warning("finalize %s source=%s failed: %s", cid, src, e)
+        if not loaded:
             self._seed_failed += 1
-            logger.warning("finalize %s failed: %s", cid, e)
 
     async def _handle_seed_complete(self, msg: dict) -> None:
         seed_id = int(msg.get("seed_id", 0))
