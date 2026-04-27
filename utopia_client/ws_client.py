@@ -75,6 +75,11 @@ class ColonyWSClient:
         # Phase F3.3.a: счётчик отправленных weights_dump.
         self._weights_dumps_sent: int = 0
         self._weights_requests_received: int = 0
+        # Phase F3.3.b.2: cross-owner mate. Мать получает mate_request от P40,
+        # делает кроссинговер локально и отвечает newborn.
+        self._mate_requests_received: int = 0
+        self._mate_newborns_sent: int = 0
+        self._mate_rejects_sent: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -261,6 +266,10 @@ class ColonyWSClient:
         # ── Phase F3.3.a: pull-on-demand weights ────────────────────────
         if msg_type == "weights_request":
             await self._handle_weights_request(msg)
+            return
+        # ── Phase F3.3.b.2: cross-owner mate ────────────────────────────
+        if msg_type == "mate_request":
+            await self._handle_mate_request(msg)
             return
         # Прочее — F3 (force_death, world_event, newborn_ack — F3.4+)
         logger.debug("unhandled msg type=%s", msg_type)
@@ -498,6 +507,85 @@ class ColonyWSClient:
             self._weights_dumps_sent += 1
         except Exception as e:
             logger.warning("weights_dump send failed: %s", e)
+
+    # ── Phase F3.3.b.2: mate_request → newborn ──────────────────────────
+
+    async def _handle_mate_request(self, msg: dict) -> None:
+        """P40 запросил у нас (мать-владельца) собрать ребёнка кроссинговером.
+
+        Шаги: загружаем отца из присланных bytes (через тот же путь что и
+        seed-finalize), берём свою мать из compute.organisms, deepcopy → reset
+        → apply_crossover_inheritance → сериализуем child_blob → отвечаем.
+        """
+        import base64
+        import copy as _copy
+        request_id = msg.get("request_id")
+        mother_cid = str(msg.get("mother_cid", ""))
+        father_cid = str(msg.get("father_cid", ""))
+        sigma_scale = float(msg.get("sigma_scale", 1.0) or 1.0)
+        father_blob_b64 = msg.get("father_blob_b64", "")
+        ws = self._ws
+        if ws is None:
+            return
+        self._mate_requests_received += 1
+
+        async def _reject(reason: str) -> None:
+            self._mate_rejects_sent += 1
+            try:
+                await ws.send(json.dumps({
+                    "type": "newborn",
+                    "request_id": request_id,
+                    "mother_cid": mother_cid,
+                    "father_cid": father_cid,
+                    "ok": False, "reason": reason,
+                }))
+            except Exception as e:
+                logger.warning("newborn reject send failed: %s", e)
+
+        if not mother_cid or self.compute is None:
+            await _reject("no_compute")
+            return
+        mother_org = self.compute.organisms.get(mother_cid)
+        if mother_org is None:
+            await _reject("unknown_mother")
+            return
+        try:
+            father_blob = base64.b64decode(father_blob_b64)
+        except Exception as e:
+            logger.warning("mate_request bad b64 from P40: %s", e)
+            await _reject("bad_father_blob")
+            return
+        try:
+            from .seed_loader import organism_from_weights, seed_cache_path
+            father_org, _ = organism_from_weights(father_blob, seed_cache_path())
+        except Exception as e:
+            logger.warning("mate_request father load failed: %s", e)
+            await _reject(f"father_load_error: {type(e).__name__}")
+            return
+        try:
+            from .crossover import apply_crossover_inheritance, serialize_organism_blob
+            child_org = _copy.deepcopy(mother_org)
+            if hasattr(child_org, "reset_states"):
+                child_org.reset_states()
+            apply_crossover_inheritance(child_org, mother_org, father_org,
+                                         sigma_scale=sigma_scale)
+            child_blob = serialize_organism_blob(child_org)
+        except Exception as e:
+            logger.warning("mate_request crossover failed: %s", e)
+            await _reject(f"crossover_error: {type(e).__name__}")
+            return
+        try:
+            await ws.send(json.dumps({
+                "type": "newborn",
+                "request_id": request_id,
+                "mother_cid": mother_cid,
+                "father_cid": father_cid,
+                "ok": True,
+                "child_blob_b64": base64.b64encode(child_blob).decode("ascii"),
+            }))
+            self._mate_newborns_sent += 1
+        except Exception as e:
+            logger.warning("newborn send failed: %s", e)
 
     async def _handle_echo_request(self, msg: dict) -> None:
         action = msg.get("action", "")
