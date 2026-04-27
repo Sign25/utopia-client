@@ -80,6 +80,31 @@ class LocalColonyCompute:
         self.action_selectors.pop(cid, None)
         self.hebbian.pop(cid, None)
 
+    def apply_inherited_state(self, cid: str, payload: dict) -> None:
+        """Phase F3.1.b: накатить унаследованные state_dicts на уже
+        зарегистрированную особь.
+
+        Payload — то, что вернул `seed_loader.organism_from_weights`.
+        Содержит ключи 'hebbian' / 'selector' / 'predictor' от родителя
+        на P40. Что отсутствует — пропускается без ошибок.
+        """
+        if cid not in self.organisms:
+            logger.warning("apply_inherited_state: cid=%s unknown (skip)", cid)
+            return
+        heb_sd = payload.get("hebbian")
+        if heb_sd is not None and self.hebbian.get(cid) is not None:
+            try:
+                self.hebbian[cid].load_state_dict(heb_sd)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s hebbian: %s", cid, e)
+        sel_sd = payload.get("selector")
+        sel = self.action_selectors.get(cid)
+        if sel_sd is not None and sel is not None and hasattr(sel, "load_state_dict"):
+            try:
+                sel.load_state_dict(sel_sd)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s selector: %s", cid, e)
+
     @property
     def n_alive(self) -> int:
         return len(self.organisms)

@@ -62,6 +62,16 @@ class ColonyWSClient:
         self._echo_seq: int = 0
         self._echo_snapshots_received: int = 0
         self._echo_last_snap_ts_p40_ns: int = 0
+        # Phase F3.1.b: локальная compute-колония, создаётся лениво при seed_start.
+        self.compute = None  # type: Optional["LocalColonyCompute"]
+        # Чанки seed копятся по (seed_id, cid). Метаданные — из seq=0.
+        self._seed_buffers: dict[tuple[int, str], list[bytes]] = {}
+        self._seed_meta: dict[tuple[int, str], dict] = {}
+        self._seed_accepted: int = 0
+        self._seed_failed: int = 0
+        # Метрики obs/actions
+        self._obs_batches_received: int = 0
+        self._actions_batches_sent: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -221,8 +231,173 @@ class ColonyWSClient:
             logger.info("echo: world_snapshot seq=%s tick=%s",
                         msg.get("seq"), msg.get("world_tick"))
             return
-        # Прочее — F3 (actions/observations)
+        # ── Phase F3.1.b/d: seed (chunked weights) ──────────────────────
+        if msg_type == "seed_start":
+            self._handle_seed_start(msg)
+            return
+        if msg_type == "seed_chunk":
+            self._handle_seed_chunk(msg)
+            return
+        if msg_type == "seed_complete":
+            await self._handle_seed_complete(msg)
+            return
+        # ── Phase F3.1.b/c: obs_batch → handle_tick → actions_batch ─────
+        if msg_type == "obs_batch":
+            await self._handle_obs_batch(msg)
+            return
+        # Прочее — F3 (force_death, world_event, newborn_ack — F3.4+)
         logger.debug("unhandled msg type=%s", msg_type)
+
+    # ── Phase F3.1.b: seed handling ──────────────────────────────────────
+
+    def _ensure_compute(self) -> bool:
+        """Лениво создать LocalColonyCompute. False — если torch/neurocore не
+        установлены."""
+        if self.compute is not None:
+            return True
+        try:
+            from .local_compute import LocalColonyCompute
+            self.compute = LocalColonyCompute()
+            logger.info("compute initialized: device=%s", self.compute.device)
+            return True
+        except Exception as e:
+            logger.warning("compute init failed: %s", e)
+            return False
+
+    def _handle_seed_start(self, msg: dict) -> None:
+        seed_id = int(msg.get("seed_id", 0))
+        n = int(msg.get("n_creatures", 0))
+        total = int(msg.get("total_bytes", 0))
+        # Очищаем старые буферы под этот seed_id (на случай повторной рассылки).
+        for key in [k for k in self._seed_buffers if k[0] == seed_id]:
+            self._seed_buffers.pop(key, None)
+            self._seed_meta.pop(key, None)
+        self._seed_accepted = 0
+        self._seed_failed = 0
+        self._ensure_compute()
+        logger.info("seed_start id=%d n=%d total_bytes=%d", seed_id, n, total)
+
+    def _handle_seed_chunk(self, msg: dict) -> None:
+        import base64
+        seed_id = int(msg.get("seed_id", 0))
+        cid = str(msg.get("cid", ""))
+        seq = int(msg.get("seq", 0))
+        last = bool(msg.get("last", False))
+        payload_b64 = msg.get("payload_b64", "")
+        if not cid or not payload_b64:
+            logger.warning("seed_chunk: bad msg (cid=%s)", cid)
+            return
+        key = (seed_id, cid)
+        try:
+            chunk = base64.b64decode(payload_b64)
+        except Exception as e:
+            logger.warning("seed_chunk %s: b64 decode failed: %s", cid, e)
+            self._seed_failed += 1
+            return
+        if seq == 0:
+            meta = msg.get("meta")
+            if isinstance(meta, dict):
+                self._seed_meta[key] = meta
+            self._seed_buffers[key] = []
+        buf = self._seed_buffers.setdefault(key, [])
+        buf.append(chunk)
+        if last:
+            self._finalize_seed_creature(key)
+
+    def _finalize_seed_creature(self, key: tuple[int, str]) -> None:
+        seed_id, cid = key
+        chunks = self._seed_buffers.pop(key, [])
+        meta = self._seed_meta.pop(key, {})
+        if not chunks:
+            logger.warning("finalize %s: no chunks", cid)
+            self._seed_failed += 1
+            return
+        if self.compute is None and not self._ensure_compute():
+            logger.warning("finalize %s: compute unavailable", cid)
+            self._seed_failed += 1
+            return
+        weights = b"".join(chunks)
+        try:
+            from .seed_loader import organism_from_weights, seed_cache_path
+            org, payload = organism_from_weights(weights, seed_cache_path())
+            self.compute.add_creature(
+                cid, org,
+                hebbian_enabled=True,
+                learning_rate=float(meta.get("learning_rate", 1e-4)),
+                trace_decay=float(meta.get("trace_decay", 0.9)),
+            )
+            self.compute.apply_inherited_state(cid, payload)
+            self._seed_accepted += 1
+            logger.info("seed accepted cid=%s seed_id=%d bytes=%d",
+                        cid, seed_id, len(weights))
+        except Exception as e:
+            self._seed_failed += 1
+            logger.warning("finalize %s failed: %s", cid, e)
+
+    async def _handle_seed_complete(self, msg: dict) -> None:
+        seed_id = int(msg.get("seed_id", 0))
+        ws = self._ws
+        if ws is None:
+            return
+        ack = {
+            "type": "seed_ack",
+            "seed_id": seed_id,
+            "accepted": self._seed_accepted,
+            "failed": self._seed_failed,
+            "ts": int(time.time() * 1000),
+        }
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception as e:
+            logger.warning("seed_ack send failed: %s", e)
+        logger.info("seed_complete id=%d accepted=%d failed=%d",
+                    seed_id, self._seed_accepted, self._seed_failed)
+
+    # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
+
+    async def _handle_obs_batch(self, msg: dict) -> None:
+        import numpy as np
+        creatures = msg.get("creatures") or []
+        world_tick = int(msg.get("world_tick", 0))
+        ts_echo = msg.get("ts_p40_ns")
+        self._obs_batches_received += 1
+        if self.compute is None or not creatures:
+            return
+        obs_per_cid: dict = {}
+        for c in creatures:
+            cid = c.get("cid")
+            obs = c.get("obs")
+            if not cid or obs is None:
+                continue
+            try:
+                obs_per_cid[str(cid)] = np.asarray(obs, dtype=np.float32)
+            except Exception as e:
+                logger.debug("obs parse %s: %s", cid, e)
+        if not obs_per_cid:
+            return
+        try:
+            actions = self.compute.handle_tick(obs_per_cid)
+        except Exception as e:
+            logger.warning("handle_tick failed: %s", e)
+            return
+        ws = self._ws
+        if ws is None or not actions:
+            return
+        out = {
+            "type": "actions_batch",
+            "world_tick": world_tick,
+            "ts_p40_ns_echo": ts_echo,
+            "creatures": [
+                {"cid": cid, "action": int(a["action"]),
+                 "target_id": a.get("target_id")}
+                for cid, a in actions.items()
+            ],
+        }
+        try:
+            await ws.send(json.dumps(out))
+            self._actions_batches_sent += 1
+        except Exception as e:
+            logger.warning("actions_batch send failed: %s", e)
 
     async def _handle_echo_request(self, msg: dict) -> None:
         action = msg.get("action", "")

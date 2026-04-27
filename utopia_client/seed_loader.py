@@ -67,3 +67,45 @@ def load_founders(seed_path: Path, n: int):
         org.id = f"seed_{uuid.uuid4().hex[:12]}"
         founders.append(org)
     return founders
+
+
+def organism_from_weights(weights_bytes: bytes, seed_path: Path):
+    """Phase F3.1.b/d: создать CompositeOrganism с обученными весами от P40.
+
+    Скелет (архитектура tissues) — из локального seed.norg. Веса tissues —
+    накатываются из переданных bytes (формат `_save_member_pt` на P40:
+    `{"tissues_state_dict": {tid: state_dict}, "hebbian": ..., "selector": ...,
+    "predictor": ..., ...}`).
+
+    Возвращает (organism, payload_dict). Payload отдаётся клиенту, чтобы
+    отдельно накатить hebbian/selector/predictor через
+    LocalColonyCompute.apply_inherited_state.
+
+    При несовпадении tid между seed-архитектурой и payload — соответствующий
+    tissue остаётся со seed-весами (warning).
+    """
+    import io
+    import torch
+
+    payload = torch.load(io.BytesIO(weights_bytes), map_location="cpu",
+                         weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"weights payload must be dict, got {type(payload)}")
+
+    org = load_founders(seed_path, 1)[0]
+    if "tissues_state_dict" not in payload:
+        raise ValueError("payload missing 'tissues_state_dict'")
+    tsd = payload["tissues_state_dict"]
+    if not isinstance(tsd, dict) or not tsd:
+        raise ValueError("tissues_state_dict must be non-empty dict")
+
+    for tid, sd in tsd.items():
+        if tid not in org.tissues:
+            logger.warning("organism_from_weights: tid=%s not in seed (skip)", tid)
+            continue
+        try:
+            org.tissues[tid].load_state_dict(sd)
+        except Exception as e:
+            logger.warning("organism_from_weights: tid=%s load failed: %s", tid, e)
+
+    return org, payload
