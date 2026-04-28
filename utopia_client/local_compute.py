@@ -452,6 +452,10 @@ class LocalColonyCompute:
                     (1 - _EMA_ALPHA) * self.intrinsic_ema.get(cid, 0.0)
                     + _EMA_ALPHA * intrinsic
                 )
+                if self.predictor_steps == 0:
+                    logger.info(
+                        "predictor train OK first time cid=%s loss=%.4f",
+                        cid, loss_f)
                 self.predictor_steps += 1
             except Exception as e:
                 logger.warning("predictor train %s: %s", cid, e)
@@ -519,7 +523,14 @@ class LocalColonyCompute:
 
     # ── Diagnostics aggregation ──────────────────────────────────────────
 
-    def diagnostics(self) -> dict:
+    def diagnostics(self) -> dict:  # noqa: C901
+        # debug: один раз логируем сводку чтобы понять состояние объектов
+        if not getattr(self, "_diag_logged", False):
+            logger.info(
+                "diagnostics: n_alive=%d n_pred=%d n_prev_obs=%d steps=%d",
+                self.n_alive, len(self.predictor),
+                len(self.prev_obs), self.predictor_steps)
+            self._diag_logged = True
         """Снимок метрик обучения для /api/diagnostics/training (Phase 1/2/6)."""
         n = len(self.organisms)
         if n == 0:
@@ -556,6 +567,8 @@ class LocalColonyCompute:
         rvs = list(self.reward_var_ema.values())
         return {
             "n_alive": n,
+            "n_predictors": len(self.predictor),
+            "n_prev_obs": len(self.prev_obs),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
             "intrinsic_reward_avg": (
