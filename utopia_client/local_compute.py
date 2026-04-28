@@ -136,6 +136,14 @@ class LocalColonyCompute:
         self.reward_var_ema.pop(cid, None)
         self.reward_history.pop(cid, None)
 
+    def reset_all(self) -> int:
+        n = len(self.organisms)
+        for cid in list(self.organisms.keys()):
+            self.remove_creature(cid)
+        self.hebbian_updates = 0
+        self.predictor_steps = 0
+        return n
+
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
         """Phase F3.1.b: накатить унаследованные state_dicts на уже
         зарегистрированную особь.

@@ -260,6 +260,10 @@ class ColonyWSClient:
             logger.info("echo: world_snapshot seq=%s tick=%s",
                         msg.get("seq"), msg.get("world_tick"))
             return
+        # ── colony_reset (P40 говорит: выкинь всех, новый seed идёт) ────
+        if msg_type == "colony_reset":
+            self._handle_colony_reset(msg)
+            return
         # ── Phase F3.1.b/d: seed (chunked weights) ──────────────────────
         if msg_type == "seed_start":
             self._handle_seed_start(msg)
@@ -310,6 +314,15 @@ class ColonyWSClient:
         except Exception as e:
             logger.warning("compute init failed: %s", e)
             return False
+
+    def _handle_colony_reset(self, msg: dict) -> None:
+        reason = msg.get("reason", "unknown")
+        n_dropped = 0
+        if self.compute is not None:
+            n_dropped = self.compute.reset_all()
+        self._seed_buffers.clear()
+        self._seed_meta.clear()
+        logger.info("colony_reset reason=%s dropped=%d", reason, n_dropped)
 
     def _handle_seed_start(self, msg: dict) -> None:
         seed_id = int(msg.get("seed_id", 0))
