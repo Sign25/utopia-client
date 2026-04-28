@@ -69,6 +69,15 @@ class ColonyWSClient:
         self._seed_meta: dict[tuple[int, str], dict] = {}
         self._seed_accepted: int = 0
         self._seed_failed: int = 0
+        # F4: чанки seed.norg (один файл, нет cid). Складываются по seq до
+        # получения seed_norg_complete, далее — write_seed_bytes.
+        self._seed_norg_chunks: list[bytes] = []
+        self._seed_norg_sha: str = ""
+        self._seed_norg_total: int = 0
+        # F4: если seed_chunk пришёл до seed_norg_complete — буферизуем
+        # finalize до тех пор, пока локальный seed.norg не появится.
+        # Список ключей (seed_id, cid), готовых к финализации.
+        self._pending_finalize: list[tuple[int, str]] = []
         # Метрики obs/actions
         self._obs_batches_received: int = 0
         self._actions_batches_sent: int = 0
@@ -156,11 +165,13 @@ class ColonyWSClient:
             self.last_error = ""
             logger.info("connected")
 
+            from .seed_loader import seed_sha256
             await ws.send(json.dumps({
                 "type": "hello",
                 "colony_name": self.colony_name,
                 "client_version": self.client_version,
                 "estimated_population": self.estimated_population,
+                "known_seed_hash": seed_sha256(),
                 "ts": int(time.time() * 1000),
             }))
 
@@ -259,6 +270,16 @@ class ColonyWSClient:
         if msg_type == "seed_complete":
             await self._handle_seed_complete(msg)
             return
+        # ── F4: seed.norg (центральный «днк-предок» от P40) ─────────────
+        if msg_type == "seed_norg_start":
+            self._handle_seed_norg_start(msg)
+            return
+        if msg_type == "seed_norg_chunk":
+            self._handle_seed_norg_chunk(msg)
+            return
+        if msg_type == "seed_norg_complete":
+            self._handle_seed_norg_complete(msg)
+            return
         # ── Phase F3.1.b/c: obs_batch → handle_tick → actions_batch ─────
         if msg_type == "obs_batch":
             await self._handle_obs_batch(msg)
@@ -328,7 +349,16 @@ class ColonyWSClient:
         buf = self._seed_buffers.setdefault(key, [])
         buf.append(chunk)
         if last:
-            self._finalize_seed_creature(key)
+            # F4: если локального seed.norg ещё нет — отложим finalize до
+            # seed_norg_complete (organism_from_weights читает архитектуру
+            # из локального файла, иначе FileNotFoundError).
+            from .seed_loader import seed_cached
+            if not seed_cached():
+                self._pending_finalize.append(key)
+                logger.info(
+                    "seed_chunk %s: deferred (waiting for seed.norg)", cid)
+            else:
+                self._finalize_seed_creature(key)
 
     def _finalize_seed_creature(self, key: tuple[int, str]) -> None:
         seed_id, cid = key
@@ -395,6 +425,56 @@ class ColonyWSClient:
             logger.warning("seed_ack send failed: %s", e)
         logger.info("seed_complete id=%d accepted=%d failed=%d",
                     seed_id, self._seed_accepted, self._seed_failed)
+
+    # ── F4: seed.norg (центральный «днк-предок» от P40) ──────────────────
+
+    def _handle_seed_norg_start(self, msg: dict) -> None:
+        self._seed_norg_chunks = []
+        self._seed_norg_sha = str(msg.get("sha256", "") or "")
+        self._seed_norg_total = int(msg.get("total_bytes", 0) or 0)
+        n_chunks = int(msg.get("n_chunks", 0) or 0)
+        logger.info("seed_norg_start sha=%s bytes=%d chunks=%d",
+                    self._seed_norg_sha[:12], self._seed_norg_total, n_chunks)
+
+    def _handle_seed_norg_chunk(self, msg: dict) -> None:
+        import base64
+        payload_b64 = msg.get("payload_b64", "") or ""
+        if not payload_b64:
+            return
+        try:
+            self._seed_norg_chunks.append(base64.b64decode(payload_b64))
+        except Exception as e:
+            logger.warning("seed_norg_chunk b64 decode failed: %s", e)
+
+    def _handle_seed_norg_complete(self, msg: dict) -> None:
+        import hashlib
+        from .seed_loader import write_seed_bytes
+        data = b"".join(self._seed_norg_chunks)
+        self._seed_norg_chunks = []
+        expected = self._seed_norg_sha
+        actual = hashlib.sha256(data).hexdigest() if data else ""
+        if not data:
+            logger.warning("seed_norg_complete: no data")
+            return
+        if expected and actual != expected:
+            logger.warning("seed_norg_complete: sha mismatch expected=%s got=%s",
+                           expected[:12], actual[:12])
+            return
+        try:
+            path = write_seed_bytes(data)
+        except Exception as e:
+            logger.warning("seed_norg_complete: write failed: %s", e)
+            return
+        logger.info("seed_norg saved: %s sha=%s bytes=%d",
+                    path, actual[:12], len(data))
+        # Прокатываем отложенные finalize теперь, когда seed.norg на диске.
+        pending = self._pending_finalize
+        self._pending_finalize = []
+        for key in pending:
+            try:
+                self._finalize_seed_creature(key)
+            except Exception as e:
+                logger.warning("deferred finalize %s failed: %s", key, e)
 
     # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
 

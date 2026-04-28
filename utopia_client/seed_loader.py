@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import uuid
@@ -34,6 +35,31 @@ def seed_cache_path() -> Path:
 
 def seed_cached() -> bool:
     return _DEFAULT_SEED_PATH.exists() and _DEFAULT_SEED_PATH.stat().st_size > 0
+
+
+def seed_sha256() -> str:
+    """SHA256 локального seed.norg (hex). Пустая строка если файла нет."""
+    if not seed_cached():
+        return ""
+    try:
+        return hashlib.sha256(_DEFAULT_SEED_PATH.read_bytes()).hexdigest()
+    except Exception as e:
+        logger.warning("seed_sha256 failed: %s", e)
+        return ""
+
+
+def write_seed_bytes(data: bytes) -> Path:
+    """Атомарно записать сырые байты в локальный seed.norg.
+
+    Используется WS-каналом seed_norg_complete. Запись через временный файл
+    + os.replace, чтобы не оставить наполовину-записанный seed при крэше.
+    """
+    path = _DEFAULT_SEED_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return path
 
 
 # Phase F3.2.c: локальный кеш Hebbian-state особей колонии.
