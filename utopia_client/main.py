@@ -28,6 +28,7 @@ COMMAND_POLL_SEC = 10.0
 LOGPUSH_SEC = 30.0
 LOGPUSH_LINES = 200
 DIAGNOSTICS_PUSH_SEC = 30.0
+SELFUPDATE_CHECK_SEC = 60.0
 
 logger = logging.getLogger("utopia_client")
 
@@ -123,6 +124,60 @@ def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
     )
 
 
+def _try_self_update(api: UtopiaAPI) -> bool:
+    """Если /api/client/info вернул новую версию — скачать zip, распаковать
+    поверх установочной директории и сделать execv. Возвращает True если
+    обновление прошло (этот процесс уже не вернётся; код ниже не выполнится).
+    """
+    info = api.get_client_info()
+    if not info:
+        return False
+    remote_ver = str(info.get("version") or "")
+    if not remote_ver or remote_ver == __version__:
+        return False
+    # Сравнение лексикографическое подходит для семвера X.Y.Z
+    try:
+        cur = tuple(int(p) for p in __version__.split("."))
+        nxt = tuple(int(p) for p in remote_ver.split("."))
+    except Exception:
+        return False
+    if nxt <= cur:
+        return False
+    logger.info("self-update: %s → %s, downloading…", __version__, remote_ver)
+    import os
+    import tempfile
+    import zipfile
+    from pathlib import Path
+    fd, tmp_path = tempfile.mkstemp(prefix="utopia_client_", suffix=".zip")
+    os.close(fd)
+    try:
+        if not api.download_client_zip(tmp_path):
+            return False
+        # Установочный каталог = parent(parent(__file__)) для main.py.
+        pkg_dir = Path(__file__).resolve().parent  # …/utopia_client
+        install_dir = pkg_dir.parent              # …/(install_root)
+        with zipfile.ZipFile(tmp_path) as z:
+            z.extractall(install_dir)
+        logger.info("self-update: extracted to %s, restarting via execv",
+                    install_dir)
+    except Exception as e:
+        logger.warning("self-update failed: %s", e)
+        return False
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    # execv: то же python, тот же argv → новый процесс с новым кодом.
+    try:
+        os.execv(sys.executable,
+                 [sys.executable, "-m", "utopia_client.main"] + sys.argv[1:])
+    except Exception as e:
+        logger.error("execv failed: %s — exit(75) для перезапуска снаружи", e)
+        sys.exit(75)
+    return True  # недостижимо
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Daemon-петля: опрашивает команду от VPS и реагирует."""
     cfg = _ensure_config()
@@ -141,6 +196,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     last_poll = 0.0
     last_logpush = 0.0
     last_diag_push = 0.0
+    last_selfupdate_check = 0.0
     current_state = "idle"
     bench = cfg.get("benchmark", {})
     ring = get_ring()
@@ -195,10 +251,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                 try:
                     diag = ws.compute.diagnostics()
                     diag["world_tick"] = ws.last_world_tick
+                    diag["dump"] = ws.compute._dump_state()
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)
                 last_diag_push = now
+
+            # Self-update проверка: дёргаем /api/client/info, при новой версии
+            # скачиваем zip, распаковываем, execv. Этот вызов может не вернуться.
+            if now - last_selfupdate_check >= SELFUPDATE_CHECK_SEC:
+                last_selfupdate_check = now
+                try:
+                    if _try_self_update(api):
+                        return 0  # недостижимо после execv
+                except Exception as e:
+                    logger.warning("self-update check error: %s", e)
 
             time.sleep(1.0)
     except KeyboardInterrupt:

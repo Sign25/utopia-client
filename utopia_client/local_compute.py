@@ -523,13 +523,54 @@ class LocalColonyCompute:
 
     # ── Diagnostics aggregation ──────────────────────────────────────────
 
+    def _dump_state(self) -> dict:
+        """Расширенная диагностика для admin: размеры всех state-dict'ов
+        + sample по первому живому cid (предиктор params count, loss_ema,
+        intrinsic_ema, prev_obs.shape).
+        """
+        sample = None
+        if self.organisms:
+            first_cid = next(iter(self.organisms.keys()))
+            pred = self.predictor.get(first_cid)
+            prev = self.prev_obs.get(first_cid)
+            sample = {
+                "cid": first_cid,
+                "has_predictor": pred is not None,
+                "predictor_params": (
+                    sum(p.numel() for p in pred.parameters())
+                    if pred is not None else 0
+                ),
+                "has_prev_obs": prev is not None,
+                "prev_obs_shape": (
+                    list(prev.shape) if prev is not None else None
+                ),
+                "loss_ema": float(self.loss_ema.get(first_cid, 0.0)),
+                "intrinsic_ema": float(self.intrinsic_ema.get(first_cid, 0.0)),
+                "entropy_ema": float(self.entropy_ema.get(first_cid, 0.0)),
+                "trace_norm_ema": float(self.trace_norm_ema.get(first_cid, 0.0)),
+            }
+        return {
+            "sizes": {
+                "organisms": len(self.organisms),
+                "predictor": len(self.predictor),
+                "predictor_opt": len(self.predictor_opt),
+                "prev_obs": len(self.prev_obs),
+                "loss_ema": len(self.loss_ema),
+                "intrinsic_ema": len(self.intrinsic_ema),
+                "entropy_ema": len(self.entropy_ema),
+                "trace_norm_ema": len(self.trace_norm_ema),
+                "reward_var_ema": len(self.reward_var_ema),
+                "hebbian": len(self.hebbian),
+                "action_selectors": len(self.action_selectors),
+            },
+            "counters": {
+                "predictor_steps": int(self.predictor_steps),
+                "hebbian_updates": int(self.hebbian_updates),
+            },
+            "sample": sample,
+        }
+
     def diagnostics(self) -> dict:  # noqa: C901
-        # debug: лог при каждом snapshot чтобы видеть динамику
-        logger.info(
-            "diagnostics: n_alive=%d n_pred=%d n_prev_obs=%d steps=%d hebs=%d",
-            self.n_alive, len(self.predictor),
-            len(self.prev_obs), self.predictor_steps,
-            self.hebbian_updates)
         """Снимок метрик обучения для /api/diagnostics/training (Phase 1/2/6)."""
         n = len(self.organisms)
         if n == 0:

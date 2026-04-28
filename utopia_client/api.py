@@ -122,6 +122,33 @@ class UtopiaAPI:
             logger.warning("push_log_tail error: %s", e)
             return False
 
+    def get_client_info(self) -> dict | None:
+        """Метаданные актуальной версии клиента: {version, sha256, size, ...}."""
+        url = f"{self.server}/api/client/info"
+        try:
+            r = requests.get(url, timeout=self.timeout)
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("get_client_info HTTP %d", r.status_code)
+            return None
+        except Exception as e:
+            logger.warning("get_client_info error: %s", e)
+            return None
+
+    def download_client_zip(self, dest_path: str) -> bool:
+        """Скачать актуальный client zip в файл. Для self-update."""
+        url = f"{self.server}/api/client/download"
+        try:
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+            return True
+        except Exception as e:
+            logger.warning("download_client_zip error: %s", e)
+            return False
+
     def fetch_seed(self, dest_path: str) -> bool:
         url = f"{self.server}/api/seed"
         try:
