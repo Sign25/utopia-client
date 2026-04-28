@@ -79,6 +79,30 @@ class UtopiaAPI:
             logger.warning("push_benchmark error: %s", e)
             return False
 
+    def push_diagnostics(self, name: str, diag: dict) -> bool:
+        """Послать снимок Phase 1/2/6 метрик обучения на VPS.
+
+        Эндпоинт: `POST /api/colony/diagnostics`. Header `X-Push-Token`.
+        `diag` — `LocalColonyCompute.diagnostics()` + поле `colony_name`.
+        VPS хранит последний снимок per-colony (см. utopia routes_colony.py).
+        """
+        url = f"{self.server}/api/colony/diagnostics"
+        body = dict(diag)
+        body["colony_name"] = str(name)
+        try:
+            r = requests.post(
+                url, json=body,
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return True
+            logger.warning("push_diagnostics HTTP %d: %s", r.status_code, r.text[:200])
+            return False
+        except Exception as e:
+            logger.warning("push_diagnostics error: %s", e)
+            return False
+
     def push_log_tail(self, lines: list[str]) -> bool:
         """Послать последние строки лога в VPS (admin сможет их прочитать)."""
         if not lines:

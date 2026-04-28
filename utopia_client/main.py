@@ -27,6 +27,7 @@ HEARTBEAT_SEC = 30.0
 COMMAND_POLL_SEC = 10.0
 LOGPUSH_SEC = 30.0
 LOGPUSH_LINES = 200
+DIAGNOSTICS_PUSH_SEC = 30.0
 
 logger = logging.getLogger("utopia_client")
 
@@ -139,6 +140,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     last_heartbeat = 0.0
     last_poll = 0.0
     last_logpush = 0.0
+    last_diag_push = 0.0
     current_state = "idle"
     bench = cfg.get("benchmark", {})
     ring = get_ring()
@@ -186,6 +188,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                 except Exception as e:
                     logger.debug("log_tail push skipped: %s", e)
                 last_logpush = now
+
+            # Phase 1/2/6 diagnostics push (only when compute is alive).
+            if (ws.compute is not None
+                    and now - last_diag_push >= DIAGNOSTICS_PUSH_SEC):
+                try:
+                    diag = ws.compute.diagnostics()
+                    diag["world_tick"] = ws.last_world_tick
+                    api.push_diagnostics(name, diag)
+                except Exception as e:
+                    logger.debug("diagnostics push skipped: %s", e)
+                last_diag_push = now
 
             time.sleep(1.0)
     except KeyboardInterrupt:
