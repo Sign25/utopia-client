@@ -388,7 +388,7 @@ class LocalColonyCompute:
             from core.connection import CellGene
             from core.tissue import Tissue, TissuePort, TissueSpec
         except Exception as e:
-            logger.debug("predictor: core imports failed: %s", e)
+            logger.warning("predictor: core imports failed: %s", e)
             return None
         try:
             cg = CellGene(innovation=1, n_embd=n_embd, n_head=3, n_layer=1)
@@ -403,7 +403,7 @@ class LocalColonyCompute:
             )
             return Tissue(spec).to(self.device)
         except Exception as e:
-            logger.debug("predictor: build failed: %s", e)
+            logger.warning("predictor: build failed: %s", e)
             return None
 
     def _apply_y50_to_predictor(self, predictor) -> None:
@@ -454,7 +454,7 @@ class LocalColonyCompute:
                 )
                 self.predictor_steps += 1
             except Exception as e:
-                logger.debug("predictor train %s: %s", cid, e)
+                logger.warning("predictor train %s: %s", cid, e)
         if pred is not None:
             self.prev_obs[cid] = obs_tensor.detach()
         return intrinsic
