@@ -117,8 +117,8 @@ class LocalColonyCompute:
             self.trace_norm_ema[cid] = 0.0
             self.reward_var_ema[cid] = 0.0
             self.reward_history[cid] = deque(maxlen=10)
-        logger.debug("add_creature %s n_tissues=%d predictor=%s", cid,
-                     getattr(organism, "n_tissues", 0), pred is not None)
+        logger.info("add_creature %s n_tissues=%d predictor=%s", cid,
+                    getattr(organism, "n_tissues", 0), pred is not None)
 
     def remove_creature(self, cid: str) -> None:
         self.organisms.pop(cid, None)
@@ -524,13 +524,12 @@ class LocalColonyCompute:
     # ── Diagnostics aggregation ──────────────────────────────────────────
 
     def diagnostics(self) -> dict:  # noqa: C901
-        # debug: один раз логируем сводку чтобы понять состояние объектов
-        if not getattr(self, "_diag_logged", False):
-            logger.info(
-                "diagnostics: n_alive=%d n_pred=%d n_prev_obs=%d steps=%d",
-                self.n_alive, len(self.predictor),
-                len(self.prev_obs), self.predictor_steps)
-            self._diag_logged = True
+        # debug: лог при каждом snapshot чтобы видеть динамику
+        logger.info(
+            "diagnostics: n_alive=%d n_pred=%d n_prev_obs=%d steps=%d hebs=%d",
+            self.n_alive, len(self.predictor),
+            len(self.prev_obs), self.predictor_steps,
+            self.hebbian_updates)
         """Снимок метрик обучения для /api/diagnostics/training (Phase 1/2/6)."""
         n = len(self.organisms)
         if n == 0:
