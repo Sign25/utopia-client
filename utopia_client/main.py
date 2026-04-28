@@ -168,12 +168,21 @@ def _try_self_update(api: UtopiaAPI) -> bool:
             os.unlink(tmp_path)
         except Exception:
             pass
-    # execv: то же python, тот же argv → новый процесс с новым кодом.
+    # Перезапуск. На Windows os.execv не цитирует argv — путь с пробелом
+    # (напр. "C:\Users\Mr. Krabs\...\python.exe") ломает командную строку,
+    # интерпретатор стартует от мусорного префикса до первого пробела.
+    # Поэтому на Windows используем subprocess.Popen + sys.exit (всё равно
+    # exec там реализован как spawn-and-exit), на POSIX — os.execv.
+    argv = [sys.executable, "-m", "utopia_client.main"] + sys.argv[1:]
     try:
-        os.execv(sys.executable,
-                 [sys.executable, "-m", "utopia_client.main"] + sys.argv[1:])
+        if os.name == "nt":
+            import subprocess
+            subprocess.Popen(argv, close_fds=False)
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, argv)
     except Exception as e:
-        logger.error("execv failed: %s — exit(75) для перезапуска снаружи", e)
+        logger.error("restart failed: %s — exit(75) для перезапуска снаружи", e)
         sys.exit(75)
     return True  # недостижимо
 
