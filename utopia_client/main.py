@@ -20,19 +20,19 @@ from . import __version__
 from .api import UtopiaAPI
 from .benchmark import estimate_population, run_full
 from .config import DEFAULT_SERVER, get_or_prompt, load_config, save_config
+from .log_buffer import get_ring, setup_logging
 from .ws_client import ColonyWSClient
 
 HEARTBEAT_SEC = 30.0
 COMMAND_POLL_SEC = 10.0
+LOGPUSH_SEC = 30.0
+LOGPUSH_LINES = 200
 
 logger = logging.getLogger("utopia_client")
 
 
 def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
+    setup_logging(level=logging.INFO)
 
 
 def _ensure_config() -> dict:
@@ -138,8 +138,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     last_heartbeat = 0.0
     last_poll = 0.0
+    last_logpush = 0.0
     current_state = "idle"
     bench = cfg.get("benchmark", {})
+    ring = get_ring()
 
     try:
         while True:
@@ -176,6 +178,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 logger.info("heartbeat world_tick=%d state=%s ws=%s n_alive=%d ok=%s",
                             world_tick, current_state, ws.connected, n_alive, ok)
                 last_heartbeat = now
+
+            # Push tail логов в VPS (admin потом достаёт через cabinet_log.sh)
+            if ring is not None and now - last_logpush >= LOGPUSH_SEC:
+                try:
+                    api.push_log_tail(ring.tail(LOGPUSH_LINES))
+                except Exception as e:
+                    logger.debug("log_tail push skipped: %s", e)
+                last_logpush = now
 
             time.sleep(1.0)
     except KeyboardInterrupt:

@@ -79,6 +79,25 @@ class UtopiaAPI:
             logger.warning("push_benchmark error: %s", e)
             return False
 
+    def push_log_tail(self, lines: list[str]) -> bool:
+        """Послать последние строки лога в VPS (admin сможет их прочитать)."""
+        if not lines:
+            return True
+        url = f"{self.server}/api/colony/log_tail"
+        try:
+            r = requests.post(
+                url, json={"lines": lines},
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return True
+            logger.warning("push_log_tail HTTP %d: %s", r.status_code, r.text[:200])
+            return False
+        except Exception as e:
+            logger.warning("push_log_tail error: %s", e)
+            return False
+
     def fetch_seed(self, dest_path: str) -> bool:
         url = f"{self.server}/api/seed"
         try:
