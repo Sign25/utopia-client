@@ -50,14 +50,14 @@ def test_death_envelope_roundtrip(organism):
     import torch
     from utopia_client.death import build_death_envelope
     from utopia_client.reproduce import (
-        _extract_tissues_state_dict,
+        _extract_tissues_by_role,
         unpack_zstd_b64,
     )
 
-    parent_sd = _extract_tissues_state_dict(organism)
+    parent_sd = _extract_tissues_by_role(organism)
     env = build_death_envelope("c1", organism)
     decoded = unpack_zstd_b64(env["weights_b64"])
-    out_sd = decoded["tissues_state_dict"]
+    out_sd = decoded["tissues_by_role"]
     assert set(out_sd.keys()) == set(parent_sd.keys())
     for tid, ref in parent_sd.items():
         for k, v in ref.items():

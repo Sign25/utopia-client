@@ -114,8 +114,8 @@ def test_weights_request_known_cid_returns_blob(seed_file):
 
         # Roundtrip: blob → organism (через тот же контракт что P40 seed).
         org2, payload = organism_from_weights(blob, seed_file)
-        assert "tissues_state_dict" in payload
-        assert len(payload["tissues_state_dict"]) > 0
+        assert "tissues_by_role" in payload
+        assert len(payload["tissues_by_role"]) > 0
         # Hebbian включён → state присутствует.
         assert "hebbian" in payload
         assert ws._weights_dumps_sent == 1

@@ -134,19 +134,43 @@ def organism_from_weights(weights_bytes: bytes, seed_path: Path):
         raise ValueError(f"weights payload must be dict, got {type(payload)}")
 
     org = load_founders(seed_path, 1)[0]
-    if "tissues_state_dict" not in payload:
-        raise ValueError("payload missing 'tissues_state_dict'")
-    tsd = payload["tissues_state_dict"]
-    if not isinstance(tsd, dict) or not tsd:
-        raise ValueError("tissues_state_dict must be non-empty dict")
 
-    for tid, sd in tsd.items():
-        if tid not in org.tissues:
-            logger.warning("organism_from_weights: tid=%s not in seed (skip)", tid)
-            continue
-        try:
-            org.tissues[tid].load_state_dict(sd)
-        except Exception as e:
-            logger.warning("organism_from_weights: tid=%s load failed: %s", tid, e)
+    # Новый формат (P40 ≥ 30.04.2026): tissues_by_role — стабильный ключ.
+    # Legacy: tissues_state_dict (tid-keyed) — теряется при rebuild seed.
+    if "tissues_by_role" in payload:
+        tbr = payload["tissues_by_role"]
+        if not isinstance(tbr, dict) or not tbr:
+            raise ValueError("tissues_by_role must be non-empty dict")
+        role_to_tid = {
+            getattr(t, "role", ""): tid for tid, t in org.tissues.items()
+        }
+        for role, sd in tbr.items():
+            tid = role_to_tid.get(role)
+            if tid is None:
+                logger.warning(
+                    "organism_from_weights: role=%s not in seed (skip)", role)
+                continue
+            try:
+                org.tissues[tid].load_state_dict(sd)
+            except Exception as e:
+                logger.warning(
+                    "organism_from_weights: role=%s load failed: %s", role, e)
+    elif "tissues_state_dict" in payload:
+        tsd = payload["tissues_state_dict"]
+        if not isinstance(tsd, dict) or not tsd:
+            raise ValueError("tissues_state_dict must be non-empty dict")
+        for tid, sd in tsd.items():
+            if tid not in org.tissues:
+                logger.warning(
+                    "organism_from_weights: tid=%s not in seed (skip)", tid)
+                continue
+            try:
+                org.tissues[tid].load_state_dict(sd)
+            except Exception as e:
+                logger.warning(
+                    "organism_from_weights: tid=%s load failed: %s", tid, e)
+    else:
+        raise ValueError(
+            "payload missing 'tissues_by_role' or 'tissues_state_dict'")
 
     return org, payload

@@ -30,8 +30,21 @@ DEFAULT_SIGMA = _PHI ** -5  # ≈ 0.09017
 
 
 def _extract_tissues_state_dict(organism) -> dict:
-    """{tid: state_dict} всех тканей CompositeOrganism."""
+    """{tid: state_dict} всех тканей CompositeOrganism. Legacy."""
     return {tid: t.state_dict() for tid, t in organism.tissues.items()}
+
+
+def _extract_tissues_by_role(organism) -> dict:
+    """{role: state_dict} — стабильный ключ между сессиями (P40 ≥ 30.04.2026).
+
+    tissue_id = uuid.uuid4()[:8] нестабилен после rebuild seed, поэтому
+    P40 теперь ожидает role-keyed формат (sensory, motor, brain, ...).
+    """
+    out: dict = {}
+    for tid, t in organism.tissues.items():
+        role = getattr(t, "role", "") or f"_unknown_{tid}"
+        out[role] = t.state_dict()
+    return out
 
 
 def mutate_state_dict(tissues_sd: dict, *, sigma: float = DEFAULT_SIGMA,
@@ -93,11 +106,11 @@ def build_reproduce_envelope(parent_cid: str, organism, *,
         {type: "reproduce", parent_cid, child_weights_b64, sigma}
 
     `child_weights_b64` — zstd-base64 от
-        {"tissues_state_dict": {tid: state_dict}}
+        {"tissues_by_role": {role: state_dict}}
     """
-    parent_sd = _extract_tissues_state_dict(organism)
+    parent_sd = _extract_tissues_by_role(organism)
     child_sd = mutate_state_dict(parent_sd, sigma=sigma)
-    payload = {"tissues_state_dict": child_sd}
+    payload = {"tissues_by_role": child_sd}
     return {
         "type": "reproduce",
         "parent_cid": str(parent_cid),
@@ -107,16 +120,22 @@ def build_reproduce_envelope(parent_cid: str, organism, *,
 
 
 def apply_state_dict(organism, tissues_sd: dict) -> int:
-    """Загрузить state_dict в ткани organism. Возвращает число загруженных."""
+    """Загрузить state_dict в ткани organism. Поддерживает оба формата:
+    role-keyed (новый, P40 ≥ 30.04.2026) и tid-keyed (legacy).
+    """
+    role_to_tid = {
+        getattr(t, "role", ""): tid for tid, t in organism.tissues.items()
+    }
     n = 0
-    for tid, sd in tissues_sd.items():
-        t = organism.tissues.get(tid)
-        if t is None:
-            logger.warning("apply_state_dict: tissue %s missing in organism", tid)
+    for key, sd in tissues_sd.items():
+        # Сначала пробуем role-key, затем legacy tid-key.
+        tid = role_to_tid.get(key, key if key in organism.tissues else None)
+        if tid is None:
+            logger.warning("apply_state_dict: tissue %s missing in organism", key)
             continue
         try:
-            t.load_state_dict(sd)
+            organism.tissues[tid].load_state_dict(sd)
             n += 1
         except Exception as e:
-            logger.warning("apply_state_dict: load %s failed: %s", tid, e)
+            logger.warning("apply_state_dict: load %s failed: %s", key, e)
     return n

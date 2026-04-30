@@ -28,12 +28,12 @@ def build_death_envelope(cid: str, organism, *, reason: str = "hp_zero",
         {type: "death", cid, reason, fitness, weights_b64}
     """
     from utopia_client.reproduce import (
-        _extract_tissues_state_dict,
+        _extract_tissues_by_role,
         pack_zstd_b64,
     )
 
-    sd = _extract_tissues_state_dict(organism)
-    payload = {"tissues_state_dict": sd}
+    sd = _extract_tissues_by_role(organism)
+    payload = {"tissues_by_role": sd}
     return {
         "type": "death",
         "cid": str(cid),

@@ -60,7 +60,7 @@ def _serialize_father(seed_file):
     import torch
     from utopia_client.seed_loader import load_founders
     org = load_founders(seed_file, 1)[0]
-    payload = {"tissues_state_dict":
+    payload = {"tissues_by_role":
                {tid: t.state_dict() for tid, t in org.tissues.items()}}
     buf = io.BytesIO()
     torch.save(payload, buf)
@@ -175,8 +175,8 @@ def test_mate_request_known_mother_returns_child(seed_file):
         # child_blob деserialize-ится через тот же путь что seed
         child_blob = base64.b64decode(msg["child_blob_b64"])
         child_org, payload = organism_from_weights(child_blob, seed_file)
-        assert "tissues_state_dict" in payload
-        assert len(payload["tissues_state_dict"]) > 0
+        assert "tissues_by_role" in payload
+        assert len(payload["tissues_by_role"]) > 0
         assert ws._mate_newborns_sent == 1
         assert ws._mate_rejects_sent == 0
 

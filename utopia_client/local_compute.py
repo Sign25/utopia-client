@@ -291,8 +291,9 @@ class LocalColonyCompute:
         payload: dict = {}
         if hasattr(org, "tissues"):
             try:
-                payload["tissues_state_dict"] = {
-                    tid: t.state_dict() for tid, t in org.tissues.items()
+                payload["tissues_by_role"] = {
+                    (getattr(t, "role", "") or f"_unknown_{tid}"): t.state_dict()
+                    for tid, t in org.tissues.items()
                 }
             except Exception as e:
                 logger.warning("save_state %s tissues: %s", cid, e)

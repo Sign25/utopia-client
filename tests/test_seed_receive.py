@@ -44,7 +44,7 @@ def _make_weights_bytes(seed_path: Path) -> bytes:
     from utopia_client.seed_loader import load_founders
     org = load_founders(seed_path, 1)[0]
     payload = {
-        "tissues_state_dict": {tid: t.state_dict()
+        "tissues_by_role": {(getattr(t,'role','') or '_'+tid): t.state_dict()
                                 for tid, t in org.tissues.items()},
     }
     buf = io.BytesIO()
@@ -60,7 +60,7 @@ def test_organism_from_weights_smoke(seed_file):
     org, payload = organism_from_weights(weights, seed_file)
     assert org is not None
     assert hasattr(org, "tissues")
-    assert "tissues_state_dict" in payload
+    assert "tissues_by_role" in payload
 
 
 def test_organism_from_weights_bad_payload(seed_file):

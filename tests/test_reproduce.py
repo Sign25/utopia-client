@@ -44,20 +44,20 @@ def test_pack_unpack_roundtrip(seed_and_organism):
     import torch
 
     from utopia_client.reproduce import (
-        _extract_tissues_state_dict,
+        _extract_tissues_by_role,
         pack_zstd_b64,
         unpack_zstd_b64,
     )
 
     org = seed_and_organism
-    sd = _extract_tissues_state_dict(org)
-    payload = {"tissues_state_dict": sd}
+    sd = _extract_tissues_by_role(org)
+    payload = {"tissues_by_role": sd}
     encoded = pack_zstd_b64(payload)
     assert isinstance(encoded, str) and len(encoded) > 0
 
     decoded = unpack_zstd_b64(encoded)
-    assert "tissues_state_dict" in decoded
-    out_sd = decoded["tissues_state_dict"]
+    assert "tissues_by_role" in decoded
+    out_sd = decoded["tissues_by_role"]
     assert set(out_sd.keys()) == set(sd.keys())
     for tid, ref_sd in sd.items():
         for k, v in ref_sd.items():
@@ -70,13 +70,13 @@ def test_mutate_state_dict_changes_floats(seed_and_organism):
 
     from utopia_client.reproduce import (
         DEFAULT_SIGMA,
-        _extract_tissues_state_dict,
+        _extract_tissues_by_role,
         mutate_state_dict,
     )
 
     torch.manual_seed(123)
     org = seed_and_organism
-    parent_sd = _extract_tissues_state_dict(org)
+    parent_sd = _extract_tissues_by_role(org)
     child_sd = mutate_state_dict(parent_sd, sigma=DEFAULT_SIGMA)
 
     # хотя бы один float-тензор изменился
@@ -116,20 +116,20 @@ def test_apply_state_dict_roundtrip(seed_and_organism):
     import torch
 
     from utopia_client.reproduce import (
-        _extract_tissues_state_dict,
+        _extract_tissues_by_role,
         apply_state_dict,
         mutate_state_dict,
     )
 
     torch.manual_seed(7)
     org = seed_and_organism
-    parent_sd = _extract_tissues_state_dict(org)
+    parent_sd = _extract_tissues_by_role(org)
     child_sd = mutate_state_dict(parent_sd)
 
     # Применяем child_sd к organism, проверяем что веса теперь = child_sd
     n = apply_state_dict(org, child_sd)
     assert n == len(parent_sd)
-    out_sd = _extract_tissues_state_dict(org)
+    out_sd = _extract_tissues_by_role(org)
     for tid, ref_sd in child_sd.items():
         for k, v in ref_sd.items():
             if isinstance(v, torch.Tensor):

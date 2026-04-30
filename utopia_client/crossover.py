@@ -80,16 +80,17 @@ def apply_crossover_inheritance(child_org, mother_org, father_org,
 
 
 def serialize_organism_blob(org) -> bytes:
-    """Сериализовать tissues_state_dict в формате, который P40 ждёт от newborn.
+    """Сериализовать tissues_by_role в формате, который P40 ждёт от newborn.
 
-    Формат тот же что и у `LocalColonyCompute.save_state` — словарь с ключом
-    `tissues_state_dict`. Hebbian/selector ребёнка не передаём — они будут
-    созданы заново на сервере (`_make_hebbian` от offspring CreatureState).
+    P40 ≥ 30.04.2026 ожидает role-keyed формат (`tissues_by_role`), т.к.
+    tissue_id (uuid) нестабилен между rebuild seed. Hebbian/selector ребёнка
+    не передаём — они будут созданы заново на сервере.
     """
     import io
     payload = {
-        "tissues_state_dict": {
-            tid: t.state_dict() for tid, t in org.tissues.items()
+        "tissues_by_role": {
+            (getattr(t, "role", "") or f"_unknown_{tid}"): t.state_dict()
+            for tid, t in org.tissues.items()
         }
     }
     buf = io.BytesIO()

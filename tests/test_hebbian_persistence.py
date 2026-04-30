@@ -67,9 +67,9 @@ def test_save_state_returns_payload(seed_file):
 
     payload = compute.save_state("c1")
     assert payload is not None
-    assert "tissues_state_dict" in payload
-    assert isinstance(payload["tissues_state_dict"], dict)
-    assert len(payload["tissues_state_dict"]) > 0
+    assert "tissues_by_role" in payload
+    assert isinstance(payload["tissues_by_role"], dict)
+    assert len(payload["tissues_by_role"]) > 0
     # Hebbian state включается, если HebbianController есть
     assert "hebbian" in payload
 
@@ -160,7 +160,7 @@ def test_local_cache_path_used_when_present(tmp_path, seed_file, monkeypatch):
     sd[marker_key] = sd[marker_key] + 0.5  # сдвиг для отличия
     org_local.tissues[first_tid].load_state_dict(sd)
     payload_local = {
-        "tissues_state_dict": {tid: t.state_dict()
+        "tissues_by_role": {(getattr(t,'role','') or '_'+tid): t.state_dict()
                                 for tid, t in org_local.tissues.items()},
     }
     colony = "tcol"
@@ -171,7 +171,7 @@ def test_local_cache_path_used_when_present(tmp_path, seed_file, monkeypatch):
     # Готовим P40-bytes из чистого seed (без сдвига).
     org_seed = load_founders(seed_file, 1)[0]
     p40_payload = {
-        "tissues_state_dict": {tid: t.state_dict()
+        "tissues_by_role": {(getattr(t,'role','') or '_'+tid): t.state_dict()
                                 for tid, t in org_seed.tissues.items()},
     }
     buf = io.BytesIO()
@@ -209,7 +209,7 @@ def test_seed_used_when_no_local_cache(tmp_path, seed_file):
 
     org_seed = load_founders(seed_file, 1)[0]
     payload = {
-        "tissues_state_dict": {tid: t.state_dict()
+        "tissues_by_role": {(getattr(t,'role','') or '_'+tid): t.state_dict()
                                 for tid, t in org_seed.tissues.items()},
     }
     buf = io.BytesIO()
@@ -242,7 +242,7 @@ def test_corrupt_local_cache_falls_back_to_seed(tmp_path, seed_file):
 
     org_seed = load_founders(seed_file, 1)[0]
     payload = {
-        "tissues_state_dict": {tid: t.state_dict()
+        "tissues_by_role": {(getattr(t,'role','') or '_'+tid): t.state_dict()
                                 for tid, t in org_seed.tissues.items()},
     }
     buf = io.BytesIO()
