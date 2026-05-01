@@ -212,3 +212,27 @@ def test_diagnostics_empty_compute():
     assert diag["n_alive"] == 0
     assert diag["prediction_accuracy"] == 0.0
     assert diag["entropy_avg"] == 0.0
+
+
+def test_diagnostics_includes_local_only_fields(compute_with_one):
+    """Архитектура / гены обучения / Phase 4 — поля, которых нет на P40."""
+    c = compute_with_one
+    for i in range(5):
+        c.handle_tick({"c0": _obs(i)})
+    diag = c.diagnostics()
+
+    # architecture: гистограммы по организмам.
+    arch = diag["architecture"]
+    assert sum(arch["n_embd_hist"].values()) == 1
+    assert sum(arch["n_layer_hist"].values()) == 1
+    assert sum(arch["n_head_hist"].values()) == 1
+
+    # learning_genes: средние от HebbianController.config.
+    lg = diag["learning_genes"]
+    assert lg["lr_oja_avg"] >= 0.0
+    assert lg["trace_decay_avg"] >= 0.0
+    assert 0.0 <= lg["hebbian_enabled_pct"] <= 1.0
+
+    # phase4: specialization_avg может быть пустым на старте.
+    assert "specialization_avg" in diag["phase4"]
+    assert isinstance(diag["phase4"]["specialization_avg"], dict)

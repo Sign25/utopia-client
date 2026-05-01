@@ -580,7 +580,14 @@ class LocalColonyCompute:
         }
 
     def diagnostics(self) -> dict:  # noqa: C901
-        """Снимок метрик обучения для /api/diagnostics/training (Phase 1/2/6)."""
+        """Снимок метрик обучения для /api/diagnostics/training.
+
+        Поля, которые знает только клиент (P40 их не видит):
+          - Phase 1/2/6 — Forward Model / intrinsic / self-observable
+          - architecture — n_embd/n_layer/n_head гистограммы по организмам
+          - learning_genes — lr_oja, lr_reward, trace_decay, % hebbian_enabled
+          - phase4 — specialization_avg по ролям тканей (Hebbian attribution)
+        """
         n = len(self.organisms)
         if n == 0:
             return {
@@ -614,6 +621,66 @@ class LocalColonyCompute:
         ents = list(self.entropy_ema.values())
         tns = list(self.trace_norm_ema.values())
         rvs = list(self.reward_var_ema.values())
+
+        # Architecture — гистограммы n_embd/n_layer/n_head по организмам.
+        # Внутри одной ткани все cells имеют одинаковый genome — берём первую.
+        n_embd_hist: dict[int, int] = {}
+        n_layer_hist: dict[int, int] = {}
+        n_head_hist: dict[int, int] = {}
+        for org in self.organisms.values():
+            tissues = getattr(org, "tissues", None)
+            if not tissues:
+                continue
+            try:
+                first_tissue = next(iter(tissues.values()))
+                first_cell = next(iter(first_tissue.cells.values()))
+                ne = int(first_cell.n_embd)
+                nl = int(first_cell.n_layer)
+                nh = int(first_cell.n_head)
+            except (StopIteration, AttributeError):
+                continue
+            n_embd_hist[ne] = n_embd_hist.get(ne, 0) + 1
+            n_layer_hist[nl] = n_layer_hist.get(nl, 0) + 1
+            n_head_hist[nh] = n_head_hist.get(nh, 0) + 1
+
+        # Learning genes — средние по HebbianController.config.
+        lr_ojas: list[float] = []
+        lr_rewards: list[float] = []
+        trace_decays: list[float] = []
+        n_heb_enabled = 0
+        for ctrl in self.hebbian.values():
+            if ctrl is None:
+                continue
+            n_heb_enabled += 1
+            cfg = getattr(ctrl, "config", None)
+            if cfg is None:
+                continue
+            lr_ojas.append(float(getattr(cfg, "lr_oja", 0.0)))
+            lr_rewards.append(float(getattr(cfg, "lr_reward", 0.0)))
+            trace_decays.append(float(getattr(cfg, "eligibility_decay", 0.0)))
+
+        def _avg(vals: list[float]) -> float:
+            return round(sum(vals) / len(vals), 6) if vals else 0.0
+
+        # Phase 4 — specialization_avg агрегат по ролям.
+        spec_sums: dict[str, float] = {}
+        spec_counts: dict[str, int] = {}
+        for ctrl in self.hebbian.values():
+            if ctrl is None or not hasattr(ctrl, "tissue_specialization"):
+                continue
+            try:
+                shares = ctrl.tissue_specialization()
+            except Exception:
+                continue
+            for role, share in shares.items():
+                spec_sums[role] = spec_sums.get(role, 0.0) + float(share)
+                spec_counts[role] = spec_counts.get(role, 0) + 1
+        specialization_avg = {
+            role: round(spec_sums[role] / spec_counts[role], 4)
+            for role in spec_sums
+            if spec_counts[role] > 0
+        }
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -631,4 +698,18 @@ class LocalColonyCompute:
             "reward_var_avg": round(sum(rvs) / len(rvs), 6) if rvs else 0.0,
             "hebbian_updates_total": int(self.hebbian_updates),
             "predictor_steps_total": int(self.predictor_steps),
+            "architecture": {
+                "n_embd_hist": {str(k): v for k, v in n_embd_hist.items()},
+                "n_layer_hist": {str(k): v for k, v in n_layer_hist.items()},
+                "n_head_hist": {str(k): v for k, v in n_head_hist.items()},
+            },
+            "learning_genes": {
+                "lr_oja_avg": _avg(lr_ojas),
+                "lr_reward_avg": _avg(lr_rewards),
+                "trace_decay_avg": _avg(trace_decays),
+                "hebbian_enabled_pct": round(n_heb_enabled / max(1, n), 3),
+            },
+            "phase4": {
+                "specialization_avg": specialization_avg,
+            },
         }
