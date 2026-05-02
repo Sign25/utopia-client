@@ -23,6 +23,7 @@ logger = logging.getLogger("utopia_client.ws")
 PING_INTERVAL_SEC = 20.0
 INITIAL_BACKOFF_SEC = 1.0
 MAX_BACKOFF_SEC = 30.0
+LOCAL_SAVE_INTERVAL_SEC = 60.0
 
 
 class ColonyWSClient:
@@ -198,6 +199,7 @@ class ColonyWSClient:
                     logger.warning("send seed_pack failed: %s", e)
 
             ping_task = asyncio.create_task(self._ping_loop(ws))
+            save_task = asyncio.create_task(self._save_loop())
             try:
                 async for raw in ws:
                     try:
@@ -213,10 +215,12 @@ class ColonyWSClient:
                         break
             finally:
                 ping_task.cancel()
-                try:
-                    await ping_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                save_task.cancel()
+                for t in (ping_task, save_task):
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 self._ws = None
                 self.connected = False
 
@@ -228,6 +232,26 @@ class ColonyWSClient:
                                           "ts": int(time.time() * 1000)}))
             except Exception:
                 return
+
+    async def _save_loop(self) -> None:
+        """Периодическая запись Hebbian/predictor state в local cache.
+
+        Без этого state живёт только в RAM до stop(). При crash без stop()
+        теряется обучение. Когда P40 удалит свои `/data/colonies/*/members/*.pt`
+        (план A6), local cache становится единственным backup'ом.
+        """
+        while True:
+            await asyncio.sleep(LOCAL_SAVE_INTERVAL_SEC)
+            if self.compute is None:
+                continue
+            try:
+                from .seed_loader import colony_state_dir
+                n = await asyncio.to_thread(
+                    self.compute.save_all_states,
+                    colony_state_dir(self.colony_name))
+                logger.debug("periodic local-save: %d creatures", n)
+            except Exception as e:
+                logger.warning("periodic save_all_states failed: %s", e)
 
     async def _handle(self, msg: dict) -> None:
         msg_type = msg.get("type", "")

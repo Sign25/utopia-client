@@ -280,3 +280,41 @@ def test_stop_saves_local_state(tmp_path, seed_file):
 
     saved = colony_state_dir(colony) / "c_stop.pt"
     assert saved.exists() and saved.stat().st_size > 0
+
+
+def test_periodic_save_loop_writes_local_state(seed_file, monkeypatch):
+    """`_save_loop` периодически вызывает `compute.save_all_states`.
+
+    Без него local cache наполняется только на `stop()`, а если клиент
+    падает без чистой остановки — обучение теряется. Тест: укорачиваем
+    интервал до 0.05с и проверяем, что файлы появляются после нескольких
+    итераций.
+    """
+    import asyncio
+
+    from utopia_client import ws_client as wsmod
+    from utopia_client.seed_loader import colony_state_dir, load_founders
+    from utopia_client.ws_client import ColonyWSClient
+
+    monkeypatch.setattr(wsmod, "LOCAL_SAVE_INTERVAL_SEC", 0.05)
+
+    colony = "periodic_col"
+    ws = ColonyWSClient(server="https://x", token="t",
+                         colony_name=colony, client_version="test")
+    assert ws._ensure_compute()
+    org = load_founders(seed_file, 1)[0]
+    ws.compute.add_creature("c_p1", org, hebbian_enabled=True)
+
+    async def _run():
+        task = asyncio.create_task(ws._save_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+    saved = colony_state_dir(colony) / "c_p1.pt"
+    assert saved.exists() and saved.stat().st_size > 0
