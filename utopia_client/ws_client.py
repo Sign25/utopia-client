@@ -166,14 +166,36 @@ class ColonyWSClient:
             logger.info("connected")
 
             from .seed_loader import seed_sha256
-            await ws.send(json.dumps({
+
+            # A1: разведка локального seed-pack ДО hello. Если на диске
+            # есть .pt от прошлой сессии — объявляем серверу через
+            # local_save в hello + сразу шлём seed_pack_start/chunk*/complete.
+            local_pack = self._scan_local_seed_pack()
+
+            hello_msg: dict = {
                 "type": "hello",
                 "colony_name": self.colony_name,
                 "client_version": self.client_version,
                 "estimated_population": self.estimated_population,
                 "known_seed_hash": seed_sha256(),
                 "ts": int(time.time() * 1000),
-            }))
+            }
+            if local_pack:
+                hello_msg["local_save"] = {
+                    "available": True,
+                    "n_creatures": len(local_pack),
+                    "est_bytes": sum(len(p["weights"]) for p in local_pack),
+                    "seed_revision": int(time.time()),
+                }
+            await ws.send(json.dumps(hello_msg))
+
+            if local_pack:
+                try:
+                    await self._send_seed_pack(
+                        ws, local_pack,
+                        seed_revision=hello_msg["local_save"]["seed_revision"])
+                except Exception as e:
+                    logger.warning("send seed_pack failed: %s", e)
 
             ping_task = asyncio.create_task(self._ping_loop(ws))
             try:
@@ -235,6 +257,17 @@ class ColonyWSClient:
                     }))
                 except Exception:
                     pass
+            return
+        if msg_type == "seed_pack_ack":
+            # A1: P40 ответил после restore_personal_from_pack или fallback.
+            # restored>0 — наш local seed применён; иначе сервер ушёл в
+            # fallback (load_personal/genesis) и ждать обычный seed_*.
+            logger.info(
+                "seed_pack_ack: restored=%s requested=%s failed=%s "
+                "error=%s fallback=%s",
+                msg.get("restored"), msg.get("requested"),
+                msg.get("failed"), msg.get("error"),
+                msg.get("fallback_path"))
             return
         if msg_type == "stats":
             n = msg.get("n_alive_owned", 0)
@@ -419,6 +452,132 @@ class ColonyWSClient:
                 logger.warning("finalize %s source=%s failed: %s", cid, src, e)
         if not loaded:
             self._seed_failed += 1
+            return
+
+        # A1: сохранить meta на диск рядом с .pt — чтобы при reconnect
+        # клиент мог отправить её обратно в seed_pack_chunk[seq=0].
+        # Без meta P40 при restore_personal_from_pack применит дефолты
+        # (learning_rate=1e-4, trace_decay=0.9, diet_gene=0.5, random tile).
+        try:
+            from .seed_loader import colony_state_dir
+            meta_path = colony_state_dir(self.colony_name) / f"{cid}.meta.json"
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.warning("save meta %s: %s", cid, e)
+
+    # ── A1: seed_pack клиент→P40 ─────────────────────────────────────────
+    # Cap: 10 особей по mtime DESC. Симметрия с MAX_SEED_PACK_CREATURES
+    # на стороне сервера (server/colony_storage.py).
+    MAX_SEED_PACK_CREATURES = 10
+    SEED_PACK_CHUNK_SIZE = 240 * 1024  # 240 КиБ — как push_owned_seed P40→client
+
+    def _scan_local_seed_pack(self) -> list[dict]:
+        """A1: отобрать .pt от прошлой сессии для отправки в seed_pack.
+
+        Читает colony_state_dir(name)/*.pt + соответствующий *.meta.json,
+        сортирует по mtime DESC, берёт top-MAX_SEED_PACK_CREATURES.
+        Возвращает [{"cid": str, "weights": bytes, "meta": dict}, ...].
+
+        Пустой список — нет ничего на диске или ошибка чтения.
+        """
+        try:
+            from .seed_loader import colony_state_dir
+            d = colony_state_dir(self.colony_name)
+            if not d.exists():
+                return []
+            pt_files = sorted(
+                [p for p in d.glob("*.pt") if p.is_file() and p.stat().st_size > 0],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:self.MAX_SEED_PACK_CREATURES]
+            pack: list[dict] = []
+            for pt in pt_files:
+                cid = pt.stem
+                try:
+                    weights = pt.read_bytes()
+                except Exception as e:
+                    logger.warning("scan_local: read %s: %s", pt, e)
+                    continue
+                meta: dict = {}
+                meta_path = d / f"{cid}.meta.json"
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    except Exception as e:
+                        logger.warning("scan_local: meta %s: %s", cid, e)
+                pack.append({"cid": cid, "weights": weights, "meta": meta})
+            if pack:
+                logger.info(
+                    "local seed-pack found: n=%d total_bytes=%d (cap=%d)",
+                    len(pack), sum(len(p["weights"]) for p in pack),
+                    self.MAX_SEED_PACK_CREATURES)
+            return pack
+        except Exception as e:
+            logger.warning("_scan_local_seed_pack failed: %s", e)
+            return []
+
+    async def _send_seed_pack(
+        self, ws, pack: list[dict], *, seed_revision: int,
+    ) -> None:
+        """A1: отправить seed_pack_start/chunk*/complete после hello.
+
+        Симметрия с push_owned_seed (P40→клиент): тот же chunk-size,
+        тот же 5 мс throttle, base64-encoded payload. Сервер собирает
+        в _handle(seed_pack_*), вызывает restore_personal_from_pack.
+        """
+        import base64
+        total_bytes = sum(len(p["weights"]) for p in pack)
+        await ws.send(json.dumps({
+            "type": "seed_pack_start",
+            "seed_revision": seed_revision,
+            "n_creatures": len(pack),
+            "total_bytes": total_bytes,
+            "ts_client_ns": time.monotonic_ns(),
+        }))
+        sent_chunks = 0
+        for entry in pack:
+            cid = entry["cid"]
+            weights: bytes = entry["weights"]
+            meta: dict = entry["meta"] or {}
+            chunks = [weights[i:i + self.SEED_PACK_CHUNK_SIZE]
+                      for i in range(0, len(weights), self.SEED_PACK_CHUNK_SIZE)]
+            if not chunks:
+                chunks = [b""]
+            total = len(chunks)
+            for seq, blob in enumerate(chunks):
+                msg: dict = {
+                    "type": "seed_pack_chunk",
+                    "seed_revision": seed_revision,
+                    "cid": cid,
+                    "seq": seq,
+                    "total": total,
+                    "payload_b64": base64.b64encode(blob).decode("ascii"),
+                    "last": (seq == total - 1),
+                }
+                if seq == 0:
+                    msg["meta"] = meta
+                try:
+                    await ws.send(json.dumps(msg))
+                    sent_chunks += 1
+                except Exception as e:
+                    logger.warning(
+                        "seed_pack_chunk send cid=%s seq=%d failed: %s",
+                        cid, seq, e)
+                    return
+                await asyncio.sleep(0.005)
+        await ws.send(json.dumps({
+            "type": "seed_pack_complete",
+            "seed_revision": seed_revision,
+            "sent_creatures": len(pack),
+            "sent_chunks": sent_chunks,
+        }))
+        logger.info(
+            "seed_pack sent: n=%d chunks=%d bytes=%d revision=%d",
+            len(pack), sent_chunks, total_bytes, seed_revision)
 
     async def _handle_seed_complete(self, msg: dict) -> None:
         seed_id = int(msg.get("seed_id", 0))
