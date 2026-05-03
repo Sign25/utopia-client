@@ -100,6 +100,19 @@ class ColonyWSClient:
 
     def stop(self) -> None:
         self._stop_flag.set()
+        # F.6.B (03.05.2026): graceful idle — отправить bye до закрытия WS.
+        # VPS broker увидит close → emit client_disconnected → P40 заморозит
+        # owned-особей. bye — явный сигнал «штатный idle, не crash».
+        if self._loop and self.connected and self._ws is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.send_bye(), self._loop)
+                try:
+                    fut.result(timeout=2.0)
+                except Exception as e:
+                    logger.warning("bye dispatch failed: %s", e)
+            except RuntimeError:
+                pass
         if self._loop and self._stop_event:
             try:
                 self._loop.call_soon_threadsafe(self._stop_event.set)
@@ -223,6 +236,25 @@ class ColonyWSClient:
                         pass
                 self._ws = None
                 self.connected = False
+
+    async def send_bye(self) -> None:
+        """F.6.B: graceful idle — отправить bye, далее WS закрывается штатно.
+
+        Сервер на close → broker.client_disconnected → P40 freeze_personal
+        owned-особей (не размножаются, неуязвимы для PvP, остаются в Мире).
+        Hello при следующем подключении триггерит unfreeze_personal.
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.send(json.dumps({
+                "type": "bye",
+                "ts": int(time.time() * 1000),
+            }))
+            logger.info("bye sent (graceful idle)")
+        except Exception as e:
+            logger.warning("bye send failed: %s", e)
 
     async def _ping_loop(self, ws) -> None:
         while True:

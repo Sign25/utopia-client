@@ -105,6 +105,17 @@ def _run_benchmark() -> dict:
     return result
 
 
+def _make_ws(cfg: dict, name: str) -> ColonyWSClient:
+    """F.6.B: фабрика WS-клиента. Создаём заново на каждый idle→run, чтобы
+    после bye+close был чистый hello (не зависим от состояния прошлой
+    сессии: _stop_flag, _seed_buffers, compute и т.п.)."""
+    bench = cfg.get("benchmark", {})
+    return ColonyWSClient(
+        cfg["server"], cfg["token"], name, __version__,
+        estimated_population=bench.get("estimated_population", 0),
+    )
+
+
 def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
                bench: dict, n_alive: int = 0) -> bool:
     extra = {
@@ -194,12 +205,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     name = cfg["name"]
     logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
 
-    bench_initial = cfg.get("benchmark", {})
-    ws = ColonyWSClient(
-        cfg["server"], cfg["token"], name, __version__,
-        estimated_population=bench_initial.get("estimated_population", 0),
-    )
-    ws.start()
+    # F.6.B: WS подключается только в state=run. В idle WS не открыт →
+    # P40 видит client_disconnected → freeze_personal (owned-особи живут
+    # в Мире, не размножаются). При idle→run hello триггерит unfreeze.
+    ws: ColonyWSClient | None = None
 
     last_heartbeat = 0.0
     last_poll = 0.0
@@ -233,17 +242,32 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("benchmark pushed: pop=%d gflops=%.2f",
                                         result["estimated_population"],
                                         result["cpu_gflops"])
+                        # benchmark не должен оставлять WS открытым.
+                        if ws is not None:
+                            ws.stop()
+                            ws = None
+                            logger.info("ws stopped (benchmark→idle)")
                         current_state = "idle"
                     else:
+                        # F.6.B: переходы run↔idle переключают WS.
+                        if desired == "run" and ws is None:
+                            ws = _make_ws(cfg, name)
+                            ws.start()
+                            logger.info("ws started (idle→run)")
+                        elif desired == "idle" and ws is not None:
+                            ws.stop()  # отправит bye → close
+                            ws = None
+                            logger.info("ws stopped with bye (run→idle)")
                         current_state = desired
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
-                n_alive = ws.n_alive_owned
-                world_tick = ws.last_world_tick
+                n_alive = ws.n_alive_owned if ws is not None else 0
+                world_tick = ws.last_world_tick if ws is not None else 0
+                ws_connected = ws.connected if ws is not None else False
                 ok = _heartbeat(api, name, current_state, world_tick, bench, n_alive)
                 logger.info("heartbeat world_tick=%d state=%s ws=%s n_alive=%d ok=%s",
-                            world_tick, current_state, ws.connected, n_alive, ok)
+                            world_tick, current_state, ws_connected, n_alive, ok)
                 last_heartbeat = now
 
             # Push tail логов в VPS (admin потом достаёт через cabinet_log.sh)
@@ -255,7 +279,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 last_logpush = now
 
             # Phase 1/2/6 diagnostics push (only when compute is alive).
-            if (ws.compute is not None
+            if (ws is not None and ws.compute is not None
                     and now - last_diag_push >= DIAGNOSTICS_PUSH_SEC):
                 try:
                     diag = ws.compute.diagnostics()
@@ -280,7 +304,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         logger.info("interrupted, stopping…")
     finally:
-        ws.stop()
+        if ws is not None:
+            ws.stop()
     return 0
 
 
