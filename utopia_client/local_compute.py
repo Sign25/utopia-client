@@ -200,6 +200,42 @@ class LocalColonyCompute:
     def n_alive(self) -> int:
         return len(self.organisms)
 
+    # ── Phase emas pushback (03.05.2026) ─────────────────────────────────
+
+    def get_phase_emas(self, cid: str) -> Optional[dict]:
+        """Снимок 4 EMA для отправки в actions_batch.
+
+        Поля идентичны server-side `phase_emas` receiver:
+          - loss_ema  (Phase 1 predictor running MSE)
+          - entropy_ema (Phase 6 action-distribution entropy)
+          - trace_norm_ema (Phase 6 Hebbian eligibility trace L2)
+          - intrinsic_ema (Phase 2 Δsurprise baseline)
+
+        Возвращает None для незарегистрированных cid (нечего слать).
+        Все значения нормированы как float и проверены на finite.
+        """
+        if cid not in self.loss_ema:
+            return None
+        import math
+        out: dict = {}
+        for src, key in (
+            (self.loss_ema, "loss_ema"),
+            (self.entropy_ema, "entropy_ema"),
+            (self.trace_norm_ema, "trace_norm_ema"),
+            (self.intrinsic_ema, "intrinsic_ema"),
+        ):
+            v = src.get(cid)
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(vf):
+                continue
+            out[key] = vf
+        return out or None
+
     # ── Tick ─────────────────────────────────────────────────────────────
 
     def handle_tick(self, obs_per_cid: dict,

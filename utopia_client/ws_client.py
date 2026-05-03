@@ -745,15 +745,28 @@ class ColonyWSClient:
         ws = self._ws
         if ws is None or not actions:
             return
+        # Phase emas pushback (03.05.2026): подмешиваем phase_emas per-creature,
+        # чтобы сервер видел Phase 1/2/6 метрики для owned. Поле опциональное —
+        # старые серверы игнорируют, новые применяют через _apply_phase_emas.
+        creatures_out: list = []
+        for cid, a in actions.items():
+            entry: dict = {
+                "cid": cid,
+                "action": int(a["action"]),
+                "target_id": a.get("target_id"),
+            }
+            try:
+                emas = self.compute.get_phase_emas(cid) if self.compute else None
+            except Exception:
+                emas = None
+            if emas:
+                entry["phase_emas"] = emas
+            creatures_out.append(entry)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
             "ts_p40_ns_echo": ts_echo,
-            "creatures": [
-                {"cid": cid, "action": int(a["action"]),
-                 "target_id": a.get("target_id")}
-                for cid, a in actions.items()
-            ],
+            "creatures": creatures_out,
         }
         try:
             await ws.send(json.dumps(out))
