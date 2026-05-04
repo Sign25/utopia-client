@@ -143,6 +143,22 @@ def cmd_set_name(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_genesis_mode(args: argparse.Namespace) -> int:
+    mode = args.mode.strip().lower()
+    if mode not in ("donor", "fresh"):
+        print(f"Неизвестный режим: {mode!r}. Допустимо: donor, fresh.",
+              flush=True)
+        return 2
+    cfg = load_config()
+    if not cfg.get("server"):
+        cfg["server"] = DEFAULT_SERVER
+    cfg["genesis_mode"] = mode
+    save_config(cfg)
+    print(f"genesis_mode = {mode}. Перезапусти клиент, чтобы применить.",
+          flush=True)
+    return 0
+
+
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = _ensure_config()
     print("Замер производительности…")
@@ -385,6 +401,11 @@ def main(argv: list[str] | None = None) -> int:
     p_token.add_argument("token", help="Push-токен из Кабинета на divisci.com")
     p_name = sub.add_parser("set-name", help="Записать имя колонии в конфиг")
     p_name.add_argument("name", help="Короткое имя колонии (например home-3060ti)")
+    p_gm = sub.add_parser("set-genesis-mode",
+                          help="Сменить режим создания колонии (donor/fresh)")
+    p_gm.add_argument("mode", choices=["donor", "fresh"],
+                      help="donor — старт от обученных доноров; "
+                           "fresh — с чистого листа")
     args = p.parse_args(argv)
     if args.cmd == "run":
         return cmd_run(args)
@@ -396,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_token(args)
     if args.cmd == "set-name":
         return cmd_set_name(args)
+    if args.cmd == "set-genesis-mode":
+        return cmd_set_genesis_mode(args)
     if args.cmd == "bench-gpu":
         from .gpu_bench import cmd_bench_gpu
         return cmd_bench_gpu(args)
