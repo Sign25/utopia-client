@@ -70,6 +70,9 @@ class ColonyWSClient:
         self.n_alive_owned: int = 0
         self.last_stats_ts: float = 0.0
         self.last_world_tick: int = 0
+        # Phase G.2: последний полученный world_meta (season/event), чтобы
+        # логировать ТОЛЬКО переходы, а не каждый tick.
+        self.last_world_meta: dict = {}
         # Phase G.3: момент последнего ненулевого n_alive_owned + момент
         # последнего отправленного respawn_owned_request (cooldown).
         self.last_owned_alive_ts: float = 0.0
@@ -425,6 +428,26 @@ class ColonyWSClient:
             self.last_stats_ts = now
             if self.n_alive_owned > 0:
                 self.last_owned_alive_ts = now
+            wm = msg.get("world_meta")
+            if isinstance(wm, dict) and wm:
+                old = self.last_world_meta
+                old_season = str(old.get("season_name", "") or "")
+                new_season = str(wm.get("season_name", "") or "")
+                if old_season and new_season and old_season != new_season:
+                    logger.info("season: %s → %s", old_season, new_season)
+                old_event = str(old.get("active_event", "") or "")
+                new_event = str(wm.get("active_event", "") or "")
+                if old_event != new_event:
+                    if new_event:
+                        logger.info("event started: %s", new_event)
+                    elif old_event:
+                        logger.info("event ended: %s", old_event)
+                self.last_world_meta = wm
+                if self.compute is not None:
+                    try:
+                        setattr(self.compute, "world_meta", dict(wm))
+                    except Exception:
+                        pass
             logger.info("stats: n_alive_owned=%d world_tick=%s",
                         self.n_alive_owned, wt)
             return
