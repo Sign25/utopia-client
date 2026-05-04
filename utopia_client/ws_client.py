@@ -36,7 +36,8 @@ class ColonyWSClient:
     """Держит WS к VPS в фоновом потоке."""
 
     def __init__(self, server: str, token: str, colony_name: str,
-                 client_version: str, estimated_population: int = 0) -> None:
+                 client_version: str, estimated_population: int = 0,
+                 genesis_mode: str = "auto") -> None:
         # https://divisci.com -> wss://divisci.com/ws/colony/client
         if server.startswith("https://"):
             base = "wss://" + server[len("https://"):]
@@ -49,6 +50,11 @@ class ColonyWSClient:
         self.colony_name = colony_name
         self.client_version = client_version
         self.estimated_population = int(estimated_population)
+        # Phase F.7.4: выбор пользователя при первом подключении.
+        # 'fresh' — seed.norg only, 'donor' — fallback с чужими весами,
+        # 'auto' — legacy. Прокидывается в hello + respawn_owned_request.
+        gm = str(genesis_mode or "auto").lower()
+        self.genesis_mode = gm if gm in ("auto", "fresh", "donor") else "auto"
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -204,6 +210,7 @@ class ColonyWSClient:
                 "client_version": self.client_version,
                 "estimated_population": self.estimated_population,
                 "known_seed_hash": seed_sha256(),
+                "genesis_mode": self.genesis_mode,
                 "ts": int(time.time() * 1000),
             }
             if local_pack:
@@ -329,7 +336,7 @@ class ColonyWSClient:
             await ws.send(json.dumps({
                 "type": "respawn_owned_request",
                 "colony_name": self.colony_name,
-                "mode": "auto",
+                "mode": self.genesis_mode,
                 "n": 5,
                 "ts": int(now * 1000),
             }))

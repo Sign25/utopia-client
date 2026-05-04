@@ -149,6 +149,25 @@ class UtopiaAPI:
             logger.warning("download_client_zip error: %s", e)
             return False
 
+    def get_genepool_info(self) -> dict | None:
+        """Phase F.7.4: статистика донорского пула Мира (без auth).
+
+        Возвращает {fresh_available, donor_available, donor_pool_size,
+        donor_avg_score, world_population, ...} или None при ошибке.
+        Используется CLI-диалогом первого подключения для выбора режима
+        genesis ('fresh' | 'donor').
+        """
+        url = f"{self.server}/api/world/genepool/info"
+        try:
+            r = requests.get(url, timeout=self.timeout)
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("get_genepool_info HTTP %d", r.status_code)
+            return None
+        except Exception as e:
+            logger.warning("get_genepool_info error: %s", e)
+            return None
+
     def fetch_seed(self, dest_path: str) -> bool:
         url = f"{self.server}/api/seed"
         try:

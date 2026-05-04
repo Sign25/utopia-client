@@ -48,7 +48,49 @@ def _ensure_config() -> dict:
     cfg["name"] = get_or_prompt(
         "name", "Имя колонии (короткое, например home-3060ti)",
     )
+    if not cfg.get("genesis_mode"):
+        cfg["genesis_mode"] = _prompt_genesis_mode(cfg)
+        save_config(cfg)
     return cfg
+
+
+def _prompt_genesis_mode(cfg: dict) -> str:
+    """Phase F.7.4: при первом подключении спросить, как создать колонию.
+
+    Опрашивает /api/world/genepool/info (без auth), показывает CLI-меню:
+      [1] С генофонда (потомки активных колоний Мира)
+      [2] С чистого листа (свежие веса из seed.norg)
+    Если donor_pool_size=0 — опция 1 недоступна, авто-выбор 'fresh'.
+    Сохранённое значение прокидывается в hello через ColonyWSClient.
+    """
+    api = UtopiaAPI(cfg["server"], cfg.get("token", ""))
+    info = api.get_genepool_info() or {}
+    donor_available = bool(info.get("donor_available"))
+    pool_size = int(info.get("donor_pool_size", 0) or 0)
+    avg_score = float(info.get("donor_avg_score", 0.0) or 0.0)
+    world_pop = int(info.get("world_population", 0) or 0)
+
+    print()
+    print("=== Создание колонии ===")
+    print(f"Мир: {world_pop} особей онлайн, "
+          f"донорский пул: {pool_size} ({avg_score:.0f} ср. score)")
+    print()
+    if donor_available:
+        print(" [1] С генофонда — потомки активных колоний (быстрый старт)")
+    else:
+        print(" [1] С генофонда — недоступно (Мир пока пустой)")
+    print(" [2] С чистого листа — свежие веса из seed.norg")
+    print()
+    if not donor_available:
+        print("Авто-выбор: с чистого листа.")
+        return "fresh"
+    while True:
+        choice = input("Выбор [1/2, по умолчанию 1]: ").strip()
+        if choice in ("", "1"):
+            return "donor"
+        if choice == "2":
+            return "fresh"
+        print("Введите 1 или 2.")
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -113,6 +155,7 @@ def _make_ws(cfg: dict, name: str) -> ColonyWSClient:
     return ColonyWSClient(
         cfg["server"], cfg["token"], name, __version__,
         estimated_population=bench.get("estimated_population", 0),
+        genesis_mode=cfg.get("genesis_mode", "auto"),
     )
 
 
