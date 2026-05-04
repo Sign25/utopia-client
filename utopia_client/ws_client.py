@@ -24,6 +24,12 @@ PING_INTERVAL_SEC = 20.0
 INITIAL_BACKOFF_SEC = 1.0
 MAX_BACKOFF_SEC = 30.0
 LOCAL_SAVE_INTERVAL_SEC = 60.0
+# Phase G.3 (04.05.2026): пустой Мир. Если n_alive_owned=0 дольше grace и
+# нет seed_pack/colony_reset в полёте — клиент шлёт respawn_owned_request
+# через WS, P40 запускает _async_respawn (load → clone → genesis).
+EMPTY_WORLD_GRACE_SEC = 120.0
+EMPTY_WORLD_RETRY_SEC = 300.0
+EMPTY_WORLD_CHECK_SEC = 30.0
 
 
 class ColonyWSClient:
@@ -58,6 +64,12 @@ class ColonyWSClient:
         self.n_alive_owned: int = 0
         self.last_stats_ts: float = 0.0
         self.last_world_tick: int = 0
+        # Phase G.3: момент последнего ненулевого n_alive_owned + момент
+        # последнего отправленного respawn_owned_request (cooldown).
+        self.last_owned_alive_ts: float = 0.0
+        self._last_respawn_request_ts: float = 0.0
+        # Server-объявленный режим из welcome (awaiting_seed_pack | normal | ...)
+        self._welcome_mode: str = ""
         # Phase F3.0 echo-loop: один фоновый таск шлёт фейковый tick_summary.
         self._echo_task: Optional[asyncio.Task] = None
         self._echo_seq: int = 0
@@ -213,6 +225,7 @@ class ColonyWSClient:
 
             ping_task = asyncio.create_task(self._ping_loop(ws))
             save_task = asyncio.create_task(self._save_loop())
+            empty_task = asyncio.create_task(self._empty_world_loop())
             try:
                 async for raw in ws:
                     try:
@@ -229,7 +242,8 @@ class ColonyWSClient:
             finally:
                 ping_task.cancel()
                 save_task.cancel()
-                for t in (ping_task, save_task):
+                empty_task.cancel()
+                for t in (ping_task, save_task, empty_task):
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):
@@ -285,17 +299,83 @@ class ColonyWSClient:
             except Exception as e:
                 logger.warning("periodic save_all_states failed: %s", e)
 
+    async def _maybe_request_respawn(self, connect_ts: float) -> bool:
+        """Phase G.3: одна проверка watchdog'а.
+
+        Возвращает True если запрос отправлен, False — пропуск (любая из
+        guard-проверок не прошла или send упал).
+        """
+        if not self.connected:
+            return False
+        if self.n_alive_owned > 0:
+            return False
+        # awaiting_seed_pack — сервер сам обещает прислать seed_pack
+        # через _seed_pack_timeout_fallback. Не дублируем запрос.
+        if self._welcome_mode == "awaiting_seed_pack":
+            return False
+        now = time.time()
+        ref = self.last_owned_alive_ts or connect_ts
+        since_alive = now - ref
+        since_request = now - self._last_respawn_request_ts
+        if since_alive < EMPTY_WORLD_GRACE_SEC:
+            return False
+        if (self._last_respawn_request_ts > 0
+                and since_request < EMPTY_WORLD_RETRY_SEC):
+            return False
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            await ws.send(json.dumps({
+                "type": "respawn_owned_request",
+                "colony_name": self.colony_name,
+                "mode": "auto",
+                "n": 5,
+                "ts": int(now * 1000),
+            }))
+        except Exception as e:
+            logger.warning("respawn_owned_request send failed: %s", e)
+            return False
+        self._last_respawn_request_ts = now
+        logger.info(
+            "empty-world watchdog: respawn_owned_request sent "
+            "(empty %.0fs, last_request %.0fs ago)",
+            since_alive,
+            since_request if self._last_respawn_request_ts else -1)
+        return True
+
+    async def _empty_world_loop(self) -> None:
+        """Phase G.3 watchdog: респавн при долгом n_alive_owned=0.
+
+        Если клиент остался без живых owned дольше EMPTY_WORLD_GRACE_SEC и
+        Мир не объявил awaiting_seed_pack, шлёт `respawn_owned_request`
+        через WS. P40 шедулит _async_respawn (load → clone → genesis),
+        ответ идёт обычным потоком colony_reset → seed → obs_batch.
+        Cooldown EMPTY_WORLD_RETRY_SEC между попытками.
+        """
+        # Стартовая отметка — момент запуска watchdog. Ноль значит «пока
+        # ни одного живого не видели», старт grace-таймера = connect time.
+        connect_ts = time.time()
+        while True:
+            await asyncio.sleep(EMPTY_WORLD_CHECK_SEC)
+            await self._maybe_request_respawn(connect_ts)
+
     async def _handle(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
         if msg_type == "welcome":
             n = msg.get("n_creatures")
             if isinstance(n, int):
                 self.n_alive_owned = n
+                if n > 0:
+                    self.last_owned_alive_ts = time.time()
             wt = msg.get("world_tick")
             if isinstance(wt, int):
                 self.last_world_tick = wt
-            logger.info("welcome: world_tick=%s server_time=%s n_creatures=%s",
-                        wt, msg.get("server_time"), n)
+            mode = str(msg.get("mode", "") or "")
+            self._welcome_mode = mode
+            logger.info(
+                "welcome: world_tick=%s server_time=%s n_creatures=%s mode=%s",
+                wt, msg.get("server_time"), n, mode or "normal")
             return
         if msg_type == "pong":
             self.last_pong_ts = time.time()
@@ -334,9 +414,17 @@ class ColonyWSClient:
             wt = msg.get("world_tick")
             if isinstance(wt, int):
                 self.last_world_tick = wt
-            self.last_stats_ts = time.time()
+            now = time.time()
+            self.last_stats_ts = now
+            if self.n_alive_owned > 0:
+                self.last_owned_alive_ts = now
             logger.info("stats: n_alive_owned=%d world_tick=%s",
                         self.n_alive_owned, wt)
+            return
+        if msg_type == "respawn_owned_ack":
+            logger.info(
+                "respawn_owned_ack: colony=%s scheduled=%s",
+                msg.get("colony_name"), msg.get("scheduled"))
             return
         if msg_type == "echo_request":
             await self._handle_echo_request(msg)
@@ -411,6 +499,11 @@ class ColonyWSClient:
             n_dropped = self.compute.reset_all()
         self._seed_buffers.clear()
         self._seed_meta.clear()
+        # Phase G.3: новый seed едет — снимаем awaiting/respawn-cooldown,
+        # обновляем «последний раз alive», чтобы grace отсчитался заново.
+        self._welcome_mode = ""
+        self._last_respawn_request_ts = 0.0
+        self.last_owned_alive_ts = time.time()
         logger.info("colony_reset reason=%s dropped=%d", reason, n_dropped)
 
     def _handle_seed_start(self, msg: dict) -> None:
