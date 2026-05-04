@@ -62,6 +62,10 @@ def _prompt_genesis_mode(cfg: dict) -> str:
       [2] С чистого листа (свежие веса из seed.norg)
     Если donor_pool_size=0 — опция 1 недоступна, авто-выбор 'fresh'.
     Сохранённое значение прокидывается в hello через ColonyWSClient.
+
+    v0.9.18: flush=True, try/except EOFError, логируем конечный выбор —
+    embedded Python на Windows иногда теряет prompt без явного flush;
+    при non-TTY (запуск из сервиса) input() кидает EOFError → 'fresh'.
     """
     api = UtopiaAPI(cfg["server"], cfg.get("token", ""))
     info = api.get_genepool_info() or {}
@@ -70,27 +74,41 @@ def _prompt_genesis_mode(cfg: dict) -> str:
     avg_score = float(info.get("donor_avg_score", 0.0) or 0.0)
     world_pop = int(info.get("world_population", 0) or 0)
 
-    print()
-    print("=== Создание колонии ===")
+    print(flush=True)
+    print("=== Создание колонии ===", flush=True)
     print(f"Мир: {world_pop} особей онлайн, "
-          f"донорский пул: {pool_size} ({avg_score:.0f} ср. score)")
-    print()
+          f"донорский пул: {pool_size} ({avg_score:.0f} ср. score)",
+          flush=True)
+    print(flush=True)
     if donor_available:
-        print(" [1] С генофонда — потомки активных колоний (быстрый старт)")
+        print(" [1] С генофонда — потомки активных колоний (быстрый старт)",
+              flush=True)
     else:
-        print(" [1] С генофонда — недоступно (Мир пока пустой)")
-    print(" [2] С чистого листа — свежие веса из seed.norg")
-    print()
+        print(" [1] С генофонда — недоступно (Мир пока пустой)", flush=True)
+    print(" [2] С чистого листа — свежие веса из seed.norg", flush=True)
+    print(flush=True)
     if not donor_available:
-        print("Авто-выбор: с чистого листа.")
+        print("Авто-выбор: с чистого листа.", flush=True)
+        logger.info("genesis_mode: fresh (donor pool empty)")
         return "fresh"
     while True:
-        choice = input("Выбор [1/2, по умолчанию 1]: ").strip()
+        try:
+            sys.stdout.flush()
+            choice = input("Выбор [1/2, по умолчанию 1]: ").strip()
+        except EOFError:
+            print("Нет интерактивного ввода — авто-выбор: с генофонда.",
+                  flush=True)
+            logger.info("genesis_mode: donor (EOFError fallback)")
+            return "donor"
         if choice in ("", "1"):
+            print("Выбрано: с генофонда.", flush=True)
+            logger.info("genesis_mode: donor")
             return "donor"
         if choice == "2":
+            print("Выбрано: с чистого листа.", flush=True)
+            logger.info("genesis_mode: fresh")
             return "fresh"
-        print("Введите 1 или 2.")
+        print("Введите 1 или 2.", flush=True)
 
 
 def cmd_config(args: argparse.Namespace) -> int:
