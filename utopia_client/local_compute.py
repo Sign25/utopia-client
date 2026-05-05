@@ -203,16 +203,17 @@ class LocalColonyCompute:
     # ── Phase emas pushback (03.05.2026) ─────────────────────────────────
 
     def get_phase_emas(self, cid: str) -> Optional[dict]:
-        """Снимок 4 EMA для отправки в actions_batch.
+        """Снимок EMA для отправки в actions_batch.
 
         Поля идентичны server-side `phase_emas` receiver:
           - loss_ema  (Phase 1 predictor running MSE)
           - entropy_ema (Phase 6 action-distribution entropy)
           - trace_norm_ema (Phase 6 Hebbian eligibility trace L2)
           - intrinsic_ema (Phase 2 Δsurprise baseline)
+          - specialization_ema (Phase 4 per-role tissue attribution, dict)
 
         Возвращает None для незарегистрированных cid (нечего слать).
-        Все значения нормированы как float и проверены на finite.
+        Все скалярные значения нормированы как float и проверены на finite.
         """
         if cid not in self.loss_ema:
             return None
@@ -234,6 +235,25 @@ class LocalColonyCompute:
             if not math.isfinite(vf):
                 continue
             out[key] = vf
+        # Phase 4 — specialization_ema (per-role attribution, dict role→share).
+        ctrl = self.hebbian.get(cid)
+        if ctrl is not None and hasattr(ctrl, "tissue_specialization"):
+            try:
+                shares = ctrl.tissue_specialization()
+            except Exception:
+                shares = None
+            if isinstance(shares, dict) and shares:
+                spec: dict = {}
+                for role, share in shares.items():
+                    try:
+                        sf = float(share)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(sf):
+                        continue
+                    spec[str(role)] = sf
+                if spec:
+                    out["specialization_ema"] = spec
         return out or None
 
     # ── Tick ─────────────────────────────────────────────────────────────
