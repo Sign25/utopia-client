@@ -212,7 +212,8 @@ class ColonyWSClient:
                 "colony_name": self.colony_name,
                 "client_version": self.client_version,
                 "estimated_population": self.estimated_population,
-                "known_seed_hash": seed_sha256(),
+                "known_seed_hash": seed_sha256("wanderer"),
+                "lineage": "wanderer",
                 "genesis_mode": self.genesis_mode,
                 "ts": int(time.time() * 1000),
             }
@@ -578,7 +579,7 @@ class ColonyWSClient:
             # seed_norg_complete (organism_from_weights читает архитектуру
             # из локального файла, иначе FileNotFoundError).
             from .seed_loader import seed_cached
-            if not seed_cached():
+            if not seed_cached("wanderer"):
                 self._pending_finalize.append(key)
                 logger.info(
                     "seed_chunk %s: deferred (waiting for seed.norg)", cid)
@@ -614,7 +615,8 @@ class ColonyWSClient:
         loaded = False
         for src, weights in sources:
             try:
-                org, payload = organism_from_weights(weights, seed_cache_path())
+                org, payload = organism_from_weights(
+                    weights, seed_cache_path("wanderer"))
                 self.compute.add_creature(
                     cid, org,
                     hebbian_enabled=True,
@@ -812,7 +814,7 @@ class ColonyWSClient:
                            expected[:12], actual[:12])
             return
         try:
-            path = write_seed_bytes(data)
+            path = write_seed_bytes(data, "wanderer")
         except Exception as e:
             logger.warning("seed_norg_complete: write failed: %s", e)
             return
@@ -1001,7 +1003,8 @@ class ColonyWSClient:
             return
         try:
             from .seed_loader import organism_from_weights, seed_cache_path
-            father_org, _ = organism_from_weights(father_blob, seed_cache_path())
+            father_org, _ = organism_from_weights(
+                father_blob, seed_cache_path("wanderer"))
         except Exception as e:
             logger.warning("mate_request father load failed: %s", e)
             await _reject(f"father_load_error: {type(e).__name__}")

@@ -30,6 +30,8 @@ def seed_file(tmp_path, monkeypatch):
     ns_loader.ensure_seed(preset="nexus")
 
     monkeypatch.setenv("UTOPIA_SEED_PATH", str(tmp_path / "client_seed.norg"))
+
+    monkeypatch.setenv("UTOPIA_WANDERER_SEED_PATH", str(tmp_path / "client_seed.norg"))
     client_seed = tmp_path / "client_seed.norg"
     client_seed.write_bytes(seed_path.read_bytes())
 

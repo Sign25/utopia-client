@@ -186,7 +186,15 @@ class UtopiaAPI:
             return None
 
     def fetch_seed(self, dest_path: str) -> bool:
-        url = f"{self.server}/api/seed"
+        return self._fetch_seed_url(f"{self.server}/api/seed", dest_path,
+                                    label="seed")
+
+    def fetch_wanderer_seed(self, dest_path: str) -> bool:
+        """Скачать wanderer.norg (17 тканей) с VPS."""
+        return self._fetch_seed_url(f"{self.server}/api/seed/wanderer",
+                                    dest_path, label="wanderer_seed")
+
+    def _fetch_seed_url(self, url: str, dest_path: str, *, label: str) -> bool:
         try:
             with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
@@ -195,5 +203,5 @@ class UtopiaAPI:
                         f.write(chunk)
             return True
         except Exception as e:
-            logger.warning("fetch_seed error: %s", e)
+            logger.warning("%s error: %s", label, e)
             return False

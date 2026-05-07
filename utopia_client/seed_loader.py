@@ -24,37 +24,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger("utopia_client.seed")
 
 # Кеш seed.norg рядом с конфигом клиента.
+# Два варианта: elder (10 тканей nexus) и wanderer (17 тканей).
 _DEFAULT_SEED_PATH = Path(
     os.getenv("UTOPIA_SEED_PATH", str(Path.home() / ".utopia-client" / "seed.norg"))
 )
+_WANDERER_SEED_PATH = Path(
+    os.getenv("UTOPIA_WANDERER_SEED_PATH",
+              str(Path.home() / ".utopia-client" / "wanderer.norg"))
+)
 
 
-def seed_cache_path() -> Path:
-    return _DEFAULT_SEED_PATH
+def _path_for(lineage: str) -> Path:
+    """Кеш-путь по lineage. 'wanderer' → wanderer.norg, иначе seed.norg."""
+    return _WANDERER_SEED_PATH if lineage == "wanderer" else _DEFAULT_SEED_PATH
 
 
-def seed_cached() -> bool:
-    return _DEFAULT_SEED_PATH.exists() and _DEFAULT_SEED_PATH.stat().st_size > 0
+def seed_cache_path(lineage: str = "elder") -> Path:
+    return _path_for(lineage)
 
 
-def seed_sha256() -> str:
-    """SHA256 локального seed.norg (hex). Пустая строка если файла нет."""
-    if not seed_cached():
+def seed_cached(lineage: str = "elder") -> bool:
+    p = _path_for(lineage)
+    return p.exists() and p.stat().st_size > 0
+
+
+def seed_sha256(lineage: str = "elder") -> str:
+    """SHA256 локального seed-файла (hex). Пустая строка если файла нет."""
+    if not seed_cached(lineage):
         return ""
     try:
-        return hashlib.sha256(_DEFAULT_SEED_PATH.read_bytes()).hexdigest()
+        return hashlib.sha256(_path_for(lineage).read_bytes()).hexdigest()
     except Exception as e:
-        logger.warning("seed_sha256 failed: %s", e)
+        logger.warning("seed_sha256(%s) failed: %s", lineage, e)
         return ""
 
 
-def write_seed_bytes(data: bytes) -> Path:
-    """Атомарно записать сырые байты в локальный seed.norg.
+def write_seed_bytes(data: bytes, lineage: str = "elder") -> Path:
+    """Атомарно записать сырые байты в локальный seed-файл по lineage.
 
     Используется WS-каналом seed_norg_complete. Запись через временный файл
     + os.replace, чтобы не оставить наполовину-записанный seed при крэше.
     """
-    path = _DEFAULT_SEED_PATH
+    path = _path_for(lineage)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(data)
@@ -77,21 +88,32 @@ def creature_state_path(colony_name: str, cid: str) -> Path:
     return colony_state_dir(colony_name) / f"{cid}.pt"
 
 
-def ensure_seed(api: "UtopiaAPI", *, force: bool = False) -> Optional[Path]:
-    """Скачать seed.norg в локальный кеш (если ещё нет / force=True).
+def ensure_seed(api: "UtopiaAPI", *, force: bool = False,
+                lineage: str = "elder") -> Optional[Path]:
+    """Скачать seed-файл в локальный кеш (если ещё нет / force=True).
+
+    `lineage`:
+      - "elder" (default) → /api/seed (world.norg, 10 тканей nexus).
+      - "wanderer"        → /api/seed/wanderer (17 тканей).
 
     Возвращает путь к локальному файлу, либо None если скачать не удалось.
     """
-    path = _DEFAULT_SEED_PATH
+    path = _path_for(lineage)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if seed_cached() and not force:
-        logger.info("seed cached at %s (%d bytes)", path, path.stat().st_size)
+    if seed_cached(lineage) and not force:
+        logger.info("seed[%s] cached at %s (%d bytes)",
+                    lineage, path, path.stat().st_size)
         return path
-    logger.info("fetching seed.norg from VPS → %s", path)
-    if not api.fetch_seed(str(path)):
-        logger.warning("seed fetch failed")
+    logger.info("fetching seed[%s] from VPS → %s", lineage, path)
+    if lineage == "wanderer":
+        ok = api.fetch_wanderer_seed(str(path))
+    else:
+        ok = api.fetch_seed(str(path))
+    if not ok:
+        logger.warning("seed[%s] fetch failed", lineage)
         return None
-    logger.info("seed downloaded: %d bytes", path.stat().st_size)
+    logger.info("seed[%s] downloaded: %d bytes",
+                lineage, path.stat().st_size)
     return path
 
 

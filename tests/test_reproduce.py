@@ -23,6 +23,7 @@ def seed_and_organism(tmp_path, monkeypatch):
     seed_path = tmp_path / "seed.norg"
     monkeypatch.setenv("WORLD_SEED_PATH", str(seed_path))
     monkeypatch.setenv("UTOPIA_SEED_PATH", str(tmp_path / "client_seed.norg"))
+    monkeypatch.setenv("UTOPIA_WANDERER_SEED_PATH", str(tmp_path / "client_seed.norg"))
 
     import importlib
 
