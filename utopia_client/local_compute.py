@@ -768,4 +768,80 @@ class LocalColonyCompute:
             "phase4": {
                 "specialization_avg": specialization_avg,
             },
+            "creatures": self._per_creature_stats(),
         }
+
+    def _per_creature_stats(self) -> list[dict]:
+        """Per-organism breakdown — что клиент знает о каждой живой особи.
+
+        Без position/clan_id/role/diet (это от P40 через colony reporter).
+        Размер: ~21 особь × ~200 байт ≈ 4 КБ.
+        """
+        out: list[dict] = []
+        for cid, org in self.organisms.items():
+            tissues = getattr(org, "tissues", None) or {}
+            n_embd = n_layer = n_head = 0
+            n_params = 0
+            if tissues:
+                try:
+                    first_tissue = next(iter(tissues.values()))
+                    first_cell = next(iter(first_tissue.cells.values()))
+                    n_embd = int(first_cell.n_embd)
+                    n_layer = int(first_cell.n_layer)
+                    n_head = int(first_cell.n_head)
+                except (StopIteration, AttributeError):
+                    pass
+                try:
+                    n_params = sum(
+                        sum(p.numel() for p in cell.parameters())
+                        for tissue in tissues.values()
+                        for cell in tissue.cells.values()
+                    )
+                except Exception:
+                    n_params = 0
+            ctrl = self.hebbian.get(cid)
+            cfg = getattr(ctrl, "config", None) if ctrl is not None else None
+            top_spec: list[list] = []
+            if ctrl is not None and hasattr(ctrl, "tissue_specialization"):
+                try:
+                    shares = ctrl.tissue_specialization()
+                    items = sorted(
+                        ((r, float(s)) for r, s in shares.items()),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:3]
+                    top_spec = [[r, round(s, 4)] for r, s in items]
+                except Exception:
+                    pass
+            loss_ema = float(self.loss_ema.get(cid, 0.0))
+            out.append({
+                "cid": str(cid),
+                "n_embd": n_embd,
+                "n_layer": n_layer,
+                "n_head": n_head,
+                "n_tissues": len(tissues),
+                "n_params": int(n_params),
+                "prediction_accuracy": round(math.exp(-loss_ema), 4)
+                                        if loss_ema > 0 else 0.0,
+                "loss_ema": round(loss_ema, 5),
+                "intrinsic_ema": round(
+                    float(self.intrinsic_ema.get(cid, 0.0)), 6),
+                "intrinsic_last": round(
+                    float(self.intrinsic_last.get(cid, 0.0)), 6),
+                "entropy_ema": round(
+                    float(self.entropy_ema.get(cid, 0.0)), 4),
+                "trace_norm_ema": round(
+                    float(self.trace_norm_ema.get(cid, 0.0)), 4),
+                "reward_var_ema": round(
+                    float(self.reward_var_ema.get(cid, 0.0)), 6),
+                "hebbian_enabled": ctrl is not None,
+                "lr_oja": round(float(getattr(cfg, "lr_oja", 0.0)), 6)
+                         if cfg else 0.0,
+                "lr_reward": round(float(getattr(cfg, "lr_reward", 0.0)), 6)
+                            if cfg else 0.0,
+                "trace_decay": round(
+                    float(getattr(cfg, "eligibility_decay", 0.0)), 4)
+                    if cfg else 0.0,
+                "top_specialization": top_spec,
+            })
+        return out
