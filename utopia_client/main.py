@@ -351,6 +351,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     name = cfg["name"]
     logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
 
+    # Prefetch wanderer-сида (17 тканей) до подъёма WS. Без этого
+    # ws_client отвергает каждый seed_chunk → "deferred (waiting for
+    # seed.norg)" и owned-особи никогда не оживают.
+    try:
+        from .seed_loader import ensure_seed, seed_cached
+        if not seed_cached("wanderer"):
+            ensure_seed(api, lineage="wanderer")
+    except Exception as e:
+        logger.warning("wanderer seed prefetch failed: %s", e)
+
     # F.6.B: WS подключается только в state=run. В idle WS не открыт →
     # P40 видит client_disconnected → freeze_personal (owned-особи живут
     # в Мире, не размножаются). При idle→run hello триггерит unfreeze.
