@@ -275,6 +275,75 @@ def _try_self_update(api: UtopiaAPI) -> bool:
     return True  # недостижимо
 
 
+def _try_neurocore_update(api: UtopiaAPI) -> bool:
+    """Если sha256 neurocore-зеркала на VPS отличается от установленного —
+    переустановить пакет и перезапустить процесс. Возвращает True, если
+    обновление прошло (этот процесс уже не вернётся).
+
+    Локальный sha256 хранится в `<install_dir>/neurocore_sha256.txt`.
+    Если файла нет — это либо первая установка, либо обновление со старого
+    клиента; в обоих случаях переустанавливаем, чтобы гарантировать, что
+    локальный neurocore соответствует тому, что отдаёт зеркало.
+    """
+    info = api.get_neurocore_info()
+    if not info:
+        return False
+    remote_sha = str(info.get("sha256") or "")
+    if not remote_sha:
+        return False
+
+    import os
+    import subprocess
+    from pathlib import Path
+
+    pkg_dir = Path(__file__).resolve().parent
+    install_dir = pkg_dir.parent
+    hash_file = install_dir / "neurocore_sha256.txt"
+
+    local_sha = None
+    if hash_file.exists():
+        try:
+            local_sha = hash_file.read_text().strip()
+        except Exception:
+            local_sha = None
+
+    if local_sha == remote_sha:
+        return False
+
+    logger.info("neurocore-update: %s → %s, reinstalling…",
+                (local_sha or "(none)")[:8], remote_sha[:8])
+    url = f"{api.server}/api/client/neurocore.zip"
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--force-reinstall", "--no-deps", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=300)
+    except Exception as e:
+        logger.warning("neurocore-update pip error: %s", e)
+        return False
+    if result.returncode != 0:
+        logger.warning("neurocore-update pip failed: %s",
+                       (result.stderr or "")[-500:])
+        return False
+    try:
+        hash_file.write_text(remote_sha)
+    except Exception as e:
+        logger.warning("neurocore-update: cannot persist hash: %s", e)
+    logger.info("neurocore-update: installed, restarting via execv")
+
+    argv = [sys.executable, "-m", "utopia_client.main"] + sys.argv[1:]
+    try:
+        if os.name == "nt":
+            subprocess.Popen(argv, close_fds=False)
+            sys.exit(0)
+        else:
+            os.execv(sys.executable, argv)
+    except Exception as e:
+        logger.error("neurocore-update restart failed: %s — exit(75)", e)
+        sys.exit(75)
+    return True  # недостижимо
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Daemon-петля: опрашивает команду от VPS и реагирует."""
     cfg = _ensure_config()
@@ -373,6 +442,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 last_selfupdate_check = now
                 try:
                     if _try_self_update(api):
+                        return 0  # недостижимо после execv
+                    # Neurocore-зависимость обновляется отдельно от клиента —
+                    # при изменении sha256 на зеркале переустанавливаем пакет.
+                    if _try_neurocore_update(api):
                         return 0  # недостижимо после execv
                 except Exception as e:
                     logger.warning("self-update check error: %s", e)

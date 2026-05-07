@@ -149,6 +149,23 @@ class UtopiaAPI:
             logger.warning("download_client_zip error: %s", e)
             return False
 
+    def get_neurocore_info(self) -> dict | None:
+        """Метаданные актуального neurocore-зеркала: {version, sha256, ...}.
+
+        Используется автоапдейтом зависимости: клиент сравнивает remote sha256
+        с записанным локально и при расхождении переустанавливает пакет.
+        """
+        url = f"{self.server}/api/client/neurocore.json"
+        try:
+            r = requests.get(url, timeout=self.timeout)
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("get_neurocore_info HTTP %d", r.status_code)
+            return None
+        except Exception as e:
+            logger.warning("get_neurocore_info error: %s", e)
+            return None
+
     def get_genepool_info(self) -> dict | None:
         """Phase F.7.4: статистика донорского пула Мира (без auth).
 
