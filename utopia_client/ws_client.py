@@ -841,6 +841,7 @@ class ColonyWSClient:
             return
         obs_per_cid: dict = {}
         events_per_cid: dict = {}
+        intero_per_cid: dict = {}
         for c in creatures:
             cid = c.get("cid")
             obs = c.get("obs")
@@ -859,11 +860,20 @@ class ColonyWSClient:
                 "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
                 "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
             }
+            # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
+            # Старые серверы поле не шлют → fallback пустой (insula пропускается).
+            intero = c.get("intero")
+            if intero is not None:
+                try:
+                    intero_per_cid[str(cid)] = np.asarray(intero, dtype=np.float32)
+                except Exception:
+                    pass
         if not obs_per_cid:
             return
         try:
             actions = self.compute.handle_tick(obs_per_cid,
-                                                events_per_cid=events_per_cid)
+                                                events_per_cid=events_per_cid,
+                                                intero_per_cid=intero_per_cid)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return

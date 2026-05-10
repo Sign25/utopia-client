@@ -36,6 +36,22 @@ _PREDICTOR_Y50_SCALE = 0.0902
 # EMA-коэффициент для Phase 1/2/6.
 _EMA_ALPHA = 0.01
 
+# Brain migration (10.05.2026): высшие ткани S2.E/G/A/F на клиенте.
+# Биты ablation_mask (синхронны с P40 routes_world.py):
+_DOPAMINE_BIT = 14      # S2.E
+_PLANNER_BIT = 10       # S2.A
+_INSULA_BIT = 15        # S2.F
+_IMAGINATION_BIT = 16   # S2.G
+# Phase S2.A planner — N_ACTIONS из routes_world.
+_PLANNER_N_ACTIONS = 16
+_PLANNER_SCALE = 1.0
+# Phase S2.E dopamine: β_local ∈ [0, 1/φ ≈ 0.618].
+_PHI = 1.6180339887498949
+# Phase S2.F insula: 64 obs + 7 интероцепции = 71.
+_INSULA_DATA_DIM = 71
+# Y50 для высших тканей (тот же scale, что у predictor).
+_HIGHER_TISSUE_Y50_SCALE = 0.0902
+
 
 class LocalColonyCompute:
     """Локальная колония: forward + Hebbian + ActionSelector per-creature.
@@ -86,6 +102,18 @@ class LocalColonyCompute:
         # Метрики счётчиков (для diagnostics endpoint).
         self.predictor_steps: int = 0
 
+        # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
+        # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
+        self.dopamine: dict = {}        # cid → Tissue (S2.E)
+        self.imagination: dict = {}     # cid → Tissue (S2.G)
+        self.planner: dict = {}         # cid → Tissue (S2.A)
+        self.insula: dict = {}          # cid → Tissue (S2.F, data_dim=71)
+        # Last-snapshot для get_phase_emas → push в actions_batch.
+        self.last_beta_local: dict = {}    # cid → float ∈ [0, 1/φ]
+        self.last_imag_mult: dict = {}     # cid → float ∈ [1, 2]
+        self.last_planner_delta: dict = {} # cid → torch.Tensor [16]
+        self.last_stress: dict = {}        # cid → float ∈ [0, 1]
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -117,8 +145,18 @@ class LocalColonyCompute:
             self.trace_norm_ema[cid] = 0.0
             self.reward_var_ema[cid] = 0.0
             self.reward_history[cid] = deque(maxlen=10)
-        logger.info("add_creature %s n_tissues=%d predictor=%s", cid,
-                    getattr(organism, "n_tissues", 0), pred is not None)
+        # Brain migration (10.05.2026): 4 высшие ткани S2.E/G/A/F. Создаём
+        # для всех owned-cid (P40 шлёт в obs_batch только owned, лineage-гейт
+        # делает сервер на fastpath; client_* ткани нейтральны для elder'а).
+        self.dopamine[cid] = self._make_higher_tissue("dopamine")
+        self.imagination[cid] = self._make_higher_tissue("imagination")
+        self.planner[cid] = self._make_higher_tissue("planner")
+        self.insula[cid] = self._make_higher_tissue("insula",
+                                                     data_dim=_INSULA_DATA_DIM)
+        logger.info(
+            "add_creature %s n_tissues=%d predictor=%s S2=%s",
+            cid, getattr(organism, "n_tissues", 0), pred is not None,
+            all(self.dopamine.get(cid) is not None for _ in [0]))
 
     def remove_creature(self, cid: str) -> None:
         self.organisms.pop(cid, None)
@@ -135,6 +173,15 @@ class LocalColonyCompute:
         self.trace_norm_ema.pop(cid, None)
         self.reward_var_ema.pop(cid, None)
         self.reward_history.pop(cid, None)
+        # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
+        self.dopamine.pop(cid, None)
+        self.imagination.pop(cid, None)
+        self.planner.pop(cid, None)
+        self.insula.pop(cid, None)
+        self.last_beta_local.pop(cid, None)
+        self.last_imag_mult.pop(cid, None)
+        self.last_planner_delta.pop(cid, None)
+        self.last_stress.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -195,6 +242,22 @@ class LocalColonyCompute:
                         getattr(self, target)[cid] = float(payload[key])
                     except Exception:
                         pass
+        # Brain migration (10.05.2026): Y50 для высших тканей S2.E/G/A/F.
+        for key, store in (
+            ("dopamine", self.dopamine),
+            ("imagination", self.imagination),
+            ("planner", self.planner),
+            ("insula", self.insula),
+        ):
+            sd = payload.get(key)
+            tissue = store.get(cid)
+            if sd is None or tissue is None:
+                continue
+            try:
+                tissue.load_state_dict(sd)
+                self._apply_y50_to_tissue(tissue)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s %s: %s", cid, key, e)
 
     @property
     def n_alive(self) -> int:
@@ -254,18 +317,46 @@ class LocalColonyCompute:
                     spec[str(role)] = sf
                 if spec:
                     out["specialization_ema"] = spec
+        # Brain migration (10.05.2026): S2.E/G/A/F push.
+        for src, key in (
+            (self.last_beta_local, "client_beta_local"),
+            (self.last_imag_mult, "client_imag_mult"),
+            (self.last_stress, "client_stress"),
+        ):
+            v = src.get(cid)
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(vf):
+                continue
+            out[key] = vf
+        pd = self.last_planner_delta.get(cid)
+        if pd is not None:
+            try:
+                vals = [float(x) for x in pd.reshape(-1).tolist()]
+                if all(math.isfinite(x) for x in vals):
+                    out["client_planner_delta"] = vals
+            except Exception:
+                pass
         return out or None
 
     # ── Tick ─────────────────────────────────────────────────────────────
 
     def handle_tick(self, obs_per_cid: dict,
-                    events_per_cid: Optional[dict] = None) -> dict:
+                    events_per_cid: Optional[dict] = None,
+                    intero_per_cid: Optional[dict] = None) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
             obs_per_cid: {cid: np.ndarray[80] float32} — env-наблюдения от P40.
             events_per_cid: {cid: {ate, killed, damage_taken, delta_energy}} —
                 события прошлого тика. Если None — Hebbian update пропускается.
+            intero_per_cid: {cid: np.ndarray[7] float32} — Brain migration
+                (10.05.2026) интероцепция от P40 для S2.F insula. None или
+                отсутствие cid → insula пропускается, остальные ткани работают.
 
         Returns:
             {cid: {"action": int, "target_id": Optional[str]}} — готово к
@@ -304,6 +395,23 @@ class LocalColonyCompute:
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Должен идти ДО Hebbian update, чтобы intrinsic подмешать в r_imm.
                 intrinsic_now = self._predictor_train_step(cid, obs_tensor)
+
+                # Brain migration (10.05.2026): forward S2.E/G/A/F.
+                # Результаты лежат в last_beta_local/last_imag_mult/
+                # last_planner_delta/last_stress, отгружаются в actions_batch
+                # через get_phase_emas. Сервер применит через fastpath
+                # _compute_*. Forward после predictor — nothing depends.
+                intero_tensor = None
+                if intero_per_cid is not None:
+                    intero_arr = intero_per_cid.get(cid)
+                    if intero_arr is not None:
+                        try:
+                            intero_tensor = torch.from_numpy(
+                                np.asarray(intero_arr, dtype=np.float32)
+                            ).to(self.device).unsqueeze(0)
+                        except Exception:
+                            intero_tensor = None
+                self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
 
                 # Phase 6 — entropy EMA по action-distribution.
                 self._update_entropy_ema(cid, logits)
@@ -380,6 +488,20 @@ class LocalColonyCompute:
             payload["entropy_ema"] = float(self.entropy_ema.get(cid, 0.0))
             payload["trace_norm_ema"] = float(self.trace_norm_ema.get(cid, 0.0))
             payload["reward_var_ema"] = float(self.reward_var_ema.get(cid, 0.0))
+        # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
+        for key, store in (
+            ("dopamine", self.dopamine),
+            ("imagination", self.imagination),
+            ("planner", self.planner),
+            ("insula", self.insula),
+        ):
+            tissue = store.get(cid)
+            if tissue is None:
+                continue
+            try:
+                payload[key] = tissue.state_dict()
+            except Exception as e:
+                logger.debug("save_state %s %s: %s", cid, key, e)
         return payload
 
     def save_all_states(self, dir_path) -> int:
@@ -481,6 +603,110 @@ class LocalColonyCompute:
                     noise = torch.randn_like(p.data) * _PREDICTOR_Y50_SCALE * std
                     p.data.copy_(0.5 * p.data + 0.5 * noise)
                 # bias / 1D — не трогаем (Y50 на P40 тоже).
+
+    # ── Brain migration (10.05.2026) — S2.E/G/A/F sidecar tissues ────────
+
+    def _make_higher_tissue(self, role: str, *, data_dim: int = 64,
+                             n_embd: int = 21):
+        """Universal sidecar Tissue 21/3/1 для высших тканей (S2.E/G/A/F).
+
+        role: "dopamine" | "imagination" | "planner" | "insula".
+        data_dim: 64 для большинства, 71 для insula (obs+intero_7).
+        Возвращает Tissue или None при ошибке импортов.
+        """
+        try:
+            from core.connection import CellGene
+            from core.tissue import Tissue, TissuePort, TissueSpec
+        except Exception as e:
+            logger.warning("higher tissue %s: imports failed: %s", role, e)
+            return None
+        try:
+            cg = CellGene(innovation=1, n_embd=n_embd, n_head=3, n_layer=1)
+            kwargs = dict(
+                name=role,
+                role=role,
+                cell_genes=[cg],
+                connection_genes=[],
+                input_ports=[TissuePort("input", 1)],
+                output_ports=[TissuePort("output", 1)],
+                internal_lr_scale=1.0,
+            )
+            if data_dim != 64:
+                kwargs["data_dim"] = data_dim  # Phase B per-tissue data_dim
+            spec = TissueSpec(**kwargs)
+            return Tissue(spec).to(self.device)
+        except Exception as e:
+            logger.warning("higher tissue %s: build failed: %s", role, e)
+            return None
+
+    def _apply_y50_to_tissue(self, tissue) -> None:
+        """Generic Y50 для любой ткани (мирор _apply_y50_to_predictor)."""
+        torch = self._torch
+        with torch.no_grad():
+            for name, p in tissue.named_parameters():
+                if p.dim() >= 2 and "weight" in name:
+                    std = max(float(p.data.std().item()), 1e-6)
+                    noise = torch.randn_like(p.data) * _HIGHER_TISSUE_Y50_SCALE * std
+                    p.data.copy_(0.5 * p.data + 0.5 * noise)
+
+    def _compute_higher_tissues(self, cid: str, obs_tensor,
+                                  intero_tensor=None) -> None:
+        """Forward всех 4 высших тканей: S2.E/G/A/F.
+
+        Сохраняет:
+          last_beta_local[cid]    — S2.E ∈ [0, 1/φ]
+          last_imag_mult[cid]     — S2.G ∈ [1, 2]
+          last_planner_delta[cid] — S2.A torch.Tensor [16]
+          last_stress[cid]        — S2.F ∈ [0, 1] (если intero_tensor задан)
+
+        Сервер прочитает их через get_phase_emas → actions_batch.phase_emas.
+        Ablation_mask клиент не знает — гейт делает сервер на стороне fastpath.
+        """
+        torch = self._torch
+        # S2.E — dopamine: β_local = sigmoid(out[0,0]) / φ ∈ [0, 1/φ].
+        d_tissue = self.dopamine.get(cid)
+        if d_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = d_tissue({"input": obs_tensor.detach()})["output"]
+                    raw = float(out[0, 0].item())
+                    beta = 1.0 / (1.0 + math.exp(-raw)) / _PHI
+                    self.last_beta_local[cid] = beta
+            except Exception as e:
+                logger.debug("dopamine forward %s: %s", cid, e)
+        # S2.G — imagination: mult = 1 + sigmoid(out[0,0]) ∈ [1, 2].
+        i_tissue = self.imagination.get(cid)
+        if i_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = i_tissue({"input": obs_tensor.detach()})["output"]
+                    raw = float(out[0, 0].item())
+                    mult = 1.0 + 1.0 / (1.0 + math.exp(-raw))
+                    self.last_imag_mult[cid] = mult
+            except Exception as e:
+                logger.debug("imagination forward %s: %s", cid, e)
+        # S2.A — planner: delta = scale · tanh(out[0, :16]) ∈ [-1, 1]^16.
+        p_tissue = self.planner.get(cid)
+        if p_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = p_tissue({"input": obs_tensor.detach()})["output"]
+                    delta = torch.tanh(out[0, :_PLANNER_N_ACTIONS]) * _PLANNER_SCALE
+                    self.last_planner_delta[cid] = delta.detach().cpu()
+            except Exception as e:
+                logger.debug("planner forward %s: %s", cid, e)
+        # S2.F — insula: stress = sigmoid(out[0,0]) ∈ [0, 1] над cat[obs, intero].
+        ins_tissue = self.insula.get(cid)
+        if ins_tissue is not None and intero_tensor is not None:
+            try:
+                with torch.no_grad():
+                    full = torch.cat([obs_tensor.detach(),
+                                       intero_tensor.detach()], dim=-1)
+                    out = ins_tissue({"input": full})["output"]
+                    raw = float(out[0, 0].item())
+                    self.last_stress[cid] = 1.0 / (1.0 + math.exp(-raw))
+            except Exception as e:
+                logger.debug("insula forward %s: %s", cid, e)
 
     def _predictor_train_step(self, cid: str, obs_tensor) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
