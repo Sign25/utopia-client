@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import time
 from collections import deque
 from typing import Optional
 
@@ -113,6 +114,9 @@ class LocalColonyCompute:
         self.last_imag_mult: dict = {}     # cid → float ∈ [1, 2]
         self.last_planner_delta: dict = {} # cid → torch.Tensor [16]
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
+
+        # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
+        self.tick_ts: deque = deque(maxlen=200)
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -365,6 +369,7 @@ class LocalColonyCompute:
         Особи, не зарегистрированные локально, игнорируются. Особи без obs —
         получают STAY (защита от рассинхронизации).
         """
+        self.tick_ts.append(time.time())
         out: dict = {}
         torch = self._torch
         for cid, organism in self.organisms.items():
@@ -871,6 +876,12 @@ class LocalColonyCompute:
           - phase4 — specialization_avg по ролям тканей (Hebbian attribution)
         """
         n = len(self.organisms)
+        # client_tps — handle_tick rate (общий, не per-cid).
+        client_tps = 0.0
+        if len(self.tick_ts) >= 2:
+            dt = self.tick_ts[-1] - self.tick_ts[0]
+            if dt > 0:
+                client_tps = round((len(self.tick_ts) - 1) / dt, 2)
         if n == 0:
             return {
                 "n_alive": 0,
@@ -883,6 +894,11 @@ class LocalColonyCompute:
                 "reward_var_avg": 0.0,
                 "hebbian_updates_total": int(self.hebbian_updates),
                 "predictor_steps_total": int(self.predictor_steps),
+                "client_tps": client_tps,
+                "s2_beta_local_avg": 0.0,
+                "s2_imag_mult_avg": 0.0,
+                "s2_stress_avg": 0.0,
+                "s2_planner_norm_avg": 0.0,
             }
         # Phase 1 — predictor accuracy.
         loss_vals = []
@@ -963,6 +979,21 @@ class LocalColonyCompute:
             if spec_counts[role] > 0
         }
 
+        # Brain migration: средние по высшим тканям S2.E/G/A/F.
+        beta_vals = list(self.last_beta_local.values())
+        imag_vals = list(self.last_imag_mult.values())
+        stress_vals = list(self.last_stress.values())
+        planner_norms: list[float] = []
+        for delta in self.last_planner_delta.values():
+            try:
+                planner_norms.append(float(delta.norm().item()))
+            except Exception:
+                continue
+        s2_beta_avg = round(sum(beta_vals) / len(beta_vals), 4) if beta_vals else 0.0
+        s2_imag_avg = round(sum(imag_vals) / len(imag_vals), 4) if imag_vals else 0.0
+        s2_stress_avg = round(sum(stress_vals) / len(stress_vals), 4) if stress_vals else 0.0
+        s2_planner_avg = round(sum(planner_norms) / len(planner_norms), 4) if planner_norms else 0.0
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -994,6 +1025,11 @@ class LocalColonyCompute:
             "phase4": {
                 "specialization_avg": specialization_avg,
             },
+            "client_tps": client_tps,
+            "s2_beta_local_avg": s2_beta_avg,
+            "s2_imag_mult_avg": s2_imag_avg,
+            "s2_stress_avg": s2_stress_avg,
+            "s2_planner_norm_avg": s2_planner_avg,
             "creatures": self._per_creature_stats(),
         }
 
@@ -1069,5 +1105,11 @@ class LocalColonyCompute:
                     float(getattr(cfg, "eligibility_decay", 0.0)), 4)
                     if cfg else 0.0,
                 "top_specialization": top_spec,
+                "client_beta_local": round(
+                    float(self.last_beta_local.get(cid, 0.0)), 4),
+                "client_imag_mult": round(
+                    float(self.last_imag_mult.get(cid, 1.0)), 4),
+                "client_stress": round(
+                    float(self.last_stress.get(cid, 0.0)), 4),
             })
         return out
