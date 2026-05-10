@@ -341,7 +341,7 @@ class ColonyWSClient:
                 "type": "respawn_owned_request",
                 "colony_name": self.colony_name,
                 "mode": self.genesis_mode,
-                "n": 5,
+                "n": 8,
                 "ts": int(now * 1000),
             }))
         except Exception as e:
