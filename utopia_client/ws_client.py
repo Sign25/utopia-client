@@ -111,6 +111,14 @@ class ColonyWSClient:
         self._mate_requests_received: int = 0
         self._mate_newborns_sent: int = 0
         self._mate_rejects_sent: int = 0
+        # Brain migration Etap 3.1 (11.05.2026): кеш child_org после кроссинговера.
+        # Ключ — mother_cid; значение (child_org, ts). На первом obs_batch с новым
+        # cid и parent_id==mother_cid ребёнок регистрируется в compute и
+        # наследует predictor/высшие ткани через Y50. Старые записи (>120с)
+        # выкашиваются на каждом обращении.
+        self._pending_newborn_orgs: dict[str, tuple[object, float]] = {}
+        self._newborn_attached: int = 0
+        self._newborn_brain_inherited: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -829,6 +837,68 @@ class ColonyWSClient:
             except Exception as e:
                 logger.warning("deferred finalize %s failed: %s", key, e)
 
+    # ── Brain migration Etap 3.1 — newborn attach + Y50 ─────────────────
+
+    _NEWBORN_CACHE_TTL_SEC = 120.0
+
+    def _attach_pending_newborns(self, creatures: list) -> None:
+        """Etap 3.1: для каждой новой особи в obs_batch с известным parent_id —
+        регистрирует child_org из кеша mate-pair кроссинговера и Y50-наследует
+        мозг (predictor + S2.E/G/A/F) от родителя.
+
+        Кеш заполняется в `_handle_mate_request` после успешного кроссинговера.
+        Просроченные записи (>TTL) выкашиваются по дороге.
+        """
+        if self.compute is None or not self._pending_newborn_orgs:
+            return
+        # Сначала expire старых entries (>120s).
+        now = time.time()
+        stale = [
+            k for k, (_, ts) in self._pending_newborn_orgs.items()
+            if now - ts > self._NEWBORN_CACHE_TTL_SEC
+        ]
+        for k in stale:
+            self._pending_newborn_orgs.pop(k, None)
+        if not self._pending_newborn_orgs:
+            return
+        for c in creatures:
+            cid = c.get("cid")
+            parent_id = c.get("parent_id") or ""
+            if not cid or not parent_id:
+                continue
+            cid_s = str(cid)
+            if cid_s in self.compute.organisms:
+                continue
+            entry = self._pending_newborn_orgs.get(str(parent_id))
+            if entry is None:
+                continue
+            child_org, _ts = entry
+            # Унаследуем learning_rate/trace_decay от родителя если возможно.
+            ctrl = self.compute.hebbian.get(str(parent_id))
+            cfg = getattr(ctrl, "config", None) if ctrl is not None else None
+            lr = float(getattr(cfg, "lr_reward", 1e-4)) if cfg else 1e-4
+            decay = float(getattr(cfg, "eligibility_decay", 0.9)) if cfg else 0.9
+            try:
+                self.compute.add_creature(
+                    cid_s, child_org,
+                    hebbian_enabled=True,
+                    learning_rate=lr,
+                    trace_decay=decay,
+                )
+                self._newborn_attached += 1
+            except Exception as e:
+                logger.warning("attach newborn %s: %s", cid_s, e)
+                continue
+            try:
+                ok = self.compute.inherit_brain_y50(str(parent_id), cid_s)
+                if ok:
+                    self._newborn_brain_inherited += 1
+            except Exception as e:
+                logger.warning("inherit_brain_y50 %s ← %s: %s",
+                               cid_s, parent_id, e)
+            # Запись из кеша больше не нужна.
+            self._pending_newborn_orgs.pop(str(parent_id), None)
+
     # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
 
     async def _handle_obs_batch(self, msg: dict) -> None:
@@ -839,6 +909,10 @@ class ColonyWSClient:
         self._obs_batches_received += 1
         if self.compute is None or not creatures:
             return
+        # Brain migration Etap 3.1: до handle_tick — привязать новорождённых.
+        # P40 шлёт parent_id для каждой особи. Если cid новый, и мы кешировали
+        # child_org после mate-pair кроссинговера, регистрируем + Y50.
+        self._attach_pending_newborns(creatures)
         obs_per_cid: dict = {}
         events_per_cid: dict = {}
         intero_per_cid: dict = {}
@@ -1031,6 +1105,14 @@ class ColonyWSClient:
             logger.warning("mate_request crossover failed: %s", e)
             await _reject(f"crossover_error: {type(e).__name__}")
             return
+        # Brain migration Etap 3.1: ребёнка пока неизвестно как зовут (P40
+        # создаст CreatureState и пришлёт cid через obs_batch с parent_id).
+        # Запомним child_org, чтобы при первом obs зарегистрировать в compute
+        # и Y50-наследовать predictor + 4 высшие ткани от матери.
+        try:
+            self._pending_newborn_orgs[mother_cid] = (child_org, time.time())
+        except Exception as e:
+            logger.debug("pending_newborn cache failed: %s", e)
         try:
             await ws.send(json.dumps({
                 "type": "newborn",

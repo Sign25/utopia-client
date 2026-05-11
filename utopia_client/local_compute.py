@@ -263,6 +263,55 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s %s: %s", cid, key, e)
 
+    def inherit_brain_y50(self, parent_cid: str, child_cid: str) -> bool:
+        """Brain migration Etap 3.1 (11.05.2026): Y50-наследование мозга
+        родителя в свежезарегистрированного потомка.
+
+        Тело (tissues) ребёнок получает через mate-pair кроссинговер в
+        `_handle_mate_request`. Сайдкары (predictor + S2.E/G/A/F высшие
+        ткани) у новой особи в `add_creature` создаются random-init —
+        этот метод накатывает Y50(parent) поверх.
+
+        Возвращает True если хотя бы одна ткань была унаследована, False
+        если parent или child неизвестен / pyторч state_dict собрать не вышло.
+        """
+        if parent_cid == child_cid:
+            return False
+        if child_cid not in self.organisms or parent_cid not in self.organisms:
+            return False
+        payload: dict = {}
+        parent_pred = self.predictor.get(parent_cid)
+        if parent_pred is not None:
+            try:
+                payload["predictor"] = parent_pred.state_dict()
+                # EMA-агрегаты родителя → стартовые baseline для ребёнка.
+                payload["predictor_loss_ema"] = float(
+                    self.loss_ema.get(parent_cid, 0.0))
+                payload["intrinsic_ema"] = float(
+                    self.intrinsic_ema.get(parent_cid, 0.0))
+            except Exception as e:
+                logger.debug("inherit_brain_y50 parent predictor: %s", e)
+        for key, store in (
+            ("dopamine", self.dopamine),
+            ("imagination", self.imagination),
+            ("planner", self.planner),
+            ("insula", self.insula),
+        ):
+            tissue = store.get(parent_cid)
+            if tissue is None:
+                continue
+            try:
+                payload[key] = tissue.state_dict()
+            except Exception as e:
+                logger.debug("inherit_brain_y50 parent %s: %s", key, e)
+        if not payload:
+            return False
+        self.apply_inherited_state(child_cid, payload)
+        logger.info(
+            "inherit_brain_y50 %s → %s (%s)",
+            parent_cid, child_cid, ",".join(sorted(payload.keys())))
+        return True
+
     @property
     def n_alive(self) -> int:
         return len(self.organisms)
