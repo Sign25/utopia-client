@@ -480,6 +480,24 @@ def cmd_run(args: argparse.Namespace) -> int:
                         "max_diff": ws._client_obs_max_diff,
                         "last_worst": dict(ws._client_obs_last_worst or {}),
                     }
+                    # Размеры кеша мира: помогает понять, есть ли вообще
+                    # flora/fauna/signals у клиента (если 0 — apply_snap не
+                    # дошёл до полного кадра).
+                    cache = getattr(ws, "world_cache", None)
+                    if cache is not None:
+                        try:
+                            shadow["cache"] = {
+                                "flora": len(cache.flora),
+                                "fauna": len(cache.fauna),
+                                "signals": len(cache.signals),
+                                "creature_pos": len(cache.creature_pos),
+                                "meta": len(cache.creature_meta),
+                                "last_tick": cache.last_tick,
+                                "snaps_applied": cache.snaps_applied,
+                                "full_frames": cache.full_frames_received,
+                            }
+                        except Exception:
+                            pass
                     # Топ-3 слота по среднему |diff|. Помогает понять, где
                     # client_obs расходится с server_obs (terrain? signals?
                     # ally_positions?). Без этого 100% mismatch неотличим от
