@@ -123,6 +123,9 @@ def test_actions_batch_includes_phase_emas(seed_file):
     client.compute = compute
     client._obs_batches_received = 0
     client._actions_batches_sent = 0
+    client._pending_newborn_orgs = {}
+    client._newborn_attached = 0
+    client._newborn_brain_inherited = 0
     sent: list = []
 
     class FakeWS:
