@@ -104,7 +104,7 @@ def test_g3_respawn_request_after_grace():
         assert msg["type"] == "respawn_owned_request"
         assert msg["colony_name"] == "home"
         assert msg["mode"] == "auto"
-        assert msg["n"] == 5
+        assert msg["n"] == 8
         assert isinstance(msg["ts"], int)
         assert c._last_respawn_request_ts > 0.0
     asyncio.run(_run())

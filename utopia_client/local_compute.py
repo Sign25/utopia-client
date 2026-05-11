@@ -1111,5 +1111,8 @@ class LocalColonyCompute:
                     float(self.last_imag_mult.get(cid, 1.0)), 4),
                 "client_stress": round(
                     float(self.last_stress.get(cid, 0.0)), 4),
+                "client_planner_norm": round(
+                    float(self.last_planner_delta[cid].norm().item()), 4)
+                    if cid in self.last_planner_delta else 0.0,
             })
         return out
