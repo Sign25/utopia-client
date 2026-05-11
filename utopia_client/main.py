@@ -472,13 +472,31 @@ def cmd_run(args: argparse.Namespace) -> int:
                     diag["world_tick"] = ws.last_world_tick
                     diag["dump"] = ws.compute._dump_state()
                     # Фаза 3.3A: метрики client-built obs vs server obs.
-                    diag["shadow_obs"] = {
+                    shadow = {
                         "built": ws._client_obs_built,
                         "skipped": ws._client_obs_skipped,
                         "match": ws._client_obs_match,
                         "mismatch": ws._client_obs_mismatch,
                         "max_diff": ws._client_obs_max_diff,
+                        "last_worst": dict(ws._client_obs_last_worst or {}),
                     }
+                    # Топ-3 слота по среднему |diff|. Помогает понять, где
+                    # client_obs расходится с server_obs (terrain? signals?
+                    # ally_positions?). Без этого 100% mismatch неотличим от
+                    # «одно поле ошиблось на всём obs».
+                    slot_sum = ws._client_obs_slot_diff_sum
+                    built = max(1, ws._client_obs_built)
+                    if slot_sum is not None:
+                        try:
+                            mean = slot_sum / float(built)
+                            order = mean.argsort()[::-1][:3]
+                            shadow["top_slots"] = [
+                                {"slot": int(i), "mean_diff": float(mean[i])}
+                                for i in order
+                            ]
+                        except Exception:
+                            pass
+                    diag["shadow_obs"] = shadow
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)

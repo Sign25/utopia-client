@@ -130,6 +130,11 @@ class ColonyWSClient:
         self._client_obs_match: int = 0     # max |diff| < 1e-3
         self._client_obs_mismatch: int = 0  # max |diff| >= 1e-3
         self._client_obs_max_diff: float = 0.0  # running max |diff|
+        # Per-slot аккумулятор: где именно расходится client vs server obs.
+        # _slot_diff_sum[i] / _client_obs_built ~ среднее |diff| по слоту i.
+        self._client_obs_slot_diff_sum = None  # type: Optional[object]  # np.array(64,)
+        # Последний worst-slot пример (slot, client, server, lag_ticks).
+        self._client_obs_last_worst: dict = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -912,7 +917,8 @@ class ColonyWSClient:
 
     # ── Phase 3.3A: shadow obs из локального кеша (validation mode) ──────
 
-    def _compare_shadow_obs(self, creatures: list, obs_per_cid: dict) -> None:
+    def _compare_shadow_obs(self, creatures: list, obs_per_cid: dict,
+                              server_world_tick: int = 0) -> None:
         """Строит client obs из WorldStateCache и сравнивает с серверным.
 
         Не влияет на handle_tick (тот по-прежнему использует серверный obs).
@@ -934,6 +940,17 @@ class ColonyWSClient:
             logger.debug("shadow obs import failed: %s", e)
             self._client_obs_skipped += len(obs_per_cid)
             return
+        # Сколько тиков кеш отстаёт от server_world_tick. Помогает понять
+        # — расхождение от устаревшего snap'а, или от ошибки в builder'е.
+        cache_tick = int(getattr(cache, "world_tick", 0) or 0)
+        lag = max(0, server_world_tick - cache_tick) if server_world_tick else 0
+        if getattr(self, "_client_obs_slot_diff_sum", None) is None:
+            try:
+                self._client_obs_slot_diff_sum = np.zeros(64, dtype=np.float64)
+            except Exception:
+                self._client_obs_slot_diff_sum = None
+        if not hasattr(self, "_client_obs_last_worst"):
+            self._client_obs_last_worst = {}
         # creature_meta: {cid → (clan, sig_type)} — обновляется WorldFeedClient
         # из snap.creatures[]. Если для нашего cid ещё нет — пропускаем.
         meta = cache.creature_meta
@@ -966,23 +983,38 @@ class ColonyWSClient:
                 valence = (float(server_obs[54]), float(server_obs[55]))
                 client_obs = build_observation(cv, view, valence=valence)
                 self._client_obs_built += 1
-                diff = float(np.abs(client_obs - server_obs).max())
+                slot_diff = np.abs(client_obs - server_obs)
+                diff = float(slot_diff.max())
+                if self._client_obs_slot_diff_sum is not None:
+                    try:
+                        self._client_obs_slot_diff_sum += slot_diff
+                    except Exception:
+                        pass
                 if diff > self._client_obs_max_diff:
                     self._client_obs_max_diff = diff
                 if diff < 1e-3:
                     self._client_obs_match += 1
                 else:
                     self._client_obs_mismatch += 1
+                    worst = int(slot_diff.argmax())
+                    self._client_obs_last_worst = {
+                        "slot": worst,
+                        "client": float(client_obs[worst]),
+                        "server": float(server_obs[worst]),
+                        "max_diff": diff,
+                        "lag_ticks": int(lag),
+                        "cache_tick": cache_tick,
+                        "server_tick": int(server_world_tick),
+                    }
                     if self._client_obs_mismatch <= 5 or \
                             self._client_obs_mismatch % 100 == 0:
-                        slot_diff = np.abs(client_obs - server_obs)
-                        worst = int(slot_diff.argmax())
                         logger.info(
                             "shadow_obs mismatch cid=%s max=%.4f slot=%d "
-                            "client=%.4f server=%.4f",
+                            "client=%.4f server=%.4f lag=%d",
                             cid_s, diff, worst,
                             float(client_obs[worst]),
                             float(server_obs[worst]),
+                            int(lag),
                         )
             except Exception as e:
                 logger.debug("shadow obs build %s: %s", cid_s, e)
@@ -1038,7 +1070,8 @@ class ColonyWSClient:
         # Сравниваем slot-by-slot, метрики идут в diagnostics(). После
         # подтверждения совпадения в live (3.3B) клиент переключается на свой
         # obs и сервер перестаёт его слать для owned.
-        self._compare_shadow_obs(creatures, obs_per_cid)
+        self._compare_shadow_obs(creatures, obs_per_cid,
+                                   server_world_tick=world_tick)
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,
