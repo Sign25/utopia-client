@@ -942,7 +942,8 @@ class ColonyWSClient:
             return
         # Сколько тиков кеш отстаёт от server_world_tick. Помогает понять
         # — расхождение от устаревшего snap'а, или от ошибки в builder'е.
-        cache_tick = int(getattr(cache, "world_tick", 0) or 0)
+        cache_tick = int(getattr(cache, "last_tick", 0) or 0)
+        snaps_applied = int(getattr(cache, "snaps_applied", 0) or 0)
         lag = max(0, server_world_tick - cache_tick) if server_world_tick else 0
         if getattr(self, "_client_obs_slot_diff_sum", None) is None:
             try:
@@ -1005,6 +1006,7 @@ class ColonyWSClient:
                         "lag_ticks": int(lag),
                         "cache_tick": cache_tick,
                         "server_tick": int(server_world_tick),
+                        "snaps_applied": snaps_applied,
                     }
                     if self._client_obs_mismatch <= 5 or \
                             self._client_obs_mismatch % 100 == 0:
