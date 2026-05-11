@@ -99,18 +99,36 @@ def unpack_zstd_b64(b64: str):
 
 
 def build_reproduce_envelope(parent_cid: str, organism, *,
-                              sigma: float = DEFAULT_SIGMA) -> dict:
+                              sigma: float = DEFAULT_SIGMA,
+                              brain_state_dicts: dict | None = None,
+                              brain_emas: dict | None = None) -> dict:
     """Собрать envelope для отправки на P40.
 
     Возвращает dict готовый к json.dumps:
         {type: "reproduce", parent_cid, child_weights_b64, sigma}
 
     `child_weights_b64` — zstd-base64 от
-        {"tissues_by_role": {role: state_dict}}
+        {"tissues_by_role": {role: state_dict},
+         "brain": {predictor|dopamine|imagination|planner|insula: state_dict},
+         "brain_emas": {predictor_loss_ema|intrinsic_ema|...: float}}
+
+    Brain migration Etap 3.2 (11.05.2026): мозг (predictor + S2.E/G/A/F)
+    мутируется на клиенте (Y50 σ=1/φ⁵) и отправляется на P40. Сервер
+    `register_newborn` грузит готовые мутированные веса в ColonyMember
+    без дополнительной Y50 (она уже применена здесь). Если
+    `brain_state_dicts is None` — envelope шлёт только тело (legacy).
     """
     parent_sd = _extract_tissues_by_role(organism)
     child_sd = mutate_state_dict(parent_sd, sigma=sigma)
-    payload = {"tissues_by_role": child_sd}
+    payload: dict = {"tissues_by_role": child_sd}
+    if brain_state_dicts:
+        # Y50: те же правила что для тела, но per-tissue ключи
+        # (predictor, dopamine, imagination, planner, insula).
+        brain_mut = mutate_state_dict(brain_state_dicts, sigma=sigma)
+        payload["brain"] = brain_mut
+    if brain_emas:
+        # EMA-агрегаты — float, не мутируются. Стартовый baseline для ребёнка.
+        payload["brain_emas"] = {str(k): float(v) for k, v in brain_emas.items()}
     return {
         "type": "reproduce",
         "parent_cid": str(parent_cid),

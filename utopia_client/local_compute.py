@@ -263,6 +263,58 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s %s: %s", cid, key, e)
 
+    def extract_brain_state_dicts(self, cid: str) -> tuple[dict, dict]:
+        """Brain migration Etap 3.2 (11.05.2026): собрать state_dict мозга
+        родителя для отправки на P40 в asexual reproduce-envelope.
+
+        Возвращает `(brain_state_dicts, brain_emas)`:
+          - `brain_state_dicts`: dict с ключами predictor/dopamine/imagination/
+            planner/insula → state_dict (только те ткани, что есть у parent).
+          - `brain_emas`: dict со скалярными EMA (predictor_loss_ema,
+            intrinsic_ema, entropy_ema, trace_norm_ema, reward_var_ema).
+
+        Y50 здесь НЕ применяется — это делает `build_reproduce_envelope`
+        перед упаковкой. Метод чисто извлекает.
+        """
+        brain: dict = {}
+        emas: dict = {}
+        if cid not in self.organisms:
+            return brain, emas
+        pred = self.predictor.get(cid)
+        if pred is not None:
+            try:
+                brain["predictor"] = pred.state_dict()
+            except Exception as e:
+                logger.debug("extract_brain_state_dicts predictor: %s", e)
+        for key, store in (
+            ("dopamine", self.dopamine),
+            ("imagination", self.imagination),
+            ("planner", self.planner),
+            ("insula", self.insula),
+        ):
+            tissue = store.get(cid)
+            if tissue is None:
+                continue
+            try:
+                brain[key] = tissue.state_dict()
+            except Exception as e:
+                logger.debug("extract_brain_state_dicts %s: %s", key, e)
+        # EMA-агрегаты — float, baseline для ребёнка.
+        for ema_key, attr in (
+            ("predictor_loss_ema", "loss_ema"),
+            ("intrinsic_ema", "intrinsic_ema"),
+            ("entropy_ema", "entropy_ema"),
+            ("trace_norm_ema", "trace_norm_ema"),
+            ("reward_var_ema", "reward_var_ema"),
+        ):
+            store = getattr(self, attr, None)
+            if isinstance(store, dict) and cid in store:
+                try:
+                    emas[ema_key] = float(store[cid])
+                except Exception:
+                    pass
+        return brain, emas
+
     def inherit_brain_y50(self, parent_cid: str, child_cid: str) -> bool:
         """Brain migration Etap 3.1 (11.05.2026): Y50-наследование мозга
         родителя в свежезарегистрированного потомка.
