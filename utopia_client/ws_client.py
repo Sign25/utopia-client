@@ -119,6 +119,17 @@ class ColonyWSClient:
         self._pending_newborn_orgs: dict[str, tuple[object, float]] = {}
         self._newborn_attached: int = 0
         self._newborn_brain_inherited: int = 0
+        # Фаза 3.3 obs migration (11.05.2026): ссылка на WorldStateCache
+        # для shadow-сборки obs из локального кеша. Прокидывается main.py
+        # сразу после _make_ws. None → shadow-build пропускается, поведение
+        # как раньше (server obs используется напрямую).
+        self.world_cache = None  # type: Optional[object]
+        # Метрики shadow build (для diagnostics endpoint).
+        self._client_obs_built: int = 0
+        self._client_obs_skipped: int = 0   # cache не готов / meta нет
+        self._client_obs_match: int = 0     # max |diff| < 1e-3
+        self._client_obs_mismatch: int = 0  # max |diff| >= 1e-3
+        self._client_obs_max_diff: float = 0.0  # running max |diff|
 
     def start(self) -> None:
         if self._thread is not None:
@@ -899,6 +910,84 @@ class ColonyWSClient:
             # Запись из кеша больше не нужна.
             self._pending_newborn_orgs.pop(str(parent_id), None)
 
+    # ── Phase 3.3A: shadow obs из локального кеша (validation mode) ──────
+
+    def _compare_shadow_obs(self, creatures: list, obs_per_cid: dict) -> None:
+        """Строит client obs из WorldStateCache и сравнивает с серверным.
+
+        Не влияет на handle_tick (тот по-прежнему использует серверный obs).
+        Логирует max-diff и счётчик match/mismatch в self._client_obs_*.
+        Если кеш не bootstrap'нут или meta для cid отсутствует — increment
+        skipped и идём дальше. Любой Exception — silent skip (не должен
+        ронять основной поток).
+        """
+        cache = getattr(self, "world_cache", None)
+        if cache is None or not getattr(cache, "is_bootstrapped", False):
+            self._client_obs_skipped = getattr(self, "_client_obs_skipped", 0) + len(obs_per_cid)
+            return
+        try:
+            import numpy as np
+            from environment.observation_client import (
+                ObsCreatureView, build_observation,
+            )
+        except Exception as e:
+            logger.debug("shadow obs import failed: %s", e)
+            self._client_obs_skipped += len(obs_per_cid)
+            return
+        # creature_meta: {cid → (clan, sig_type)} — обновляется WorldFeedClient
+        # из snap.creatures[]. Если для нашего cid ещё нет — пропускаем.
+        meta = cache.creature_meta
+        for c in creatures:
+            cid = c.get("cid")
+            if not cid:
+                continue
+            cid_s = str(cid)
+            server_obs = obs_per_cid.get(cid_s)
+            if server_obs is None:
+                continue
+            if cid_s not in meta:
+                self._client_obs_skipped += 1
+                continue
+            try:
+                cv = ObsCreatureView(
+                    row=int(c.get("row", 0)),
+                    col=int(c.get("col", 0)),
+                    energy=float(c.get("energy", 0.0) or 0.0),
+                    hydration=float(c.get("hydration", 0.0) or 0.0),
+                    vision_radius=int(c.get("vision_radius", 7)),
+                    smell_radius=int(c.get("smell_radius", 40)),
+                    signal_type=int(c.get("signal_type", 0)),
+                    clan_id=int(c.get("clan_id", 0)),
+                    camel=int(c.get("camel", 0)),
+                )
+                view = cache.obs_world_view(self_cid=cid_s)
+                # Valence (slots 54-55) серверный знает по EMA — берём
+                # из server_obs, чтобы не давать ложного mismatch.
+                valence = (float(server_obs[54]), float(server_obs[55]))
+                client_obs = build_observation(cv, view, valence=valence)
+                self._client_obs_built += 1
+                diff = float(np.abs(client_obs - server_obs).max())
+                if diff > self._client_obs_max_diff:
+                    self._client_obs_max_diff = diff
+                if diff < 1e-3:
+                    self._client_obs_match += 1
+                else:
+                    self._client_obs_mismatch += 1
+                    if self._client_obs_mismatch <= 5 or \
+                            self._client_obs_mismatch % 100 == 0:
+                        slot_diff = np.abs(client_obs - server_obs)
+                        worst = int(slot_diff.argmax())
+                        logger.info(
+                            "shadow_obs mismatch cid=%s max=%.4f slot=%d "
+                            "client=%.4f server=%.4f",
+                            cid_s, diff, worst,
+                            float(client_obs[worst]),
+                            float(server_obs[worst]),
+                        )
+            except Exception as e:
+                logger.debug("shadow obs build %s: %s", cid_s, e)
+                self._client_obs_skipped += 1
+
     # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
 
     async def _handle_obs_batch(self, msg: dict) -> None:
@@ -944,6 +1033,12 @@ class ColonyWSClient:
                     pass
         if not obs_per_cid:
             return
+        # Фаза 3.3A obs migration (11.05.2026): shadow-сборка obs из локального
+        # кеша. Поведение не меняется — forward по-прежнему по серверному obs.
+        # Сравниваем slot-by-slot, метрики идут в diagnostics(). После
+        # подтверждения совпадения в live (3.3B) клиент переключается на свой
+        # obs и сервер перестаёт его слать для owned.
+        self._compare_shadow_obs(creatures, obs_per_cid)
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,

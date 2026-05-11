@@ -426,6 +426,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                             world_feed = WorldFeedClient(
                                 server=cfg["server"], cache=world_cache)
                             world_feed.start()
+                            # Фаза 3.3A obs migration: ws видит кеш для
+                            # shadow-сборки obs (валидация vs server obs).
+                            ws.world_cache = world_cache
                             logger.info("world feed started (idle→run)")
                         elif desired == "idle" and ws is not None:
                             ws.stop()  # отправит bye → close
@@ -468,6 +471,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                     diag = ws.compute.diagnostics()
                     diag["world_tick"] = ws.last_world_tick
                     diag["dump"] = ws.compute._dump_state()
+                    # Фаза 3.3A: метрики client-built obs vs server obs.
+                    diag["shadow_obs"] = {
+                        "built": ws._client_obs_built,
+                        "skipped": ws._client_obs_skipped,
+                        "match": ws._client_obs_match,
+                        "mismatch": ws._client_obs_mismatch,
+                        "max_diff": ws._client_obs_max_diff,
+                    }
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)
