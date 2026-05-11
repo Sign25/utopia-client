@@ -22,6 +22,8 @@ from .benchmark import estimate_population, run_full
 from .config import DEFAULT_SERVER, get_or_prompt, load_config, save_config
 from .log_buffer import get_ring, setup_logging
 from .ws_client import ColonyWSClient
+from .world_cache import WorldStateCache
+from .world_feed_client import WorldFeedClient
 
 HEARTBEAT_SEC = 30.0
 COMMAND_POLL_SEC = 10.0
@@ -365,6 +367,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # P40 видит client_disconnected → freeze_personal (owned-особи живут
     # в Мире, не размножаются). При idle→run hello триггерит unfreeze.
     ws: ColonyWSClient | None = None
+    # Фаза 2: WS-подписчик snap'а Мира (broker /ws/feed) + локальный кеш.
+    # Поднимается вместе с ws в run, гасится в idle. Кеш переживает обрывы.
+    world_cache: WorldStateCache | None = None
+    world_feed: WorldFeedClient | None = None
 
     last_heartbeat = 0.0
     last_poll = 0.0
@@ -403,6 +409,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                             ws.stop()
                             ws = None
                             logger.info("ws stopped (benchmark→idle)")
+                        if world_feed is not None:
+                            world_feed.stop()
+                            world_feed = None
+                            world_cache = None
+                            logger.info("world feed stopped (benchmark→idle)")
                         current_state = "idle"
                     else:
                         # F.6.B: переходы run↔idle переключают WS.
@@ -410,10 +421,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                             ws = _make_ws(cfg, name)
                             ws.start()
                             logger.info("ws started (idle→run)")
+                            # Фаза 2: snap-кеш Мира.
+                            world_cache = WorldStateCache(base_url=cfg["server"])
+                            world_feed = WorldFeedClient(
+                                server=cfg["server"], cache=world_cache)
+                            world_feed.start()
+                            logger.info("world feed started (idle→run)")
                         elif desired == "idle" and ws is not None:
                             ws.stop()  # отправит bye → close
                             ws = None
                             logger.info("ws stopped with bye (run→idle)")
+                            if world_feed is not None:
+                                world_feed.stop()
+                                world_feed = None
+                                world_cache = None
+                                logger.info("world feed stopped (run→idle)")
                         current_state = desired
 
             # Heartbeat
@@ -422,8 +444,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 world_tick = ws.last_world_tick if ws is not None else 0
                 ws_connected = ws.connected if ws is not None else False
                 ok = _heartbeat(api, name, current_state, world_tick, bench, n_alive)
-                logger.info("heartbeat world_tick=%d state=%s ws=%s n_alive=%d ok=%s",
-                            world_tick, current_state, ws_connected, n_alive, ok)
+                feed_snaps = world_feed.snapshots_received if world_feed else 0
+                feed_conn = world_feed.connected if world_feed else False
+                logger.info(
+                    "heartbeat world_tick=%d state=%s ws=%s n_alive=%d "
+                    "feed=%s snaps=%d ok=%s",
+                    world_tick, current_state, ws_connected, n_alive,
+                    feed_conn, feed_snaps, ok)
                 last_heartbeat = now
 
             # Push tail логов в VPS (admin потом достаёт через cabinet_log.sh)
@@ -466,6 +493,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         if ws is not None:
             ws.stop()
+        if world_feed is not None:
+            world_feed.stop()
     return 0
 
 
