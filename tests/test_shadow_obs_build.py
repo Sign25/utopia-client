@@ -165,9 +165,10 @@ class TestCompareShadowObs:
         assert skip_info.get("cache_tick") == cache.last_tick
         assert skip_info.get("server_tick") == server_world_tick
 
-    def test_tick_sync_within_one_tick_compares(self):
-        """|tick_diff| = 1 — сравнение всё ещё валидно (минимальная сетевая
-        рассинхронизация на тик допустима)."""
+    def test_tick_sync_exact_match_compares(self):
+        """tick_diff == 0 — единственный валидный случай для сравнения.
+        Любая рассинхронизация (даже 1 тик) даёт реальные расхождения
+        на быстрой фауне (хищник speed=3 за тик)."""
         ws = _make_ws_stub()
         cache = WorldStateCache(base_url="https://x")
         w = _make_world(size=64, n_creatures=3, seed=19)
@@ -180,10 +181,30 @@ class TestCompareShadowObs:
 
         creatures, obs_per_cid = _make_creatures_payload(w)
         ws._compare_shadow_obs(creatures, obs_per_cid,
-                                 server_world_tick=cache.last_tick + 1)
+                                 server_world_tick=cache.last_tick)
 
         assert ws._client_obs_built == len(obs_per_cid)
         assert ws._client_obs_match == ws._client_obs_built
+
+    def test_tick_sync_one_tick_lag_skips(self):
+        """tick_diff == 1 — теперь тоже skip (ужесточили гейт)."""
+        ws = _make_ws_stub()
+        cache = WorldStateCache(base_url="https://x")
+        w = _make_world(size=64, n_creatures=3, seed=23)
+        w.tick = 500
+        _bootstrap_cache_from_world(w, cache)
+        snap, _ = _build_snap_from_world(
+            w, ClientSnapshotState(full_frame_interval=50))
+        cache.apply_snap(snap)
+        ws.world_cache = cache
+
+        creatures, obs_per_cid = _make_creatures_payload(w)
+        ws._compare_shadow_obs(creatures, obs_per_cid,
+                                 server_world_tick=cache.last_tick + 1)
+
+        assert ws._client_obs_built == 0
+        assert ws._client_obs_skipped == len(obs_per_cid)
+        assert ws._client_obs_last_tick_skip.get("tick_diff") == -1
 
     def test_mismatch_when_cache_stale(self):
         """Если cache отстал (особь пропала из creature_pos) → mismatch.

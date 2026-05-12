@@ -952,11 +952,12 @@ class ColonyWSClient:
         snaps_applied = int(getattr(cache, "snaps_applied", 0) or 0)
         tick_diff = cache_tick - server_world_tick if server_world_tick else 0
         lag = max(0, server_world_tick - cache_tick) if server_world_tick else 0
-        # Шейдов-сравнение валидно только при синхронизированных тиках.
-        # |tick_diff| > 1 → fauna/flora могли сместиться (хищник speed=3 за тик),
-        # prey/pred slots 56-61 дают огромные diffs — это не баг builder'а.
-        # Inкрементируем skipped, выходим без сравнения.
-        if server_world_tick and abs(tick_diff) > 1:
+        # Шейдов-сравнение валидно только при точно синхронизированных тиках.
+        # Даже 1-тик lag даёт реальные расхождения в prey/pred slots 56-61
+        # (хищник speed=3 за тик может перейти с N на S, prey_grad перевернётся).
+        # Это не баг builder'а — это объективный сдвиг состояния Мира.
+        # При tick_diff != 0 → инкрементируем skipped, выходим без сравнения.
+        if server_world_tick and tick_diff != 0:
             self._client_obs_skipped += len(obs_per_cid)
             self._client_obs_last_tick_skip = {
                 "cache_tick": cache_tick,
