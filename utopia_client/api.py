@@ -63,6 +63,25 @@ class UtopiaAPI:
             logger.warning("fetch_command error: %s", e)
             return None
 
+    def ack_command(self) -> bool:
+        """Сбросить oneshot-команду (restart/update_now/benchmark) на VPS в idle.
+        Вызывается клиентом ДО выполнения действия, чтобы после restart/execv
+        повторный fetch_command не зациклил процесс на той же команде."""
+        url = f"{self.server}/api/colony/command/ack"
+        try:
+            r = requests.post(
+                url,
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return True
+            logger.warning("ack_command HTTP %d: %s", r.status_code, r.text[:200])
+            return False
+        except Exception as e:
+            logger.warning("ack_command error: %s", e)
+            return False
+
     def push_benchmark(self, result: dict) -> bool:
         url = f"{self.server}/api/colony/benchmark"
         try:

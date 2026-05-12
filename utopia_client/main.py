@@ -393,6 +393,32 @@ def cmd_run(args: argparse.Namespace) -> int:
                     desired = cmd.get("state", "idle")
                     if desired != current_state:
                         logger.info("command: %s -> %s", current_state, desired)
+                    # Remote restart: ack команду (VPS сбросит в idle), погасить
+                    # WS, sys.exit(0). systemd-сервис перезапустит процесс,
+                    # после старта desired_colony_state будет уже idle.
+                    if desired == "restart":
+                        logger.info("remote restart requested — acking + exiting")
+                        api.ack_command()
+                        if ws is not None:
+                            ws.stop()
+                        if world_feed is not None:
+                            world_feed.stop()
+                        return 0
+                    # Принудительный self-update: ack + проверка _try_self_update
+                    # и _try_neurocore_update немедленно (вне ритма 60с). При
+                    # успехе execv не вернётся; иначе остаёмся в текущем
+                    # current_state (на след. poll увидим уже idle от VPS).
+                    if desired == "update_now":
+                        logger.info("remote update_now requested — acking + check")
+                        api.ack_command()
+                        try:
+                            if _try_self_update(api):
+                                return 0  # недостижимо после execv
+                            if _try_neurocore_update(api):
+                                return 0  # недостижимо после execv
+                            logger.info("update_now: уже на свежей версии")
+                        except Exception as e:
+                            logger.warning("update_now check error: %s", e)
                     # benchmark — выполняем сразу, состояние сбрасывает VPS на idle
                     if desired == "benchmark":
                         logger.info("running benchmark…")
