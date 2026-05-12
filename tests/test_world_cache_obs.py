@@ -1,21 +1,18 @@
-"""Тесты obs_world_view + equivalence client build_observation ↔ server get_observation.
+"""Тесты obs_world_view + equivalence client build_observation ↔ server
+get_observation_earth_compat (Фаза 3.3).
 
-Фаза 3.2 переноса obs-сборки на клиент. Сценарий:
-  1. На сервере поднимаем синтетический `World` с известными creatures/flora/fauna.
-  2. Серверным обогащением snap (через `_enrich_snap_with_deltas`-эквивалент)
-     получаем delta-блоки + creatures-list.
+Сценарий:
+  1. Поднимаем синтетический `World` с creatures/flora/fauna.
+  2. Серверным обогащением snap получаем delta-блоки + creatures-list.
   3. Применяем snap к `WorldStateCache`.
   4. `cache.obs_world_view(self_cid=...)` → ObsWorldView.
   5. `build_observation(creature_view, world_view)` на клиенте.
-  6. Сравниваем со серверным `world.get_observation(creature)` слот-в-слот.
+  6. Сравниваем с серверным `get_observation_earth_compat(creature, _ctx=...)`.
 
 ТЗ: docs/tasks/tz_world_snapshot_to_client.md.
 """
 
 from __future__ import annotations
-
-import base64
-import gzip
 
 import numpy as np
 import pytest
@@ -24,7 +21,7 @@ from environment.observation_client import (
     ObsCreatureView,
     build_observation,
 )
-from environment.world import SignalChannel, World, WorldConfig
+from environment.world import World, WorldConfig, _ObsBatchContext
 from environment.world_snapshot_delta import (
     ClientSnapshotState,
     build_snapshot_delta,
@@ -64,23 +61,19 @@ def _bootstrap_cache_from_world(w: World, cache: WorldStateCache) -> None:
 
 def _build_snap_from_world(w: World, server_state: ClientSnapshotState):
     """Серверная сборка snap (дельты + creatures с метаданными) из World."""
-    # Flora list [(r, c, kind), ...]
     flora_list = [
         (int(r), int(c), int(fl.kind))
         for (r, c), fl in w.flora.items() if fl.alive
     ]
-    # Fauna list — формат сервера: (id, col, row, kind, hp_norm).
     fauna_list = [
         (int(f.id), int(f.col), int(f.row), int(f.kind),
          float(f.hp) / max(1.0, float(f.max_hp)))
         for f in w.fauna if f.alive
     ]
-    # Signals list [(r, c, sig_tick, sig_type, channel)]
     signals_list = [
         (int(r), int(c), int(st), int(stype), int(ch))
         for (r, c), (st, stype, ch) in w.signals.items()
     ]
-    # creatures: snap-формат (id, x=col, y=row, clan, sig).
     creatures_snap = [
         {"id": cr.creature_id, "x": int(cr.col), "y": int(cr.row),
          "clan": int(cr.clan_id), "sig": int(cr.signal_type)}
@@ -104,12 +97,16 @@ def _make_creature_view(creature) -> ObsCreatureView:
         row=int(creature.row),
         col=int(creature.col),
         energy=float(creature.energy),
-        hydration=float(creature.hydration),
-        vision_radius=int(creature.vision_radius),
-        smell_radius=int(creature.smell_radius),
-        signal_type=int(creature.signal_type),
-        clan_id=int(creature.clan_id),
-        camel=int(creature.camel),
+        steps_taken=int(creature.steps_taken),
+    )
+
+
+def _server_obs(w: World, creature) -> np.ndarray:
+    """Серверный earth_compat через `_ObsBatchContext` — путь продакшна."""
+    ctx = _ObsBatchContext(w)
+    return np.asarray(
+        w.get_observation_earth_compat(creature, _ctx=ctx),
+        dtype=np.float32,
     )
 
 
@@ -138,6 +135,7 @@ class TestObsWorldView:
         assert view.size == 64
         assert view.terrain.shape == (64, 64)
         assert view.terrain.dtype == np.uint8
+        assert view.smell_radius == int(w.config.smell_radius)
 
     def test_flora_indices_populated(self):
         w = _make_world(size=64, n_creatures=2, seed=2)
@@ -146,14 +144,17 @@ class TestObsWorldView:
         snap, _ = _build_snap_from_world(w, ClientSnapshotState(full_frame_interval=50))
         cache.apply_snap(snap)
         view = cache.obs_world_view()
-        # Все живые flora-позиции должны быть в массивах.
         n_flora_server = sum(1 for fl in w.flora.values() if fl.alive)
         assert view.flora_fr.size == n_flora_server
         assert view.flora_fc.size == n_flora_server
 
     def test_creature_meta_extracted_from_creatures_list(self):
+        """meta (clan/sig_type) сохраняется как opaque metadata.
+
+        earth_compat layout их не использует, но meta остаётся в cache —
+        вдруг пригодится для будущих фич (e.g. UI-агрегация по кланам).
+        """
         w = _make_world(size=64, n_creatures=4, seed=3)
-        # Назначим уникальные clan_id и signal_type.
         for i, c in enumerate(w.creatures):
             c.clan_id = 100 + i
             c.signal_type = 200 + i
@@ -164,7 +165,8 @@ class TestObsWorldView:
         for i, c in enumerate(w.creatures):
             assert cache.creature_meta[c.creature_id] == (100 + i, 200 + i)
 
-    def test_self_excluded_from_clan_by_pos(self):
+    def test_self_excluded_from_creature_pos(self):
+        """creature_pos в view не содержит self_cid."""
         w = _make_world(size=64, n_creatures=3, seed=4)
         cache = WorldStateCache(base_url="https://x")
         _bootstrap_cache_from_world(w, cache)
@@ -173,9 +175,11 @@ class TestObsWorldView:
         self_cid = w.creatures[0].creature_id
         view = cache.obs_world_view(self_cid=self_cid)
         self_pos = (int(w.creatures[0].row), int(w.creatures[0].col))
-        assert self_pos not in view.creature_clan_by_pos
-        # ally_positions при этом ВКЛЮЧАЕТ self (как на сервере).
-        assert self_pos in view.ally_positions
+        assert self_pos not in view.creature_pos
+        # Другие особи должны быть.
+        other_pos = (int(w.creatures[1].row), int(w.creatures[1].col))
+        if other_pos != self_pos:
+            assert other_pos in view.creature_pos
 
     def test_is_night_from_snap(self):
         """cache.is_night обновляется из snap.world.is_night."""
@@ -183,12 +187,9 @@ class TestObsWorldView:
         w = _make_world(size=64, n_creatures=2, seed=5)
         _bootstrap_cache_from_world(w, cache)
         snap, _ = _build_snap_from_world(w, ClientSnapshotState(full_frame_interval=50))
-        # Подменяем поле в snap (для теста — обычно сервер сам выставляет).
         snap["world"]["is_night"] = True
         cache.apply_snap(snap)
         assert cache.is_night is True
-        view = cache.obs_world_view()
-        assert view.is_night is True
 
     def test_obs_world_view_before_bootstrap_raises(self):
         cache = WorldStateCache(base_url="https://x")
@@ -197,28 +198,11 @@ class TestObsWorldView:
 
 
 class TestBuildObservationEquivalence:
-    """build_observation на клиенте == get_observation на сервере.
-
-    Замечание о порядке: серверный `_obs_flora_fr/fc` строится из
-    `dict.items()` (insertion order), а клиентский — из `set` после
-    apply_delta_reference (порядок теряется). При равных distance
-    `np.argmin` возвращает разный idx → разные `food_dir` (slots 48-49,
-    51-52). Чтобы тесты не зависели от tie-break, выравниваем порядок
-    на сервере с порядком клиента перед вызовом `get_observation`.
-    """
+    """build_observation на клиенте == get_observation_earth_compat на сервере."""
 
     def _check_one_creature(self, w: World, creature, cache: WorldStateCache):
-        # Сначала строим клиентский view (стабильный порядок) и подменяем
-        # серверные obs-индексы на ровно те же массивы → tie-break
-        # одинаков.
         view = cache.obs_world_view(self_cid=creature.creature_id)
-        w._prepare_obs_cache()
-        w._obs_flora_fr = view.flora_fr
-        w._obs_flora_fc = view.flora_fc
-        w._obs_fauna_fr = view.fauna_fr
-        w._obs_fauna_fc = view.fauna_fc
-        w._obs_fauna_kind = view.fauna_kind
-        server_obs = np.asarray(w.get_observation(creature), dtype=np.float32)
+        server_obs = _server_obs(w, creature)
         cv = _make_creature_view(creature)
         client_obs = build_observation(cv, view)
         diff = np.abs(server_obs - client_obs)
@@ -239,11 +223,11 @@ class TestBuildObservationEquivalence:
                 f"slots = {np.where(diff > 1e-6)[0].tolist()}"
             )
 
-    def test_equivalence_with_signals(self):
+    def test_equivalence_after_ticks(self):
+        """После нескольких тиков мира — флора/фауна сдвинулись."""
         w = _make_world(size=96, n_creatures=6, seed=23)
-        w.signals[(10, 10)] = (w.tick, 1, SignalChannel.FOOD)
-        w.signals[(15, 20)] = (w.tick, 2, SignalChannel.DANGER)
-        w.signals[(50, 50)] = (w.tick, 0, SignalChannel.GENERIC)
+        for _ in range(30):
+            w.tick_world()
         cache = WorldStateCache(base_url="https://x")
         _bootstrap_cache_from_world(w, cache)
         snap, _ = _build_snap_from_world(w, ClientSnapshotState(full_frame_interval=50))
@@ -256,20 +240,6 @@ class TestBuildObservationEquivalence:
                 f"creature {c.creature_id}: slots {np.where(diff > 1e-6)[0].tolist()}"
             )
 
-    def test_equivalence_kin_proximity(self):
-        w = _make_world(size=96, n_creatures=4, seed=3)
-        c1, c2 = w.creatures[0], w.creatures[1]
-        c1.clan_id = c2.clan_id = 42
-        c1.row, c1.col = 30, 30
-        c2.row, c2.col = 32, 31
-        cache = WorldStateCache(base_url="https://x")
-        _bootstrap_cache_from_world(w, cache)
-        snap, _ = _build_snap_from_world(w, ClientSnapshotState(full_frame_interval=50))
-        cache.apply_snap(snap)
-        server_obs, client_obs, diff = self._check_one_creature(w, c1, cache)
-        assert server_obs[62] > 0.0, "kin_proximity должен быть > 0"
-        assert diff.max() < 1e-6
-
     def test_equivalence_torus_wrap(self):
         w = _make_world(size=64, n_creatures=4, seed=7)
         c = next(x for x in w.creatures if x.alive)
@@ -281,20 +251,15 @@ class TestBuildObservationEquivalence:
         _, _, diff = self._check_one_creature(w, c, cache)
         assert diff.max() < 1e-6
 
-    def test_equivalence_mixed_signal_types(self):
-        """Сигналы разных type'ов: свой ×2, чужой ×0.5."""
-        w = _make_world(size=64, n_creatures=2, seed=9)
+    def test_steps_taken_passes_through(self):
+        """steps_taken из payload корректно попадает в slot 35."""
+        w = _make_world(size=64, n_creatures=2, seed=13)
         c = w.creatures[0]
-        c.row, c.col = 30, 30
-        c.signal_type = 5
-        w.signals.clear()
-        w.signals[(25, 30)] = (w.tick, 5, SignalChannel.FOOD)
-        w.signals[(35, 30)] = (w.tick, 99, SignalChannel.FOOD)
+        c.steps_taken = 1000
         cache = WorldStateCache(base_url="https://x")
         _bootstrap_cache_from_world(w, cache)
         snap, _ = _build_snap_from_world(w, ClientSnapshotState(full_frame_interval=50))
         cache.apply_snap(snap)
-        server_obs, client_obs, diff = self._check_one_creature(w, c, cache)
-        # slot 58 — sig_food_NS, ожидаем > 0 т.к. свой северный ×2 больше чужого южного ×0.5.
-        assert server_obs[58] > 0.0
+        _, client_obs, diff = self._check_one_creature(w, c, cache)
+        assert abs(float(client_obs[35]) - 0.2) < 1e-6  # 1000/5000
         assert diff.max() < 1e-6

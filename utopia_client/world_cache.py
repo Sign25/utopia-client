@@ -233,24 +233,23 @@ class WorldStateCache:
     # ─────────────────────────── obs view ────────────────────────────
 
     def obs_world_view(self, *, self_cid: Optional[str] = None) -> ObsWorldView:
-        """Собирает `ObsWorldView` для клиентского `build_observation` (Фаза 3).
+        """Собирает `ObsWorldView` для клиентского `build_observation`
+        (earth_compat layout, Фаза 3.3).
 
         Аргументы:
-            self_cid: ID особи, для которой строится obs. Если задан, она
-                будет исключена из `creature_clan_by_pos` (но сохранится в
-                `ally_positions` — серверный `get_observation` так и делает).
+            self_cid: ID особи, для которой строится obs. Если задан, её
+                позиция исключается из `creature_pos`.
 
         Поля:
             - terrain — np.uint8[size, size], кешируется на жизнь bootstrap.
             - flora_fr/fc — np.int32 из `state.flora` (kind игнорируется).
             - fauna_fr/fc/kind — np.int32 из `state.fauna`.
             - fauna_by_pos — dict[(row, col), kind].
-            - signals — dict[(r, c, ch), (sig_tick, sig_type)] (state.signals).
-            - ally_positions — set[(row, col)] всех известных существ.
-            - creature_clan_by_pos — dict[(row, col), clan_id], без self_cid.
+            - creature_pos — set[(row, col)] ДРУГИХ живых особей (без self).
+            - smell_radius — глобальный радиус из WorldConfig.
 
-        Размер ~O(N_flora + N_fauna + N_signals + N_creatures). На P40:
-        6700 flora + 100 fauna + 21 creatures ~ 0.5 мс.
+        Размер ~O(N_flora + N_fauna + N_creatures). На P40:
+        6700 flora + 100 fauna + 21 creatures ~ 0.3 мс.
         """
         if self._config is None:
             raise RuntimeError("WorldStateCache: bootstrap() ещё не вызван")
@@ -300,30 +299,19 @@ class WorldStateCache:
             fauna_kind = np.empty(0, dtype=np.int32)
             fauna_by_pos = {}
 
-        # Сородичи: ally_positions включает всех живых (со self_cid),
-        # creature_clan_by_pos — исключает self_cid (как на сервере при
-        # переборе `for other in self.creatures: if other is creature: continue`).
-        ally_positions: set[tuple[int, int]] = set()
-        clan_by_pos: dict[tuple[int, int], int] = {}
-        # snap.creatures даёт (x, y) — col, row. У state.creature_pos то же.
+        # earth_compat использует `creature_pos` — множество позиций ДРУГИХ
+        # живых особей (без self). snap.creatures даёт (x, y) = (col, row);
+        # state.creature_pos хранит то же.
+        creature_pos: set[tuple[int, int]] = set()
         for cid, (x, y) in self._state.creature_pos.items():
-            pos = (int(y), int(x))  # (row, col)
-            ally_positions.add(pos)
             if self_cid is not None and cid == self_cid:
                 continue
-            meta = self._creature_meta.get(cid)
-            if meta is None:
-                continue
-            clan_by_pos[pos] = meta[0]
+            creature_pos.add((int(y), int(x)))
 
         return ObsWorldView(
             size=size,
             max_energy=float(cfg.max_energy),
-            max_hydration=float(cfg.max_hydration),
-            signal_decay=int(cfg.signal_decay),
-            night_vision_penalty=int(cfg.night_vision_penalty),
-            is_night=bool(self._is_night),
-            tick=int(self._state.last_tick),
+            smell_radius=int(cfg.smell_radius),
             terrain=terrain,
             flora_fr=flora_fr,
             flora_fc=flora_fc,
@@ -331,9 +319,13 @@ class WorldStateCache:
             fauna_fc=fauna_fc,
             fauna_kind=fauna_kind,
             fauna_by_pos=fauna_by_pos,
-            signals=dict(self._state.signals),
-            ally_positions=ally_positions,
-            creature_clan_by_pos=clan_by_pos,
+            creature_pos=creature_pos,
+            # backward-compat поля (earth_compat их не использует).
+            max_hydration=float(cfg.max_hydration),
+            signal_decay=int(cfg.signal_decay),
+            night_vision_penalty=int(cfg.night_vision_penalty),
+            is_night=bool(self._is_night),
+            tick=int(self._state.last_tick),
         )
 
     # ─────────────────────────── observability ────────────────────────

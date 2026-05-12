@@ -971,18 +971,10 @@ class ColonyWSClient:
                     row=int(c.get("row", 0)),
                     col=int(c.get("col", 0)),
                     energy=float(c.get("energy", 0.0) or 0.0),
-                    hydration=float(c.get("hydration", 0.0) or 0.0),
-                    vision_radius=int(c.get("vision_radius", 7)),
-                    smell_radius=int(c.get("smell_radius", 40)),
-                    signal_type=int(c.get("signal_type", 0)),
-                    clan_id=int(c.get("clan_id", 0)),
-                    camel=int(c.get("camel", 0)),
+                    steps_taken=int(c.get("steps_taken", 0)),
                 )
                 view = cache.obs_world_view(self_cid=cid_s)
-                # Valence (slots 54-55) серверный знает по EMA — берём
-                # из server_obs, чтобы не давать ложного mismatch.
-                valence = (float(server_obs[54]), float(server_obs[55]))
-                client_obs = build_observation(cv, view, valence=valence)
+                client_obs = build_observation(cv, view)
                 self._client_obs_built += 1
                 slot_diff = np.abs(client_obs - server_obs)
                 diff = float(slot_diff.max())

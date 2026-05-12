@@ -4,27 +4,21 @@
   - Если кеш не bootstrap'нут — все cid идут в skipped.
   - Если meta для cid есть и view доступен — client_obs строится и
     сравнивается с серверным. Matched/mismatched корректно учитываются.
-  - Tie-break в slots 48-49/51-52 не должен ронять матч, поскольку этот
-    тест моделирует «идеальный» live-сценарий (cache == server). Tie-break
-    смягчён monkey-patch'ем серверных obs-кешей, как и в Фазе 3.2C.
+  - На live-сценарии (cache == server) earth_compat obs совпадает.
 
 ТЗ: docs/tasks/tz_world_snapshot_to_client.md.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import numpy as np
-import pytest
 
-from environment.world import World, WorldConfig
+from environment.world import World, WorldConfig, _ObsBatchContext
 from environment.world_snapshot_delta import ClientSnapshotState
 
-from utopia_client.world_cache import WorldStateCache, WorldConfigSnapshot
+from utopia_client.world_cache import WorldStateCache
 from utopia_client.ws_client import ColonyWSClient
 
-# Импортируем helpers из соседнего теста, чтобы не дублировать.
 from tests.test_world_cache_obs import (
     _bootstrap_cache_from_world,
     _build_snap_from_world,
@@ -44,17 +38,17 @@ def _make_ws_stub() -> ColonyWSClient:
 
 
 def _make_creatures_payload(w: World) -> tuple[list, dict]:
-    """Серверный payload obs_batch для всех живых особей.
-
-    Возвращает (creatures_list, obs_per_cid) — slot-by-slot матч клиенту
-    обеспечивается monkey-patch'ем серверных obs-кешей view'ом cache.
-    """
+    """Серверный payload obs_batch для всех живых особей (earth_compat)."""
     creatures = []
     obs_per_cid: dict = {}
+    ctx = _ObsBatchContext(w)
     for cr in w.creatures:
         if not cr.alive:
             continue
-        obs = np.asarray(w.get_observation(cr), dtype=np.float32)
+        obs = np.asarray(
+            w.get_observation_earth_compat(cr, _ctx=ctx),
+            dtype=np.float32,
+        )
         cid = str(cr.creature_id)
         obs_per_cid[cid] = obs
         creatures.append({
@@ -62,12 +56,7 @@ def _make_creatures_payload(w: World) -> tuple[list, dict]:
             "row": int(cr.row),
             "col": int(cr.col),
             "energy": float(cr.energy),
-            "hydration": float(cr.hydration),
-            "vision_radius": int(cr.vision_radius),
-            "smell_radius": int(cr.smell_radius),
-            "signal_type": int(cr.signal_type),
-            "clan_id": int(cr.clan_id),
-            "camel": int(cr.camel),
+            "steps_taken": int(cr.steps_taken),
             "obs": obs.tolist(),
         })
     return creatures, obs_per_cid
@@ -96,7 +85,6 @@ class TestCompareShadowObs:
     def test_cache_not_bootstrapped_skips(self):
         ws = _make_ws_stub()
         ws.world_cache = WorldStateCache(base_url="https://x")
-        # is_bootstrapped == False → skipped
         w = _make_world()
         creatures, obs_per_cid = _make_creatures_payload(w)
         ws._compare_shadow_obs(creatures, obs_per_cid)
@@ -114,27 +102,17 @@ class TestCompareShadowObs:
         cache.apply_snap(snap)
         ws.world_cache = cache
 
-        # Удалим meta для одной особи — она должна попасть в skipped.
         target_cid = str(w.creatures[0].creature_id)
         cache._creature_meta.pop(target_cid, None)
-        # Monkey-patch obs-кешей сервера — детерминистический tie-break.
-        w._prepare_obs_cache()
-        view0 = cache.obs_world_view(self_cid=target_cid)
-        w._obs_flora_fr = view0.flora_fr
-        w._obs_flora_fc = view0.flora_fc
-        w._obs_fauna_fr = view0.fauna_fr
-        w._obs_fauna_fc = view0.fauna_fc
-        w._obs_fauna_kind = view0.fauna_kind
 
         creatures, obs_per_cid = _make_creatures_payload(w)
         ws._compare_shadow_obs(creatures, obs_per_cid)
 
-        # Один cid скипнут, остальные построены.
         assert ws._client_obs_skipped == 1
         assert ws._client_obs_built == len(obs_per_cid) - 1
 
     def test_match_on_consistent_cache(self):
-        """Когда cache совпадает с server world, все obs матчатся."""
+        """Когда cache совпадает с server world, earth_compat obs совпадает."""
         ws = _make_ws_stub()
         cache = WorldStateCache(base_url="https://x")
         w = _make_world(size=64, n_creatures=3, seed=7)
@@ -144,21 +122,6 @@ class TestCompareShadowObs:
         cache.apply_snap(snap)
         ws.world_cache = cache
 
-        # Делаем серверные obs детерминированными (tie-break == client).
-        w._prepare_obs_cache()
-        for cr in w.creatures:
-            if not cr.alive:
-                continue
-            view = cache.obs_world_view(self_cid=str(cr.creature_id))
-            w._obs_flora_fr = view.flora_fr
-            w._obs_flora_fc = view.flora_fc
-            w._obs_fauna_fr = view.fauna_fr
-            w._obs_fauna_fc = view.fauna_fc
-            w._obs_fauna_kind = view.fauna_kind
-            # Перезатираем obs в payload после переподмены кеша.
-            pass
-
-        # Строим payload по перевернутым obs-кешам (детерминистический tie-break).
         creatures, obs_per_cid = _make_creatures_payload(w)
         ws._compare_shadow_obs(creatures, obs_per_cid)
 
@@ -168,25 +131,44 @@ class TestCompareShadowObs:
         assert ws._client_obs_max_diff < 1e-3
 
     def test_mismatch_when_cache_stale(self):
-        """Если cache отстал (особь сдвинута на сервере) → mismatch."""
+        """Если cache отстал (особь пропала из creature_pos) → mismatch.
+
+        Ставим cr0 и cr1 рядом на PLAIN-тайлах: сервер видит cr1 как
+        poison-соседа cr0. После apply_snap удаляем cr1 из creature_pos
+        кеша — клиент думает, что соседа нет → slot[3] = 0 vs 1.
+        """
+        from environment.world import Tile
         ws = _make_ws_stub()
         cache = WorldStateCache(base_url="https://x")
         w = _make_world(size=64, n_creatures=2, seed=11)
+
+        cr0, cr1 = w.creatures[0], w.creatures[1]
+        sz = w.config.size
+        pos = None
+        for r in range(2, sz - 2):
+            for col in range(2, sz - 2):
+                if (w.terrain[r][col] == Tile.PLAIN
+                        and w.terrain[(r - 1) % sz][col] == Tile.PLAIN):
+                    pos = (r, col)
+                    break
+            if pos:
+                break
+        assert pos is not None, "не нашли пару PLAIN-тайлов"
+        r, col = pos
+        cr0.row, cr0.col = r, col
+        cr1.row, cr1.col = (r - 1) % sz, col
+
         _bootstrap_cache_from_world(w, cache)
         snap, _ = _build_snap_from_world(
             w, ClientSnapshotState(full_frame_interval=50))
         cache.apply_snap(snap)
         ws.world_cache = cache
 
-        # Сдвинем особь на сервере, не обновляя кеш → шахматное расхождение.
-        cr0 = w.creatures[0]
-        cr0.row = (cr0.row + 5) % w.config.size
-        cr0.col = (cr0.col + 5) % w.config.size
+        cache._state.creature_pos.pop(str(cr1.creature_id), None)
 
         creatures, obs_per_cid = _make_creatures_payload(w)
         ws._compare_shadow_obs(creatures, obs_per_cid)
 
         assert ws._client_obs_built >= 1
-        # Хотя бы одна должна не совпасть.
         assert ws._client_obs_mismatch >= 1
         assert ws._client_obs_max_diff > 1e-3
