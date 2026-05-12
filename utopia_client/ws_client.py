@@ -135,6 +135,9 @@ class ColonyWSClient:
         self._client_obs_slot_diff_sum = None  # type: Optional[object]  # np.array(64,)
         # Последний worst-slot пример (slot, client, server, lag_ticks).
         self._client_obs_last_worst: dict = {}
+        # Phase 3.3 fix2: tick desync (cache_tick != server_world_tick) → skip.
+        # Хранит инфо о последнем пропуске для диагностики.
+        self._client_obs_last_tick_skip: dict = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -942,9 +945,25 @@ class ColonyWSClient:
             return
         # Сколько тиков кеш отстаёт от server_world_tick. Помогает понять
         # — расхождение от устаревшего snap'а, или от ошибки в builder'е.
+        # Знаковая разница: кеш может уходить ВПЕРЁД obs_batch, если snap-поток
+        # обогнал WS-очередь obs_batch'ей (происходит регулярно — snap пушится
+        # ~500мс, obs_batch ~50мс, между ними нет тиковой синхронизации).
         cache_tick = int(getattr(cache, "last_tick", 0) or 0)
         snaps_applied = int(getattr(cache, "snaps_applied", 0) or 0)
+        tick_diff = cache_tick - server_world_tick if server_world_tick else 0
         lag = max(0, server_world_tick - cache_tick) if server_world_tick else 0
+        # Шейдов-сравнение валидно только при синхронизированных тиках.
+        # |tick_diff| > 1 → fauna/flora могли сместиться (хищник speed=3 за тик),
+        # prey/pred slots 56-61 дают огромные diffs — это не баг builder'а.
+        # Inкрементируем skipped, выходим без сравнения.
+        if server_world_tick and abs(tick_diff) > 1:
+            self._client_obs_skipped += len(obs_per_cid)
+            self._client_obs_last_tick_skip = {
+                "cache_tick": cache_tick,
+                "server_tick": int(server_world_tick),
+                "tick_diff": int(tick_diff),
+            }
+            return
         if getattr(self, "_client_obs_slot_diff_sum", None) is None:
             try:
                 self._client_obs_slot_diff_sum = np.zeros(64, dtype=np.float64)

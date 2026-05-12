@@ -479,6 +479,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                         "mismatch": ws._client_obs_mismatch,
                         "max_diff": ws._client_obs_max_diff,
                         "last_worst": dict(ws._client_obs_last_worst or {}),
+                        # Phase 3.3 fix2: tick desync — основная причина
+                        # большинства skip'ов в live. Помогает отличить
+                        # «cache не готов» от «cache ушёл вперёд obs_batch».
+                        "last_tick_skip": dict(
+                            getattr(ws, "_client_obs_last_tick_skip", {}) or {}),
                     }
                     # Размеры кеша мира: помогает понять, есть ли вообще
                     # flora/fauna/signals у клиента (если 0 — apply_snap не

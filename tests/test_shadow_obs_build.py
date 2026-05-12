@@ -130,6 +130,61 @@ class TestCompareShadowObs:
         assert ws._client_obs_match == ws._client_obs_built
         assert ws._client_obs_max_diff < 1e-3
 
+    def test_skip_when_tick_desync(self):
+        """Phase 3.3 fix2: если |cache_tick - server_world_tick| > 1 → skip.
+
+        В live snap-поток (~500мс) и obs_batch (~50мс) не синхронизированы;
+        кеш может уйти на десятки/сотни тиков вперёд obs_batch. Без гейта
+        prey/pred slots 56-61 дают огромные diffs из-за реальных шагов
+        фауны между тиками — это не баг builder'а. Сравниваем только при
+        |tick_diff| ≤ 1.
+        """
+        ws = _make_ws_stub()
+        cache = WorldStateCache(base_url="https://x")
+        w = _make_world(size=64, n_creatures=3, seed=17)
+        w.tick = 500  # cache.last_tick = 500 после apply_snap
+        _bootstrap_cache_from_world(w, cache)
+        snap, _ = _build_snap_from_world(
+            w, ClientSnapshotState(full_frame_interval=50))
+        cache.apply_snap(snap)
+        ws.world_cache = cache
+        assert cache.last_tick == 500
+
+        creatures, obs_per_cid = _make_creatures_payload(w)
+        # cache.last_tick=500, server отстал на 100 тиков
+        server_world_tick = cache.last_tick - 100
+        ws._compare_shadow_obs(creatures, obs_per_cid,
+                                 server_world_tick=server_world_tick)
+
+        assert ws._client_obs_built == 0
+        assert ws._client_obs_match == 0
+        assert ws._client_obs_mismatch == 0
+        assert ws._client_obs_skipped == len(obs_per_cid)
+        skip_info = ws._client_obs_last_tick_skip
+        assert skip_info.get("tick_diff") == 100
+        assert skip_info.get("cache_tick") == cache.last_tick
+        assert skip_info.get("server_tick") == server_world_tick
+
+    def test_tick_sync_within_one_tick_compares(self):
+        """|tick_diff| = 1 — сравнение всё ещё валидно (минимальная сетевая
+        рассинхронизация на тик допустима)."""
+        ws = _make_ws_stub()
+        cache = WorldStateCache(base_url="https://x")
+        w = _make_world(size=64, n_creatures=3, seed=19)
+        w.tick = 500
+        _bootstrap_cache_from_world(w, cache)
+        snap, _ = _build_snap_from_world(
+            w, ClientSnapshotState(full_frame_interval=50))
+        cache.apply_snap(snap)
+        ws.world_cache = cache
+
+        creatures, obs_per_cid = _make_creatures_payload(w)
+        ws._compare_shadow_obs(creatures, obs_per_cid,
+                                 server_world_tick=cache.last_tick + 1)
+
+        assert ws._client_obs_built == len(obs_per_cid)
+        assert ws._client_obs_match == ws._client_obs_built
+
     def test_mismatch_when_cache_stale(self):
         """Если cache отстал (особь пропала из creature_pos) → mismatch.
 
