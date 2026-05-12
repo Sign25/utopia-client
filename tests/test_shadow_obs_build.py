@@ -34,7 +34,13 @@ def _make_ws_stub() -> ColonyWSClient:
     ws._client_obs_match = 0
     ws._client_obs_mismatch = 0
     ws._client_obs_max_diff = 0.0
+    ws._client_obs_local_built = 0
     return ws
+
+
+def _strip_obs_from_payload(creatures: list) -> list:
+    """Phase 3.3B: симулирует серверный payload без поля 'obs'."""
+    return [{k: v for k, v in c.items() if k != "obs"} for c in creatures]
 
 
 def _make_creatures_payload(w: World) -> tuple[list, dict]:
@@ -248,3 +254,64 @@ class TestCompareShadowObs:
         assert ws._client_obs_built >= 1
         assert ws._client_obs_mismatch >= 1
         assert ws._client_obs_max_diff > 1e-3
+
+
+class TestCollectObsBatchPhase33B:
+    """Phase 3.3B: клиент строит obs локально, если сервер не прислал."""
+
+    def test_server_sends_obs_passthrough(self):
+        """Старый сервер: obs есть в payload → используем его, локальный
+        builder НЕ дёргается."""
+        ws = _make_ws_stub()
+        cache = WorldStateCache(base_url="https://x")
+        w = _make_world(size=64, n_creatures=3, seed=31)
+        _bootstrap_cache_from_world(w, cache)
+        snap, _ = _build_snap_from_world(
+            w, ClientSnapshotState(full_frame_interval=50))
+        cache.apply_snap(snap)
+        ws.world_cache = cache
+
+        creatures, _ = _make_creatures_payload(w)
+        obs, events, intero = ws._collect_obs_batch(creatures)
+
+        assert len(obs) == 3
+        assert ws._client_obs_local_built == 0
+        for cid in obs:
+            assert obs[cid].shape == (64,)
+            assert cid in events
+
+    def test_server_omits_obs_local_builder_kicks_in(self):
+        """Phase 3.3B: сервер не шлёт obs для owned → клиент строит локально.
+        Результат сравнивается с тем, что построил бы сервер — должен совпасть."""
+        ws = _make_ws_stub()
+        cache = WorldStateCache(base_url="https://x")
+        w = _make_world(size=64, n_creatures=3, seed=37)
+        _bootstrap_cache_from_world(w, cache)
+        snap, _ = _build_snap_from_world(
+            w, ClientSnapshotState(full_frame_interval=50))
+        cache.apply_snap(snap)
+        ws.world_cache = cache
+
+        creatures, server_obs = _make_creatures_payload(w)
+        creatures_no_obs = _strip_obs_from_payload(creatures)
+        obs, events, intero = ws._collect_obs_batch(creatures_no_obs)
+
+        assert len(obs) == 3
+        assert ws._client_obs_local_built == 3
+        # Локальный builder должен дать тот же obs, что и серверный.
+        for cid, server_arr in server_obs.items():
+            assert cid in obs
+            diff = float(np.max(np.abs(obs[cid] - server_arr)))
+            assert diff < 1e-3, f"cid={cid} diff={diff}"
+
+    def test_no_cache_no_obs_skips_all(self):
+        """Кеш не bootstrap'нут, obs нет → все cid отброшены."""
+        ws = _make_ws_stub()
+        w = _make_world(size=64, n_creatures=3, seed=41)
+        creatures, _ = _make_creatures_payload(w)
+        creatures_no_obs = _strip_obs_from_payload(creatures)
+        obs, events, intero = ws._collect_obs_batch(creatures_no_obs)
+
+        assert obs == {}
+        assert events == {}
+        assert ws._client_obs_local_built == 0

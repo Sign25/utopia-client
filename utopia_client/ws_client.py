@@ -138,6 +138,9 @@ class ColonyWSClient:
         # Phase 3.3 fix2: tick desync (cache_tick != server_world_tick) → skip.
         # Хранит инфо о последнем пропуске для диагностики.
         self._client_obs_last_tick_skip: dict = {}
+        # Phase 3.3B: счётчик локальной сборки obs (когда сервер не прислал).
+        # Помогает понять, сколько живой колонии работает через client builder.
+        self._client_obs_local_built: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1036,8 +1039,91 @@ class ColonyWSClient:
 
     # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
 
-    async def _handle_obs_batch(self, msg: dict) -> None:
+    def _collect_obs_batch(
+        self, creatures: list
+    ) -> tuple[dict, dict, dict]:
+        """Phase 3.3B: собирает obs/events/intero по cid.
+
+        Если сервер прислал obs → используем (backward-compat для старых
+        серверов). Если obs нет → строим локально из `world_cache`. После
+        стабилизации серверный путь удалим. Stale до cache_tick (~3 тика
+        lag) — допустимо, slow-moving особи это не ломает.
+        """
         import numpy as np
+        obs_per_cid: dict = {}
+        events_per_cid: dict = {}
+        intero_per_cid: dict = {}
+        cache = getattr(self, "world_cache", None)
+        local_builder_ready = bool(
+            cache is not None and getattr(cache, "is_bootstrapped", False))
+        _obs_view_cls = None
+        _build_obs_fn = None
+        if local_builder_ready:
+            try:
+                from environment.observation_client import (
+                    ObsCreatureView as _ObsCreatureView,
+                    build_observation as _build_observation,
+                )
+                _obs_view_cls = _ObsCreatureView
+                _build_obs_fn = _build_observation
+            except Exception as e:
+                logger.debug("obs builder import failed: %s", e)
+                local_builder_ready = False
+        for c in creatures:
+            cid = c.get("cid")
+            if not cid:
+                continue
+            cid_s = str(cid)
+            obs = c.get("obs")
+            obs_arr = None
+            if obs is not None:
+                try:
+                    obs_arr = np.asarray(obs, dtype=np.float32)
+                except Exception as e:
+                    logger.debug("obs parse %s: %s", cid_s, e)
+                    obs_arr = None
+            if obs_arr is None and local_builder_ready:
+                # Сервер не шлёт obs (Phase 3.3B) → строим локально.
+                # Если в кеше для cid нет meta — особь только что появилась
+                # в obs_batch до прихода snap'а с creatures-дельтой.
+                # Пропускаем, получит STAY на этом тике.
+                try:
+                    cv = _obs_view_cls(
+                        row=int(c.get("row", 0)),
+                        col=int(c.get("col", 0)),
+                        energy=float(c.get("energy", 0.0) or 0.0),
+                        steps_taken=int(c.get("steps_taken", 0)),
+                    )
+                    view = cache.obs_world_view(self_cid=cid_s)
+                    obs_arr = _build_obs_fn(cv, view)
+                    self._client_obs_local_built = (
+                        getattr(self, "_client_obs_local_built", 0) + 1)
+                except Exception as e:
+                    logger.debug("local obs build %s: %s", cid_s, e)
+                    obs_arr = None
+            if obs_arr is None:
+                continue
+            obs_per_cid[cid_s] = obs_arr
+            # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
+            # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
+            events_per_cid[cid_s] = {
+                "ate": bool(c.get("ate", False)),
+                "killed": bool(c.get("killed", False)),
+                "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
+                "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
+            }
+            # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
+            # Старые серверы поле не шлют → fallback пустой.
+            intero = c.get("intero")
+            if intero is not None:
+                try:
+                    intero_per_cid[cid_s] = np.asarray(
+                        intero, dtype=np.float32)
+                except Exception:
+                    pass
+        return obs_per_cid, events_per_cid, intero_per_cid
+
+    async def _handle_obs_batch(self, msg: dict) -> None:
         creatures = msg.get("creatures") or []
         world_tick = int(msg.get("world_tick", 0))
         ts_echo = msg.get("ts_p40_ns")
@@ -1048,35 +1134,8 @@ class ColonyWSClient:
         # P40 шлёт parent_id для каждой особи. Если cid новый, и мы кешировали
         # child_org после mate-pair кроссинговера, регистрируем + Y50.
         self._attach_pending_newborns(creatures)
-        obs_per_cid: dict = {}
-        events_per_cid: dict = {}
-        intero_per_cid: dict = {}
-        for c in creatures:
-            cid = c.get("cid")
-            obs = c.get("obs")
-            if not cid or obs is None:
-                continue
-            try:
-                obs_per_cid[str(cid)] = np.asarray(obs, dtype=np.float32)
-            except Exception as e:
-                logger.debug("obs parse %s: %s", cid, e)
-                continue
-            # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
-            # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
-            events_per_cid[str(cid)] = {
-                "ate": bool(c.get("ate", False)),
-                "killed": bool(c.get("killed", False)),
-                "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
-                "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
-            }
-            # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
-            # Старые серверы поле не шлют → fallback пустой (insula пропускается).
-            intero = c.get("intero")
-            if intero is not None:
-                try:
-                    intero_per_cid[str(cid)] = np.asarray(intero, dtype=np.float32)
-                except Exception:
-                    pass
+        obs_per_cid, events_per_cid, intero_per_cid = self._collect_obs_batch(
+            creatures)
         if not obs_per_cid:
             return
         # Фаза 3.3A obs migration (11.05.2026): shadow-сборка obs из локального

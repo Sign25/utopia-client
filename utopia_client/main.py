@@ -484,6 +484,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                         # «cache не готов» от «cache ушёл вперёд obs_batch».
                         "last_tick_skip": dict(
                             getattr(ws, "_client_obs_last_tick_skip", {}) or {}),
+                        # Phase 3.3B: сколько раз клиент построил obs локально
+                        # (когда сервер не прислал obs для owned).
+                        "local_built": getattr(
+                            ws, "_client_obs_local_built", 0),
                     }
                     # Размеры кеша мира: помогает понять, есть ли вообще
                     # flora/fauna/signals у клиента (если 0 — apply_snap не
