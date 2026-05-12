@@ -41,11 +41,16 @@ _EMA_ALPHA = 0.01
 # Биты ablation_mask (синхронны с P40 routes_world.py):
 _DOPAMINE_BIT = 14      # S2.E
 _PLANNER_BIT = 10       # S2.A
+_MOTOR_POLICY_BIT = 11  # Phase 7
 _INSULA_BIT = 15        # S2.F
 _IMAGINATION_BIT = 16   # S2.G
 # Phase S2.A planner — N_ACTIONS из routes_world.
 _PLANNER_N_ACTIONS = 16
 _PLANNER_SCALE = 1.0
+# Phase 7 motor_policy: delta = scale·tanh(out[:16]) ∈ [-1, 1]^16.
+_MOTOR_POLICY_N_ACTIONS = 16
+_MOTOR_POLICY_SCALE = 1.0
+_MOTOR_POLICY_LR = 1e-4
 # Phase S2.E dopamine: β_local ∈ [0, 1/φ ≈ 0.618].
 _PHI = 1.6180339887498949
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
@@ -109,10 +114,20 @@ class LocalColonyCompute:
         self.imagination: dict = {}     # cid → Tissue (S2.G)
         self.planner: dict = {}         # cid → Tissue (S2.A)
         self.insula: dict = {}          # cid → Tissue (S2.F, data_dim=71)
+        # Phase 7 — motor_policy REINFORCE-sidecar (бит 11, только wanderer).
+        # supervised: log_prob[a_t] · (r_imm_total - baseline), Adam lr=1e-4.
+        self.motor_policy: dict = {}        # cid → Tissue (Phase 7)
+        self.motor_policy_opt: dict = {}    # cid → torch.optim.Adam
+        # pending_log_prob — scalar tensor с grad-графом от motor_delta предыдущего
+        # тика; REINFORCE-loss применяется на следующем тике, когда приходят events.
+        self.pending_log_prob: dict = {}    # cid → torch.Tensor (scalar, requires_grad)
+        self.pending_action: dict = {}      # cid → int (для диагностики)
+        self.motor_reinforce_steps: int = 0
         # Last-snapshot для get_phase_emas → push в actions_batch.
         self.last_beta_local: dict = {}    # cid → float ∈ [0, 1/φ]
         self.last_imag_mult: dict = {}     # cid → float ∈ [1, 2]
         self.last_planner_delta: dict = {} # cid → torch.Tensor [16]
+        self.last_motor_delta: dict = {}   # cid → torch.Tensor [16] (Phase 7)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
 
         # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
@@ -157,6 +172,12 @@ class LocalColonyCompute:
         self.planner[cid] = self._make_higher_tissue("planner")
         self.insula[cid] = self._make_higher_tissue("insula",
                                                      data_dim=_INSULA_DATA_DIM)
+        # Phase 7 — motor_policy: Tissue 21/3/1 + Adam(lr=1e-4) для REINFORCE.
+        motor = self._make_higher_tissue("motor_policy")
+        if motor is not None:
+            self.motor_policy[cid] = motor
+            self.motor_policy_opt[cid] = self._torch.optim.Adam(
+                motor.parameters(), lr=_MOTOR_POLICY_LR)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -186,6 +207,12 @@ class LocalColonyCompute:
         self.last_imag_mult.pop(cid, None)
         self.last_planner_delta.pop(cid, None)
         self.last_stress.pop(cid, None)
+        # Phase 7 — motor_policy.
+        self.motor_policy.pop(cid, None)
+        self.motor_policy_opt.pop(cid, None)
+        self.pending_log_prob.pop(cid, None)
+        self.pending_action.pop(cid, None)
+        self.last_motor_delta.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -262,6 +289,18 @@ class LocalColonyCompute:
                 self._apply_y50_to_tissue(tissue)
             except Exception as e:
                 logger.warning("apply_inherited_state %s %s: %s", cid, key, e)
+        # Phase 7 — motor_policy: Y50 + свежий Adam (как predictor).
+        m_sd = payload.get("motor_policy")
+        motor = self.motor_policy.get(cid)
+        if m_sd is not None and motor is not None:
+            try:
+                motor.load_state_dict(m_sd)
+                self._apply_y50_to_tissue(motor)
+                self.motor_policy_opt[cid] = self._torch.optim.Adam(
+                    motor.parameters(), lr=_MOTOR_POLICY_LR)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s motor_policy: %s",
+                                cid, e)
 
     def extract_brain_state_dicts(self, cid: str) -> tuple[dict, dict]:
         """Brain migration Etap 3.2 (11.05.2026): собрать state_dict мозга
@@ -291,6 +330,7 @@ class LocalColonyCompute:
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
+            ("motor_policy", self.motor_policy),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -348,6 +388,7 @@ class LocalColonyCompute:
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
+            ("motor_policy", self.motor_policy),
         ):
             tissue = store.get(parent_cid)
             if tissue is None:
@@ -446,6 +487,15 @@ class LocalColonyCompute:
                     out["client_planner_delta"] = vals
             except Exception:
                 pass
+        # Phase 7 — motor_policy delta push (server fastpath override).
+        md = self.last_motor_delta.get(cid)
+        if md is not None:
+            try:
+                vals_m = [float(x) for x in md.reshape(-1).tolist()]
+                if all(math.isfinite(x) and -1.0 <= x <= 1.0 for x in vals_m):
+                    out["client_motor_delta"] = vals_m
+            except Exception:
+                pass
         return out or None
 
     # ── Tick ─────────────────────────────────────────────────────────────
@@ -494,19 +544,38 @@ class LocalColonyCompute:
                 with torch.no_grad():
                     logits = organism.forward(obs_tensor)
 
-                selector = self.action_selectors[cid]
-                action = int(selector.select(logits, n_actions=N_ACTIONS))
-                out[cid] = {"action": action, "target_id": None}
-
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
-                # Должен идти ДО Hebbian update, чтобы intrinsic подмешать в r_imm.
+                # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
+                # в r_imm_total как baseline-сигнал.
                 intrinsic_now = self._predictor_train_step(cid, obs_tensor)
 
-                # Brain migration (10.05.2026): forward S2.E/G/A/F.
-                # Результаты лежат в last_beta_local/last_imag_mult/
-                # last_planner_delta/last_stress, отгружаются в actions_batch
-                # через get_phase_emas. Сервер применит через fastpath
-                # _compute_*. Forward после predictor — nothing depends.
+                # Phase 7 — REINFORCE update от прошлого тика. Сначала
+                # применяем pending градиент по pending_log_prob, ПОТОМ
+                # делаем свежий motor forward с grad для текущего тика.
+                self._motor_reinforce_step(cid, events_per_cid, intrinsic_now)
+
+                # Phase 7 — motor_policy forward с grad → motor_delta [16].
+                # Применяется к первым 16 элементам logits (action-space)
+                # ДО selector. grad через motor_delta нужен для log_prob[a_t]
+                # — на следующем тике REINFORCE возьмёт его в loss. Если
+                # ткани нет (legacy state) — fallback к raw_logits.
+                motor_delta = self._motor_forward(cid, obs_tensor)
+                selector = self.action_selectors[cid]
+                if motor_delta is not None:
+                    # logits = [1, 64] no_grad → action_slice [N_ACTIONS] с
+                    # прикреплённым grad-графом через motor_delta.
+                    action_slice = (logits[0, :N_ACTIONS].detach()
+                                     + motor_delta)
+                    action = int(selector.select(
+                        action_slice.detach(), n_actions=N_ACTIONS))
+                    # log_prob[a_t] с grad через motor_delta → pending для
+                    # REINFORCE-update на следующем тике.
+                    self._stash_pending_log_prob(cid, action_slice, action)
+                else:
+                    action = int(selector.select(logits, n_actions=N_ACTIONS))
+                out[cid] = {"action": action, "target_id": None}
+
+                # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
                 intero_tensor = None
                 if intero_per_cid is not None:
                     intero_arr = intero_per_cid.get(cid)
@@ -523,8 +592,6 @@ class LocalColonyCompute:
                 self._update_entropy_ema(cid, logits)
 
                 # Phase F3.2.b: Hebbian update по локальному R3 reward.
-                # immediate-only — medium/long требуют state (ema, repro
-                # tracking) и помечены как долг.
                 if heb is not None and events_per_cid is not None:
                     event = events_per_cid.get(cid)
                     if event is not None:
@@ -594,12 +661,13 @@ class LocalColonyCompute:
             payload["entropy_ema"] = float(self.entropy_ema.get(cid, 0.0))
             payload["trace_norm_ema"] = float(self.trace_norm_ema.get(cid, 0.0))
             payload["reward_var_ema"] = float(self.reward_var_ema.get(cid, 0.0))
-        # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
+        # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F + Phase 7 motor.
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
+            ("motor_policy", self.motor_policy),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -814,6 +882,83 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("insula forward %s: %s", cid, e)
 
+    # ── Phase 7 — motor_policy REINFORCE-sidecar ─────────────────────────
+
+    def _motor_forward(self, cid: str, obs_tensor):
+        """Forward motor_policy с grad. Возвращает delta torch.Tensor [16]
+        с прикреплённым grad-графом или None если ткани нет / ошибка.
+
+        Грейд нужен здесь, чтобы при выборе действия с применённой delta
+        log_prob[a_t] нёс градиент в motor_policy weights (REINFORCE).
+        """
+        torch = self._torch
+        tissue = self.motor_policy.get(cid)
+        if tissue is None:
+            return None
+        try:
+            tissue.train()
+            with torch.enable_grad():
+                out = tissue({"input": obs_tensor.detach()})["output"]
+                delta = (torch.tanh(out[0, :_MOTOR_POLICY_N_ACTIONS])
+                          * _MOTOR_POLICY_SCALE)
+            # Snapshot для push на сервер (detached cpu).
+            self.last_motor_delta[cid] = delta.detach().cpu()
+            return delta
+        except Exception as e:
+            logger.debug("motor_policy forward %s: %s", cid, e)
+            return None
+
+    def _stash_pending_log_prob(self, cid: str, action_slice,
+                                  action: int) -> None:
+        """Сохранить log_prob[a_t] (с grad через motor_delta) для REINFORCE
+        на следующем тике. action_slice — [N_ACTIONS] 1D-тензор raw_logits +
+        motor_delta с прикреплённым grad-графом через motor_delta.
+        """
+        torch = self._torch
+        try:
+            n = int(action_slice.shape[-1])
+            if not (0 <= action < n):
+                return
+            log_probs = torch.log_softmax(action_slice, dim=-1)
+            self.pending_log_prob[cid] = log_probs[action]
+            self.pending_action[cid] = int(action)
+        except Exception as e:
+            logger.debug("stash_pending_log_prob %s: %s", cid, e)
+
+    def _motor_reinforce_step(self, cid: str, events_per_cid,
+                                intrinsic_now: float) -> None:
+        """REINFORCE update от прошлого тика: loss = -log_prob · (r_imm_total
+        - baseline). baseline = intrinsic_ema[cid] (running mean intrinsic).
+        Применяется и опт-шаг, и градиент очищается через opt.zero_grad().
+        Pending_log_prob — scalar tensor с requires_grad, созданный на
+        предыдущем _stash_pending_log_prob.
+        """
+        pending = self.pending_log_prob.pop(cid, None)
+        self.pending_action.pop(cid, None)
+        if pending is None:
+            return
+        if events_per_cid is None:
+            return
+        event = events_per_cid.get(cid)
+        if event is None:
+            return
+        opt = self.motor_policy_opt.get(cid)
+        if opt is None:
+            return
+        try:
+            r_imm = self._compute_immediate_reward(event)
+            r_imm_total = float(r_imm + intrinsic_now)
+            baseline = float(self.intrinsic_ema.get(cid, 0.0))
+            advantage = r_imm_total - baseline
+            # REINFORCE: maximize log_prob · A → minimize -log_prob · A.
+            loss = -pending * advantage
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            self.motor_reinforce_steps += 1
+        except Exception as e:
+            logger.debug("motor_reinforce %s: %s", cid, e)
+
     def _predictor_train_step(self, cid: str, obs_tensor) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
 
@@ -1000,6 +1145,8 @@ class LocalColonyCompute:
                 "s2_imag_mult_avg": 0.0,
                 "s2_stress_avg": 0.0,
                 "s2_planner_norm_avg": 0.0,
+                "motor_delta_norm_avg": 0.0,
+                "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             }
         # Phase 1 — predictor accuracy.
         loss_vals = []
@@ -1094,6 +1241,15 @@ class LocalColonyCompute:
         s2_imag_avg = round(sum(imag_vals) / len(imag_vals), 4) if imag_vals else 0.0
         s2_stress_avg = round(sum(stress_vals) / len(stress_vals), 4) if stress_vals else 0.0
         s2_planner_avg = round(sum(planner_norms) / len(planner_norms), 4) if planner_norms else 0.0
+        # Phase 7 — motor_policy delta norms.
+        motor_norms: list[float] = []
+        for delta in self.last_motor_delta.values():
+            try:
+                motor_norms.append(float(delta.norm().item()))
+            except Exception:
+                continue
+        motor_delta_avg = (round(sum(motor_norms) / len(motor_norms), 4)
+                            if motor_norms else 0.0)
 
         return {
             "n_alive": n,
@@ -1131,6 +1287,8 @@ class LocalColonyCompute:
             "s2_imag_mult_avg": s2_imag_avg,
             "s2_stress_avg": s2_stress_avg,
             "s2_planner_norm_avg": s2_planner_avg,
+            "motor_delta_norm_avg": motor_delta_avg,
+            "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             "creatures": self._per_creature_stats(),
         }
 
@@ -1215,5 +1373,8 @@ class LocalColonyCompute:
                 "client_planner_norm": round(
                     float(self.last_planner_delta[cid].norm().item()), 4)
                     if cid in self.last_planner_delta else 0.0,
+                "client_motor_norm": round(
+                    float(self.last_motor_delta[cid].norm().item()), 4)
+                    if cid in self.last_motor_delta else 0.0,
             })
         return out
