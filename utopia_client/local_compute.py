@@ -65,6 +65,20 @@ _TOM_ACC_EMA_ALPHA = 0.02      # быстрый EMA по hit/miss
 _TOM_DELTA_NORM = 32.0         # шкала нормализации dx/dy ∈ [-1, 1] для радиуса ~32
 _TOM_N_LINEAGES = 2            # one-hot: [elder, wanderer]
 _TOM_N_SIGNALS = 8             # one-hot: sig ∈ [0, 7]
+# S2.C language (13.05.2026): supervised decode чужого сигнала → собственный
+# исход на следующий тик. data_dim=16 (own_sig one_hot[8] + neighbor counts/k[8]).
+# 4 класса события: 0=ate, 1=damage, 2=killed, 3=idle (idle пропускаем).
+_LANG_BIT = 12
+_LANG_DATA_DIM = 16
+_LANG_N_SIGNALS = 8
+_LANG_N_CLASSES = 4
+_LANG_K_NEIGHBORS = 8         # топ-K ближайших соседей для counts
+_LANG_LR = 1e-4
+_LANG_ACC_EMA_ALPHA = 0.02
+_LANG_EVT_ATE = 0
+_LANG_EVT_DAMAGE = 1
+_LANG_EVT_KILLED = 2
+_LANG_EVT_IDLE = 3
 # Action codes для target classification (синхронно с environment.world.Action).
 _TOM_ACT_NORTH = 0
 _TOM_ACT_SOUTH = 1
@@ -159,6 +173,17 @@ class LocalColonyCompute:
         # считаем Δposition → target action, cross-entropy step.
         self._tom_prev_focus: dict = {}     # cid → (str, int, int) | None
         self.tom_steps: int = 0
+        # S2.C (13.05.2026) — language: supervised decode чужого сигнала →
+        # собственное событие на следующем тике. data_dim=16 (own_sig
+        # one_hot[8] + neighbor signal counts/k[8]). target ∈ {ate, damage,
+        # killed, idle}, idle skip (class imbalance).
+        self.language: dict = {}              # cid → Tissue (S2.C)
+        self.language_opt: dict = {}          # cid → torch.optim.Adam
+        self.last_lang_acc: dict = {}         # cid → float ∈ [0, 1]
+        # _lang_prev_context[cid] = torch.Tensor [1, 16] — контекст прошлого
+        # тика (на t слышали сигналы, на t+1 получаем event для t→t+1).
+        self._lang_prev_context: dict = {}    # cid → torch.Tensor [1, 16] | None
+        self.lang_steps: int = 0
         # Связь с WorldStateCache (для tom_neighbors_view). Прокидывается
         # из ws_client после bootstrap'а кеша. None → ToM no-op.
         self.world_cache = None  # type: Optional[object]
@@ -232,6 +257,13 @@ class LocalColonyCompute:
             self.theory_of_mind_opt[cid] = self._torch.optim.Adam(
                 tom.parameters(), lr=_TOM_LR)
             self.last_tom_acc[cid] = 0.0
+        # S2.C (13.05.2026) — language: Tissue 21/3/1 data_dim=16 + Adam.
+        lang = self._make_higher_tissue("language", data_dim=_LANG_DATA_DIM)
+        if lang is not None:
+            self.language[cid] = lang
+            self.language_opt[cid] = self._torch.optim.Adam(
+                lang.parameters(), lr=_LANG_LR)
+            self.last_lang_acc[cid] = 0.0
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -275,6 +307,11 @@ class LocalColonyCompute:
         self.theory_of_mind_opt.pop(cid, None)
         self.last_tom_acc.pop(cid, None)
         self._tom_prev_focus.pop(cid, None)
+        # S2.C — language.
+        self.language.pop(cid, None)
+        self.language_opt.pop(cid, None)
+        self.last_lang_acc.pop(cid, None)
+        self._lang_prev_context.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -551,6 +588,7 @@ class LocalColonyCompute:
             (self.last_stress, "client_stress"),
             (self.last_dmn_floor, "client_dmn_floor"),
             (self.last_tom_acc, "client_tom_acc"),
+            (self.last_lang_acc, "client_lang_acc"),
         ):
             v = src.get(cid)
             if v is None:
@@ -676,6 +714,13 @@ class LocalColonyCompute:
                 # нет / соседей нет — no-op без побочных эффектов.
                 self._compute_theory_of_mind(cid)
 
+                # S2.C (13.05.2026) — language supervised step.
+                # prev_context (сигналы соседей с прошлого тика) → текущий
+                # event_class (ate/damage/killed/idle, idle skip).
+                lang_event = (events_per_cid.get(cid)
+                              if events_per_cid is not None else None)
+                self._compute_language(cid, lang_event)
+
                 # Phase 6 — entropy EMA по action-distribution.
                 self._update_entropy_ema(cid, logits)
 
@@ -758,6 +803,7 @@ class LocalColonyCompute:
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
             ("theory_of_mind", self.theory_of_mind),
+            ("language", self.language),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -1108,6 +1154,122 @@ class LocalColonyCompute:
         # Обновить focus для следующего тика — текущий ближайший сосед.
         self._tom_prev_focus[cid] = (str(ncid_curr), int(x_curr), int(y_curr))
 
+    # ── S2.C — language supervised sidecar ───────────────────────────────
+
+    @staticmethod
+    def _lang_event_class(event: Optional[dict]) -> int:
+        """Маппинг event-dict → класс ∈ {ate, damage, killed, idle}.
+
+        Приоритет (взаимоисключаем): killed > damage > ate > idle.
+        Хищники чаще killed, травоядные — ate; damage — редкое значимое
+        событие (укусили). idle = всё прочее (передвижение/спокойствие)
+        — этот класс пропускаем при обучении (class imbalance).
+        """
+        if not event:
+            return _LANG_EVT_IDLE
+        try:
+            killed = bool(event.get("killed", False))
+            if killed:
+                return _LANG_EVT_KILLED
+            damage = float(event.get("damage_taken", 0.0) or 0.0)
+            if damage > 0.0:
+                return _LANG_EVT_DAMAGE
+            ate = bool(event.get("ate", False))
+            if ate:
+                return _LANG_EVT_ATE
+        except (TypeError, ValueError):
+            return _LANG_EVT_IDLE
+        return _LANG_EVT_IDLE
+
+    def _build_lang_features(self, cid: str):
+        """Собрать [1, 16] tensor контекста сигналов для cid.
+
+        own_signal_one_hot[8] + neighbor_signal_counts/k[8]. Если world_cache
+        не привязан или нет данных — возвращаем None (no-op).
+        """
+        torch = self._torch
+        wc = self.world_cache
+        if wc is None or not getattr(wc, "is_bootstrapped", False):
+            return None
+        feat = torch.zeros(1, _LANG_DATA_DIM, dtype=torch.float32,
+                            device=self.device)
+        # own signal (если known).
+        own_tom = wc.creature_tom.get(cid)
+        if own_tom is not None:
+            try:
+                own_sig = int(own_tom[3])
+            except (TypeError, ValueError, IndexError):
+                own_sig = -1
+            if 0 <= own_sig < _LANG_N_SIGNALS:
+                feat[0, own_sig] = 1.0
+        # neighbor signal counts по K ближайшим.
+        try:
+            neighbors = wc.tom_neighbors_view(cid, n=_LANG_K_NEIGHBORS)
+        except Exception:
+            neighbors = []
+        if neighbors:
+            denom = float(len(neighbors))
+            for n in neighbors:
+                try:
+                    sig = int(n[7])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if 0 <= sig < _LANG_N_SIGNALS:
+                    feat[0, _LANG_N_SIGNALS + sig] += 1.0 / denom
+        return feat
+
+    def _compute_language(self, cid: str, event: Optional[dict]) -> None:
+        """Один supervised step S2.C: decode prev_context → текущее событие.
+
+        Если на прошлом тике был сохранён контекст и текущий event != idle,
+        делаем cross_entropy step на 4 классах (ate/damage/killed). Это
+        учит ткань ассоциировать чужие сигналы с собственными исходами.
+
+        Затем обновляем prev_context = свежим контекстом текущего тика —
+        для использования на следующем supervised шаге.
+        """
+        torch = self._torch
+        tissue = self.language.get(cid)
+        opt = self.language_opt.get(cid)
+        if tissue is None or opt is None:
+            return
+        prev_context = self._lang_prev_context.get(cid)
+        event_class = self._lang_event_class(event)
+        # Supervised step: prev_context + non-idle event → cross_entropy на 3
+        # классах (ate/damage/killed). idle → skip, чтобы не схлопнуть policy
+        # на доминанту (idle ~95% тиков).
+        if prev_context is not None and event_class != _LANG_EVT_IDLE:
+            try:
+                import torch.nn.functional as F
+                tissue.train()
+                with torch.enable_grad():
+                    out = tissue({"input": prev_context})["output"]
+                    logits = out[0, :_LANG_N_CLASSES].unsqueeze(0)
+                    target_t = torch.tensor([int(event_class)],
+                                              dtype=torch.long,
+                                              device=self.device)
+                    loss = F.cross_entropy(logits, target_t)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                pred = int(logits.argmax(dim=-1).item())
+                hit = 1.0 if pred == int(event_class) else 0.0
+                prev_acc = float(self.last_lang_acc.get(cid, 0.0))
+                self.last_lang_acc[cid] = (
+                    (1 - _LANG_ACC_EMA_ALPHA) * prev_acc
+                    + _LANG_ACC_EMA_ALPHA * hit
+                )
+                self.lang_steps += 1
+            except Exception as e:
+                logger.debug("lang train %s: %s", cid, e)
+        # Обновить prev_context: свежий слепок сигналов для следующего шага.
+        try:
+            curr_features = self._build_lang_features(cid)
+            if curr_features is not None:
+                self._lang_prev_context[cid] = curr_features.detach()
+        except Exception as e:
+            logger.debug("lang build features %s: %s", cid, e)
+
     # ── Phase 7 — motor_policy REINFORCE-sidecar ─────────────────────────
 
     def _motor_forward(self, cid: str, obs_tensor):
@@ -1373,9 +1535,11 @@ class LocalColonyCompute:
                 "s2_planner_norm_avg": 0.0,
                 "s2_dmn_floor_avg": 0.0,
                 "s2_tom_acc_avg": 0.0,
+                "s2_lang_acc_avg": 0.0,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "tom_steps_total": int(self.tom_steps),
+                "lang_steps_total": int(self.lang_steps),
             }
         # Phase 1 — predictor accuracy.
         loss_vals = []
@@ -1485,6 +1649,10 @@ class LocalColonyCompute:
         tom_vals = list(self.last_tom_acc.values())
         s2_tom_avg = (round(sum(tom_vals) / len(tom_vals), 4)
                        if tom_vals else 0.0)
+        # S2.C — language accuracy avg.
+        lang_vals = list(self.last_lang_acc.values())
+        s2_lang_avg = (round(sum(lang_vals) / len(lang_vals), 4)
+                        if lang_vals else 0.0)
 
         return {
             "n_alive": n,
@@ -1527,6 +1695,8 @@ class LocalColonyCompute:
             "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
+            "s2_lang_acc_avg": s2_lang_avg,
+            "lang_steps_total": int(self.lang_steps),
             "creatures": self._per_creature_stats(),
         }
 
@@ -1618,5 +1788,7 @@ class LocalColonyCompute:
                     float(self.last_dmn_floor.get(cid, 0.0)), 6),
                 "client_tom_acc": round(
                     float(self.last_tom_acc.get(cid, 0.0)), 4),
+                "client_lang_acc": round(
+                    float(self.last_lang_acc.get(cid, 0.0)), 4),
             })
         return out
