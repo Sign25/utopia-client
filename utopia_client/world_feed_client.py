@@ -153,7 +153,7 @@ class WorldFeedClient:
         logger.info("world feed connecting to %s", self.url)
         async with websockets.connect(
                 self.url, max_size=2 * 1024 * 1024,
-                ping_interval=20, ping_timeout=20) as ws:
+                ping_interval=30, ping_timeout=120) as ws:
             self.connected = True
             self.last_error = ""
             logger.info("world feed connected")

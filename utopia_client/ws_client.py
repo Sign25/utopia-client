@@ -224,7 +224,7 @@ class ColonyWSClient:
         url = f"{self.url}?token={self.token}"
         logger.info("connecting %s", self.url)
         async with websockets.connect(url, max_size=512 * 1024,
-                                       ping_interval=20, ping_timeout=20) as ws:
+                                       ping_interval=30, ping_timeout=120) as ws:
             self._ws = ws
             self.connected = True
             self.last_error = ""

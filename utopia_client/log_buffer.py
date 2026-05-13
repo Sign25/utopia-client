@@ -65,16 +65,16 @@ def setup_logging(level: int = logging.INFO,
         ch.setFormatter(fmt)
         root.addHandler(ch)
 
-    # File — RotatingFileHandler.
+    # File — обычный FileHandler без ротации (RotatingFileHandler падает на
+    # Windows: doRollover() пытается переименовать client.log → client.log.1,
+    # но другой поток держит fd → PermissionError [WinError 32]).
     log_path = config_dir() / "client.log"
-    if not any(isinstance(h, logging.handlers.RotatingFileHandler)
+    if not any(isinstance(h, logging.FileHandler)
                and Path(getattr(h, "baseFilename", "")) == log_path
                for h in root.handlers):
         try:
-            fh = logging.handlers.RotatingFileHandler(
-                log_path, maxBytes=log_file_bytes,
-                backupCount=log_file_backups, encoding="utf-8",
-            )
+            fh = logging.FileHandler(log_path, mode="a", encoding="utf-8",
+                                       delay=True)
             fh.setFormatter(fmt)
             root.addHandler(fh)
         except Exception as e:
