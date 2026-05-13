@@ -80,6 +80,10 @@ class WorldStateCache:
         # Метаданные особей из snap.creatures[] — нужны obs_world_view.
         # creature_meta[cid] = (clan_id, signal_type)
         self._creature_meta: dict[str, tuple[int, int]] = {}
+        # S2.B (13.05.2026) theory_of_mind: расширенная мета для соседей.
+        # creature_tom[cid] = (lineage_str, energy, max_energy, signal_type)
+        # lineage: "elder" | "wanderer" | "" (unknown).
+        self._creature_tom: dict[str, tuple[str, float, float, int]] = {}
         # Время суток из snap.world.is_night (для night_vision_penalty).
         self._is_night: bool = False
         # Лёгкий кеш numpy-массива terrain (uint8 size×size).
@@ -135,6 +139,74 @@ class WorldStateCache:
     def creature_meta(self) -> dict[str, tuple[int, int]]:
         """`{cid: (clan_id, signal_type)}` — обновляется из snap.creatures[]."""
         return self._creature_meta
+
+    @property
+    def creature_tom(self) -> dict[str, tuple[str, float, float, int]]:
+        """`{cid: (lineage, energy, max_energy, signal_type)}` — для S2.B ToM."""
+        return self._creature_tom
+
+    def tom_neighbors_view(
+        self, self_cid: str, *, n: int = 4,
+    ) -> list[tuple[str, int, int, float, float, str, float, int]]:
+        """Возвращает список ближайших соседей вокруг `self_cid` для S2.B ToM.
+
+        Каждый элемент:
+            `(neighbor_cid, x, y, dx, dy, lineage, energy_norm, sig)`.
+
+        `x`, `y` — абсолютные координаты соседа (col, row), нужны клиенту
+        для трекинга Δposition между тиками.
+        `dx`, `dy` — смещение от self к соседу с тор-метрикой.
+        `lineage` — "elder" | "wanderer" | "".
+        `energy_norm` ∈ [0, 1] — `energy / max_energy`.
+        `sig` ∈ [0, 7] — сигнальный тип.
+
+        Соседи отсортированы по возрастанию квадрата расстояния. Если их
+        меньше `n` — список короче `n` (паддинг — на стороне вызова).
+        """
+        if self._config is None:
+            return []
+        size = int(self._config.size)
+        half = size // 2
+
+        pos_map = self._state.creature_pos
+        self_pos = pos_map.get(self_cid)
+        if self_pos is None:
+            return []
+        sx, sy = int(self_pos[0]), int(self_pos[1])
+
+        candidates: list[tuple[int, str, int, int, float, float, str, float, int]] = []
+        for cid, (x, y) in pos_map.items():
+            if cid == self_cid:
+                continue
+            dx = int(x) - sx
+            dy = int(y) - sy
+            if dx > half:
+                dx -= size
+            elif dx < -half:
+                dx += size
+            if dy > half:
+                dy -= size
+            elif dy < -half:
+                dy += size
+            d2 = dx * dx + dy * dy
+            tom = self._creature_tom.get(cid)
+            if tom is None:
+                lineage = ""
+                energy_norm = 0.0
+                sig = 0
+            else:
+                lineage_str, energy, max_e, sig_i = tom
+                lineage = lineage_str
+                energy_norm = energy / max_e if max_e > 0 else 0.0
+                sig = sig_i
+            candidates.append((d2, str(cid), int(x), int(y),
+                               float(dx), float(dy), lineage,
+                               float(energy_norm), int(sig)))
+
+        candidates.sort(key=lambda t: t[0])
+        return [(ncid, x, y, dx, dy, lineage, energy_norm, sig)
+                for (_d2, ncid, x, y, dx, dy, lineage, energy_norm, sig)
+                in candidates[:n]]
 
     # ─────────────────────────── bootstrap ─────────────────────────────
 
@@ -218,12 +290,21 @@ class WorldStateCache:
         creatures_list = snap.get("creatures") or []
         if creatures_list:
             new_meta: dict[str, tuple[int, int]] = {}
+            new_tom: dict[str, tuple[str, float, float, int]] = {}
             for c in creatures_list:
                 cid = c.get("id")
                 if cid is None:
                     continue
-                new_meta[str(cid)] = (int(c.get("clan", 0)), int(c.get("sig", 0)))
+                key = str(cid)
+                clan = int(c.get("clan", 0))
+                sig = int(c.get("sig", 0))
+                new_meta[key] = (clan, sig)
+                lineage = str(c.get("lineage") or "")
+                energy = float(c.get("e", 0.0))
+                max_e = float(c.get("max_e", 0.0)) or 1.0
+                new_tom[key] = (lineage, energy, max_e, sig)
             self._creature_meta = new_meta
+            self._creature_tom = new_tom
 
         self.snaps_applied += 1
         if flora_delta.get("full"):

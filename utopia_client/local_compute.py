@@ -41,10 +41,12 @@ _EMA_ALPHA = 0.01
 # Биты ablation_mask (синхронны с P40 routes_world.py):
 _DOPAMINE_BIT = 14      # S2.E
 _PLANNER_BIT = 10       # S2.A
-_MOTOR_POLICY_BIT = 11  # Phase 7
+_TOM_BIT = 11           # S2.B (theory_of_mind) — добавлен 13.05.2026
 _DEFAULT_MODE_BIT = 13  # S2.D
 _INSULA_BIT = 15        # S2.F
 _IMAGINATION_BIT = 16   # S2.G
+_MOTOR_POLICY_BIT = 17  # Phase 7 — перенумерован с 11 на 17 (13.05.2026),
+                         # чтобы освободить канонический бит 11 для S2.B.
 # Phase S2.A planner — N_ACTIONS из routes_world.
 _PLANNER_N_ACTIONS = 16
 _PLANNER_SCALE = 1.0
@@ -52,6 +54,23 @@ _PLANNER_SCALE = 1.0
 _MOTOR_POLICY_N_ACTIONS = 16
 _MOTOR_POLICY_SCALE = 1.0
 _MOTOR_POLICY_LR = 1e-4
+# S2.B theory_of_mind (13.05.2026): supervised predict 8 motor-actions для соседа.
+# 4 соседа × 13 признаков = 52 data_dim. target = направление Δposition.
+_TOM_DATA_DIM = 52
+_TOM_N_NEIGHBORS = 4
+_TOM_FEATURES_PER_NEIGHBOR = 13
+_TOM_N_ACTIONS = 8
+_TOM_LR = 1e-4
+_TOM_ACC_EMA_ALPHA = 0.02      # быстрый EMA по hit/miss
+_TOM_DELTA_NORM = 32.0         # шкала нормализации dx/dy ∈ [-1, 1] для радиуса ~32
+_TOM_N_LINEAGES = 2            # one-hot: [elder, wanderer]
+_TOM_N_SIGNALS = 8             # one-hot: sig ∈ [0, 7]
+# Action codes для target classification (синхронно с environment.world.Action).
+_TOM_ACT_NORTH = 0
+_TOM_ACT_SOUTH = 1
+_TOM_ACT_EAST = 2
+_TOM_ACT_WEST = 3
+_TOM_ACT_STAY = 4
 # Phase S2.E dopamine: β_local ∈ [0, 1/φ ≈ 0.618].
 _PHI = 1.6180339887498949
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
@@ -123,10 +142,26 @@ class LocalColonyCompute:
         # рождался со случайными весами (P40 потерял default_mode в
         # envelope_brain). Теперь — owned-only, как dopamine/imagination.
         self.default_mode: dict = {}    # cid → Tissue (S2.D)
-        # Phase 7 — motor_policy REINFORCE-sidecar (бит 11, только wanderer).
+        # Phase 7 — motor_policy REINFORCE-sidecar (бит 17 с 13.05.2026,
+        # перенумерован с 11 для освобождения канонического бита под S2.B).
         # supervised: log_prob[a_t] · (r_imm_total - baseline), Adam lr=1e-4.
         self.motor_policy: dict = {}        # cid → Tissue (Phase 7)
         self.motor_policy_opt: dict = {}    # cid → torch.optim.Adam
+        # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
+        # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
+        self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
+        self.theory_of_mind_opt: dict = {}  # cid → torch.optim.Adam
+        # last_tom_acc[cid] — running accuracy ∈ [0, 1], EMA по hit/miss
+        # последних supervised step'ов. Пушим в actions_batch.phase_emas.
+        self.last_tom_acc: dict = {}        # cid → float
+        # _tom_prev_focus[cid] = (neighbor_cid, x, y) — кого предсказывали
+        # на прошлом тике и где он был. На текущем — ищем того же соседа,
+        # считаем Δposition → target action, cross-entropy step.
+        self._tom_prev_focus: dict = {}     # cid → (str, int, int) | None
+        self.tom_steps: int = 0
+        # Связь с WorldStateCache (для tom_neighbors_view). Прокидывается
+        # из ws_client после bootstrap'а кеша. None → ToM no-op.
+        self.world_cache = None  # type: Optional[object]
         # pending_log_prob — scalar tensor с grad-графом от motor_delta предыдущего
         # тика; REINFORCE-loss применяется на следующем тике, когда приходят events.
         self.pending_log_prob: dict = {}    # cid → torch.Tensor (scalar, requires_grad)
@@ -190,6 +225,13 @@ class LocalColonyCompute:
             self.motor_policy[cid] = motor
             self.motor_policy_opt[cid] = self._torch.optim.Adam(
                 motor.parameters(), lr=_MOTOR_POLICY_LR)
+        # S2.B (13.05.2026) — theory_of_mind: Tissue 21/3/1 data_dim=52 + Adam.
+        tom = self._make_higher_tissue("theory_of_mind", data_dim=_TOM_DATA_DIM)
+        if tom is not None:
+            self.theory_of_mind[cid] = tom
+            self.theory_of_mind_opt[cid] = self._torch.optim.Adam(
+                tom.parameters(), lr=_TOM_LR)
+            self.last_tom_acc[cid] = 0.0
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -228,6 +270,11 @@ class LocalColonyCompute:
         self.pending_log_prob.pop(cid, None)
         self.pending_action.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
+        # S2.B — theory_of_mind.
+        self.theory_of_mind.pop(cid, None)
+        self.theory_of_mind_opt.pop(cid, None)
+        self.last_tom_acc.pop(cid, None)
+        self._tom_prev_focus.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -318,6 +365,18 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s motor_policy: %s",
                                 cid, e)
+        # S2.B — theory_of_mind: Y50 + свежий Adam.
+        tom_sd = payload.get("theory_of_mind")
+        tom_tissue = self.theory_of_mind.get(cid)
+        if tom_sd is not None and tom_tissue is not None:
+            try:
+                tom_tissue.load_state_dict(tom_sd)
+                self._apply_y50_to_tissue(tom_tissue)
+                self.theory_of_mind_opt[cid] = self._torch.optim.Adam(
+                    tom_tissue.parameters(), lr=_TOM_LR)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s theory_of_mind: %s",
+                                cid, e)
 
     def extract_brain_state_dicts(self, cid: str) -> tuple[dict, dict]:
         """Brain migration Etap 3.2 (11.05.2026): собрать state_dict мозга
@@ -349,6 +408,7 @@ class LocalColonyCompute:
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
             ("default_mode", self.default_mode),
+            ("theory_of_mind", self.theory_of_mind),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -408,6 +468,7 @@ class LocalColonyCompute:
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
             ("default_mode", self.default_mode),
+            ("theory_of_mind", self.theory_of_mind),
         ):
             tissue = store.get(parent_cid)
             if tissue is None:
@@ -483,12 +544,13 @@ class LocalColonyCompute:
                 if spec:
                     out["specialization_ema"] = spec
         # Brain migration (10.05.2026): S2.E/G/A/F push.
-        # 13.05.2026: + client_dmn_floor (S2.D мигрирована на клиент).
+        # 13.05.2026: + client_dmn_floor (S2.D) + client_tom_acc (S2.B).
         for src, key in (
             (self.last_beta_local, "client_beta_local"),
             (self.last_imag_mult, "client_imag_mult"),
             (self.last_stress, "client_stress"),
             (self.last_dmn_floor, "client_dmn_floor"),
+            (self.last_tom_acc, "client_tom_acc"),
         ):
             v = src.get(cid)
             if v is None:
@@ -609,6 +671,11 @@ class LocalColonyCompute:
                             intero_tensor = None
                 self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
 
+                # S2.B (13.05.2026) — theory_of_mind supervised step.
+                # Использует WorldStateCache.tom_neighbors_view; если кеша
+                # нет / соседей нет — no-op без побочных эффектов.
+                self._compute_theory_of_mind(cid)
+
                 # Phase 6 — entropy EMA по action-distribution.
                 self._update_entropy_ema(cid, logits)
 
@@ -683,12 +750,14 @@ class LocalColonyCompute:
             payload["trace_norm_ema"] = float(self.trace_norm_ema.get(cid, 0.0))
             payload["reward_var_ema"] = float(self.reward_var_ema.get(cid, 0.0))
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F + Phase 7 motor.
+        # 13.05.2026: + S2.B theory_of_mind.
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
+            ("theory_of_mind", self.theory_of_mind),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -915,6 +984,129 @@ class LocalColonyCompute:
                     self.last_dmn_floor[cid] = dmn * _DEFAULT_MODE_FLOOR_MAX
             except Exception as e:
                 logger.debug("default_mode forward %s: %s", cid, e)
+
+    # ── S2.B — theory_of_mind supervised sidecar ─────────────────────────
+
+    @staticmethod
+    def _tom_target_action(prev_xy: tuple[int, int],
+                            curr_xy: tuple[int, int],
+                            world_size: int) -> int:
+        """Маппинг Δposition → action class ∈ {NORTH, SOUTH, EAST, WEST, STAY}.
+
+        Тор-метрика: |Δ| > size/2 → знак инвертируется через границу.
+        Диагональное движение → ось с большим |Δ|. Если |dx| == |dy| != 0,
+        предпочитаем горизонталь (EAST/WEST).
+        """
+        dx = int(curr_xy[0]) - int(prev_xy[0])
+        dy = int(curr_xy[1]) - int(prev_xy[1])
+        half = world_size // 2
+        if dx > half:
+            dx -= world_size
+        elif dx < -half:
+            dx += world_size
+        if dy > half:
+            dy -= world_size
+        elif dy < -half:
+            dy += world_size
+        if dx == 0 and dy == 0:
+            return _TOM_ACT_STAY
+        if abs(dx) >= abs(dy):
+            return _TOM_ACT_EAST if dx > 0 else _TOM_ACT_WEST
+        return _TOM_ACT_SOUTH if dy > 0 else _TOM_ACT_NORTH
+
+    def _build_tom_features(self, neighbors: list) -> "object":
+        """neighbors: list[tuple(ncid, x, y, dx, dy, lineage, energy_norm, sig)].
+        Возвращает torch.Tensor [1, _TOM_DATA_DIM=52]. Слоты соседей короче 4
+        паддятся нулями.
+        """
+        torch = self._torch
+        feat = torch.zeros(1, _TOM_DATA_DIM, dtype=torch.float32,
+                            device=self.device)
+        for i, n in enumerate(neighbors[:_TOM_N_NEIGHBORS]):
+            base = i * _TOM_FEATURES_PER_NEIGHBOR
+            _ncid, _x, _y, dx, dy, lineage, energy_norm, sig = n
+            feat[0, base + 0] = float(dx) / _TOM_DELTA_NORM
+            feat[0, base + 1] = float(dy) / _TOM_DELTA_NORM
+            # lineage one-hot [elder, wanderer]
+            if lineage == "elder":
+                feat[0, base + 2] = 1.0
+            elif lineage == "wanderer":
+                feat[0, base + 3] = 1.0
+            # signal one-hot [0..7]
+            si = int(sig)
+            if 0 <= si < _TOM_N_SIGNALS:
+                feat[0, base + 4 + si] = 1.0
+            # energy_norm в последний слот блока
+            feat[0, base + 4 + _TOM_N_SIGNALS] = max(0.0, min(1.0,
+                                                                float(energy_norm)))
+        return feat
+
+    def _compute_theory_of_mind(self, cid: str) -> None:
+        """Один supervised step S2.B: предсказание следующего motor-action
+        для focus-соседа (nearest на прошлом тике) и сравнение с реальным
+        Δposition. Cross-entropy backward + Adam.
+
+        Если world_cache не привязан — no-op. Если ткани/Adam нет — no-op.
+        """
+        torch = self._torch
+        tissue = self.theory_of_mind.get(cid)
+        opt = self.theory_of_mind_opt.get(cid)
+        if tissue is None or opt is None:
+            return
+        wc = self.world_cache
+        if wc is None or not getattr(wc, "is_bootstrapped", False):
+            return
+        try:
+            neighbors = wc.tom_neighbors_view(cid, n=_TOM_N_NEIGHBORS)
+        except Exception as e:
+            logger.debug("tom_neighbors_view %s: %s", cid, e)
+            return
+        if not neighbors:
+            self._tom_prev_focus[cid] = None
+            return
+
+        size = int(wc.config.size) if wc.config is not None else 256
+        prev_focus = self._tom_prev_focus.get(cid)
+        # Текущая ближайшая особь (для следующего тика).
+        ncid_curr, x_curr, y_curr = neighbors[0][:3]
+        # Если на прошлом тике был focus и он жив сейчас — supervised step.
+        if prev_focus is not None:
+            prev_ncid, prev_x, prev_y = prev_focus
+            # Ищем prev_ncid в текущих соседях, если есть — берём его (x, y).
+            curr_pos = None
+            for n in neighbors:
+                if n[0] == prev_ncid:
+                    curr_pos = (int(n[1]), int(n[2]))
+                    break
+            if curr_pos is not None:
+                target = self._tom_target_action(
+                    (int(prev_x), int(prev_y)), curr_pos, size)
+                try:
+                    import torch.nn.functional as F
+                    features = self._build_tom_features(neighbors)
+                    tissue.train()
+                    with torch.enable_grad():
+                        out = tissue({"input": features})["output"]
+                        logits = out[0, :_TOM_N_ACTIONS].unsqueeze(0)
+                        target_t = torch.tensor([int(target)],
+                                                  dtype=torch.long,
+                                                  device=self.device)
+                        loss = F.cross_entropy(logits, target_t)
+                        opt.zero_grad()
+                        loss.backward()
+                        opt.step()
+                    pred = int(logits.argmax(dim=-1).item())
+                    hit = 1.0 if pred == int(target) else 0.0
+                    prev_acc = float(self.last_tom_acc.get(cid, 0.0))
+                    self.last_tom_acc[cid] = (
+                        (1 - _TOM_ACC_EMA_ALPHA) * prev_acc
+                        + _TOM_ACC_EMA_ALPHA * hit
+                    )
+                    self.tom_steps += 1
+                except Exception as e:
+                    logger.debug("tom train %s: %s", cid, e)
+        # Обновить focus для следующего тика — текущий ближайший сосед.
+        self._tom_prev_focus[cid] = (str(ncid_curr), int(x_curr), int(y_curr))
 
     # ── Phase 7 — motor_policy REINFORCE-sidecar ─────────────────────────
 
@@ -1180,8 +1372,10 @@ class LocalColonyCompute:
                 "s2_stress_avg": 0.0,
                 "s2_planner_norm_avg": 0.0,
                 "s2_dmn_floor_avg": 0.0,
+                "s2_tom_acc_avg": 0.0,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
+                "tom_steps_total": int(self.tom_steps),
             }
         # Phase 1 — predictor accuracy.
         loss_vals = []
@@ -1287,6 +1481,10 @@ class LocalColonyCompute:
                 continue
         motor_delta_avg = (round(sum(motor_norms) / len(motor_norms), 4)
                             if motor_norms else 0.0)
+        # S2.B — theory_of_mind accuracy avg.
+        tom_vals = list(self.last_tom_acc.values())
+        s2_tom_avg = (round(sum(tom_vals) / len(tom_vals), 4)
+                       if tom_vals else 0.0)
 
         return {
             "n_alive": n,
@@ -1327,6 +1525,8 @@ class LocalColonyCompute:
             "s2_dmn_floor_avg": s2_dmn_avg,
             "motor_delta_norm_avg": motor_delta_avg,
             "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
+            "s2_tom_acc_avg": s2_tom_avg,
+            "tom_steps_total": int(self.tom_steps),
             "creatures": self._per_creature_stats(),
         }
 
@@ -1416,5 +1616,7 @@ class LocalColonyCompute:
                     if cid in self.last_motor_delta else 0.0,
                 "client_dmn_floor": round(
                     float(self.last_dmn_floor.get(cid, 0.0)), 6),
+                "client_tom_acc": round(
+                    float(self.last_tom_acc.get(cid, 0.0)), 4),
             })
         return out

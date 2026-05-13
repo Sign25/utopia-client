@@ -543,10 +543,20 @@ class ColonyWSClient:
         """Лениво создать LocalColonyCompute. False — если torch/neurocore не
         установлены."""
         if self.compute is not None:
+            # S2.B (13.05.2026): обновляем ссылку на world_cache, если в
+            # промежутке кеш мог быть пересоздан (idle→run).
+            if (self.world_cache is not None
+                    and getattr(self.compute, "world_cache", None)
+                    is not self.world_cache):
+                self.compute.world_cache = self.world_cache
             return True
         try:
             from .local_compute import LocalColonyCompute
             self.compute = LocalColonyCompute()
+            # S2.B: пробрасываем world_cache в compute, чтобы
+            # _compute_theory_of_mind мог дёрнуть tom_neighbors_view.
+            if self.world_cache is not None:
+                self.compute.world_cache = self.world_cache
             logger.info("compute initialized: device=%s", self.compute.device)
             return True
         except Exception as e:
