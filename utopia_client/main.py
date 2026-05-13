@@ -78,13 +78,37 @@ def _ensure_config() -> dict:
     cfg["token"] = get_or_prompt(
         "token", "Push-токен (страница Кабинет на divisci.com)", secret=True,
     )
-    cfg["name"] = get_or_prompt(
-        "name", "Имя колонии (короткое, например home-3060ti)",
-    )
+    # Имя колонии теперь живёт в кабинете на divisci.com (profile.name).
+    # Дёргаем VPS через push-токен; кешируем в config.json для офлайна.
+    name = _fetch_colony_name(cfg)
+    if name and name != cfg.get("name"):
+        if cfg.get("name"):
+            logger.info("colony name: %s → %s (из кабинета)", cfg["name"], name)
+        cfg["name"] = name
+        save_config(cfg)
+    elif not cfg.get("name"):
+        # VPS недоступен и нет кеша — отказываем, без имени работать нельзя.
+        raise SystemExit(
+            "Не удалось получить имя колонии: VPS недоступен, локальный кеш "
+            "пуст. Открой Кабинет на divisci.com, заполни поле «имя», "
+            "потом запусти клиент снова."
+        )
     if not cfg.get("genesis_mode"):
         cfg["genesis_mode"] = _prompt_genesis_mode(cfg)
         save_config(cfg)
     return cfg
+
+
+def _fetch_colony_name(cfg: dict) -> str:
+    """Запросить colony_name из кабинета на VPS. '' при недоступности."""
+    try:
+        api = UtopiaAPI(cfg["server"], cfg.get("token", ""))
+        ident = api.get_identity() or {}
+        name = str(ident.get("colony_name", "")).strip()
+        return name
+    except Exception as e:
+        logger.warning("colony name fetch failed: %s", e)
+        return ""
 
 
 def _prompt_genesis_mode(cfg: dict) -> str:
@@ -163,16 +187,6 @@ def cmd_set_token(args: argparse.Namespace) -> int:
     cfg["token"] = args.token.strip()
     save_config(cfg)
     print("Токен сохранён.")
-    return 0
-
-
-def cmd_set_name(args: argparse.Namespace) -> int:
-    cfg = load_config()
-    if not cfg.get("server"):
-        cfg["server"] = DEFAULT_SERVER
-    cfg["name"] = args.name.strip()
-    save_config(cfg)
-    print(f"Имя колонии: {cfg['name']}")
     return 0
 
 
@@ -627,8 +641,6 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("bench-gpu", help="Phase F3.0: forward StemCell на CUDA, ms/tps")
     p_token = sub.add_parser("set-token", help="Записать push-токен в конфиг")
     p_token.add_argument("token", help="Push-токен из Кабинета на divisci.com")
-    p_name = sub.add_parser("set-name", help="Записать имя колонии в конфиг")
-    p_name.add_argument("name", help="Короткое имя колонии (например home-3060ti)")
     p_gm = sub.add_parser("set-genesis-mode",
                           help="Сменить режим создания колонии (donor/fresh)")
     p_gm.add_argument("mode", choices=["donor", "fresh"],
@@ -643,8 +655,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_config(args)
     if args.cmd == "set-token":
         return cmd_set_token(args)
-    if args.cmd == "set-name":
-        return cmd_set_name(args)
     if args.cmd == "set-genesis-mode":
         return cmd_set_genesis_mode(args)
     if args.cmd == "bench-gpu":

@@ -185,6 +185,29 @@ class UtopiaAPI:
             logger.warning("get_neurocore_info error: %s", e)
             return None
 
+    def get_identity(self) -> dict | None:
+        """Имя колонии из кабинета юзера. None при ошибке/невалидном токене.
+
+        VPS-эндпоинт `GET /api/colony/identity` (auth: X-Push-Token) отдаёт
+        `{colony_name, email}`. Используется на старте daemon вместо
+        локального prompt'а имени в config.json — источник истины переехал
+        в `profile.name` на divisci.com (раздел Кабинет → имя).
+        """
+        url = f"{self.server}/api/colony/identity"
+        try:
+            r = requests.get(
+                url,
+                headers={"X-Push-Token": self.token},
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return r.json()
+            logger.warning("get_identity HTTP %d: %s", r.status_code, r.text[:200])
+            return None
+        except Exception as e:
+            logger.warning("get_identity error: %s", e)
+            return None
+
     def get_genepool_info(self) -> dict | None:
         """Phase F.7.4: статистика донорского пула Мира (без auth).
 
