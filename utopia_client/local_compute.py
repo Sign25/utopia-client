@@ -42,6 +42,7 @@ _EMA_ALPHA = 0.01
 _DOPAMINE_BIT = 14      # S2.E
 _PLANNER_BIT = 10       # S2.A
 _MOTOR_POLICY_BIT = 11  # Phase 7
+_DEFAULT_MODE_BIT = 13  # S2.D
 _INSULA_BIT = 15        # S2.F
 _IMAGINATION_BIT = 16   # S2.G
 # Phase S2.A planner — N_ACTIONS из routes_world.
@@ -55,6 +56,9 @@ _MOTOR_POLICY_LR = 1e-4
 _PHI = 1.6180339887498949
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
 _INSULA_DATA_DIM = 71
+# Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
+# Совпадает с _DEFAULT_MODE_FLOOR_MAX на P40 (routes_world.py).
+_DEFAULT_MODE_FLOOR_MAX = 0.01
 # Y50 для высших тканей (тот же scale, что у predictor).
 _HIGHER_TISSUE_Y50_SCALE = 0.0902
 
@@ -114,6 +118,11 @@ class LocalColonyCompute:
         self.imagination: dict = {}     # cid → Tissue (S2.G)
         self.planner: dict = {}         # cid → Tissue (S2.A)
         self.insula: dict = {}          # cid → Tissue (S2.F, data_dim=71)
+        # 13.05.2026: S2.D default_mode мигрирован с P40 на клиент. Раньше
+        # жил только как server-side sidecar и каждое register_newborn
+        # рождался со случайными весами (P40 потерял default_mode в
+        # envelope_brain). Теперь — owned-only, как dopamine/imagination.
+        self.default_mode: dict = {}    # cid → Tissue (S2.D)
         # Phase 7 — motor_policy REINFORCE-sidecar (бит 11, только wanderer).
         # supervised: log_prob[a_t] · (r_imm_total - baseline), Adam lr=1e-4.
         self.motor_policy: dict = {}        # cid → Tissue (Phase 7)
@@ -129,6 +138,7 @@ class LocalColonyCompute:
         self.last_planner_delta: dict = {} # cid → torch.Tensor [16]
         self.last_motor_delta: dict = {}   # cid → torch.Tensor [16] (Phase 7)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
+        self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
 
         # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
         self.tick_ts: deque = deque(maxlen=200)
@@ -172,6 +182,8 @@ class LocalColonyCompute:
         self.planner[cid] = self._make_higher_tissue("planner")
         self.insula[cid] = self._make_higher_tissue("insula",
                                                      data_dim=_INSULA_DATA_DIM)
+        # 13.05.2026: default_mode (S2.D) — data_dim=64, как dopamine/imagination.
+        self.default_mode[cid] = self._make_higher_tissue("default_mode")
         # Phase 7 — motor_policy: Tissue 21/3/1 + Adam(lr=1e-4) для REINFORCE.
         motor = self._make_higher_tissue("motor_policy")
         if motor is not None:
@@ -203,10 +215,13 @@ class LocalColonyCompute:
         self.imagination.pop(cid, None)
         self.planner.pop(cid, None)
         self.insula.pop(cid, None)
+        # 13.05.2026: S2.D default_mode.
+        self.default_mode.pop(cid, None)
         self.last_beta_local.pop(cid, None)
         self.last_imag_mult.pop(cid, None)
         self.last_planner_delta.pop(cid, None)
         self.last_stress.pop(cid, None)
+        self.last_dmn_floor.pop(cid, None)
         # Phase 7 — motor_policy.
         self.motor_policy.pop(cid, None)
         self.motor_policy_opt.pop(cid, None)
@@ -274,11 +289,13 @@ class LocalColonyCompute:
                     except Exception:
                         pass
         # Brain migration (10.05.2026): Y50 для высших тканей S2.E/G/A/F.
+        # 13.05.2026: + default_mode (S2.D мигрирована с P40 на клиент).
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
+            ("default_mode", self.default_mode),
         ):
             sd = payload.get(key)
             tissue = store.get(cid)
@@ -331,6 +348,7 @@ class LocalColonyCompute:
             ("planner", self.planner),
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
+            ("default_mode", self.default_mode),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -389,6 +407,7 @@ class LocalColonyCompute:
             ("planner", self.planner),
             ("insula", self.insula),
             ("motor_policy", self.motor_policy),
+            ("default_mode", self.default_mode),
         ):
             tissue = store.get(parent_cid)
             if tissue is None:
@@ -464,10 +483,12 @@ class LocalColonyCompute:
                 if spec:
                     out["specialization_ema"] = spec
         # Brain migration (10.05.2026): S2.E/G/A/F push.
+        # 13.05.2026: + client_dmn_floor (S2.D мигрирована на клиент).
         for src, key in (
             (self.last_beta_local, "client_beta_local"),
             (self.last_imag_mult, "client_imag_mult"),
             (self.last_stress, "client_stress"),
+            (self.last_dmn_floor, "client_dmn_floor"),
         ):
             v = src.get(cid)
             if v is None:
@@ -881,6 +902,19 @@ class LocalColonyCompute:
                     self.last_stress[cid] = 1.0 / (1.0 + math.exp(-raw))
             except Exception as e:
                 logger.debug("insula forward %s: %s", cid, e)
+        # S2.D — default_mode: floor = sigmoid(out[0,0]) · _DEFAULT_MODE_FLOOR_MAX.
+        # Применяется на P40 как фоновый floor для Δsurprise → intrinsic
+        # не схлопывается в ноль в «тихом» мире (delta≈0).
+        dmn_tissue = self.default_mode.get(cid)
+        if dmn_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = dmn_tissue({"input": obs_tensor.detach()})["output"]
+                    raw = float(out[0, 0].item())
+                    dmn = 1.0 / (1.0 + math.exp(-raw))
+                    self.last_dmn_floor[cid] = dmn * _DEFAULT_MODE_FLOOR_MAX
+            except Exception as e:
+                logger.debug("default_mode forward %s: %s", cid, e)
 
     # ── Phase 7 — motor_policy REINFORCE-sidecar ─────────────────────────
 
@@ -1145,6 +1179,7 @@ class LocalColonyCompute:
                 "s2_imag_mult_avg": 0.0,
                 "s2_stress_avg": 0.0,
                 "s2_planner_norm_avg": 0.0,
+                "s2_dmn_floor_avg": 0.0,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             }
@@ -1241,6 +1276,8 @@ class LocalColonyCompute:
         s2_imag_avg = round(sum(imag_vals) / len(imag_vals), 4) if imag_vals else 0.0
         s2_stress_avg = round(sum(stress_vals) / len(stress_vals), 4) if stress_vals else 0.0
         s2_planner_avg = round(sum(planner_norms) / len(planner_norms), 4) if planner_norms else 0.0
+        dmn_vals = list(self.last_dmn_floor.values())
+        s2_dmn_avg = round(sum(dmn_vals) / len(dmn_vals), 6) if dmn_vals else 0.0
         # Phase 7 — motor_policy delta norms.
         motor_norms: list[float] = []
         for delta in self.last_motor_delta.values():
@@ -1287,6 +1324,7 @@ class LocalColonyCompute:
             "s2_imag_mult_avg": s2_imag_avg,
             "s2_stress_avg": s2_stress_avg,
             "s2_planner_norm_avg": s2_planner_avg,
+            "s2_dmn_floor_avg": s2_dmn_avg,
             "motor_delta_norm_avg": motor_delta_avg,
             "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             "creatures": self._per_creature_stats(),
@@ -1376,5 +1414,7 @@ class LocalColonyCompute:
                 "client_motor_norm": round(
                     float(self.last_motor_delta[cid].norm().item()), 4)
                     if cid in self.last_motor_delta else 0.0,
+                "client_dmn_floor": round(
+                    float(self.last_dmn_floor.get(cid, 0.0)), 6),
             })
         return out
