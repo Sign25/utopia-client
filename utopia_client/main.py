@@ -13,7 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import pathlib
 import sys
+import tempfile
 import time
 
 from . import __version__
@@ -33,6 +36,34 @@ DIAGNOSTICS_PUSH_SEC = 30.0
 SELFUPDATE_CHECK_SEC = 60.0
 
 logger = logging.getLogger("utopia_client")
+
+
+def _state_dir() -> pathlib.Path:
+    """Каталог для local heartbeat/pid (watchdog читает оттуда)."""
+    base = os.environ.get("APPDATA") or os.environ.get("XDG_STATE_HOME") \
+        or tempfile.gettempdir()
+    path = pathlib.Path(base) / "utopia-client"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _write_heartbeat_file() -> None:
+    """Local heartbeat-маркер для watchdog.py. Stale > 5 мин → процесс kill."""
+    try:
+        (_state_dir() / "heartbeat.txt").write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def _write_pid_file() -> None:
+    """Pid основного процесса — watchdog знает кого killать."""
+    try:
+        (_state_dir() / "main.pid").write_text(str(os.getpid()))
+    except Exception:
+        pass
 
 
 def _setup_logging() -> None:
@@ -351,6 +382,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = _ensure_config()
     api = UtopiaAPI(cfg["server"], cfg["token"])
     name = cfg["name"]
+    _write_pid_file()
+    _write_heartbeat_file()
     logger.info("starting daemon as colony=%s server=%s", name, cfg["server"])
 
     # Prefetch wanderer-сида (17 тканей) до подъёма WS. Без этого
@@ -480,6 +513,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "feed=%s snaps=%d ok=%s",
                     world_tick, current_state, ws_connected, n_alive,
                     feed_conn, feed_snaps, ok)
+                _write_heartbeat_file()
                 last_heartbeat = now
 
             # Push tail логов в VPS (admin потом достаёт через cabinet_log.sh)
