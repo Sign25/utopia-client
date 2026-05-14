@@ -1732,9 +1732,13 @@ class LocalColonyCompute:
         s2_dopa_td_avg = (round(sum(td_vals) / len(td_vals), 6)
                            if td_vals else 0.0)
         action_dists: dict[str, list[float]] = {}
+        bias_max: dict[str, float] = {}
         for cid, sel in self.action_selectors.items():
-            ad = sel.get_stats()["action_distribution"]
-            action_dists[cid] = [round(float(v), 4) for v in ad]
+            stats = sel.get_stats()
+            action_dists[cid] = [
+                round(float(v), 4) for v in stats["action_distribution"]
+            ]
+            bias_max[cid] = round(float(stats.get("bias_max_abs", 0.0)), 4)
         if action_dists:
             sums = [0.0] * N_ACTIONS
             for dist in action_dists.values():
@@ -1744,6 +1748,10 @@ class LocalColonyCompute:
             s2_action_dist_avg = [round(v / n_sel, 4) for v in sums]
         else:
             s2_action_dist_avg = [0.0] * N_ACTIONS
+        s2_bias_max_avg = (
+            round(sum(bias_max.values()) / len(bias_max), 4)
+            if bias_max else 0.0
+        )
 
         return {
             "n_alive": n,
@@ -1790,12 +1798,15 @@ class LocalColonyCompute:
             "lang_steps_total": int(self.lang_steps),
             "s2_dopa_td_avg": s2_dopa_td_avg,
             "s2_action_dist_avg": s2_action_dist_avg,
-            "creatures": self._per_creature_stats(action_dists=action_dists),
+            "s2_bias_max_avg": s2_bias_max_avg,
+            "creatures": self._per_creature_stats(
+                action_dists=action_dists, bias_max=bias_max),
         }
 
     def _per_creature_stats(
         self,
         action_dists: dict[str, list[float]] | None = None,
+        bias_max: dict[str, float] | None = None,
     ) -> list[dict]:
         """Per-organism breakdown — что клиент знает о каждой живой особи.
 
@@ -1804,6 +1815,7 @@ class LocalColonyCompute:
         """
         from core.action_selector import N_ACTIONS
         action_dists = action_dists or {}
+        bias_max = bias_max or {}
         empty_dist = [0.0] * N_ACTIONS
         out: list[dict] = []
         for cid, org in self.organisms.items():
@@ -1892,5 +1904,6 @@ class LocalColonyCompute:
                 "client_dopa_td": round(
                     float(self.dopamine_td.get(cid, 0.0)), 6),
                 "client_action_dist": action_dists.get(cid, empty_dist),
+                "client_bias_max": bias_max.get(cid, 0.0),
             })
         return out
