@@ -199,6 +199,16 @@ class LocalColonyCompute:
         self.last_motor_delta: dict = {}   # cid → torch.Tensor [16] (Phase 7)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
+        # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
+        # TD = β_local − EMA(β_local, α=0.01) per-cid, обновляется один раз за
+        # тик в _compute_higher_tissues. effective_eta_reward = lr_reward ·
+        # (1 + clip(td, ±0.5)). Применяется ТОЛЬКО к reward_output (motor/
+        # brain/manipulator/...) через dopa_td_mult kwarg в hebbian.update.
+        # Эфемерное состояние (ресет при рестарте клиента), α=0.01 сходится
+        # за ~100 тиков. Если S2.E off (ablation бит 14) — beta не пишется,
+        # td/ema остаются на дефолте 0.0 → mult=1.0 (без модуляции).
+        self.dopamine_ema: dict = {}       # cid → float (running EMA(β_local))
+        self.dopamine_td: dict = {}        # cid → float TD ∈ ~[-0.618, +0.618]
 
         # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
         self.tick_ts: deque = deque(maxlen=200)
@@ -296,6 +306,9 @@ class LocalColonyCompute:
         self.last_planner_delta.pop(cid, None)
         self.last_stress.pop(cid, None)
         self.last_dmn_floor.pop(cid, None)
+        # Phase 5d — reward-gated Hebbian per-cid state.
+        self.dopamine_ema.pop(cid, None)
+        self.dopamine_td.pop(cid, None)
         # Phase 7 — motor_policy.
         self.motor_policy.pop(cid, None)
         self.motor_policy_opt.pop(cid, None)
@@ -604,6 +617,10 @@ class LocalColonyCompute:
                     out["specialization_ema"] = spec
         # Brain migration (10.05.2026): S2.E/G/A/F push.
         # 13.05.2026: + client_dmn_floor (S2.D) + client_tom_acc (S2.B).
+        # 14.05.2026 (Phase 5d NEOL): + client_dopa_td — TD-error от S2.E
+        # для серверной агрегатной метрики /api/world/hebbian_stats.reward_gated.
+        # Модуляция η происходит локально в heb.update(dopa_td_mult=...),
+        # сервер этот push НЕ применяет к мозгу (мозг у владельца).
         for src, key in (
             (self.last_beta_local, "client_beta_local"),
             (self.last_imag_mult, "client_imag_mult"),
@@ -611,6 +628,7 @@ class LocalColonyCompute:
             (self.last_dmn_floor, "client_dmn_floor"),
             (self.last_tom_acc, "client_tom_acc"),
             (self.last_lang_acc, "client_lang_acc"),
+            (self.dopamine_td, "client_dopa_td"),
         ):
             v = src.get(cid)
             if v is None:
@@ -753,11 +771,27 @@ class LocalColonyCompute:
                         r_imm = self._compute_immediate_reward(event)
                         # Phase 2 — подмешать intrinsic в immediate.
                         r_imm_total = r_imm + intrinsic_now
+                        # Phase 5d (NEOL): TD-модулятор η для reward_output.
+                        # td = β − EMA(β, α=0.01), mult = 1 + clip(td, ±0.5).
+                        # Если S2.E off (нет beta → td=0.0) → mult=1.0 (no-op).
+                        # Если HebbianController старой версии (без kwarg) —
+                        # TypeError → fallback на безмодуляторный вызов.
+                        td = self.dopamine_td.get(cid, 0.0)
+                        td_mult = 1.0 + max(-0.5, min(0.5, td))
                         try:
                             heb.update(logits,
                                        {"immediate": r_imm_total,
-                                        "medium": 0.0, "long": 0.0})
+                                        "medium": 0.0, "long": 0.0},
+                                       dopa_td_mult=td_mult)
                             self.hebbian_updates += 1
+                        except TypeError:
+                            try:
+                                heb.update(logits,
+                                           {"immediate": r_imm_total,
+                                            "medium": 0.0, "long": 0.0})
+                                self.hebbian_updates += 1
+                            except Exception as e:
+                                logger.debug("hebbian update %s: %s", cid, e)
                         except Exception as e:
                             logger.debug("hebbian update %s: %s", cid, e)
                         # Phase 6 — reward_var_ema по последним 10 r_imm.
@@ -1004,6 +1038,11 @@ class LocalColonyCompute:
                     raw = float(out[0, 0].item())
                     beta = 1.0 / (1.0 + math.exp(-raw)) / _PHI
                     self.last_beta_local[cid] = beta
+                    # Phase 5d (NEOL): TD = β − EMA(β, α=0.01). Один раз за тик,
+                    # rely on _compute_higher_tissues called once per cid per tick.
+                    prev_ema = self.dopamine_ema.get(cid, 0.0)
+                    self.dopamine_td[cid] = beta - prev_ema
+                    self.dopamine_ema[cid] = (1.0 - _EMA_ALPHA) * prev_ema + _EMA_ALPHA * beta
             except Exception as e:
                 logger.debug("dopamine forward %s: %s", cid, e)
         # S2.G — imagination: mult = 1 + sigmoid(out[0,0]) ∈ [1, 2].
