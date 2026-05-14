@@ -1221,3 +1221,61 @@ def test_diagnostics_higher_sfnn_enabled_pct(seed_file):
     orgs[2].genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=False)
     diag = compute.diagnostics()
     assert abs(diag["higher_sfnn"]["enabled_pct"] - 0.667) < 1e-3
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SFNN S3.activate (14.05.2026) — manual endpoint + set_higher_sfnn
+# ─────────────────────────────────────────────────────────────────────
+
+def test_s3_activate_default_genome_attached_off(seed_file):
+    """add_creature клеит genome.higher_tissue_sfnn_enabled=False по дефолту."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 1)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    org = compute.organisms["c1"]
+    assert hasattr(org, "genome")
+    assert org.genome.higher_tissue_sfnn_enabled is False
+
+
+def test_s3_activate_set_higher_sfnn_flips_existing(seed_file):
+    """set_higher_sfnn(True) переписывает флаг у всех существующих особей."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 3)
+    for i, o in enumerate(orgs):
+        compute.add_creature(f"c{i}", o, hebbian_enabled=True)
+    n = compute.set_higher_sfnn(True)
+    assert n == 3
+    for cid in ("c0", "c1", "c2"):
+        assert compute.organisms[cid].genome.higher_tissue_sfnn_enabled is True
+
+
+def test_s3_activate_default_propagates_to_new_creatures(seed_file):
+    """После set_higher_sfnn(True) новые особи из add_creature тоже True."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    compute.set_higher_sfnn(True)
+    orgs = load_founders(seed_file, 1)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
+
+
+def test_s3_activate_toggle_off_idempotent(seed_file):
+    """Повторный set_higher_sfnn(False) — n_changed=0 после первого вызова."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 2)
+    for i, o in enumerate(orgs):
+        compute.add_creature(f"c{i}", o, hebbian_enabled=True)
+    # дефолт = False, повторный False не меняет ничего
+    n1 = compute.set_higher_sfnn(False)
+    assert n1 == 0
+    n2 = compute.set_higher_sfnn(True)
+    assert n2 == 2
+    n3 = compute.set_higher_sfnn(True)
+    assert n3 == 0

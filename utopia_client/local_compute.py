@@ -17,6 +17,7 @@ import copy
 import logging
 import math
 import time
+import types
 from collections import deque
 from typing import Optional
 
@@ -268,6 +269,10 @@ class LocalColonyCompute:
         # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
         self.tick_ts: deque = deque(maxlen=200)
 
+        # SFNN S3.activate: дефолт higher_tissue_sfnn_enabled для новых особей.
+        # set_higher_sfnn() флипает поверх + применяет к existing organisms.
+        self._higher_sfnn_default: bool = False
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -282,6 +287,14 @@ class LocalColonyCompute:
         if hasattr(organism, "eval"):
             organism.eval()
         self.organisms[cid] = organism
+        # SFNN S3.activate: CompositeOrganism не несёт genome — приклеиваем
+        # SimpleNamespace с текущим дефолтом флага. set_higher_sfnn() позже
+        # переписывает атрибут у всех существующих особей.
+        if not hasattr(organism, "genome"):
+            organism.genome = types.SimpleNamespace(
+                higher_tissue_sfnn_enabled=self._higher_sfnn_default,
+                sfnn_enabled=False,
+            )
         self.action_selectors[cid] = ActionSelector()
         self.hebbian[cid] = self._make_hebbian(organism, hebbian_enabled,
                                                 learning_rate, trace_decay)
@@ -807,6 +820,35 @@ class LocalColonyCompute:
             "inherit_brain_y50 %s → %s (%s)",
             parent_cid, child_cid, ",".join(sorted(payload.keys())))
         return True
+
+    # ── SFNN S3.activate (14.05.2026) ─────────────────────────────────────
+
+    def set_higher_sfnn(self, on: bool) -> int:
+        """Включить/выключить higher_tissue_sfnn_enabled у всех owned особей.
+
+        Дефолт колонии обновляется → новые особи в `add_creature` родятся
+        с этим значением. Существующие — патчатся in-place через
+        `org.genome.higher_tissue_sfnn_enabled`. Возвращает число изменённых.
+        """
+        on = bool(on)
+        self._higher_sfnn_default = on
+        n_changed = 0
+        for cid, org in self.organisms.items():
+            if not hasattr(org, "genome"):
+                org.genome = types.SimpleNamespace(
+                    higher_tissue_sfnn_enabled=on,
+                    sfnn_enabled=False,
+                )
+                n_changed += 1
+                continue
+            prev = bool(getattr(org.genome,
+                                 "higher_tissue_sfnn_enabled", False))
+            if prev != on:
+                org.genome.higher_tissue_sfnn_enabled = on
+                n_changed += 1
+        logger.info("set_higher_sfnn(%s) — changed %d / %d organisms",
+                    on, n_changed, len(self.organisms))
+        return n_changed
 
     @property
     def n_alive(self) -> int:

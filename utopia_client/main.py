@@ -425,6 +425,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     last_diag_push = 0.0
     last_selfupdate_check = 0.0
     current_state = "idle"
+    # SFNN S3.activate: применённый флаг sfnn_higher из flags. None — ещё не
+    # видели команду, не трогаем дефолт compute. Сравниваем с поллом.
+    applied_sfnn_higher: bool | None = None
     bench = cfg.get("benchmark", {})
     ring = get_ring()
 
@@ -513,6 +516,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 world_cache = None
                                 logger.info("world feed stopped (run→idle)")
                         current_state = desired
+
+                    # SFNN S3.activate: применить sfnn_higher из flags.
+                    # Применяем независимо от desired state (флаг может
+                    # переключаться когда колония уже в run).
+                    flags = cmd.get("flags") or {}
+                    target_sfnn = bool(flags.get("sfnn_higher", False))
+                    if target_sfnn != applied_sfnn_higher and ws is not None \
+                            and ws.compute is not None:
+                        try:
+                            n = ws.compute.set_higher_sfnn(target_sfnn)
+                            applied_sfnn_higher = target_sfnn
+                            logger.info("sfnn_higher → %s (%d organisms)",
+                                        target_sfnn, n)
+                        except Exception as e:
+                            logger.warning("set_higher_sfnn failed: %s", e)
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
