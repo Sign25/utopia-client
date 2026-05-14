@@ -428,6 +428,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # SFNN S3.activate: применённый флаг sfnn_higher из flags. None — ещё не
     # видели команду, не трогаем дефолт compute. Сравниваем с поллом.
     applied_sfnn_higher: bool | None = None
+    # SFNN S3.activate-motor: то же для motor_policy ветки.
+    applied_sfnn_motor: bool | None = None
     bench = cfg.get("benchmark", {})
     ring = get_ring()
 
@@ -531,6 +533,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                                         target_sfnn, n)
                         except Exception as e:
                             logger.warning("set_higher_sfnn failed: %s", e)
+                    target_motor = bool(flags.get("sfnn_motor", False))
+                    if target_motor != applied_sfnn_motor and ws is not None \
+                            and ws.compute is not None:
+                        try:
+                            n = ws.compute.set_motor_sfnn(target_motor)
+                            applied_sfnn_motor = target_motor
+                            logger.info("sfnn_motor → %s (%d organisms)",
+                                        target_motor, n)
+                        except Exception as e:
+                            logger.warning("set_motor_sfnn failed: %s", e)
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:

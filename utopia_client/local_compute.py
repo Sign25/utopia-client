@@ -272,6 +272,9 @@ class LocalColonyCompute:
         # SFNN S3.activate: дефолт higher_tissue_sfnn_enabled для новых особей.
         # set_higher_sfnn() флипает поверх + применяет к existing organisms.
         self._higher_sfnn_default: bool = False
+        # SFNN S3.activate-motor: дефолт sfnn_enabled (motor_policy ветка)
+        # для новых особей. set_motor_sfnn() флипает поверх.
+        self._motor_sfnn_default: bool = False
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -293,7 +296,7 @@ class LocalColonyCompute:
         if not hasattr(organism, "genome"):
             organism.genome = types.SimpleNamespace(
                 higher_tissue_sfnn_enabled=self._higher_sfnn_default,
-                sfnn_enabled=False,
+                sfnn_enabled=self._motor_sfnn_default,
             )
         self.action_selectors[cid] = ActionSelector()
         self.hebbian[cid] = self._make_hebbian(organism, hebbian_enabled,
@@ -847,6 +850,33 @@ class LocalColonyCompute:
                 org.genome.higher_tissue_sfnn_enabled = on
                 n_changed += 1
         logger.info("set_higher_sfnn(%s) — changed %d / %d organisms",
+                    on, n_changed, len(self.organisms))
+        return n_changed
+
+    def set_motor_sfnn(self, on: bool) -> int:
+        """Включить/выключить motor sfnn_enabled у всех owned особей.
+
+        Зеркало `set_higher_sfnn` для motor_policy ветки. Дефолт колонии
+        обновляется → новые особи в `add_creature` родятся с этим значением.
+        Существующие — патчатся in-place через `org.genome.sfnn_enabled`.
+        Возвращает число изменённых.
+        """
+        on = bool(on)
+        self._motor_sfnn_default = on
+        n_changed = 0
+        for cid, org in self.organisms.items():
+            if not hasattr(org, "genome"):
+                org.genome = types.SimpleNamespace(
+                    higher_tissue_sfnn_enabled=self._higher_sfnn_default,
+                    sfnn_enabled=on,
+                )
+                n_changed += 1
+                continue
+            prev = bool(getattr(org.genome, "sfnn_enabled", False))
+            if prev != on:
+                org.genome.sfnn_enabled = on
+                n_changed += 1
+        logger.info("set_motor_sfnn(%s) — changed %d / %d organisms",
                     on, n_changed, len(self.organisms))
         return n_changed
 

@@ -1279,3 +1279,60 @@ def test_s3_activate_toggle_off_idempotent(seed_file):
     assert n2 == 2
     n3 = compute.set_higher_sfnn(True)
     assert n3 == 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SFNN S3.activate-motor (14.05.2026) — set_motor_sfnn для motor_policy
+# ─────────────────────────────────────────────────────────────────────
+
+def test_s3_activate_motor_default_off(seed_file):
+    """add_creature клеит genome.sfnn_enabled=False по дефолту."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 1)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    assert compute.organisms["c1"].genome.sfnn_enabled is False
+
+
+def test_s3_activate_motor_flips_existing(seed_file):
+    """set_motor_sfnn(True) переписывает sfnn_enabled у всех."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 3)
+    for i, o in enumerate(orgs):
+        compute.add_creature(f"c{i}", o, hebbian_enabled=True)
+    n = compute.set_motor_sfnn(True)
+    assert n == 3
+    for cid in ("c0", "c1", "c2"):
+        assert compute.organisms[cid].genome.sfnn_enabled is True
+
+
+def test_s3_activate_motor_propagates_to_new(seed_file):
+    """После set_motor_sfnn(True) новые особи рождаются с sfnn_enabled=True."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    compute.set_motor_sfnn(True)
+    orgs = load_founders(seed_file, 1)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    assert compute.organisms["c1"].genome.sfnn_enabled is True
+
+
+def test_s3_activate_motor_independent_of_higher(seed_file):
+    """sfnn_motor и sfnn_higher переключаются независимо."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 1)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    compute.set_higher_sfnn(True)
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
+    assert compute.organisms["c1"].genome.sfnn_enabled is False
+    compute.set_motor_sfnn(True)
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
+    assert compute.organisms["c1"].genome.sfnn_enabled is True
+    compute.set_higher_sfnn(False)
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is False
+    assert compute.organisms["c1"].genome.sfnn_enabled is True
