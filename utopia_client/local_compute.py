@@ -161,6 +161,11 @@ class LocalColonyCompute:
         # supervised: log_prob[a_t] · (r_imm_total - baseline), Adam lr=1e-4.
         self.motor_policy: dict = {}        # cid → Tissue (Phase 7)
         self.motor_policy_opt: dict = {}    # cid → torch.optim.Adam
+        # SFNN S1.1 (14.05.2026) — per-tissue SFNN-правило обучения для
+        # motor_policy. Под флагом genome.sfnn_enabled (дефолт False) сейчас
+        # только storage + наследование, фактическое применение в S1.2.
+        # Дефолтное правило (A=1, B=C=D=0, η=1e-3) эквивалентно Phase 5d Hebb.
+        self.motor_sfnn_rule: dict = {}     # cid → SFNNRule
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
         self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
@@ -260,6 +265,11 @@ class LocalColonyCompute:
             self.motor_policy[cid] = motor
             self.motor_policy_opt[cid] = self._torch.optim.Adam(
                 motor.parameters(), lr=_MOTOR_POLICY_LR)
+            # SFNN S1.1: дефолтное правило (Phase 5d-эквивалент). Используется
+            # только при genome.sfnn_enabled=True (S1.2+); в S1.1 — storage
+            # + наследование через Y50.
+            from core.sfnn_rule import SFNNRule
+            self.motor_sfnn_rule[cid] = SFNNRule.default()
         # S2.B (13.05.2026) — theory_of_mind: Tissue 21/3/1 data_dim=52 + Adam.
         tom = self._make_higher_tissue("theory_of_mind", data_dim=_TOM_DATA_DIM)
         if tom is not None:
@@ -312,6 +322,7 @@ class LocalColonyCompute:
         # Phase 7 — motor_policy.
         self.motor_policy.pop(cid, None)
         self.motor_policy_opt.pop(cid, None)
+        self.motor_sfnn_rule.pop(cid, None)
         self.pending_log_prob.pop(cid, None)
         self.pending_action.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
@@ -358,6 +369,18 @@ class LocalColonyCompute:
                 sel.load_state_dict(sel_sd)
             except Exception as e:
                 logger.warning("apply_inherited_state %s selector: %s", cid, e)
+        # SFNN S1.1: motor_sfnn_rule — наследуем правило родителя, мутируем
+        # для diversity (σ=0.1). Если правила в payload нет — оставляем
+        # дефолтное, созданное в add_creature.
+        rule_d = payload.get("motor_sfnn_rule")
+        if rule_d is not None and self.motor_sfnn_rule.get(cid) is not None:
+            try:
+                from core.sfnn_rule import SFNNRule
+                parent_rule = SFNNRule.from_dict(rule_d)
+                self.motor_sfnn_rule[cid] = parent_rule.mutate(sigma=0.1)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s motor_sfnn_rule: %s",
+                                cid, e)
         # Phase 1 — Y50 наследование predictor от родителя.
         pred_sd = payload.get("predictor")
         if pred_sd is not None and self.predictor.get(cid) is not None:
@@ -471,6 +494,12 @@ class LocalColonyCompute:
                 brain["selector"] = sel.state_dict()
             except Exception as e:
                 logger.debug("extract_brain_state_dicts selector: %s", e)
+        sfnn_rule = self.motor_sfnn_rule.get(cid)
+        if sfnn_rule is not None and hasattr(sfnn_rule, "to_dict"):
+            try:
+                brain["motor_sfnn_rule"] = sfnn_rule.to_dict()
+            except Exception as e:
+                logger.debug("extract_brain_state_dicts motor_sfnn_rule: %s", e)
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
@@ -544,6 +573,12 @@ class LocalColonyCompute:
                 payload["selector"] = parent_sel.state_dict()
             except Exception as e:
                 logger.debug("inherit_brain_y50 parent selector: %s", e)
+        parent_rule = self.motor_sfnn_rule.get(parent_cid)
+        if parent_rule is not None and hasattr(parent_rule, "to_dict"):
+            try:
+                payload["motor_sfnn_rule"] = parent_rule.to_dict()
+            except Exception as e:
+                logger.debug("inherit_brain_y50 parent motor_sfnn_rule: %s", e)
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
@@ -848,6 +883,13 @@ class LocalColonyCompute:
                 payload["selector"] = sel.state_dict()
             except Exception as e:
                 logger.debug("save_state %s selector: %s", cid, e)
+        # SFNN S1.1: motor_sfnn_rule в seed_pack для reconnect.
+        sfnn_rule = self.motor_sfnn_rule.get(cid)
+        if sfnn_rule is not None and hasattr(sfnn_rule, "to_dict"):
+            try:
+                payload["motor_sfnn_rule"] = sfnn_rule.to_dict()
+            except Exception as e:
+                logger.debug("save_state %s motor_sfnn_rule: %s", cid, e)
         # Phase 1 — predictor + EMA. Формат идентичен P40 _save_member_pt.
         pred = self.predictor.get(cid)
         if pred is not None:

@@ -327,3 +327,85 @@ def test_extract_brain_state_dicts_includes_selector(seed_file):
     sd = brain["selector"]
     assert "action_bias" in sd
     assert max(abs(v) for v in sd["action_bias"]) > 0.05
+
+
+# ── 8. SFNN S1.1: motor_sfnn_rule storage + наследование ────────────
+
+
+def test_add_creature_initializes_default_sfnn_rule(seed_file):
+    """Каждая особь с motor_policy получает дефолтное SFNN-правило (Phase 5d-эквивалент)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from core.sfnn_rule import SYNAPSE_TYPES
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    rule = compute.motor_sfnn_rule.get("m1")
+    assert rule is not None, "motor_sfnn_rule не создан в add_creature"
+    assert set(rule.coeffs.keys()) == set(SYNAPSE_TYPES)
+    # Дефолт = Phase 5d (A=1, B=C=D=0, η=1e-3).
+    for c in rule.coeffs.values():
+        assert c.eta == 1e-3
+        assert c.A == 1.0
+        assert c.B == 0.0
+        assert c.C == 0.0
+        assert c.D == 0.0
+
+
+def test_remove_creature_clears_sfnn_rule(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    assert "m1" in compute.motor_sfnn_rule
+    compute.remove_creature("m1")
+    assert "m1" not in compute.motor_sfnn_rule
+
+
+def test_extract_brain_state_dicts_includes_motor_sfnn_rule(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from core.sfnn_rule import SYNAPSE_TYPES
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    # Подкрутим коэффициенты у parent, чтобы было видно что наследуется
+    # именно его значение, а не дефолт.
+    compute.motor_sfnn_rule["m1"].coeffs["input_proj"].A = 0.5
+    compute.motor_sfnn_rule["m1"].coeffs["mlp_fc1"].eta = 5e-3
+    brain, _ = compute.extract_brain_state_dicts("m1")
+    assert "motor_sfnn_rule" in brain
+    rd = brain["motor_sfnn_rule"]
+    assert set(rd.keys()) == set(SYNAPSE_TYPES)
+    assert rd["input_proj"]["A"] == 0.5
+    assert rd["mlp_fc1"]["eta"] == 5e-3
+
+
+def test_inherit_brain_y50_carries_sfnn_rule_with_noise(seed_file):
+    """Дочернее правило = parent.mutate(σ=0.1): коэффициенты близкие, но
+    не идентичные (есть Y50-шум)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    parents = load_founders(seed_file, 2)
+    compute = LocalColonyCompute(device="cpu")
+    compute.add_creature("parent", parents[0], hebbian_enabled=True)
+    compute.add_creature("child", parents[1], hebbian_enabled=True)
+    # Сдвинем parent rule подальше от дефолта, чтобы наследование было видно.
+    p_rule = compute.motor_sfnn_rule["parent"]
+    for c in p_rule.coeffs.values():
+        c.eta = 5e-3
+        c.A = 0.5
+        c.B = 0.2
+    # До inherit child = default.
+    assert compute.motor_sfnn_rule["child"].coeffs["input_proj"].A == 1.0
+    # Inherit.
+    assert compute.inherit_brain_y50("parent", "child") is True
+    child_rule = compute.motor_sfnn_rule["child"]
+    # Child.coeff близок к parent (mutate σ=0.1, в среднем ±10%), но не равен дефолту.
+    for c in child_rule.coeffs.values():
+        # eta в окрестности 5e-3 (parent), не 1e-3 (default).
+        assert abs(c.eta - 5e-3) < 4e-3
+        # A в окрестности 0.5, не 1.0.
+        assert abs(c.A - 0.5) < 0.4
+        assert c.A != 1.0  # не дефолт
