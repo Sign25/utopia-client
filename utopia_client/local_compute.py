@@ -1570,6 +1570,7 @@ class LocalColonyCompute:
           - learning_genes — lr_oja, lr_reward, trace_decay, % hebbian_enabled
           - phase4 — specialization_avg по ролям тканей (Hebbian attribution)
         """
+        from core.action_selector import N_ACTIONS
         n = len(self.organisms)
         # client_tps — handle_tick rate (общий, не per-cid).
         client_tps = 0.0
@@ -1598,7 +1599,7 @@ class LocalColonyCompute:
                 "s2_tom_acc_avg": 0.0,
                 "s2_lang_acc_avg": 0.0,
                 "s2_dopa_td_avg": 0.0,
-                "s2_action_dist_avg": [0.0] * 16,
+                "s2_action_dist_avg": [0.0] * N_ACTIONS,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "tom_steps_total": int(self.tom_steps),
@@ -1720,22 +1721,19 @@ class LocalColonyCompute:
         td_vals = list(self.dopamine_td.values())
         s2_dopa_td_avg = (round(sum(td_vals) / len(td_vals), 6)
                            if td_vals else 0.0)
-        # 14.05.2026: per-creature action distribution + colony-avg для диагностики
-        # коллапса action-space (GATHER/EAT не выбираются → food_eaten=0).
-        action_dist_sum = [0.0] * 16
-        n_sel = 0
-        for sel in self.action_selectors.values():
-            try:
-                st = sel.get_stats()
-                ad = st.get("action_distribution", []) or []
-                for i, v in enumerate(ad[:16]):
-                    action_dist_sum[i] += float(v)
-                n_sel += 1
-            except Exception:
-                continue
-        s2_action_dist_avg = (
-            [round(v / n_sel, 4) for v in action_dist_sum] if n_sel > 0 else [0.0] * 16
-        )
+        action_dists: dict[str, list[float]] = {}
+        for cid, sel in self.action_selectors.items():
+            ad = sel.get_stats()["action_distribution"]
+            action_dists[cid] = [round(float(v), 4) for v in ad]
+        if action_dists:
+            sums = [0.0] * N_ACTIONS
+            for dist in action_dists.values():
+                for i, v in enumerate(dist):
+                    sums[i] += v
+            n_sel = len(action_dists)
+            s2_action_dist_avg = [round(v / n_sel, 4) for v in sums]
+        else:
+            s2_action_dist_avg = [0.0] * N_ACTIONS
 
         return {
             "n_alive": n,
@@ -1782,25 +1780,21 @@ class LocalColonyCompute:
             "lang_steps_total": int(self.lang_steps),
             "s2_dopa_td_avg": s2_dopa_td_avg,
             "s2_action_dist_avg": s2_action_dist_avg,
-            "creatures": self._per_creature_stats(),
+            "creatures": self._per_creature_stats(action_dists=action_dists),
         }
 
-    def _per_creature_stats(self) -> list[dict]:
+    def _per_creature_stats(
+        self,
+        action_dists: dict[str, list[float]] | None = None,
+    ) -> list[dict]:
         """Per-organism breakdown — что клиент знает о каждой живой особи.
 
         Без position/clan_id/role/diet (это от P40 через colony reporter).
         Размер: ~21 особь × ~200 байт ≈ 4 КБ.
         """
-        def _action_dist_for(cid: str) -> list[float]:
-            sel = self.action_selectors.get(cid)
-            if sel is None:
-                return [0.0] * 16
-            try:
-                ad = sel.get_stats().get("action_distribution", []) or []
-                return [round(float(v), 4) for v in ad[:16]] + [0.0] * max(0, 16 - len(ad))
-            except Exception:
-                return [0.0] * 16
-
+        from core.action_selector import N_ACTIONS
+        action_dists = action_dists or {}
+        empty_dist = [0.0] * N_ACTIONS
         out: list[dict] = []
         for cid, org in self.organisms.items():
             tissues = getattr(org, "tissues", None) or {}
@@ -1887,6 +1881,6 @@ class LocalColonyCompute:
                     float(self.last_lang_acc.get(cid, 0.0)), 4),
                 "client_dopa_td": round(
                     float(self.dopamine_td.get(cid, 0.0)), 6),
-                "client_action_dist": _action_dist_for(cid),
+                "client_action_dist": action_dists.get(cid, empty_dist),
             })
         return out
