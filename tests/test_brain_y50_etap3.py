@@ -636,3 +636,107 @@ def test_save_state_carries_higher_tissue_sfnn_rules(seed_file):
         # 6 типов синапсов, дефолтные коэф.
         assert dumped[t]["input_proj"]["A"] == 1.0
         assert dumped[t]["input_proj"]["eta"] == 1e-3
+
+
+# ── SFNN S3.1 (14.05.2026) — активация dopamine ───────────────────────────
+
+
+def test_s3_1_dopamine_hooks_registered_on_add_creature(seed_file):
+    """add_creature регистрирует 6 forward-hooks на dopamine Tissue."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    handles = compute.higher_tissue_sfnn_hook_handles["dopamine"].get("d1")
+    assert handles is not None
+    # 6 Linear модулей Tissue 21/3/1 = 6 хуков.
+    assert len(handles) == 6
+    # Для остальных 6 тканей хуки в S3.1 НЕ регистрируются.
+    for t in ("imagination", "planner", "insula",
+              "default_mode", "theory_of_mind", "language"):
+        assert "d1" not in compute.higher_tissue_sfnn_hook_handles[t], t
+
+
+def test_s3_1_dopamine_hooks_capture_pre_post_on_forward(seed_file):
+    """После forward dopamine — higher_tissue_sfnn_acts заполнен 6 парами."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    obs = torch.zeros(1, 64)
+    compute._compute_higher_tissues("d1", obs, intero_tensor=None)
+    acts = compute.higher_tissue_sfnn_acts["dopamine"]["d1"]
+    assert len(acts) == 6
+    for syn, (pre, post) in acts.items():
+        assert pre.dim() == 1, syn
+        assert post.dim() == 1, syn
+
+
+def test_s3_1_dopamine_hooks_removed_on_remove_creature(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    compute.remove_creature("d1")
+    assert "d1" not in compute.higher_tissue_sfnn_hook_handles["dopamine"]
+    assert "d1" not in compute.higher_tissue_sfnn_acts["dopamine"]
+
+
+def test_s3_1_higher_tissue_sfnn_update_step_changes_weights(seed_file):
+    """update_step реально обновляет веса dopamine Tissue (после forward)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    # Forward dopamine → активации лежат в acts.
+    obs = torch.randn(1, 64)
+    compute._compute_higher_tissues("d1", obs, intero_tensor=None)
+    # Усилим η чтобы дельта была заметной за один шаг.
+    rule = compute.higher_tissue_sfnn_rule["dopamine"]["d1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    # Снимок весов до апдейта.
+    tissue = compute.dopamine["d1"]
+    w_before = {n: p.detach().clone()
+                 for n, p in tissue.named_parameters()
+                 if p.dim() == 2}
+    steps_before = compute.higher_tissue_sfnn_steps["dopamine"]
+    compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+    # Хотя бы один вес изменился.
+    changed = False
+    for n, p in tissue.named_parameters():
+        if p.dim() == 2 and not torch.equal(w_before[n], p.detach()):
+            changed = True
+            break
+    assert changed, "ни один weight dopamine не изменился"
+    assert compute.higher_tissue_sfnn_steps["dopamine"] == steps_before + 1
+
+
+def test_s3_1_update_step_noop_without_acts(seed_file):
+    """Без forward (нет acts) update_step не падает и не считает шаг."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    # acts пуст — forward не вызывали.
+    steps_before = compute.higher_tissue_sfnn_steps["dopamine"]
+    compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+    assert compute.higher_tissue_sfnn_steps["dopamine"] == steps_before
+
+
+def test_s3_1_update_step_noop_for_unknown_tissue(seed_file):
+    """Защита от опечатки в имени ткани — no-op, не KeyError."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    compute._higher_tissue_sfnn_update_step("nonexistent", "d1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("dopamine", "unknown_cid", r=0.0)

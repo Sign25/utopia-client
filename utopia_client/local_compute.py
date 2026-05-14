@@ -201,6 +201,16 @@ class LocalColonyCompute:
         self.higher_tissue_sfnn_steps: dict[str, int] = {
             t: 0 for t in _HIGHER_SFNN_TISSUES
         }
+        # SFNN S3.1 (14.05.2026) — forward-hooks pre/post активаций 6 Linear
+        # для каждой из 7 высших тканей. Регистрируются в add_creature только
+        # для активных-в-S3.x тканей; cleanup в remove_creature. Per tissue:
+        # {cid → list[hook handle]} и {cid → {synapse_type → (pre, post)}}.
+        self.higher_tissue_sfnn_hook_handles: dict[str, dict] = {
+            t: {} for t in _HIGHER_SFNN_TISSUES
+        }
+        self.higher_tissue_sfnn_acts: dict[str, dict] = {
+            t: {} for t in _HIGHER_SFNN_TISSUES
+        }
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
         self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
@@ -348,6 +358,17 @@ class LocalColonyCompute:
                     self.higher_tissue_sfnn_rule[_name][cid] = SFNNRule.default()
         except Exception as e:
             logger.debug("add_creature %s higher_tissue_sfnn_rule init: %s", cid, e)
+        # SFNN S3.1 (14.05.2026): hooks для dopamine — первой активной высшей
+        # ткани под флагом higher_tissue_sfnn_enabled. Остальные 6 тканей —
+        # подключаются в S3.2+. Hooks дёшевы и регистрируются всегда (при
+        # выключенном флаге активации просто перезаписываются).
+        if self.dopamine.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "dopamine", cid, self.dopamine[cid])
+            except Exception as e:
+                logger.debug("add_creature %s dopamine sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -410,6 +431,17 @@ class LocalColonyCompute:
         # SFNN S3.0: вычистить правила высших тканей.
         for _t in _HIGHER_SFNN_TISSUES:
             self.higher_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
+        # SFNN S3.1: снять forward-hooks и забыть кешированные активации
+        # всех зарегистрированных в S3.x тканей. Пока активна dopamine;
+        # cleanup для остальных no-op до S3.2+.
+        for _t in _HIGHER_SFNN_TISSUES:
+            for h in (self.higher_tissue_sfnn_hook_handles.get(_t, {})
+                      .pop(cid, []) or []):
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            self.higher_tissue_sfnn_acts.get(_t, {}).pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -918,6 +950,19 @@ class LocalColonyCompute:
                         except Exception:
                             intero_tensor = None
                 self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
+
+                # SFNN S3.1 (14.05.2026): локальное правило пластичности
+                # для dopamine под флагом genome.higher_tissue_sfnn_enabled.
+                # r=0.0 — чистая Hebb, без reward-модуляции (см. S3 решение).
+                # Forward dopamine произошёл строкой выше → hooks обновили
+                # higher_tissue_sfnn_acts["dopamine"][cid]. update_step
+                # читает их и в одном шаге применяет ΔW.
+                higher_sfnn_on = bool(getattr(
+                    getattr(org, "genome", None),
+                    "higher_tissue_sfnn_enabled", False))
+                if higher_sfnn_on:
+                    self._higher_tissue_sfnn_update_step(
+                        "dopamine", cid, r=0.0)
 
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
@@ -1759,6 +1804,142 @@ class LocalColonyCompute:
             self.motor_sfnn_steps += 1
         except Exception as e:
             logger.debug("motor_sfnn_update %s: %s", cid, e)
+
+    def _register_higher_tissue_sfnn_hooks(self, tissue_name: str,
+                                              cid: str, tissue) -> None:
+        """SFNN S3.1: forward-hooks pre/post активаций 6 Linear высшей ткани.
+
+        Структура Tissue 21/3/1 одинакова у motor_policy и всех 7 высших
+        тканей — поэтому переиспользуем `_MOTOR_SFNN_SYNAPSE_MAP`.
+
+        Hooks записывают (pre, post) в
+        `self.higher_tissue_sfnn_acts[tissue_name][cid][synapse_type]`.
+        Цикл апдейта на следующем тике использует эти активации.
+
+        Регистрируется на лету в add_creature только для активных-в-S3.x
+        тканей; снимается при remove_creature. Hooks дёшевы и всегда
+        включены — даже при higher_tissue_sfnn_enabled=False активации
+        перезаписываются, но не читаются.
+        """
+        if tissue is None:
+            return
+        self.higher_tissue_sfnn_acts[tissue_name][cid] = {}
+        handles: list = []
+        for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
+            mod = None
+            for n, m in tissue.named_modules():
+                if n.endswith(module_name):
+                    mod = m
+                    break
+            if mod is None:
+                logger.debug("higher_sfnn hook: module %s not found %s/%s",
+                              module_name, tissue_name, cid)
+                continue
+
+            def _make_hook(_tissue: str, _cid: str, _syn: str):
+                def hook(_module, _input, _output):
+                    try:
+                        pre_t = (_input[0] if isinstance(_input, tuple)
+                                 else _input)
+                        pre = pre_t.detach().reshape(
+                            -1, pre_t.shape[-1]).mean(dim=0)
+                        post = _output.detach().reshape(
+                            -1, _output.shape[-1]).mean(dim=0)
+                        acts = self.higher_tissue_sfnn_acts[_tissue].get(_cid)
+                        if acts is not None:
+                            acts[_syn] = (pre, post)
+                    except Exception:
+                        pass
+                return hook
+
+            try:
+                h = mod.register_forward_hook(
+                    _make_hook(tissue_name, cid, synapse_type))
+                handles.append(h)
+            except Exception as e:
+                logger.debug("higher_sfnn hook %s/%s register: %s",
+                              tissue_name, synapse_type, e)
+        self.higher_tissue_sfnn_hook_handles[tissue_name][cid] = handles
+
+    def _higher_tissue_sfnn_update_step(self, tissue_name: str,
+                                          cid: str,
+                                          r: float = 0.0) -> None:
+        """SFNN S3.1 (14.05.2026): локальное правило пластичности для одной
+        высшей ткани под флагом `genome.higher_tissue_sfnn_enabled=True`.
+
+        Идентично `_motor_sfnn_update_step`, кроме reward-модуляции:
+        в S3.1 для всех 7 тканей r=0.0 (чистая Hebb без модуляции).
+        Поэтому reward_gain = 1.0, и формула вырождается в
+            ΔW = η · (A·outer(post, pre) + B·post + C·pre + D)
+            ΔW ← clip(ΔW, ±0.01)
+            W  ← W + ΔW
+
+        pre/post захватываются forward-hooks при предыдущем
+        `_compute_higher_tissues` (если ткань активна — был forward,
+        активации обновились). Если активаций нет (первый тик /
+        ткани нет / hook не зарегистрирован) — обновление пропускается.
+        """
+        rule_store = self.higher_tissue_sfnn_rule.get(tissue_name)
+        if rule_store is None:
+            return
+        rule = rule_store.get(cid)
+        if rule is None:
+            return
+        tissue_store = getattr(self, tissue_name, None)
+        if tissue_store is None:
+            return
+        tissue = tissue_store.get(cid)
+        if tissue is None:
+            return
+        acts = self.higher_tissue_sfnn_acts.get(tissue_name, {}).get(cid)
+        if not acts:
+            return
+        torch = self._torch
+        try:
+            reward_gain = 1.0 + float(r)
+            clip_val = self._MOTOR_SFNN_DW_CLIP
+            with torch.no_grad():
+                params = dict(tissue.named_parameters())
+                for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
+                    if synapse_type not in acts:
+                        continue
+                    p_name = None
+                    for n in params:
+                        if n.endswith(module_name + ".weight"):
+                            p_name = n
+                            break
+                    if p_name is None:
+                        continue
+                    W = params[p_name]
+                    pre, post = acts[synapse_type]
+                    if W.dim() != 2:
+                        continue
+                    if (pre.shape[0] != W.shape[1]
+                            or post.shape[0] != W.shape[0]):
+                        continue
+                    coef = rule.coeffs.get(synapse_type)
+                    if coef is None:
+                        continue
+                    eta = float(coef.eta)
+                    A = float(coef.A)
+                    B = float(coef.B)
+                    C = float(coef.C)
+                    D = float(coef.D)
+                    dW = A * torch.outer(post, pre)
+                    if B != 0.0:
+                        dW = dW + B * post.unsqueeze(1).expand_as(W)
+                    if C != 0.0:
+                        dW = dW + C * pre.unsqueeze(0).expand_as(W)
+                    if D != 0.0:
+                        dW = dW + D
+                    dW = dW * (eta * reward_gain)
+                    dW.clamp_(-clip_val, clip_val)
+                    W.data.add_(dW)
+            self.higher_tissue_sfnn_steps[tissue_name] = (
+                self.higher_tissue_sfnn_steps.get(tissue_name, 0) + 1)
+        except Exception as e:
+            logger.debug("higher_sfnn_update %s/%s: %s",
+                          tissue_name, cid, e)
 
     def _predictor_train_step(self, cid: str, obs_tensor) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
