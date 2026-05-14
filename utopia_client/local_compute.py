@@ -1598,6 +1598,7 @@ class LocalColonyCompute:
                 "s2_tom_acc_avg": 0.0,
                 "s2_lang_acc_avg": 0.0,
                 "s2_dopa_td_avg": 0.0,
+                "s2_action_dist_avg": [0.0] * 16,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "tom_steps_total": int(self.tom_steps),
@@ -1719,6 +1720,22 @@ class LocalColonyCompute:
         td_vals = list(self.dopamine_td.values())
         s2_dopa_td_avg = (round(sum(td_vals) / len(td_vals), 6)
                            if td_vals else 0.0)
+        # 14.05.2026: per-creature action distribution + colony-avg для диагностики
+        # коллапса action-space (GATHER/EAT не выбираются → food_eaten=0).
+        action_dist_sum = [0.0] * 16
+        n_sel = 0
+        for sel in self.action_selectors.values():
+            try:
+                st = sel.get_stats()
+                ad = st.get("action_distribution", []) or []
+                for i, v in enumerate(ad[:16]):
+                    action_dist_sum[i] += float(v)
+                n_sel += 1
+            except Exception:
+                continue
+        s2_action_dist_avg = (
+            [round(v / n_sel, 4) for v in action_dist_sum] if n_sel > 0 else [0.0] * 16
+        )
 
         return {
             "n_alive": n,
@@ -1764,6 +1781,7 @@ class LocalColonyCompute:
             "s2_lang_acc_avg": s2_lang_avg,
             "lang_steps_total": int(self.lang_steps),
             "s2_dopa_td_avg": s2_dopa_td_avg,
+            "s2_action_dist_avg": s2_action_dist_avg,
             "creatures": self._per_creature_stats(),
         }
 
@@ -1773,6 +1791,16 @@ class LocalColonyCompute:
         Без position/clan_id/role/diet (это от P40 через colony reporter).
         Размер: ~21 особь × ~200 байт ≈ 4 КБ.
         """
+        def _action_dist_for(cid: str) -> list[float]:
+            sel = self.action_selectors.get(cid)
+            if sel is None:
+                return [0.0] * 16
+            try:
+                ad = sel.get_stats().get("action_distribution", []) or []
+                return [round(float(v), 4) for v in ad[:16]] + [0.0] * max(0, 16 - len(ad))
+            except Exception:
+                return [0.0] * 16
+
         out: list[dict] = []
         for cid, org in self.organisms.items():
             tissues = getattr(org, "tissues", None) or {}
@@ -1859,5 +1887,6 @@ class LocalColonyCompute:
                     float(self.last_lang_acc.get(cid, 0.0)), 4),
                 "client_dopa_td": round(
                     float(self.dopamine_td.get(cid, 0.0)), 6),
+                "client_action_dist": _action_dist_for(cid),
             })
         return out
