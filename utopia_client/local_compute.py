@@ -465,6 +465,12 @@ class LocalColonyCompute:
                 brain["predictor"] = pred.state_dict()
             except Exception as e:
                 logger.debug("extract_brain_state_dicts predictor: %s", e)
+        sel = self.action_selectors.get(cid)
+        if sel is not None and hasattr(sel, "state_dict"):
+            try:
+                brain["selector"] = sel.state_dict()
+            except Exception as e:
+                logger.debug("extract_brain_state_dicts selector: %s", e)
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
@@ -532,6 +538,12 @@ class LocalColonyCompute:
                     self.last_lang_acc.get(parent_cid, 0.0))
             except Exception as e:
                 logger.debug("inherit_brain_y50 parent predictor: %s", e)
+        parent_sel = self.action_selectors.get(parent_cid)
+        if parent_sel is not None and hasattr(parent_sel, "state_dict"):
+            try:
+                payload["selector"] = parent_sel.state_dict()
+            except Exception as e:
+                logger.debug("inherit_brain_y50 parent selector: %s", e)
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),

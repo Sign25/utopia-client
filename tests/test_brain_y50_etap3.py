@@ -270,3 +270,60 @@ def test_inherit_brain_y50_unknown_cids(seed_file):
     assert compute.inherit_brain_y50("m1", "ghost") is False
     # parent == child:
     assert compute.inherit_brain_y50("m1", "m1") is False
+
+
+# ── 7. selector наследуется через inherit_brain_y50 ─────────────────
+
+
+def test_inherit_brain_y50_carries_selector_bias(seed_file):
+    """SFNN-стиль reward-modulated bias на ActionSelector должен наследоваться
+    через Y50 рядом с predictor/dopamine/.../selector apply уже есть в
+    apply_inherited_state, но extract/inherit раньше не клали selector в
+    payload → child стартовал с нулевым bias.
+    """
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    parents = load_founders(seed_file, 2)
+    compute = LocalColonyCompute(device="cpu")
+    compute.add_creature("parent", parents[0], hebbian_enabled=True)
+    compute.add_creature("child", parents[1], hebbian_enabled=True)
+    # Накопить ярко выраженный bias у parent.
+    sel_parent = compute.action_selectors["parent"]
+    for _ in range(30):
+        sel_parent.reinforce(1.0, action_idx=8)  # SHARE
+        sel_parent.reinforce(-0.5, action_idx=5)  # ATK
+    parent_bias = sel_parent._action_bias.clone()
+    assert float(parent_bias.abs().max().item()) > 0.1
+    # До inherit — у child нулевой bias.
+    sel_child = compute.action_selectors["child"]
+    assert float(sel_child._action_bias.abs().max().item()) == 0.0
+    # Y50 наследование.
+    assert compute.inherit_brain_y50("parent", "child") is True
+    # После inherit — child получил bias parent'а.
+    inherited_max = float(sel_child._action_bias.abs().max().item())
+    assert inherited_max > 0.1, (
+        f"selector bias не передался: child_max={inherited_max}, "
+        f"parent_max={float(parent_bias.abs().max().item())}"
+    )
+    # Достаточная близость к parent (load_state_dict без Y50-шума для bias).
+    diff = (sel_child._action_bias - parent_bias).abs().max().item()
+    assert diff < 1e-5, f"bias child != bias parent: max_diff={diff}"
+
+
+def test_extract_brain_state_dicts_includes_selector(seed_file):
+    """`extract_brain_state_dicts` должен класть selector в payload рядом с
+    predictor — иначе asexual envelope (P40-mediated reproduce) не передаст
+    bias ребёнку."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    sel = compute.action_selectors["m1"]
+    for _ in range(20):
+        sel.reinforce(0.5, action_idx=14)  # EAT
+    brain, _ = compute.extract_brain_state_dicts("m1")
+    assert "selector" in brain
+    sd = brain["selector"]
+    assert "action_bias" in sd
+    assert max(abs(v) for v in sd["action_bias"]) > 0.05
