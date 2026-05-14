@@ -1851,5 +1851,7 @@ class LocalColonyCompute:
                     float(self.last_tom_acc.get(cid, 0.0)), 4),
                 "client_lang_acc": round(
                     float(self.last_lang_acc.get(cid, 0.0)), 4),
+                "client_dopa_td": round(
+                    float(self.dopamine_td.get(cid, 0.0)), 6),
             })
         return out
