@@ -2269,6 +2269,15 @@ class LocalColonyCompute:
                 "motor_sfnn_eta_avg": 0.0,
                 "motor_sfnn_A_avg": 0.0,
                 "motor_sfnn_enabled_pct": 0.0,
+                # SFNN S3.diag (14.05.2026): per-tissue для 7 высших.
+                "higher_sfnn": {
+                    "enabled_pct": 0.0,
+                    **{t: {"steps_total": int(
+                                self.higher_tissue_sfnn_steps.get(t, 0)),
+                             "eta_avg": 0.0,
+                             "A_avg": 0.0}
+                       for t in _HIGHER_SFNN_TISSUES},
+                },
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
             }
@@ -2434,6 +2443,39 @@ class LocalColonyCompute:
                               if sfnn_As else 0.0)
         motor_sfnn_enabled_pct = round(sfnn_enabled_n / max(1, n), 3)
 
+        # SFNN S3.diag (14.05.2026): per-tissue агрегация для 7 высших.
+        # Те же 3 метрики что у motor_sfnn (steps/eta_avg/A_avg), но bucketed
+        # по 7 типам тканей. enabled_pct — единый флаг для всех 7.
+        higher_sfnn_enabled_n = 0
+        for c in self.organisms:
+            org_c = self.organisms.get(c)
+            if bool(getattr(getattr(org_c, "genome", None),
+                              "higher_tissue_sfnn_enabled", False)):
+                higher_sfnn_enabled_n += 1
+        higher_sfnn_per_tissue: dict[str, dict] = {}
+        for t in _HIGHER_SFNN_TISSUES:
+            etas: list[float] = []
+            As: list[float] = []
+            for rule in self.higher_tissue_sfnn_rule.get(t, {}).values():
+                if rule is None:
+                    continue
+                try:
+                    etas.append(float(rule.mean_eta()))
+                    As.append(float(rule.mean_A()))
+                except Exception:
+                    continue
+            higher_sfnn_per_tissue[t] = {
+                "steps_total": int(self.higher_tissue_sfnn_steps.get(t, 0)),
+                "eta_avg": (round(sum(etas) / len(etas), 6)
+                              if etas else 0.0),
+                "A_avg": (round(sum(As) / len(As), 4)
+                            if As else 0.0),
+            }
+        higher_sfnn_block: dict = {
+            "enabled_pct": round(higher_sfnn_enabled_n / max(1, n), 3),
+            **higher_sfnn_per_tissue,
+        }
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -2477,6 +2519,8 @@ class LocalColonyCompute:
             "motor_sfnn_eta_avg": motor_sfnn_eta_avg,
             "motor_sfnn_A_avg": motor_sfnn_A_avg,
             "motor_sfnn_enabled_pct": motor_sfnn_enabled_pct,
+            # SFNN S3.diag (14.05.2026): per-tissue для 7 высших тканей.
+            "higher_sfnn": higher_sfnn_block,
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,

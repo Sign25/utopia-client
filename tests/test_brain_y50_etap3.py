@@ -1151,3 +1151,73 @@ def test_s3_7_lang_adam_skipped_under_sfnn_flag(seed_file):
     compute._compute_language("lg1", {"damage_taken": 1.0})
     assert compute.lang_steps == 0
     assert compute.last_lang_acc.get("lg1", 0.0) == 0.0
+
+
+# ── SFNN S3.diag (14.05.2026) — per-tissue диагностика ─────────────────────
+
+
+def test_diagnostics_higher_sfnn_empty_when_no_creatures(seed_file):
+    """Без особей блок higher_sfnn присутствует с нулями для всех 7 тканей."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    diag = compute.diagnostics()
+    assert "higher_sfnn" in diag
+    block = diag["higher_sfnn"]
+    assert block["enabled_pct"] == 0.0
+    for t in ("dopamine", "imagination", "planner", "insula",
+                "default_mode", "theory_of_mind", "language"):
+        assert t in block, t
+        assert block[t]["steps_total"] == 0
+        assert block[t]["eta_avg"] == 0.0
+        assert block[t]["A_avg"] == 0.0
+
+
+def test_diagnostics_higher_sfnn_aggregates_per_tissue(seed_file):
+    """С 2 особями: средние η/A агрегируются, steps_total отражают счётчики."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 2)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    compute.add_creature("c2", orgs[1], hebbian_enabled=True)
+    # Сдвинем dopamine у двух особей: η=0.005, A=0.5 у первой и
+    # η=0.001, A=0.8 у второй → eta_avg=0.003, A_avg=0.65.
+    r1 = compute.higher_tissue_sfnn_rule["dopamine"]["c1"]
+    for c in r1.coeffs.values():
+        c.eta = 0.005
+        c.A = 0.5
+    r2 = compute.higher_tissue_sfnn_rule["dopamine"]["c2"]
+    for c in r2.coeffs.values():
+        c.eta = 0.001
+        c.A = 0.8
+    # Симулируем счётчик апдейтов dopamine.
+    compute.higher_tissue_sfnn_steps["dopamine"] = 42
+    diag = compute.diagnostics()
+    dop = diag["higher_sfnn"]["dopamine"]
+    assert dop["steps_total"] == 42
+    assert abs(dop["eta_avg"] - 0.003) < 1e-5
+    assert abs(dop["A_avg"] - 0.65) < 1e-3
+    # Остальные ткани — дефолт (η=1e-3, A=1.0).
+    for t in ("imagination", "planner", "insula", "default_mode",
+                "theory_of_mind", "language"):
+        bl = diag["higher_sfnn"][t]
+        assert abs(bl["eta_avg"] - 1e-3) < 1e-6, t
+        assert abs(bl["A_avg"] - 1.0) < 1e-3, t
+
+
+def test_diagnostics_higher_sfnn_enabled_pct(seed_file):
+    """enabled_pct = доля особей с higher_tissue_sfnn_enabled=True."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import types
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 3)
+    compute.add_creature("c1", orgs[0], hebbian_enabled=True)
+    compute.add_creature("c2", orgs[1], hebbian_enabled=True)
+    compute.add_creature("c3", orgs[2], hebbian_enabled=True)
+    # 2/3 особей с флагом on.
+    orgs[0].genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=True)
+    orgs[1].genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=True)
+    orgs[2].genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=False)
+    diag = compute.diagnostics()
+    assert abs(diag["higher_sfnn"]["enabled_pct"] - 0.667) < 1e-3
