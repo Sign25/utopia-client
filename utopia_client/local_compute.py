@@ -366,6 +366,8 @@ class LocalColonyCompute:
                 ("entropy_ema", "entropy_ema"),
                 ("trace_norm_ema", "trace_norm_ema"),
                 ("reward_var_ema", "reward_var_ema"),
+                ("tom_acc", "last_tom_acc"),
+                ("lang_acc", "last_lang_acc"),
             ):
                 if key in payload:
                     try:
@@ -414,6 +416,18 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s theory_of_mind: %s",
                                 cid, e)
+        # S2.C — language: Y50 + свежий Adam.
+        lang_sd = payload.get("language")
+        lang_tissue = self.language.get(cid)
+        if lang_sd is not None and lang_tissue is not None:
+            try:
+                lang_tissue.load_state_dict(lang_sd)
+                self._apply_y50_to_tissue(lang_tissue)
+                self.language_opt[cid] = self._torch.optim.Adam(
+                    lang_tissue.parameters(), lr=_LANG_LR)
+            except Exception as e:
+                logger.warning("apply_inherited_state %s language: %s",
+                                cid, e)
 
     def extract_brain_state_dicts(self, cid: str) -> tuple[dict, dict]:
         """Brain migration Etap 3.2 (11.05.2026): собрать state_dict мозга
@@ -446,6 +460,7 @@ class LocalColonyCompute:
             ("motor_policy", self.motor_policy),
             ("default_mode", self.default_mode),
             ("theory_of_mind", self.theory_of_mind),
+            ("language", self.language),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -461,6 +476,8 @@ class LocalColonyCompute:
             ("entropy_ema", "entropy_ema"),
             ("trace_norm_ema", "trace_norm_ema"),
             ("reward_var_ema", "reward_var_ema"),
+            ("tom_acc", "last_tom_acc"),
+            ("lang_acc", "last_lang_acc"),
         ):
             store = getattr(self, attr, None)
             if isinstance(store, dict) and cid in store:
@@ -496,6 +513,10 @@ class LocalColonyCompute:
                     self.loss_ema.get(parent_cid, 0.0))
                 payload["intrinsic_ema"] = float(
                     self.intrinsic_ema.get(parent_cid, 0.0))
+                payload["tom_acc"] = float(
+                    self.last_tom_acc.get(parent_cid, 0.0))
+                payload["lang_acc"] = float(
+                    self.last_lang_acc.get(parent_cid, 0.0))
             except Exception as e:
                 logger.debug("inherit_brain_y50 parent predictor: %s", e)
         for key, store in (
@@ -506,6 +527,7 @@ class LocalColonyCompute:
             ("motor_policy", self.motor_policy),
             ("default_mode", self.default_mode),
             ("theory_of_mind", self.theory_of_mind),
+            ("language", self.language),
         ):
             tissue = store.get(parent_cid)
             if tissue is None:
