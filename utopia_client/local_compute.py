@@ -1853,6 +1853,9 @@ class LocalColonyCompute:
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
+                "motor_sfnn_eta_avg": 0.0,
+                "motor_sfnn_A_avg": 0.0,
+                "motor_sfnn_enabled_pct": 0.0,
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
             }
@@ -1994,6 +1997,30 @@ class LocalColonyCompute:
             if bias_max else 0.0
         )
 
+        # SFNN S1.3 — средние η и A по 6 типам синапсов motor_policy
+        # каждой особи, агрегированные по колонии. Растущая дисперсия η
+        # между особями = эволюция правил активна (см. tz_sfnn_migration.md).
+        sfnn_etas: list[float] = []
+        sfnn_As: list[float] = []
+        sfnn_enabled_n = 0
+        for c, rule in self.motor_sfnn_rule.items():
+            if rule is None:
+                continue
+            try:
+                sfnn_etas.append(float(rule.mean_eta()))
+                sfnn_As.append(float(rule.mean_A()))
+            except Exception:
+                continue
+            org_c = self.organisms.get(c)
+            if bool(getattr(getattr(org_c, "genome", None),
+                              "sfnn_enabled", False)):
+                sfnn_enabled_n += 1
+        motor_sfnn_eta_avg = (round(sum(sfnn_etas) / len(sfnn_etas), 6)
+                                if sfnn_etas else 0.0)
+        motor_sfnn_A_avg = (round(sum(sfnn_As) / len(sfnn_As), 4)
+                              if sfnn_As else 0.0)
+        motor_sfnn_enabled_pct = round(sfnn_enabled_n / max(1, n), 3)
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -2034,6 +2061,9 @@ class LocalColonyCompute:
             "motor_delta_norm_avg": motor_delta_avg,
             "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
+            "motor_sfnn_eta_avg": motor_sfnn_eta_avg,
+            "motor_sfnn_A_avg": motor_sfnn_A_avg,
+            "motor_sfnn_enabled_pct": motor_sfnn_enabled_pct,
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,

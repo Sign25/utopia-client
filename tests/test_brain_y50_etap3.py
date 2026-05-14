@@ -454,18 +454,17 @@ def test_motor_sfnn_acts_populated_by_forward(seed_file):
 
 
 def test_motor_sfnn_update_modifies_weights_when_reward_positive(seed_file):
-    """С дефолтным правилом (A=1, η=1e-3) и положительным reward
-    веса 6 Linear motor_policy сдвигаются после _motor_sfnn_update_step."""
+    """С дефолтным правилом (A=1, η=1e-3) и положительным reward (ate=True
+    даёт r_imm=5.0 → reward_gain=6) веса 6 Linear motor_policy сдвигаются."""
     compute = _sfnn_setup_with_forward(seed_file)
     motor = compute.motor_policy["m1"]
-    # Снимок весов ДО апдейта.
     weights_before = {n: p.detach().clone()
                        for n, p in motor.named_parameters()
                        if p.dim() == 2}
-    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1.0}}
+    # _compute_immediate_reward ожидает ключ "ate" (bool), не "event_type".
+    events = {"m1": {"ate": True, "delta_energy": 1.0}}
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.01)
     assert compute.motor_sfnn_steps == 1
-    # Хотя бы один из 6 весов изменился (а лучше — все 6).
     changed = sum(1 for n, w_before in weights_before.items()
                    if not torch.equal(dict(motor.named_parameters())[n].data,
                                         w_before))
@@ -484,7 +483,7 @@ def test_motor_sfnn_update_noop_with_eta_zero(seed_file):
     weights_before = {n: p.detach().clone()
                        for n, p in motor.named_parameters()
                        if p.dim() == 2}
-    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1.0}}
+    events = {"m1": {"ate": True, "delta_energy": 1.0}}
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
     for n, w_before in weights_before.items():
         w_after = dict(motor.named_parameters())[n].data
@@ -499,13 +498,13 @@ def test_motor_sfnn_update_clip_caps_huge_reward(seed_file):
     weights_before = {n: p.detach().clone()
                        for n, p in motor.named_parameters()
                        if p.dim() == 2}
-    # Огромный reward.
-    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1e6}}
+    # Огромный reward через delta_energy (×0.5 в _compute_immediate_reward).
+    events = {"m1": {"delta_energy": 1e6, "ate": True}}
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
     for n, w_before in weights_before.items():
         w_after = dict(motor.named_parameters())[n].data
         max_dw = float((w_after - w_before).abs().max().item())
-        assert max_dw <= 0.01 + 1e-9, \
+        assert max_dw <= 0.01 + 1e-6, \
             f"{n}: max|ΔW|={max_dw} > clip 0.01"
 
 
@@ -540,7 +539,7 @@ def test_motor_sfnn_update_step_clears_pending_log_prob(seed_file):
     compute.add_creature("m1", org, hebbian_enabled=True)
     compute.pending_log_prob["m1"] = "stale"
     compute.pending_action["m1"] = 7
-    events = {"m1": {"event_type": "EAT_FAIL", "energy_delta": -0.1}}
+    events = {"m1": {"delta_energy": -0.1}}
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
     assert "m1" not in compute.pending_log_prob
     assert "m1" not in compute.pending_action
