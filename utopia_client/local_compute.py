@@ -1597,6 +1597,7 @@ class LocalColonyCompute:
                 "s2_dmn_floor_avg": 0.0,
                 "s2_tom_acc_avg": 0.0,
                 "s2_lang_acc_avg": 0.0,
+                "s2_dopa_td_avg": 0.0,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "tom_steps_total": int(self.tom_steps),
@@ -1714,6 +1715,10 @@ class LocalColonyCompute:
         lang_vals = list(self.last_lang_acc.values())
         s2_lang_avg = (round(sum(lang_vals) / len(lang_vals), 4)
                         if lang_vals else 0.0)
+        # Phase 5d — TD-modulation avg (NEOL reward-gated Hebbian).
+        td_vals = list(self.dopamine_td.values())
+        s2_dopa_td_avg = (round(sum(td_vals) / len(td_vals), 6)
+                           if td_vals else 0.0)
 
         return {
             "n_alive": n,
@@ -1758,6 +1763,7 @@ class LocalColonyCompute:
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,
             "lang_steps_total": int(self.lang_steps),
+            "s2_dopa_td_avg": s2_dopa_td_avg,
             "creatures": self._per_creature_stats(),
         }
 
