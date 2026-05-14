@@ -387,6 +387,17 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s planner sfnn hooks: %s",
                               cid, e)
+        # SFNN S3.4 (14.05.2026): hooks для insula — четвёртой активной.
+        # Forward в _compute_higher_tissues идёт ТОЛЬКО при intero_tensor
+        # is not None — если P40 не шлёт интероцепцию, acts не обновятся
+        # и update_step станет no-op (что корректно).
+        if self.insula.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "insula", cid, self.insula[cid])
+            except Exception as e:
+                logger.debug("add_creature %s insula sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -988,6 +999,10 @@ class LocalColonyCompute:
                     # SFNN S3.3 (14.05.2026): planner — третья активная.
                     self._higher_tissue_sfnn_update_step(
                         "planner", cid, r=0.0)
+                    # SFNN S3.4 (14.05.2026): insula — четвёртая. No-op если
+                    # intero_tensor не пришёл (acts пустой).
+                    self._higher_tissue_sfnn_update_step(
+                        "insula", cid, r=0.0)
 
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
