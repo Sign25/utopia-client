@@ -895,19 +895,20 @@ class LocalColonyCompute:
 
     @staticmethod
     def _compute_immediate_reward(event: dict) -> float:
-        """R3 immediate из событий тика. Вес как на P40 (Phase H1+):
+        """R3 immediate из событий тика.
 
-            r_imm = δenergy·0.05 + 1·ate + 5·killed − 0.1·damage
-
-        В реальной среде значения примерно: ate +1.0, killed +5.0,
-        обычный метаболизм δenergy≈-0.05 → r_imm≈0 (нейтрально).
+        14.05.2026: усилен ate (1.0→5.0, равно killed) и δenergy (×10).
+        Why: action-space collapse — REINFORCE не двигал политику, потому
+        что r_imm для ate-тика тонул в метаболическом шуме (δenergy·0.05 ≈
+        -0.0025), advantage около baseline=intrinsic_ema. reward_var_ema
+        наблюдался 1.7e-5 на live колонии.
         """
         delta_energy = float(event.get("delta_energy", 0.0))
         ate = bool(event.get("ate", False))
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
-        return (delta_energy * 0.05
-                + (1.0 if ate else 0.0)
+        return (delta_energy * 0.5
+                + (5.0 if ate else 0.0)
                 + (5.0 if killed else 0.0)
                 - damage_taken * 0.1)
 
@@ -1381,9 +1382,14 @@ class LocalColonyCompute:
         Применяется и опт-шаг, и градиент очищается через opt.zero_grad().
         Pending_log_prob — scalar tensor с requires_grad, созданный на
         предыдущем _stash_pending_log_prob.
+
+        14.05.2026: дополнительно вызывает selector.reinforce(advantage,
+        prev_action) — быстрый SFNN-стиль bias на ActionSelector. Bias
+        реагирует немедленно (1 шаг = +lr·reward к выбранному действию),
+        в отличие от motor_policy который обучается через градиент Adam.
         """
         pending = self.pending_log_prob.pop(cid, None)
-        self.pending_action.pop(cid, None)
+        prev_action = self.pending_action.pop(cid, None)
         if pending is None:
             return
         if events_per_cid is None:
@@ -1405,6 +1411,10 @@ class LocalColonyCompute:
             loss.backward()
             opt.step()
             self.motor_reinforce_steps += 1
+            # SFNN-стиль reward-modulated bias на ActionSelector.
+            sel = self.action_selectors.get(cid)
+            if sel is not None and prev_action is not None:
+                sel.reinforce(advantage, int(prev_action))
         except Exception as e:
             logger.debug("motor_reinforce %s: %s", cid, e)
 
