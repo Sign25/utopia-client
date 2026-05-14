@@ -1966,15 +1966,20 @@ class LocalColonyCompute:
         Заменяет `_motor_reinforce_step` (REINFORCE + Adam). Для каждого
         из 6 типов синапсов Tissue 21/3/1 motor_policy применяется:
 
-            ΔW = η · (1 + r_imm_total) · (A·outer(post, pre)
+            hebb_A = outer(post, pre) − post²·W       # Oja-стабилизация
+            ΔW = η · (1 + r_imm_total) · (A·hebb_A
                                             + B·post + C·preᵀ + D)
             ΔW ← clip(ΔW, ±0.01)            # защита от взрыва
             W  ← W + ΔW
+            W  ← W·(target_row_norm / cur_row_norm)  # safety renorm
 
-        Oja-нормализация (W ← W/‖W‖) намеренно НЕ применяется в S1.2b:
-        Frobenius-делитель быстро коллапсирует масштаб весов; row-wise
-        Oja сложнее и обещан в S1.2c. На малом шаге (eta=1e-3, clip=0.01)
-        веса не должны разъезжаться за несколько часов наблюдения.
+        SFNN S1.2c (14.05.2026): Oja подсложил вычитающий член `−post²·W`
+        в A-Hebbian-слагаемое. Без него чистое `outer(post, pre)`
+        сонаправляло строки W с avg(pre) — output[i] = ‖W[i]‖·‖pre‖·cos
+        → tanh saturated. Oja-rule (Oja 1982) фиксирует и направление, и
+        магнитуду: ‖W_i‖ → ‖input‖. L2-row-renorm к baseline оставлен
+        страховкой. Наблюдалось 14.05 на cheef: motor_delta_norm рос
+        3.72 → 3.97 за 2100 шагов (sqrt(16)=4.0 max) до Oja.
 
         pre/post захватываются forward-hooks (`_register_motor_sfnn_hooks`)
         при предыдущем `_motor_forward`. Если активаций нет (первый тик
@@ -2037,8 +2042,19 @@ class LocalColonyCompute:
                     B = float(coef.B)
                     C = float(coef.C)
                     D = float(coef.D)
-                    # ΔW = η·(1+r)·(A·outer(post,pre) + B·post[:,None] + C·pre[None,:] + D)
-                    dW = A * torch.outer(post, pre)
+                    # SFNN S1.2c (14.05.2026): три стабилизатора Hebbian-A
+                    # против tanh-saturation motor_delta:
+                    # (1) mean-центрирование post/pre — снимает DC-bias,
+                    #     без которого все строки W сонаправлялись с
+                    #     avg(pre) и output[i] коллапсировал в один знак;
+                    # (2) Oja-вычитающий член (−post_c²·W) — стабилизирует
+                    #     магнитуду строки (Oja 1982: ‖W_i‖ → ‖input‖);
+                    # (3) Row-wise L2-renorm к baseline (safety net ниже).
+                    post_c = post - post.mean()
+                    pre_c = pre - pre.mean()
+                    hebb_A = (torch.outer(post_c, pre_c)
+                              - post_c.square().unsqueeze(1) * W.data)
+                    dW = A * hebb_A
                     if B != 0.0:
                         dW = dW + B * post.unsqueeze(1).expand_as(W)
                     if C != 0.0:
@@ -2048,9 +2064,7 @@ class LocalColonyCompute:
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     W.data.add_(dW)
-                    # SFNN S1.2c (14.05.2026): row-wise renorm к baseline. Без
-                    # этого tanh saturates после ~5K шагов (наблюдалось 14.05
-                    # на cheef: motor_delta_norm=4.0 = sqrt(16) max).
+                    # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
                     if row_norms is not None:
                         target = row_norms.get(synapse_type)
                         if (target is not None
@@ -2128,8 +2142,9 @@ class LocalColonyCompute:
 
         Идентично `_motor_sfnn_update_step`, кроме reward-модуляции:
         в S3.1 для всех 7 тканей r=0.0 (чистая Hebb без модуляции).
-        Поэтому reward_gain = 1.0, и формула вырождается в
-            ΔW = η · (A·outer(post, pre) + B·post + C·pre + D)
+        Поэтому reward_gain = 1.0, и формула:
+            hebb_A = outer(post, pre) − post²·W       # Oja S1.2c
+            ΔW = η · (A·hebb_A + B·post + C·pre + D)
             ΔW ← clip(ΔW, ±0.01)
             W  ← W + ΔW
 
@@ -2187,7 +2202,13 @@ class LocalColonyCompute:
                     B = float(coef.B)
                     C = float(coef.C)
                     D = float(coef.D)
-                    dW = A * torch.outer(post, pre)
+                    # SFNN S1.2c (14.05.2026): три стабилизатора Hebbian-A
+                    # (см. подробности в _motor_sfnn_update_step).
+                    post_c = post - post.mean()
+                    pre_c = pre - pre.mean()
+                    hebb_A = (torch.outer(post_c, pre_c)
+                              - post_c.square().unsqueeze(1) * W.data)
+                    dW = A * hebb_A
                     if B != 0.0:
                         dW = dW + B * post.unsqueeze(1).expand_as(W)
                     if C != 0.0:
@@ -2197,7 +2218,7 @@ class LocalColonyCompute:
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     W.data.add_(dW)
-                    # SFNN S1.2c (14.05.2026): row-wise renorm к baseline.
+                    # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
                     if row_norms is not None:
                         target = row_norms.get(synapse_type)
                         if (target is not None

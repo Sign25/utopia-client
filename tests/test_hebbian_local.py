@@ -48,8 +48,8 @@ def test_reward_ate_only():
     from utopia_client.local_compute import LocalColonyCompute
     r = LocalColonyCompute._compute_immediate_reward(
         {"ate": True, "delta_energy": 3.0})
-    # 3.0*0.05 + 1.0 = 1.15
-    assert abs(r - 1.15) < 1e-6
+    # 14.05.2026 калибровка: delta_energy*0.5 + 5.0 = 1.5 + 5.0 = 6.5
+    assert abs(r - 6.5) < 1e-6
 
 
 def test_reward_killed_only():
@@ -63,16 +63,16 @@ def test_reward_damage_only():
     from utopia_client.local_compute import LocalColonyCompute
     r = LocalColonyCompute._compute_immediate_reward(
         {"damage_taken": 4.0, "delta_energy": -4.0})
-    # -4.0*0.05 - 4.0*0.1 = -0.2 - 0.4 = -0.6
-    assert abs(r - (-0.6)) < 1e-6
+    # 14.05.2026 калибровка: -4.0*0.5 - 4.0*0.1 = -2.0 - 0.4 = -2.4
+    assert abs(r - (-2.4)) < 1e-6
 
 
 def test_reward_ate_and_killed():
     from utopia_client.local_compute import LocalColonyCompute
     r = LocalColonyCompute._compute_immediate_reward(
         {"ate": True, "killed": True, "delta_energy": 5.0})
-    # 5.0*0.05 + 1.0 + 5.0 = 6.25
-    assert abs(r - 6.25) < 1e-6
+    # 14.05.2026 калибровка: 5.0*0.5 + 5.0 + 5.0 = 12.5
+    assert abs(r - 12.5) < 1e-6
 
 
 def test_reward_metabolism_only():
@@ -80,7 +80,8 @@ def test_reward_metabolism_only():
     from utopia_client.local_compute import LocalColonyCompute
     r = LocalColonyCompute._compute_immediate_reward(
         {"delta_energy": -0.05})
-    assert abs(r - (-0.0025)) < 1e-6
+    # 14.05.2026 калибровка: -0.05*0.5 = -0.025
+    assert abs(r - (-0.025)) < 1e-6
 
 
 # ── Integration: handle_tick c events → heb.update вызывается ───────

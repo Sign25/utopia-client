@@ -1441,3 +1441,73 @@ def test_s1_2c_row_norms_cleanup_on_remove_creature(seed_file):
     assert "x1" not in compute.motor_sfnn_row_norms
     for t in _HIGHER_SFNN_TISSUES:
         assert "x1" not in compute.higher_tissue_sfnn_row_norms[t]
+
+
+def test_s1_2c_oja_reduces_drift_vs_baseline(seed_file):
+    """Сравнительный тест S1.2c: дрейф ‖W‖ с Oja-стабилизатором МЕНЬШЕ
+    чем без него. Симулируем один синапс (output_proj) под одинаковыми
+    pre/post + событиями. Без Oja: W растёт пока clip не насытит.
+    С Oja: post²·W вычитающий член тормозит рост."""
+    from utopia_client.local_compute import LocalColonyCompute  # noqa
+    torch.manual_seed(42)
+    # Симулируем W (16,21) — как output_proj в Tissue 21/3/1.
+    W_no_oja = torch.randn(16, 21) * 0.1
+    W_oja = W_no_oja.clone()
+    eta = 0.001
+    A = 1.0
+    clip = 0.01
+    reward_gain = 6.5  # ate event с delta_energy=3.0
+    norm_no_oja = []
+    norm_oja = []
+    for step in range(500):
+        pre = torch.randn(21) * 0.5
+        post_no = W_no_oja @ pre  # ‖post‖ растёт с ‖W‖
+        post_o = W_oja @ pre
+        # Без Oja: dW = A · outer(post, pre).
+        dW_no = A * torch.outer(post_no, pre)
+        dW_no = (dW_no * (eta * reward_gain)).clamp(-clip, clip)
+        W_no_oja.add_(dW_no)
+        # С Oja: + mean-centering + post²·W subtractive.
+        post_c = post_o - post_o.mean()
+        pre_c = pre - pre.mean()
+        dW_o = A * (torch.outer(post_c, pre_c)
+                    - post_c.square().unsqueeze(1) * W_oja)
+        dW_o = (dW_o * (eta * reward_gain)).clamp(-clip, clip)
+        W_oja.add_(dW_o)
+        norm_no_oja.append(float(W_no_oja.norm().item()))
+        norm_oja.append(float(W_oja.norm().item()))
+    # Базовый рост (без Oja) > рост с Oja.
+    growth_no = norm_no_oja[-1] - norm_no_oja[0]
+    growth_oja = norm_oja[-1] - norm_oja[0]
+    assert growth_oja < growth_no, (
+        f"Oja должен снижать дрейф: без Oja Δ‖W‖={growth_no:.3f}, "
+        f"с Oja Δ‖W‖={growth_oja:.3f}")
+
+
+def test_s1_2c_oja_subtractive_term_reduces_drift(seed_file):
+    """Прямая проверка: dW содержит Oja-вычитающий член (-A·post²·W).
+    Без него dW = A·outer(post, pre) всегда сонаправлен. С Oja
+    знак dW зависит от соотношения outer(post, pre) и post²·W."""
+    compute = _sfnn_setup_with_forward(seed_file)
+    motor = compute.motor_policy["m1"]
+    # Принудительно сделаем W большим, чтобы post²·W доминировал.
+    with torch.no_grad():
+        for n, p in motor.named_parameters():
+            if p.dim() == 2 and n.endswith("output_proj.weight"):
+                p.data.mul_(10.0)
+    # Снимем row_norms target, чтобы L2-renorm не маскировал Oja-эффект.
+    compute.motor_sfnn_row_norms["m1"].pop("output_proj", None)
+    w_before = {n: p.detach().clone()
+                  for n, p in motor.named_parameters()
+                  if n.endswith("output_proj.weight")}
+    events = {"m1": {"ate": True, "delta_energy": 1.0}}
+    compute._motor_forward("m1", torch.randn(1, 64))
+    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
+    # output_proj weights должны УМЕНЬШИТЬСЯ (Oja-decay > Hebbian growth),
+    # потому что post (= W·pre) большой → post²·W доминирует.
+    for n, w_b in w_before.items():
+        w_a = dict(motor.named_parameters())[n].data
+        # Frobenius норма после должна быть < до (Oja-decay).
+        assert w_a.norm().item() < w_b.norm().item(), (
+            f"{n}: при больших W Oja-вычитающий член должен уменьшать ‖W‖, "
+            f"но норма не упала ({w_b.norm():.3f} → {w_a.norm():.3f})")
