@@ -398,6 +398,14 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s insula sfnn hooks: %s",
                               cid, e)
+        # SFNN S3.5 (14.05.2026): hooks для default_mode — пятой активной.
+        if self.default_mode.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "default_mode", cid, self.default_mode[cid])
+            except Exception as e:
+                logger.debug("add_creature %s default_mode sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -1003,6 +1011,9 @@ class LocalColonyCompute:
                     # intero_tensor не пришёл (acts пустой).
                     self._higher_tissue_sfnn_update_step(
                         "insula", cid, r=0.0)
+                    # SFNN S3.5 (14.05.2026): default_mode — пятая.
+                    self._higher_tissue_sfnn_update_step(
+                        "default_mode", cid, r=0.0)
 
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
