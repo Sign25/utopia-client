@@ -652,9 +652,8 @@ def test_s3_1_dopamine_hooks_registered_on_add_creature(seed_file):
     assert handles is not None
     # 6 Linear модулей Tissue 21/3/1 = 6 хуков.
     assert len(handles) == 6
-    # Активные на момент S3.2: dopamine + imagination. Остальные 5 — нет.
-    for t in ("planner", "insula", "default_mode",
-              "theory_of_mind", "language"):
+    # Активные на момент S3.3: dopamine + imagination + planner. Остальные 4 — нет.
+    for t in ("insula", "default_mode", "theory_of_mind", "language"):
         assert "d1" not in compute.higher_tissue_sfnn_hook_handles[t], t
 
 
@@ -755,9 +754,9 @@ def test_s3_2_imagination_hooks_registered_on_add_creature(seed_file):
     handles = compute.higher_tissue_sfnn_hook_handles["imagination"].get("i1")
     assert handles is not None
     assert len(handles) == 6
-    # Остальные 5 тканей (помимо dopamine+imagination) ещё не активны.
-    for t in ("planner", "insula", "default_mode",
-              "theory_of_mind", "language"):
+    # Активные на момент S3.3: dopamine + imagination + planner.
+    # Остальные 4 — ещё не активны.
+    for t in ("insula", "default_mode", "theory_of_mind", "language"):
         assert "i1" not in compute.higher_tissue_sfnn_hook_handles[t], t
 
 
@@ -797,4 +796,55 @@ def test_s3_2_imagination_update_step_changes_weights(seed_file):
         if p.dim() == 2 and n in w_before)
     assert changed, "ни один weight imagination не изменился"
     assert (compute.higher_tissue_sfnn_steps["imagination"]
+            == steps_before + 1)
+
+
+# ── SFNN S3.3 (14.05.2026) — активация planner ────────────────────────────
+
+
+def test_s3_3_planner_hooks_registered(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("p1", org, hebbian_enabled=True)
+    handles = compute.higher_tissue_sfnn_hook_handles["planner"].get("p1")
+    assert handles is not None and len(handles) == 6
+
+
+def test_s3_3_planner_hooks_capture(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("p1", org, hebbian_enabled=True)
+    compute._compute_higher_tissues(
+        "p1", torch.zeros(1, 64), intero_tensor=None)
+    assert len(compute.higher_tissue_sfnn_acts["planner"]["p1"]) == 6
+
+
+def test_s3_3_planner_update_changes_weights(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("p1", org, hebbian_enabled=True)
+    compute._compute_higher_tissues(
+        "p1", torch.randn(1, 64), intero_tensor=None)
+    rule = compute.higher_tissue_sfnn_rule["planner"]["p1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    tissue = compute.planner["p1"]
+    w_before = {n: p.detach().clone()
+                 for n, p in tissue.named_parameters() if p.dim() == 2}
+    steps_before = compute.higher_tissue_sfnn_steps["planner"]
+    compute._higher_tissue_sfnn_update_step("planner", "p1", r=0.0)
+    changed = any(
+        not torch.equal(w_before[n], p.detach())
+        for n, p in tissue.named_parameters()
+        if p.dim() == 2 and n in w_before)
+    assert changed
+    assert (compute.higher_tissue_sfnn_steps["planner"]
             == steps_before + 1)

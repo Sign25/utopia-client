@@ -378,6 +378,15 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s imagination sfnn hooks: %s",
                               cid, e)
+        # SFNN S3.3 (14.05.2026): hooks для planner — третьей активной
+        # высшей ткани.
+        if self.planner.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "planner", cid, self.planner[cid])
+            except Exception as e:
+                logger.debug("add_creature %s planner sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -976,6 +985,9 @@ class LocalColonyCompute:
                     # высшая ткань. r=0.0 как и dopamine.
                     self._higher_tissue_sfnn_update_step(
                         "imagination", cid, r=0.0)
+                    # SFNN S3.3 (14.05.2026): planner — третья активная.
+                    self._higher_tissue_sfnn_update_step(
+                        "planner", cid, r=0.0)
 
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
