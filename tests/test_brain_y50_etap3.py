@@ -492,8 +492,12 @@ def test_motor_sfnn_update_noop_with_eta_zero(seed_file):
 
 
 def test_motor_sfnn_update_clip_caps_huge_reward(seed_file):
-    """Большой reward не должен сдвинуть ни один элемент W больше чем на clip (0.01)."""
+    """Большой reward не должен сдвинуть ни один элемент W больше чем на clip (0.01).
+    Проверяется raw ΔW до S1.2c renorm — поэтому baseline row-norms убираем."""
     compute = _sfnn_setup_with_forward(seed_file)
+    # S1.2c renorm накладывается поверх raw ΔW и может изменить итоговую дельту.
+    # Здесь тестируем именно raw clip → отключаем row-norm renorm для m1.
+    compute.motor_sfnn_row_norms.pop("m1", None)
     motor = compute.motor_policy["m1"]
     weights_before = {n: p.detach().clone()
                        for n, p in motor.named_parameters()
@@ -1336,3 +1340,104 @@ def test_s3_activate_motor_independent_of_higher(seed_file):
     compute.set_higher_sfnn(False)
     assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is False
     assert compute.organisms["c1"].genome.sfnn_enabled is True
+
+
+# ── SFNN S1.2c (14.05.2026) — row-wise renorm motor + higher ────────────
+
+
+def test_s1_2c_motor_row_norms_snapshot_on_add_creature(seed_file):
+    """add_creature сохраняет baseline row-norms 6 motor_policy Linear."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from core.sfnn_rule import SYNAPSE_TYPES
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    rn = compute.motor_sfnn_row_norms.get("m1")
+    assert rn is not None
+    for s in SYNAPSE_TYPES:
+        assert s in rn, f"baseline для {s} не сохранён"
+        assert rn[s].dim() == 1
+        assert (rn[s] > 0).all()
+
+
+def test_s1_2c_motor_renorm_keeps_row_norms_stable(seed_file):
+    """100 update_step с большим reward не раздувают row-norms motor выше
+    baseline. Без renorm Frobenius норма росла бы кратно (наблюдалось 14.05
+    на cheef: motor_delta_norm=4.0 = sqrt(16) max после ~6K шагов)."""
+    compute = _sfnn_setup_with_forward(seed_file)
+    motor = compute.motor_policy["m1"]
+    baseline = {n: p.data.norm(dim=1).clone()
+                 for n, p in motor.named_parameters()
+                 if p.dim() == 2}
+    # Жирный reward + большая η для агрессивного давления на веса.
+    rule = compute.motor_sfnn_rule["m1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    events = {"m1": {"ate": True, "delta_energy": 1.0}}
+    for _ in range(100):
+        compute._motor_forward("m1", torch.randn(1, 64))
+        compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.5)
+    assert compute.motor_sfnn_steps == 100
+    # Каждая строка W должна остаться в пределах ±1% от baseline.
+    for n, base in baseline.items():
+        cur = dict(motor.named_parameters())[n].data.norm(dim=1)
+        assert torch.allclose(cur, base, rtol=1e-2), (
+            f"{n} row-norms ушли: max diff "
+            f"{(cur - base).abs().max().item()}")
+
+
+def test_s1_2c_dopamine_row_norms_snapshot_on_add_creature(seed_file):
+    """Симметрично motor — baseline row-norms 6 Linear dopamine."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from core.sfnn_rule import SYNAPSE_TYPES
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    rn = compute.higher_tissue_sfnn_row_norms["dopamine"].get("d1")
+    assert rn is not None
+    for s in SYNAPSE_TYPES:
+        assert s in rn
+        assert (rn[s] > 0).all()
+
+
+def test_s1_2c_dopamine_renorm_keeps_row_norms_stable(seed_file):
+    """50 update_step dopamine с большой η не раздувают row-norms."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("d1", org, hebbian_enabled=True)
+    tissue = compute.dopamine["d1"]
+    baseline = {n: p.data.norm(dim=1).clone()
+                 for n, p in tissue.named_parameters()
+                 if p.dim() == 2}
+    rule = compute.higher_tissue_sfnn_rule["dopamine"]["d1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    for _ in range(50):
+        compute._compute_higher_tissues(
+            "d1", torch.randn(1, 64), intero_tensor=None)
+        compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+    for n, base in baseline.items():
+        cur = dict(tissue.named_parameters())[n].data.norm(dim=1)
+        assert torch.allclose(cur, base, rtol=1e-2), (
+            f"{n} dopamine row-norms ушли")
+
+
+def test_s1_2c_row_norms_cleanup_on_remove_creature(seed_file):
+    """remove_creature вычищает baseline row-norms motor + всех 7 высших."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("x1", org, hebbian_enabled=True)
+    assert "x1" in compute.motor_sfnn_row_norms
+    for t in _HIGHER_SFNN_TISSUES:
+        assert "x1" in compute.higher_tissue_sfnn_row_norms[t]
+    compute.remove_creature("x1")
+    assert "x1" not in compute.motor_sfnn_row_norms
+    for t in _HIGHER_SFNN_TISSUES:
+        assert "x1" not in compute.higher_tissue_sfnn_row_norms[t]

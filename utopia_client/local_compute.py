@@ -189,6 +189,12 @@ class LocalColonyCompute:
         # _motor_sfnn_update_step для ΔW. Очищаются в remove_creature.
         self.motor_sfnn_hook_handles: dict = {}   # cid → list[hook handle]
         self.motor_sfnn_acts: dict = {}            # cid → {synapse_type → (pre, post)}
+        # SFNN S1.2c (14.05.2026) — baseline L2-нормы строк 6 weight matrices
+        # motor_policy, снятые при add_creature. После каждого ΔW row-wise
+        # renorm: W[i] ← W[i] · (baseline‖W[i]‖) / ‖W[i]‖. Защита от взрыва
+        # весов / tanh-saturation при долгой SFNN-тренировке. Per-row, чтобы
+        # сохранить относительный масштаб output-нейронов друг к другу.
+        self.motor_sfnn_row_norms: dict = {}      # cid → {synapse → Tensor[rows]}
         # SFNN S3.0 (14.05.2026) — те же SFNN-правила, но для 7 высших тканей.
         # Внутренний dict per tissue: cid → SFNNRule. Под флагом
         # genome.higher_tissue_sfnn_enabled (дефолт False) сейчас только
@@ -210,6 +216,12 @@ class LocalColonyCompute:
             t: {} for t in _HIGHER_SFNN_TISSUES
         }
         self.higher_tissue_sfnn_acts: dict[str, dict] = {
+            t: {} for t in _HIGHER_SFNN_TISSUES
+        }
+        # SFNN S1.2c (14.05.2026) — baseline row-norms 6 weight matrices
+        # каждой из 7 высших тканей. Та же защита от взрыва весов, что и
+        # для motor_policy. {tissue → {cid → {synapse → Tensor[rows]}}}.
+        self.higher_tissue_sfnn_row_norms: dict[str, dict] = {
             t: {} for t in _HIGHER_SFNN_TISSUES
         }
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
@@ -340,6 +352,8 @@ class LocalColonyCompute:
             # Регистрируются всегда (overhead — копия (pre,post) на forward),
             # используются только при genome.sfnn_enabled=True.
             self._register_motor_sfnn_hooks(cid, motor)
+            # SFNN S1.2c: baseline row-norms для renormalization после ΔW.
+            self.motor_sfnn_row_norms[cid] = self._snapshot_row_norms(motor)
         # S2.B (13.05.2026) — theory_of_mind: Tissue 21/3/1 data_dim=52 + Adam.
         tom = self._make_higher_tissue("theory_of_mind", data_dim=_TOM_DATA_DIM)
         if tom is not None:
@@ -491,6 +505,8 @@ class LocalColonyCompute:
             except Exception:
                 pass
         self.motor_sfnn_acts.pop(cid, None)
+        # SFNN S1.2c: forget baseline row-norms.
+        self.motor_sfnn_row_norms.pop(cid, None)
         self.pending_log_prob.pop(cid, None)
         self.pending_action.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
@@ -518,6 +534,8 @@ class LocalColonyCompute:
                 except Exception:
                     pass
             self.higher_tissue_sfnn_acts.get(_t, {}).pop(cid, None)
+            # SFNN S1.2c: cleanup baseline row-norms каждой высшей ткани.
+            self.higher_tissue_sfnn_row_norms.get(_t, {}).pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -1867,6 +1885,31 @@ class LocalColonyCompute:
     )
     # Защитный clip ΔW по infinity-норме (см. ТЗ S1).
     _MOTOR_SFNN_DW_CLIP = 0.01
+    # SFNN S1.2c: floor для row-norm деления (защита от 0).
+    _MOTOR_SFNN_RENORM_EPS = 1e-8
+
+    def _snapshot_row_norms(self, tissue) -> dict:
+        """SFNN S1.2c (14.05.2026): snapshot baseline L2-норм строк 6 weight
+        matrices Tissue 21/3/1. Используется в update_step как target для
+        row-wise renormalization после применения ΔW — защита от
+        tanh-saturation и долгосрочного дрейфа весов.
+
+        Возвращает {synapse_type → Tensor[rows]} с detached clone (W меняется,
+        baseline остаётся фиксирован — это и есть точка отсчёта).
+        """
+        torch = self._torch
+        out: dict = {}
+        if tissue is None:
+            return out
+        params = dict(tissue.named_parameters())
+        for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
+            for n in params:
+                if n.endswith(module_name + ".weight"):
+                    W = params[n]
+                    if W.dim() == 2:
+                        out[synapse_type] = W.data.norm(dim=1).detach().clone()
+                    break
+        return out
 
     def _register_motor_sfnn_hooks(self, cid: str, tissue) -> None:
         """SFNN S1.2b: forward-hooks на 6 Linear motor_policy Tissue для
@@ -1958,11 +2001,13 @@ class LocalColonyCompute:
         if not acts:
             return
         torch = self._torch
+        row_norms = self.motor_sfnn_row_norms.get(cid)
         try:
             r_imm = self._compute_immediate_reward(event)
             r_imm_total = float(r_imm + intrinsic_now)
             reward_gain = 1.0 + r_imm_total
             clip_val = self._MOTOR_SFNN_DW_CLIP
+            eps = self._MOTOR_SFNN_RENORM_EPS
             with torch.no_grad():
                 # Build name → parameter map для прямого in-place обновления.
                 params = dict(tissue.named_parameters())
@@ -2003,6 +2048,15 @@ class LocalColonyCompute:
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     W.data.add_(dW)
+                    # SFNN S1.2c (14.05.2026): row-wise renorm к baseline. Без
+                    # этого tanh saturates после ~5K шагов (наблюдалось 14.05
+                    # на cheef: motor_delta_norm=4.0 = sqrt(16) max).
+                    if row_norms is not None:
+                        target = row_norms.get(synapse_type)
+                        if (target is not None
+                                and target.shape[0] == W.shape[0]):
+                            cur = W.data.norm(dim=1).clamp(min=eps)
+                            W.data.mul_((target / cur).unsqueeze(1))
             self.motor_sfnn_steps += 1
         except Exception as e:
             logger.debug("motor_sfnn_update %s: %s", cid, e)
@@ -2026,6 +2080,9 @@ class LocalColonyCompute:
         if tissue is None:
             return
         self.higher_tissue_sfnn_acts[tissue_name][cid] = {}
+        # SFNN S1.2c (14.05.2026): baseline row-norms для renorm после ΔW.
+        self.higher_tissue_sfnn_row_norms[tissue_name][cid] = (
+            self._snapshot_row_norms(tissue))
         handles: list = []
         for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
             mod = None
@@ -2097,9 +2154,12 @@ class LocalColonyCompute:
         if not acts:
             return
         torch = self._torch
+        row_norms = (self.higher_tissue_sfnn_row_norms.get(tissue_name, {})
+                       .get(cid))
         try:
             reward_gain = 1.0 + float(r)
             clip_val = self._MOTOR_SFNN_DW_CLIP
+            eps = self._MOTOR_SFNN_RENORM_EPS
             with torch.no_grad():
                 params = dict(tissue.named_parameters())
                 for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
@@ -2137,6 +2197,13 @@ class LocalColonyCompute:
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     W.data.add_(dW)
+                    # SFNN S1.2c (14.05.2026): row-wise renorm к baseline.
+                    if row_norms is not None:
+                        target = row_norms.get(synapse_type)
+                        if (target is not None
+                                and target.shape[0] == W.shape[0]):
+                            cur = W.data.norm(dim=1).clamp(min=eps)
+                            W.data.mul_((target / cur).unsqueeze(1))
             self.higher_tissue_sfnn_steps[tissue_name] = (
                 self.higher_tissue_sfnn_steps.get(tissue_name, 0) + 1)
         except Exception as e:
