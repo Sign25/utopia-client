@@ -197,6 +197,11 @@ class LocalColonyCompute:
         self.pending_log_prob: dict = {}    # cid → torch.Tensor (scalar, requires_grad)
         self.pending_action: dict = {}      # cid → int (для диагностики)
         self.motor_reinforce_steps: int = 0
+        # SFNN S1.2 (14.05.2026) — счётчик SFNN-апдейтов motor_policy под
+        # флагом genome.sfnn_enabled. В S1.2a skeleton увеличивает счётчик,
+        # но веса не трогает (no-op для регрессии). S1.2b включит реальное
+        # правило ΔW = η·(1+r)·(A·post·preᵀ + B·post + C·pre + D).
+        self.motor_sfnn_steps: int = 0
         # Last-snapshot для get_phase_emas → push в actions_batch.
         self.last_beta_local: dict = {}    # cid → float ∈ [0, 1/φ]
         self.last_imag_mult: dict = {}     # cid → float ∈ [1, 2]
@@ -343,6 +348,7 @@ class LocalColonyCompute:
             self.remove_creature(cid)
         self.hebbian_updates = 0
         self.predictor_steps = 0
+        self.motor_sfnn_steps = 0
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -760,7 +766,18 @@ class LocalColonyCompute:
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # применяем pending градиент по pending_log_prob, ПОТОМ
                 # делаем свежий motor forward с grad для текущего тика.
-                self._motor_reinforce_step(cid, events_per_cid, intrinsic_now)
+                # SFNN S1.2 (14.05.2026): развилка по genome.sfnn_enabled.
+                # При True — локальное правило пластичности (без Adam,
+                # без REINFORCE), при False — legacy путь Phase 5d.
+                org = self.organisms.get(cid)
+                sfnn_on = bool(getattr(getattr(org, "genome", None),
+                                        "sfnn_enabled", False))
+                if sfnn_on:
+                    self._motor_sfnn_update_step(cid, events_per_cid,
+                                                   intrinsic_now)
+                else:
+                    self._motor_reinforce_step(cid, events_per_cid,
+                                                 intrinsic_now)
 
                 # Phase 7 — motor_policy forward с grad → motor_delta [16].
                 # Применяется к первым 16 элементам logits (action-space)
@@ -1472,6 +1489,48 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("motor_reinforce %s: %s", cid, e)
 
+    def _motor_sfnn_update_step(self, cid: str, events_per_cid,
+                                  intrinsic_now: float) -> None:
+        """SFNN S1.2 (14.05.2026): локальное правило пластичности для
+        motor_policy под флагом `genome.sfnn_enabled=True`.
+
+        Заменяет `_motor_reinforce_step` (REINFORCE + Adam). На каждой
+        итерации применяет ΔW = η·(1+r_imm)·(A·post·preᵀ + B·post + C·pre + D)
+        к каждому из 6 типов синапсов Tissue 21/3/1 motor_policy.
+
+        S1.2a — skeleton: pending_log_prob/pending_action чистятся (как в
+        REINFORCE-пути), счётчик инкрементится, но веса НЕ меняются. Это
+        даёт работающую развилку под флагом без поведенческой регрессии.
+        S1.2b добавит реальное обновление весов с forward-hook'ами на
+        pre/post активации.
+
+        Reward-модуляция использует тот же сигнал что REINFORCE: r_imm
+        (immediate reward от событий) + intrinsic_now (surprise predictor).
+        """
+        # Чистим pending_log_prob/pending_action — в SFNN они не нужны
+        # (нет gradient backward), но накопление мусора недопустимо.
+        self.pending_log_prob.pop(cid, None)
+        self.pending_action.pop(cid, None)
+        if events_per_cid is None:
+            return
+        event = events_per_cid.get(cid)
+        if event is None:
+            return
+        rule = self.motor_sfnn_rule.get(cid)
+        if rule is None:
+            return
+        try:
+            # r_imm_total — тот же сигнал что в REINFORCE, для согласованности
+            # baseline и интерпретации reward-модуляции (1+r) в правиле.
+            r_imm = self._compute_immediate_reward(event)
+            _r_imm_total = float(r_imm + intrinsic_now)
+            # S1.2a no-op: счётчик растёт, веса не меняются. Live-проверка,
+            # что развилка работает — после перевода особи в sfnn_enabled
+            # motor_sfnn_steps должно расти, motor_reinforce_steps — стоять.
+            self.motor_sfnn_steps += 1
+        except Exception as e:
+            logger.debug("motor_sfnn_update %s: %s", cid, e)
+
     def _predictor_train_step(self, cid: str, obs_tensor) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
 
@@ -1666,6 +1725,7 @@ class LocalColonyCompute:
                 "s2_action_dist_avg": [0.0] * N_ACTIONS,
                 "motor_delta_norm_avg": 0.0,
                 "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
+                "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
             }
@@ -1846,6 +1906,7 @@ class LocalColonyCompute:
             "s2_dmn_floor_avg": s2_dmn_avg,
             "motor_delta_norm_avg": motor_delta_avg,
             "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
+            "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,

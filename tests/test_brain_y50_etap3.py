@@ -409,3 +409,47 @@ def test_inherit_brain_y50_carries_sfnn_rule_with_noise(seed_file):
         # A в окрестности 0.5, не 1.0.
         assert abs(c.A - 0.5) < 0.4
         assert c.A != 1.0  # не дефолт
+
+
+# ── SFNN S1.2a (14.05.2026) — флаг + skeleton _motor_sfnn_update_step ───
+
+
+def test_motor_sfnn_update_step_increments_counter(seed_file):
+    """Skeleton: счётчик motor_sfnn_steps растёт после вызова, веса не меняются."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    assert compute.motor_sfnn_steps == 0
+    # Имитируем event с reward через минимальный payload.
+    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1.0}}
+    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.01)
+    assert compute.motor_sfnn_steps == 1
+    # motor_reinforce_steps НЕ должен расти при вызове SFNN-пути.
+    assert compute.motor_reinforce_steps == 0
+
+
+def test_genome_sfnn_enabled_default_false():
+    """По умолчанию у любого Genome флаг выключен — legacy путь активен."""
+    from core.organism import Genome
+    g = Genome()
+    assert g.sfnn_enabled is False
+    g2 = Genome(sfnn_enabled=True)
+    assert g2.sfnn_enabled is True
+
+
+def test_motor_sfnn_update_step_clears_pending_log_prob(seed_file):
+    """Skeleton: pending_log_prob/pending_action чистятся (как в REINFORCE-пути)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    # Положим мусор в pending — _motor_sfnn_update_step должен его убрать.
+    compute.pending_log_prob["m1"] = "stale"
+    compute.pending_action["m1"] = 7
+    events = {"m1": {"event_type": "EAT_FAIL", "energy_delta": -0.1}}
+    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
+    assert "m1" not in compute.pending_log_prob
+    assert "m1" not in compute.pending_action
