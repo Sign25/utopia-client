@@ -406,6 +406,18 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s default_mode sfnn hooks: %s",
                               cid, e)
+        # SFNN S3.6 (14.05.2026): hooks для theory_of_mind — шестой активной.
+        # Особенность: ткань имеет Adam-оптимизатор (supervised по Δposition
+        # focus-соседа). Под флагом higher_tissue_sfnn_enabled Adam-шаг в
+        # _compute_theory_of_mind пропускается, forward остаётся — чтобы
+        # SFNN-hooks словили активации.
+        if self.theory_of_mind.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "theory_of_mind", cid, self.theory_of_mind[cid])
+            except Exception as e:
+                logger.debug("add_creature %s theory_of_mind sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -1018,7 +1030,13 @@ class LocalColonyCompute:
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
                 # нет / соседей нет — no-op без побочных эффектов.
+                # SFNN S3.6 (14.05.2026): под флагом эта функция делает
+                # forward без Adam-шага → hooks стреляют → update_step
+                # применяет ΔW локальным правилом.
                 self._compute_theory_of_mind(cid)
+                if higher_sfnn_on:
+                    self._higher_tissue_sfnn_update_step(
+                        "theory_of_mind", cid, r=0.0)
 
                 # S2.C (13.05.2026) — language supervised step.
                 # prev_context (сигналы соседей с прошлого тика) → текущий
@@ -1457,6 +1475,29 @@ class LocalColonyCompute:
             return
         if not neighbors:
             self._tom_prev_focus[cid] = None
+            return
+
+        # SFNN S3.6 (14.05.2026): под флагом higher_tissue_sfnn_enabled
+        # ткань обучается локальным правилом ΔW (Pedersen/Risi), не Adam'ом.
+        # Forward всё равно делаем — иначе SFNN-hooks не словят активации.
+        # Adam-шаг (cross_entropy/backward/opt.step) + accuracy EMA (которая
+        # без обучения была бы misleading) пропускаются.
+        org_obj = self.organisms.get(cid)
+        sfnn_on = bool(getattr(getattr(org_obj, "genome", None),
+                                "higher_tissue_sfnn_enabled", False))
+        if sfnn_on:
+            try:
+                features = self._build_tom_features(neighbors)
+                tissue.eval()
+                with torch.no_grad():
+                    tissue({"input": features})
+            except Exception as e:
+                logger.debug("tom sfnn forward %s: %s", cid, e)
+            # focus всё равно обновляем — на случай ablation off, чтобы
+            # Adam-путь стартовал с известным prev_focus.
+            ncid_curr, x_curr, y_curr = neighbors[0][:3]
+            self._tom_prev_focus[cid] = (str(ncid_curr), int(x_curr),
+                                          int(y_curr))
             return
 
         size = int(wc.config.size) if wc.config is not None else 256

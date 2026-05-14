@@ -652,9 +652,8 @@ def test_s3_1_dopamine_hooks_registered_on_add_creature(seed_file):
     assert handles is not None
     # 6 Linear модулей Tissue 21/3/1 = 6 хуков.
     assert len(handles) == 6
-    # Активные на момент S3.5: dopamine+imagination+planner+insula+default_mode.
-    # Остальные 2 — нет.
-    for t in ("theory_of_mind", "language"):
+    # Активные на момент S3.6: + theory_of_mind. Остаётся 1 неактивная.
+    for t in ("language",):
         assert "d1" not in compute.higher_tissue_sfnn_hook_handles[t], t
 
 
@@ -755,9 +754,8 @@ def test_s3_2_imagination_hooks_registered_on_add_creature(seed_file):
     handles = compute.higher_tissue_sfnn_hook_handles["imagination"].get("i1")
     assert handles is not None
     assert len(handles) == 6
-    # Активные на момент S3.5: dopamine+imagination+planner+insula+default_mode.
-    # Остальные 2 — ещё не активны.
-    for t in ("theory_of_mind", "language"):
+    # Активные на момент S3.6: + theory_of_mind. Осталась 1 неактивная.
+    for t in ("language",):
         assert "i1" not in compute.higher_tissue_sfnn_hook_handles[t], t
 
 
@@ -968,3 +966,99 @@ def test_s3_5_default_mode_update_changes_weights(seed_file):
     assert changed
     assert (compute.higher_tissue_sfnn_steps["default_mode"]
             == steps_before + 1)
+
+
+# ── SFNN S3.6 (14.05.2026) — активация theory_of_mind ──────────────────────
+
+
+def test_s3_6_tom_hooks_registered(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("tm1", org, hebbian_enabled=True)
+    handles = compute.higher_tissue_sfnn_hook_handles["theory_of_mind"].get("tm1")
+    assert handles is not None and len(handles) == 6
+
+
+def test_s3_6_tom_hooks_capture_on_forward(seed_file):
+    """Прямой forward через tissue() заполняет acts (6 синапсов)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("tm1", org, hebbian_enabled=True)
+    tissue = compute.theory_of_mind["tm1"]
+    # data_dim = 4 соседа × 13 = 52.
+    feat = torch.randn(1, tissue.input_proj.in_features)
+    with torch.no_grad():
+        tissue({"input": feat})
+    acts = compute.higher_tissue_sfnn_acts["theory_of_mind"]["tm1"]
+    assert len(acts) == 6
+
+
+def test_s3_6_tom_update_step_changes_weights(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("tm1", org, hebbian_enabled=True)
+    tissue = compute.theory_of_mind["tm1"]
+    feat = torch.randn(1, tissue.input_proj.in_features)
+    with torch.no_grad():
+        tissue({"input": feat})
+    rule = compute.higher_tissue_sfnn_rule["theory_of_mind"]["tm1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    w_before = {n: p.detach().clone()
+                 for n, p in tissue.named_parameters() if p.dim() == 2}
+    steps_before = compute.higher_tissue_sfnn_steps["theory_of_mind"]
+    compute._higher_tissue_sfnn_update_step("theory_of_mind", "tm1", r=0.0)
+    changed = any(
+        not torch.equal(w_before[n], p.detach())
+        for n, p in tissue.named_parameters()
+        if p.dim() == 2 and n in w_before)
+    assert changed
+    assert (compute.higher_tissue_sfnn_steps["theory_of_mind"]
+            == steps_before + 1)
+
+
+def test_s3_6_tom_adam_skipped_under_sfnn_flag(seed_file):
+    """Под higher_tissue_sfnn_enabled=True _compute_theory_of_mind делает
+    forward (hooks стреляют) но НЕ вызывает opt.step()."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from tests.test_theory_of_mind_s2b import _FakeCache
+    import torch
+    import types
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    # CompositeOrganism не имеет .genome — впрыскиваем SimpleNamespace
+    # с нужным флагом. Production-код читает через getattr-цепочку.
+    org.genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=True)
+    compute.add_creature("tm1", org, hebbian_enabled=True)
+    # Поставим world_cache с двумя особями (self + один сосед).
+    wc = _FakeCache(size=32)
+    wc.set_creature("tm1", 10, 10)
+    wc.set_creature("n1", 11, 10)
+    compute.world_cache = wc
+    # На первом тике prev_focus is None → Adam-путь в legacy всё равно
+    # не делает step. Но forward в SFNN-режиме должен случиться.
+    # Очистить acts (после add_creature их нет).
+    compute.higher_tissue_sfnn_acts["theory_of_mind"]["tm1"] = {}
+    compute._compute_theory_of_mind("tm1")
+    acts1 = compute.higher_tissue_sfnn_acts["theory_of_mind"]["tm1"]
+    assert len(acts1) == 6, "forward должен сработать → 6 синапсов"
+    # tom_steps НЕ растёт (Adam-путь пропущен).
+    assert compute.tom_steps == 0
+    # Adam optimizer.state пуст (нет .step() → нет moment buffers).
+    opt = compute.theory_of_mind_opt["tm1"]
+    for p in opt.param_groups[0]["params"]:
+        assert p not in opt.state or "step" not in opt.state.get(p, {})
+    # Второй тик — теперь есть prev_focus. Под флагом снова Adam пропускается.
+    wc.set_creature("n1", 11, 11)  # focus двинулся.
+    compute._compute_theory_of_mind("tm1")
+    assert compute.tom_steps == 0  # всё ещё ноль.
+    assert compute.last_tom_acc.get("tm1", 0.0) == 0.0  # EMA не обновлялась.
