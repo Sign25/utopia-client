@@ -414,20 +414,112 @@ def test_inherit_brain_y50_carries_sfnn_rule_with_noise(seed_file):
 # ── SFNN S1.2a (14.05.2026) — флаг + skeleton _motor_sfnn_update_step ───
 
 
-def test_motor_sfnn_update_step_increments_counter(seed_file):
-    """Skeleton: счётчик motor_sfnn_steps растёт после вызова, веса не меняются."""
+def _sfnn_setup_with_forward(seed_file):
+    """Хелпер: создаёт compute с одной особью и прогоняет motor_forward
+    с ненулевым obs, чтобы forward-hooks захватили pre≠0 / post≠0."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     org = load_founders(seed_file, 1)[0]
     compute.add_creature("m1", org, hebbian_enabled=True)
-    assert compute.motor_sfnn_steps == 0
-    # Имитируем event с reward через минимальный payload.
+    torch.manual_seed(0)
+    obs = torch.randn(1, 64)
+    compute._motor_forward("m1", obs)
+    return compute
+
+
+def test_motor_sfnn_hooks_register_on_add_creature(seed_file):
+    """add_creature вешает 6 forward-hooks на Linear motor_policy Tissue."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    handles = compute.motor_sfnn_hook_handles.get("m1", [])
+    assert len(handles) == 6
+    assert "m1" in compute.motor_sfnn_acts
+    # acts пустые до первого forward.
+    assert compute.motor_sfnn_acts["m1"] == {}
+
+
+def test_motor_sfnn_acts_populated_by_forward(seed_file):
+    """Forward через motor_policy наполняет motor_sfnn_acts всеми 6 типами."""
+    from core.sfnn_rule import SYNAPSE_TYPES
+    compute = _sfnn_setup_with_forward(seed_file)
+    acts = compute.motor_sfnn_acts["m1"]
+    for s in SYNAPSE_TYPES:
+        assert s in acts, f"synapse {s} не захвачен hook'ом"
+        pre, post = acts[s]
+        assert pre.dim() == 1 and post.dim() == 1
+
+
+def test_motor_sfnn_update_modifies_weights_when_reward_positive(seed_file):
+    """С дефолтным правилом (A=1, η=1e-3) и положительным reward
+    веса 6 Linear motor_policy сдвигаются после _motor_sfnn_update_step."""
+    compute = _sfnn_setup_with_forward(seed_file)
+    motor = compute.motor_policy["m1"]
+    # Снимок весов ДО апдейта.
+    weights_before = {n: p.detach().clone()
+                       for n, p in motor.named_parameters()
+                       if p.dim() == 2}
     events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1.0}}
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.01)
     assert compute.motor_sfnn_steps == 1
-    # motor_reinforce_steps НЕ должен расти при вызове SFNN-пути.
-    assert compute.motor_reinforce_steps == 0
+    # Хотя бы один из 6 весов изменился (а лучше — все 6).
+    changed = sum(1 for n, w_before in weights_before.items()
+                   if not torch.equal(dict(motor.named_parameters())[n].data,
+                                        w_before))
+    assert changed >= 1, "ни один weight не изменился под дефолтным правилом"
+
+
+def test_motor_sfnn_update_noop_with_eta_zero(seed_file):
+    """η=0 во всех 6 типах → ΔW = 0 → веса не меняются (sanity)."""
+    from core.sfnn_rule import SFNNRule, SFNNSynapseCoeffs, SYNAPSE_TYPES
+    compute = _sfnn_setup_with_forward(seed_file)
+    # Подменяем правило на «всё нулевое».
+    zero_coeffs = {k: SFNNSynapseCoeffs(eta=1e-5, A=0.0, B=0.0, C=0.0, D=0.0)
+                    for k in SYNAPSE_TYPES}
+    compute.motor_sfnn_rule["m1"] = SFNNRule(coeffs=zero_coeffs)
+    motor = compute.motor_policy["m1"]
+    weights_before = {n: p.detach().clone()
+                       for n, p in motor.named_parameters()
+                       if p.dim() == 2}
+    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1.0}}
+    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
+    for n, w_before in weights_before.items():
+        w_after = dict(motor.named_parameters())[n].data
+        assert torch.allclose(w_after, w_before, atol=1e-10), \
+            f"{n} изменился при A=B=C=D=0"
+
+
+def test_motor_sfnn_update_clip_caps_huge_reward(seed_file):
+    """Большой reward не должен сдвинуть ни один элемент W больше чем на clip (0.01)."""
+    compute = _sfnn_setup_with_forward(seed_file)
+    motor = compute.motor_policy["m1"]
+    weights_before = {n: p.detach().clone()
+                       for n, p in motor.named_parameters()
+                       if p.dim() == 2}
+    # Огромный reward.
+    events = {"m1": {"event_type": "EAT_SUCCESS", "energy_delta": 1e6}}
+    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
+    for n, w_before in weights_before.items():
+        w_after = dict(motor.named_parameters())[n].data
+        max_dw = float((w_after - w_before).abs().max().item())
+        assert max_dw <= 0.01 + 1e-9, \
+            f"{n}: max|ΔW|={max_dw} > clip 0.01"
+
+
+def test_motor_sfnn_hooks_removed_on_remove_creature(seed_file):
+    """remove_creature снимает все 6 forward-hooks и очищает кеши."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    assert len(compute.motor_sfnn_hook_handles["m1"]) == 6
+    compute.remove_creature("m1")
+    assert "m1" not in compute.motor_sfnn_hook_handles
+    assert "m1" not in compute.motor_sfnn_acts
 
 
 def test_genome_sfnn_enabled_default_false():
@@ -440,13 +532,12 @@ def test_genome_sfnn_enabled_default_false():
 
 
 def test_motor_sfnn_update_step_clears_pending_log_prob(seed_file):
-    """Skeleton: pending_log_prob/pending_action чистятся (как в REINFORCE-пути)."""
+    """pending_log_prob/pending_action чистятся (как в REINFORCE-пути)."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     org = load_founders(seed_file, 1)[0]
     compute.add_creature("m1", org, hebbian_enabled=True)
-    # Положим мусор в pending — _motor_sfnn_update_step должен его убрать.
     compute.pending_log_prob["m1"] = "stale"
     compute.pending_action["m1"] = 7
     events = {"m1": {"event_type": "EAT_FAIL", "energy_delta": -0.1}}

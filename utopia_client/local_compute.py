@@ -166,6 +166,12 @@ class LocalColonyCompute:
         # только storage + наследование, фактическое применение в S1.2.
         # Дефолтное правило (A=1, B=C=D=0, η=1e-3) эквивалентно Phase 5d Hebb.
         self.motor_sfnn_rule: dict = {}     # cid → SFNNRule
+        # SFNN S1.2b (14.05.2026) — forward-hooks pre/post активаций для
+        # 6 Linear в motor_policy Tissue. Захватываются на каждом forward
+        # через _motor_forward; используются на следующем тике в
+        # _motor_sfnn_update_step для ΔW. Очищаются в remove_creature.
+        self.motor_sfnn_hook_handles: dict = {}   # cid → list[hook handle]
+        self.motor_sfnn_acts: dict = {}            # cid → {synapse_type → (pre, post)}
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
         self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
@@ -275,6 +281,10 @@ class LocalColonyCompute:
             # + наследование через Y50.
             from core.sfnn_rule import SFNNRule
             self.motor_sfnn_rule[cid] = SFNNRule.default()
+            # SFNN S1.2b: hooks для захвата pre/post 6 Linear motor_policy.
+            # Регистрируются всегда (overhead — копия (pre,post) на forward),
+            # используются только при genome.sfnn_enabled=True.
+            self._register_motor_sfnn_hooks(cid, motor)
         # S2.B (13.05.2026) — theory_of_mind: Tissue 21/3/1 data_dim=52 + Adam.
         tom = self._make_higher_tissue("theory_of_mind", data_dim=_TOM_DATA_DIM)
         if tom is not None:
@@ -328,6 +338,13 @@ class LocalColonyCompute:
         self.motor_policy.pop(cid, None)
         self.motor_policy_opt.pop(cid, None)
         self.motor_sfnn_rule.pop(cid, None)
+        # SFNN S1.2b: снять forward-hooks и забыть кешированные активации.
+        for h in self.motor_sfnn_hook_handles.pop(cid, []) or []:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.motor_sfnn_acts.pop(cid, None)
         self.pending_log_prob.pop(cid, None)
         self.pending_action.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
@@ -1489,26 +1506,92 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("motor_reinforce %s: %s", cid, e)
 
+    # Маппинг суффикса имени модуля → имя типа синапса в SFNNRule.
+    # Привязан к структуре Tissue 21/3/1 (см. core/tissue.py).
+    _MOTOR_SFNN_SYNAPSE_MAP = (
+        ("input_proj", "input_proj"),
+        ("attn.qkv", "attn_qkv"),
+        ("attn.proj", "attn_proj"),
+        ("mlp.fc1", "mlp_fc1"),
+        ("mlp.fc2", "mlp_fc2"),
+        ("output_proj", "output_proj"),
+    )
+    # Защитный clip ΔW по infinity-норме (см. ТЗ S1).
+    _MOTOR_SFNN_DW_CLIP = 0.01
+
+    def _register_motor_sfnn_hooks(self, cid: str, tissue) -> None:
+        """SFNN S1.2b: forward-hooks на 6 Linear motor_policy Tissue для
+        захвата pre (input) и post (output) активаций.
+
+        Hooks записывают в `self.motor_sfnn_acts[cid][synapse_type]` пару
+        (pre, post), усреднённую по всем batch/sequence-измерениям. На
+        следующем тике `_motor_sfnn_update_step` использует эти активации
+        для применения локального правила пластичности.
+
+        Регистрируется при add_creature; снимается при remove_creature.
+        Hooks дёшевы (≪1us на каждый) и всегда активны — даже при
+        sfnn_enabled=False активации просто перезаписываются и не читаются.
+        """
+        self.motor_sfnn_acts[cid] = {}
+        handles: list = []
+        for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
+            mod = None
+            for n, m in tissue.named_modules():
+                if n.endswith(module_name):
+                    mod = m
+                    break
+            if mod is None:
+                logger.debug("motor_sfnn hook: module %s not found for %s",
+                              module_name, cid)
+                continue
+
+            def _make_hook(_cid: str, _syn: str):
+                def hook(_module, _input, _output):
+                    try:
+                        pre_t = _input[0] if isinstance(_input, tuple) else _input
+                        # Усредняем по всем измерениям кроме последнего.
+                        pre = pre_t.detach().reshape(-1, pre_t.shape[-1]).mean(dim=0)
+                        post = _output.detach().reshape(-1, _output.shape[-1]).mean(dim=0)
+                        acts = self.motor_sfnn_acts.get(_cid)
+                        if acts is not None:
+                            acts[_syn] = (pre, post)
+                    except Exception:
+                        pass
+                return hook
+
+            try:
+                h = mod.register_forward_hook(_make_hook(cid, synapse_type))
+                handles.append(h)
+            except Exception as e:
+                logger.debug("motor_sfnn hook %s register: %s", synapse_type, e)
+        self.motor_sfnn_hook_handles[cid] = handles
+
     def _motor_sfnn_update_step(self, cid: str, events_per_cid,
                                   intrinsic_now: float) -> None:
         """SFNN S1.2 (14.05.2026): локальное правило пластичности для
         motor_policy под флагом `genome.sfnn_enabled=True`.
 
-        Заменяет `_motor_reinforce_step` (REINFORCE + Adam). На каждой
-        итерации применяет ΔW = η·(1+r_imm)·(A·post·preᵀ + B·post + C·pre + D)
-        к каждому из 6 типов синапсов Tissue 21/3/1 motor_policy.
+        Заменяет `_motor_reinforce_step` (REINFORCE + Adam). Для каждого
+        из 6 типов синапсов Tissue 21/3/1 motor_policy применяется:
 
-        S1.2a — skeleton: pending_log_prob/pending_action чистятся (как в
-        REINFORCE-пути), счётчик инкрементится, но веса НЕ меняются. Это
-        даёт работающую развилку под флагом без поведенческой регрессии.
-        S1.2b добавит реальное обновление весов с forward-hook'ами на
-        pre/post активации.
+            ΔW = η · (1 + r_imm_total) · (A·outer(post, pre)
+                                            + B·post + C·preᵀ + D)
+            ΔW ← clip(ΔW, ±0.01)            # защита от взрыва
+            W  ← W + ΔW
+
+        Oja-нормализация (W ← W/‖W‖) намеренно НЕ применяется в S1.2b:
+        Frobenius-делитель быстро коллапсирует масштаб весов; row-wise
+        Oja сложнее и обещан в S1.2c. На малом шаге (eta=1e-3, clip=0.01)
+        веса не должны разъезжаться за несколько часов наблюдения.
+
+        pre/post захватываются forward-hooks (`_register_motor_sfnn_hooks`)
+        при предыдущем `_motor_forward`. Если активаций нет (первый тик
+        или ткани нет) — обновление пропускается.
 
         Reward-модуляция использует тот же сигнал что REINFORCE: r_imm
         (immediate reward от событий) + intrinsic_now (surprise predictor).
         """
-        # Чистим pending_log_prob/pending_action — в SFNN они не нужны
-        # (нет gradient backward), но накопление мусора недопустимо.
+        # Чистим pending_log_prob/pending_action — в SFNN они не нужны.
         self.pending_log_prob.pop(cid, None)
         self.pending_action.pop(cid, None)
         if events_per_cid is None:
@@ -1519,14 +1602,58 @@ class LocalColonyCompute:
         rule = self.motor_sfnn_rule.get(cid)
         if rule is None:
             return
+        tissue = self.motor_policy.get(cid)
+        if tissue is None:
+            return
+        acts = self.motor_sfnn_acts.get(cid)
+        if not acts:
+            return
+        torch = self._torch
         try:
-            # r_imm_total — тот же сигнал что в REINFORCE, для согласованности
-            # baseline и интерпретации reward-модуляции (1+r) в правиле.
             r_imm = self._compute_immediate_reward(event)
-            _r_imm_total = float(r_imm + intrinsic_now)
-            # S1.2a no-op: счётчик растёт, веса не меняются. Live-проверка,
-            # что развилка работает — после перевода особи в sfnn_enabled
-            # motor_sfnn_steps должно расти, motor_reinforce_steps — стоять.
+            r_imm_total = float(r_imm + intrinsic_now)
+            reward_gain = 1.0 + r_imm_total
+            clip_val = self._MOTOR_SFNN_DW_CLIP
+            with torch.no_grad():
+                # Build name → parameter map для прямого in-place обновления.
+                params = dict(tissue.named_parameters())
+                for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
+                    if synapse_type not in acts:
+                        continue
+                    # Найти соответствующий weight tensor.
+                    p_name = None
+                    for n in params:
+                        if n.endswith(module_name + ".weight"):
+                            p_name = n
+                            break
+                    if p_name is None:
+                        continue
+                    W = params[p_name]
+                    pre, post = acts[synapse_type]
+                    # Размерности: W (out, in), pre (in,), post (out,).
+                    if W.dim() != 2:
+                        continue
+                    if pre.shape[0] != W.shape[1] or post.shape[0] != W.shape[0]:
+                        continue
+                    coef = rule.coeffs.get(synapse_type)
+                    if coef is None:
+                        continue
+                    eta = float(coef.eta)
+                    A = float(coef.A)
+                    B = float(coef.B)
+                    C = float(coef.C)
+                    D = float(coef.D)
+                    # ΔW = η·(1+r)·(A·outer(post,pre) + B·post[:,None] + C·pre[None,:] + D)
+                    dW = A * torch.outer(post, pre)
+                    if B != 0.0:
+                        dW = dW + B * post.unsqueeze(1).expand_as(W)
+                    if C != 0.0:
+                        dW = dW + C * pre.unsqueeze(0).expand_as(W)
+                    if D != 0.0:
+                        dW = dW + D
+                    dW = dW * (eta * reward_gain)
+                    dW.clamp_(-clip_val, clip_val)
+                    W.data.add_(dW)
             self.motor_sfnn_steps += 1
         except Exception as e:
             logger.debug("motor_sfnn_update %s: %s", cid, e)
