@@ -652,9 +652,8 @@ def test_s3_1_dopamine_hooks_registered_on_add_creature(seed_file):
     assert handles is not None
     # 6 Linear модулей Tissue 21/3/1 = 6 хуков.
     assert len(handles) == 6
-    # Активные на момент S3.6: + theory_of_mind. Остаётся 1 неактивная.
-    for t in ("language",):
-        assert "d1" not in compute.higher_tissue_sfnn_hook_handles[t], t
+    # На момент S3.7 все 7 высших тканей активны (hooks регистрируются
+    # для каждой при наличии).
 
 
 def test_s3_1_dopamine_hooks_capture_pre_post_on_forward(seed_file):
@@ -754,9 +753,7 @@ def test_s3_2_imagination_hooks_registered_on_add_creature(seed_file):
     handles = compute.higher_tissue_sfnn_hook_handles["imagination"].get("i1")
     assert handles is not None
     assert len(handles) == 6
-    # Активные на момент S3.6: + theory_of_mind. Осталась 1 неактивная.
-    for t in ("language",):
-        assert "i1" not in compute.higher_tissue_sfnn_hook_handles[t], t
+    # На момент S3.7 все 7 высших тканей активны.
 
 
 def test_s3_2_imagination_hooks_capture_pre_post_on_forward(seed_file):
@@ -1062,3 +1059,95 @@ def test_s3_6_tom_adam_skipped_under_sfnn_flag(seed_file):
     compute._compute_theory_of_mind("tm1")
     assert compute.tom_steps == 0  # всё ещё ноль.
     assert compute.last_tom_acc.get("tm1", 0.0) == 0.0  # EMA не обновлялась.
+
+
+# ── SFNN S3.7 (14.05.2026) — активация language ────────────────────────────
+
+
+def test_s3_7_lang_hooks_registered(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("lg1", org, hebbian_enabled=True)
+    handles = compute.higher_tissue_sfnn_hook_handles["language"].get("lg1")
+    assert handles is not None and len(handles) == 6
+
+
+def test_s3_7_lang_hooks_capture_on_forward(seed_file):
+    """Прямой forward через tissue() заполняет acts (6 синапсов)."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("lg1", org, hebbian_enabled=True)
+    tissue = compute.language["lg1"]
+    feat = torch.randn(1, tissue.input_proj.in_features)
+    with torch.no_grad():
+        tissue({"input": feat})
+    acts = compute.higher_tissue_sfnn_acts["language"]["lg1"]
+    assert len(acts) == 6
+
+
+def test_s3_7_lang_update_step_changes_weights(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    import torch
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("lg1", org, hebbian_enabled=True)
+    tissue = compute.language["lg1"]
+    feat = torch.randn(1, tissue.input_proj.in_features)
+    with torch.no_grad():
+        tissue({"input": feat})
+    rule = compute.higher_tissue_sfnn_rule["language"]["lg1"]
+    for c in rule.coeffs.values():
+        c.eta = 0.005
+    w_before = {n: p.detach().clone()
+                 for n, p in tissue.named_parameters() if p.dim() == 2}
+    steps_before = compute.higher_tissue_sfnn_steps["language"]
+    compute._higher_tissue_sfnn_update_step("language", "lg1", r=0.0)
+    changed = any(
+        not torch.equal(w_before[n], p.detach())
+        for n, p in tissue.named_parameters()
+        if p.dim() == 2 and n in w_before)
+    assert changed
+    assert (compute.higher_tissue_sfnn_steps["language"]
+            == steps_before + 1)
+
+
+def test_s3_7_lang_adam_skipped_under_sfnn_flag(seed_file):
+    """Под higher_tissue_sfnn_enabled=True _compute_language делает forward
+    (hooks стреляют) но НЕ вызывает opt.step()."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    from tests.test_theory_of_mind_s2b import _FakeCache
+    import torch
+    import types
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    org.genome = types.SimpleNamespace(higher_tissue_sfnn_enabled=True)
+    compute.add_creature("lg1", org, hebbian_enabled=True)
+    # _build_lang_features требует world_cache.creature_tom + neighbors.
+    wc = _FakeCache(size=32)
+    wc.set_creature("lg1", 10, 10, sig=2)
+    wc.set_creature("n1", 11, 10, sig=5)
+    # _build_lang_features читает wc.creature_tom (dict cid → (lin,e,max,sig)).
+    wc.creature_tom = wc._tom  # alias
+    compute.world_cache = wc
+    compute.higher_tissue_sfnn_acts["language"]["lg1"] = {}
+    # Event ate=True должен был бы триггерить supervised step в legacy
+    # пути (если бы был prev_context). Под флагом — всегда пропускается.
+    compute._compute_language("lg1", {"ate": True})
+    acts1 = compute.higher_tissue_sfnn_acts["language"]["lg1"]
+    assert len(acts1) == 6, "forward должен сработать → 6 синапсов"
+    assert compute.lang_steps == 0
+    opt = compute.language_opt["lg1"]
+    for p in opt.param_groups[0]["params"]:
+        assert p not in opt.state or "step" not in opt.state.get(p, {})
+    # Второй тик: prev_context уже есть, event=damage — Adam-путь в legacy
+    # сделал бы step. Под флагом — снова пропуск.
+    compute._compute_language("lg1", {"damage_taken": 1.0})
+    assert compute.lang_steps == 0
+    assert compute.last_lang_acc.get("lg1", 0.0) == 0.0

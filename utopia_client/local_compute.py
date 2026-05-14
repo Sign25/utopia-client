@@ -418,6 +418,17 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s theory_of_mind sfnn hooks: %s",
                               cid, e)
+        # SFNN S3.7 (14.05.2026): hooks для language — седьмой и последней.
+        # Та же особенность что и tom: Adam-оптимизатор (supervised по
+        # prev_context → event_class). Под флагом Adam-шаг пропускается,
+        # forward выполняется для активации SFNN-hooks.
+        if self.language.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "language", cid, self.language[cid])
+            except Exception as e:
+                logger.debug("add_creature %s language sfnn hooks: %s",
+                              cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -1041,9 +1052,14 @@ class LocalColonyCompute:
                 # S2.C (13.05.2026) — language supervised step.
                 # prev_context (сигналы соседей с прошлого тика) → текущий
                 # event_class (ate/damage/killed/idle, idle skip).
+                # SFNN S3.7 (14.05.2026): под флагом forward выполняется
+                # без Adam → hooks стреляют → update_step применяет ΔW.
                 lang_event = (events_per_cid.get(cid)
                               if events_per_cid is not None else None)
                 self._compute_language(cid, lang_event)
+                if higher_sfnn_on:
+                    self._higher_tissue_sfnn_update_step(
+                        "language", cid, r=0.0)
 
                 # Phase 6 — entropy EMA по action-distribution.
                 self._update_entropy_ema(cid, logits)
@@ -1622,6 +1638,28 @@ class LocalColonyCompute:
         opt = self.language_opt.get(cid)
         if tissue is None or opt is None:
             return
+
+        # SFNN S3.7 (14.05.2026): под флагом higher_tissue_sfnn_enabled
+        # ткань обучается локальным правилом ΔW. Forward выполняем по
+        # свежему контексту (текущие сигналы) — иначе SFNN-hooks не словят
+        # активации. Adam-шаг (cross_entropy/backward/opt.step) + accuracy
+        # EMA пропускаются. prev_context всё равно обновляем — на случай
+        # ablation off позже Adam-путь стартует с известного контекста.
+        org_obj = self.organisms.get(cid)
+        sfnn_on = bool(getattr(getattr(org_obj, "genome", None),
+                                "higher_tissue_sfnn_enabled", False))
+        if sfnn_on:
+            try:
+                curr_features = self._build_lang_features(cid)
+                if curr_features is not None:
+                    tissue.eval()
+                    with torch.no_grad():
+                        tissue({"input": curr_features})
+                    self._lang_prev_context[cid] = curr_features.detach()
+            except Exception as e:
+                logger.debug("lang sfnn forward %s: %s", cid, e)
+            return
+
         prev_context = self._lang_prev_context.get(cid)
         event_class = self._lang_event_class(event)
         # Supervised step: prev_context + non-idle event → cross_entropy на 3
