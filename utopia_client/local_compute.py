@@ -359,15 +359,24 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("add_creature %s higher_tissue_sfnn_rule init: %s", cid, e)
         # SFNN S3.1 (14.05.2026): hooks для dopamine — первой активной высшей
-        # ткани под флагом higher_tissue_sfnn_enabled. Остальные 6 тканей —
-        # подключаются в S3.2+. Hooks дёшевы и регистрируются всегда (при
-        # выключенном флаге активации просто перезаписываются).
+        # ткани под флагом higher_tissue_sfnn_enabled. Hooks дёшевы и
+        # регистрируются всегда (при выключенном флаге активации просто
+        # перезаписываются).
         if self.dopamine.get(cid) is not None:
             try:
                 self._register_higher_tissue_sfnn_hooks(
                     "dopamine", cid, self.dopamine[cid])
             except Exception as e:
                 logger.debug("add_creature %s dopamine sfnn hooks: %s",
+                              cid, e)
+        # SFNN S3.2 (14.05.2026): hooks для imagination — второй активной
+        # высшей ткани. Та же логика, дёшево, под тем же общим флагом.
+        if self.imagination.get(cid) is not None:
+            try:
+                self._register_higher_tissue_sfnn_hooks(
+                    "imagination", cid, self.imagination[cid])
+            except Exception as e:
+                logger.debug("add_creature %s imagination sfnn hooks: %s",
                               cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
@@ -963,6 +972,10 @@ class LocalColonyCompute:
                 if higher_sfnn_on:
                     self._higher_tissue_sfnn_update_step(
                         "dopamine", cid, r=0.0)
+                    # SFNN S3.2 (14.05.2026): imagination — вторая активная
+                    # высшая ткань. r=0.0 как и dopamine.
+                    self._higher_tissue_sfnn_update_step(
+                        "imagination", cid, r=0.0)
 
                 # S2.B (13.05.2026) — theory_of_mind supervised step.
                 # Использует WorldStateCache.tom_neighbors_view; если кеша
