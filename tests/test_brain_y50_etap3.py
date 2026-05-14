@@ -543,3 +543,96 @@ def test_motor_sfnn_update_step_clears_pending_log_prob(seed_file):
     compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
     assert "m1" not in compute.pending_log_prob
     assert "m1" not in compute.pending_action
+
+
+# ── SFNN S3.0 (14.05.2026) — инфраструктура высших тканей ──────────────
+
+
+_HIGHER_7 = (
+    "dopamine", "imagination", "planner", "insula",
+    "default_mode", "theory_of_mind", "language",
+)
+
+
+def test_higher_tissue_sfnn_rule_default_on_add_creature(seed_file):
+    """add_creature создаёт дефолтное правило для каждой из 7 высших тканей."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("h1", org, hebbian_enabled=True)
+    for t in _HIGHER_7:
+        rule = compute.higher_tissue_sfnn_rule[t].get("h1")
+        assert rule is not None, t
+        # Дефолт = Phase 5d Hebb (A=1, B=C=D=0, η=1e-3).
+        for c in rule.coeffs.values():
+            assert c.A == 1.0, t
+            assert c.eta == 1e-3, t
+
+
+def test_higher_tissue_sfnn_rule_removed_on_remove_creature(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("h1", org, hebbian_enabled=True)
+    compute.remove_creature("h1")
+    for t in _HIGHER_7:
+        assert "h1" not in compute.higher_tissue_sfnn_rule[t], t
+
+
+def test_higher_tissue_sfnn_rule_steps_reset_in_reset_all(seed_file):
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("h1", org, hebbian_enabled=True)
+    compute.higher_tissue_sfnn_steps["dopamine"] = 42
+    compute.higher_tissue_sfnn_steps["imagination"] = 7
+    compute.reset_all()
+    for t in _HIGHER_7:
+        assert compute.higher_tissue_sfnn_steps[t] == 0, t
+
+
+def test_inherit_brain_y50_carries_higher_tissue_sfnn_rules(seed_file):
+    """Все 7 правил родителя наследуются ребёнком с σ=0.1 mutate."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    parents = load_founders(seed_file, 2)
+    compute = LocalColonyCompute(device="cpu")
+    compute.add_creature("parent", parents[0], hebbian_enabled=True)
+    compute.add_creature("child", parents[1], hebbian_enabled=True)
+    # Сдвинем правила parent от дефолта по всем 7 тканям.
+    for t in _HIGHER_7:
+        p_rule = compute.higher_tissue_sfnn_rule[t]["parent"]
+        for c in p_rule.coeffs.values():
+            c.eta = 5e-3
+            c.A = 0.5
+    # До inherit child = default.
+    for t in _HIGHER_7:
+        assert compute.higher_tissue_sfnn_rule[t]["child"].coeffs["input_proj"].A == 1.0
+    assert compute.inherit_brain_y50("parent", "child") is True
+    # После inherit правила всех 7 тканей близки к parent (mutate σ=0.1).
+    for t in _HIGHER_7:
+        child_rule = compute.higher_tissue_sfnn_rule[t]["child"]
+        for c in child_rule.coeffs.values():
+            assert abs(c.eta - 5e-3) < 4e-3, t
+            assert abs(c.A - 0.5) < 0.4, t
+            assert c.A != 1.0, t  # не дефолт
+
+
+def test_save_state_carries_higher_tissue_sfnn_rules(seed_file):
+    """save_state кладёт 7 правил в payload['higher_tissue_sfnn_rules']."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("h1", org, hebbian_enabled=True)
+    payload = compute.save_state("h1")
+    assert "higher_tissue_sfnn_rules" in payload
+    dumped = payload["higher_tissue_sfnn_rules"]
+    for t in _HIGHER_7:
+        assert t in dumped, t
+        # 6 типов синапсов, дефолтные коэф.
+        assert dumped[t]["input_proj"]["A"] == 1.0
+        assert dumped[t]["input_proj"]["eta"] == 1e-3

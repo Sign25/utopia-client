@@ -95,6 +95,22 @@ _DEFAULT_MODE_FLOOR_MAX = 0.01
 # Y50 для высших тканей (тот же scale, что у predictor).
 _HIGHER_TISSUE_Y50_SCALE = 0.0902
 
+# SFNN S3.0 (14.05.2026): 7 высших тканей, у которых будет своё эволюционирующее
+# правило локальной пластичности (ΔW = η·(A·post·preᵀ + B·post + C·preᵀ + D),
+# r=0 — чистая Hebb с эволюционируемыми коэффициентами). predictor НЕ входит:
+# он остаётся на Adam (supervised, минимизация prediction error). Активируется
+# флагом genome.higher_tissue_sfnn_enabled (S3.1+); в S3.0 — только storage +
+# наследование через single-parent Y50.
+_HIGHER_SFNN_TISSUES: tuple[str, ...] = (
+    "dopamine",
+    "imagination",
+    "planner",
+    "insula",
+    "default_mode",
+    "theory_of_mind",
+    "language",
+)
+
 
 class LocalColonyCompute:
     """Локальная колония: forward + Hebbian + ActionSelector per-creature.
@@ -172,6 +188,19 @@ class LocalColonyCompute:
         # _motor_sfnn_update_step для ΔW. Очищаются в remove_creature.
         self.motor_sfnn_hook_handles: dict = {}   # cid → list[hook handle]
         self.motor_sfnn_acts: dict = {}            # cid → {synapse_type → (pre, post)}
+        # SFNN S3.0 (14.05.2026) — те же SFNN-правила, но для 7 высших тканей.
+        # Внутренний dict per tissue: cid → SFNNRule. Под флагом
+        # genome.higher_tissue_sfnn_enabled (дефолт False) сейчас только
+        # storage + Y50-наследование, активное применение — S3.1+.
+        # predictor сюда не входит — остаётся на Adam (supervised).
+        self.higher_tissue_sfnn_rule: dict[str, dict] = {
+            t: {} for t in _HIGHER_SFNN_TISSUES
+        }
+        # Per-tissue счётчик SFNN-апдейтов (заполняется в S3.1+ при включении
+        # дисптача). Используется в diagnostics для отслеживания активности.
+        self.higher_tissue_sfnn_steps: dict[str, int] = {
+            t: 0 for t in _HIGHER_SFNN_TISSUES
+        }
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
         self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
@@ -299,6 +328,26 @@ class LocalColonyCompute:
             self.language_opt[cid] = self._torch.optim.Adam(
                 lang.parameters(), lr=_LANG_LR)
             self.last_lang_acc[cid] = 0.0
+        # SFNN S3.0 (14.05.2026): дефолтное правило (A=1, B=C=D=0, η=1e-3)
+        # для каждой существующей высшей ткани. Используется только при
+        # genome.higher_tissue_sfnn_enabled=True (S3.1+); в S3.0 — storage
+        # + наследование через single-parent Y50.
+        try:
+            from core.sfnn_rule import SFNNRule
+            _tissue_stores = (
+                ("dopamine", self.dopamine),
+                ("imagination", self.imagination),
+                ("planner", self.planner),
+                ("insula", self.insula),
+                ("default_mode", self.default_mode),
+                ("theory_of_mind", self.theory_of_mind),
+                ("language", self.language),
+            )
+            for _name, _store in _tissue_stores:
+                if _store.get(cid) is not None:
+                    self.higher_tissue_sfnn_rule[_name][cid] = SFNNRule.default()
+        except Exception as e:
+            logger.debug("add_creature %s higher_tissue_sfnn_rule init: %s", cid, e)
         logger.info(
             "add_creature %s n_tissues=%d predictor=%s S2=%s",
             cid, getattr(organism, "n_tissues", 0), pred is not None,
@@ -358,6 +407,9 @@ class LocalColonyCompute:
         self.language_opt.pop(cid, None)
         self.last_lang_acc.pop(cid, None)
         self._lang_prev_context.pop(cid, None)
+        # SFNN S3.0: вычистить правила высших тканей.
+        for _t in _HIGHER_SFNN_TISSUES:
+            self.higher_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -366,6 +418,9 @@ class LocalColonyCompute:
         self.hebbian_updates = 0
         self.predictor_steps = 0
         self.motor_sfnn_steps = 0
+        # SFNN S3.0: сбросить счётчики апдейтов всех 7 высших тканей.
+        for _t in _HIGHER_SFNN_TISSUES:
+            self.higher_tissue_sfnn_steps[_t] = 0
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -404,6 +459,24 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s motor_sfnn_rule: %s",
                                 cid, e)
+        # SFNN S3.0 (14.05.2026): то же наследование для 7 высших тканей.
+        # Под ключом "higher_tissue_sfnn_rules" в payload — словарь
+        # {tissue_name: SFNNRule.to_dict()}. Каждое правило мутируется σ=0.1.
+        higher_rules_d = payload.get("higher_tissue_sfnn_rules")
+        if higher_rules_d:
+            try:
+                from core.sfnn_rule import SFNNRule
+                for _t, _rule_d in higher_rules_d.items():
+                    if _t not in self.higher_tissue_sfnn_rule:
+                        continue
+                    if self.higher_tissue_sfnn_rule[_t].get(cid) is None:
+                        continue
+                    parent_rule = SFNNRule.from_dict(_rule_d)
+                    self.higher_tissue_sfnn_rule[_t][cid] = parent_rule.mutate(sigma=0.1)
+            except Exception as e:
+                logger.warning(
+                    "apply_inherited_state %s higher_tissue_sfnn_rules: %s",
+                    cid, e)
         # Phase 1 — Y50 наследование predictor от родителя.
         pred_sd = payload.get("predictor")
         if pred_sd is not None and self.predictor.get(cid) is not None:
@@ -602,6 +675,22 @@ class LocalColonyCompute:
                 payload["motor_sfnn_rule"] = parent_rule.to_dict()
             except Exception as e:
                 logger.debug("inherit_brain_y50 parent motor_sfnn_rule: %s", e)
+        # SFNN S3.0: 7 правил высших тканей родителя → дочерней особи (mutate
+        # σ=0.1 уже в apply_inherited_state). Дефолтное правило ребёнка из
+        # add_creature перезаписывается родительским только если оно есть.
+        higher_rules_dump: dict = {}
+        for _t in _HIGHER_SFNN_TISSUES:
+            _parent_rule = self.higher_tissue_sfnn_rule.get(_t, {}).get(parent_cid)
+            if _parent_rule is None or not hasattr(_parent_rule, "to_dict"):
+                continue
+            try:
+                higher_rules_dump[_t] = _parent_rule.to_dict()
+            except Exception as e:
+                logger.debug(
+                    "inherit_brain_y50 parent higher_tissue_sfnn_rule[%s]: %s",
+                    _t, e)
+        if higher_rules_dump:
+            payload["higher_tissue_sfnn_rules"] = higher_rules_dump
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
@@ -924,6 +1013,19 @@ class LocalColonyCompute:
                 payload["motor_sfnn_rule"] = sfnn_rule.to_dict()
             except Exception as e:
                 logger.debug("save_state %s motor_sfnn_rule: %s", cid, e)
+        # SFNN S3.0: 7 правил высших тканей в seed_pack для reconnect.
+        higher_rules_dump: dict = {}
+        for _t in _HIGHER_SFNN_TISSUES:
+            _rule = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
+            if _rule is None or not hasattr(_rule, "to_dict"):
+                continue
+            try:
+                higher_rules_dump[_t] = _rule.to_dict()
+            except Exception as e:
+                logger.debug(
+                    "save_state %s higher_tissue_sfnn_rule[%s]: %s", cid, _t, e)
+        if higher_rules_dump:
+            payload["higher_tissue_sfnn_rules"] = higher_rules_dump
         # Phase 1 — predictor + EMA. Формат идентичен P40 _save_member_pt.
         pred = self.predictor.get(cid)
         if pred is not None:
