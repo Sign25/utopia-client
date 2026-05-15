@@ -293,7 +293,15 @@ def _try_self_update(api: UtopiaAPI) -> bool:
         install_dir = pkg_dir.parent              # …/(install_root)
         with zipfile.ZipFile(tmp_path) as z:
             z.extractall(install_dir)
-        logger.info("self-update: extracted to %s, restarting via execv",
+        # Чистим __pycache__ — иначе Python может подгрузить старый .pyc,
+        # пока mtime новых .py отстаёт или совпадает с .pyc (Windows).
+        import shutil
+        for cache_dir in pkg_dir.rglob("__pycache__"):
+            try:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            except Exception:
+                pass
+        logger.info("self-update: extracted to %s (pycache cleared), restarting via execv",
                     install_dir)
     except Exception as e:
         logger.warning("self-update failed: %s", e)
