@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM Utopia Client - repair tool
+REM Utopia Client - repair tool (v0.9.84+)
 REM
 REM Stops NSSM service, purges stale Python caches (.pyc / __pycache__)
 REM and restarts. Use when self-update partially applied (e.g. mismatched
