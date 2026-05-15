@@ -51,10 +51,9 @@ _MOTOR_POLICY_BIT = 17  # Phase 7 — перенумерован с 11 на 17 (
 # Phase S2.A planner — N_ACTIONS из routes_world.
 _PLANNER_N_ACTIONS = 16
 _PLANNER_SCALE = 1.0
-# Phase 7 motor_policy: delta = scale·tanh(out[:16]) ∈ [-1, 1]^16.
+# motor_policy: delta = scale·tanh(out[:16]) ∈ [-1, 1]^16.
 _MOTOR_POLICY_N_ACTIONS = 16
 _MOTOR_POLICY_SCALE = 1.0
-_MOTOR_POLICY_LR = 1e-4
 # S2.B theory_of_mind (13.05.2026): supervised predict 8 motor-actions для соседа.
 # 4 соседа × 13 признаков = 52 data_dim. target = направление Δposition.
 _TOM_DATA_DIM = 52
@@ -173,14 +172,10 @@ class LocalColonyCompute:
         # рождался со случайными весами (P40 потерял default_mode в
         # envelope_brain). Теперь — owned-only, как dopamine/imagination.
         self.default_mode: dict = {}    # cid → Tissue (S2.D)
-        # Phase 7 — motor_policy REINFORCE-sidecar (бит 17 с 13.05.2026,
-        # перенумерован с 11 для освобождения канонического бита под S2.B).
-        # supervised: log_prob[a_t] · (r_imm_total - baseline), Adam lr=1e-4.
-        self.motor_policy: dict = {}        # cid → Tissue (Phase 7)
-        self.motor_policy_opt: dict = {}    # cid → torch.optim.Adam
+        # motor_policy — Tissue 21/3/1, обучается SFNN-правилом (S4).
+        self.motor_policy: dict = {}        # cid → Tissue
         # SFNN S1.1 (14.05.2026) — per-tissue SFNN-правило обучения для
-        # motor_policy. Под флагом genome.sfnn_enabled (дефолт False) сейчас
-        # только storage + наследование, фактическое применение в S1.2.
+        # motor_policy. Per-synapse-type коэффициенты A/B/C/D/η.
         # Дефолтное правило (A=1, B=C=D=0, η=1e-3) эквивалентно Phase 5d Hebb.
         self.motor_sfnn_rule: dict = {}     # cid → SFNNRule
         # SFNN S1.2b (14.05.2026) — forward-hooks pre/post активаций для
@@ -250,15 +245,9 @@ class LocalColonyCompute:
         # Связь с WorldStateCache (для tom_neighbors_view). Прокидывается
         # из ws_client после bootstrap'а кеша. None → ToM no-op.
         self.world_cache = None  # type: Optional[object]
-        # pending_log_prob — scalar tensor с grad-графом от motor_delta предыдущего
-        # тика; REINFORCE-loss применяется на следующем тике, когда приходят events.
-        self.pending_log_prob: dict = {}    # cid → torch.Tensor (scalar, requires_grad)
-        self.pending_action: dict = {}      # cid → int (для диагностики)
-        self.motor_reinforce_steps: int = 0
-        # SFNN S1.2 (14.05.2026) — счётчик SFNN-апдейтов motor_policy под
-        # флагом genome.sfnn_enabled. В S1.2a skeleton увеличивает счётчик,
-        # но веса не трогает (no-op для регрессии). S1.2b включит реальное
-        # правило ΔW = η·(1+r)·(A·post·preᵀ + B·post + C·pre + D).
+        # SFNN S1.2 (14.05.2026) — счётчик SFNN-апдейтов motor_policy.
+        # ΔW = η·(1+r)·(A·hebb_A + B·post + C·preᵀ + D), где
+        # hebb_A = outer(post_c, pre_c) − post_c²·W (S1.2c Oja + mean-center).
         self.motor_sfnn_steps: int = 0
         # Last-snapshot для get_phase_emas → push в actions_batch.
         self.last_beta_local: dict = {}    # cid → float ∈ [0, 1/φ]
@@ -281,12 +270,11 @@ class LocalColonyCompute:
         # Brain migration v0.9.25: TPS-метрика клиента (handle_tick rate).
         self.tick_ts: deque = deque(maxlen=200)
 
-        # SFNN S3.activate: дефолт higher_tissue_sfnn_enabled для новых особей.
-        # set_higher_sfnn() флипает поверх + применяет к existing organisms.
-        self._higher_sfnn_default: bool = False
-        # SFNN S3.activate-motor: дефолт sfnn_enabled (motor_policy ветка)
-        # для новых особей. set_motor_sfnn() флипает поверх.
-        self._motor_sfnn_default: bool = False
+        # SFNN S4 (14.05.2026): дефолты после удаления legacy REINFORCE+Adam.
+        # set_higher_sfnn/set_motor_sfnn(False) всё ещё работают — без legacy
+        # пути это "заморозить веса" (forward без update_step).
+        self._higher_sfnn_default: bool = True
+        self._motor_sfnn_default: bool = True
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -337,15 +325,11 @@ class LocalColonyCompute:
                                                      data_dim=_INSULA_DATA_DIM)
         # 13.05.2026: default_mode (S2.D) — data_dim=64, как dopamine/imagination.
         self.default_mode[cid] = self._make_higher_tissue("default_mode")
-        # Phase 7 — motor_policy: Tissue 21/3/1 + Adam(lr=1e-4) для REINFORCE.
+        # motor_policy — Tissue 21/3/1, обучается SFNN-правилом (S4).
         motor = self._make_higher_tissue("motor_policy")
         if motor is not None:
             self.motor_policy[cid] = motor
-            self.motor_policy_opt[cid] = self._torch.optim.Adam(
-                motor.parameters(), lr=_MOTOR_POLICY_LR)
-            # SFNN S1.1: дефолтное правило (Phase 5d-эквивалент). Используется
-            # только при genome.sfnn_enabled=True (S1.2+); в S1.1 — storage
-            # + наследование через Y50.
+            # SFNN S1.1: дефолтное правило (Phase 5d-эквивалент).
             from core.sfnn_rule import SFNNRule
             self.motor_sfnn_rule[cid] = SFNNRule.default()
             # SFNN S1.2b: hooks для захвата pre/post 6 Linear motor_policy.
@@ -494,9 +478,8 @@ class LocalColonyCompute:
         # Phase 5d — reward-gated Hebbian per-cid state.
         self.dopamine_ema.pop(cid, None)
         self.dopamine_td.pop(cid, None)
-        # Phase 7 — motor_policy.
+        # motor_policy + SFNN-state (S4).
         self.motor_policy.pop(cid, None)
-        self.motor_policy_opt.pop(cid, None)
         self.motor_sfnn_rule.pop(cid, None)
         # SFNN S1.2b: снять forward-hooks и забыть кешированные активации.
         for h in self.motor_sfnn_hook_handles.pop(cid, []) or []:
@@ -507,8 +490,6 @@ class LocalColonyCompute:
         self.motor_sfnn_acts.pop(cid, None)
         # SFNN S1.2c: forget baseline row-norms.
         self.motor_sfnn_row_norms.pop(cid, None)
-        self.pending_log_prob.pop(cid, None)
-        self.pending_action.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
@@ -650,15 +631,13 @@ class LocalColonyCompute:
                 self._apply_y50_to_tissue(tissue)
             except Exception as e:
                 logger.warning("apply_inherited_state %s %s: %s", cid, key, e)
-        # Phase 7 — motor_policy: Y50 + свежий Adam (как predictor).
+        # motor_policy — Y50 (S4: без Adam, SFNN-правило применяет ΔW сам).
         m_sd = payload.get("motor_policy")
         motor = self.motor_policy.get(cid)
         if m_sd is not None and motor is not None:
             try:
                 motor.load_state_dict(m_sd)
                 self._apply_y50_to_tissue(motor)
-                self.motor_policy_opt[cid] = self._torch.optim.Adam(
-                    motor.parameters(), lr=_MOTOR_POLICY_LR)
             except Exception as e:
                 logger.warning("apply_inherited_state %s motor_policy: %s",
                                 cid, e)
@@ -1052,38 +1031,26 @@ class LocalColonyCompute:
                 intrinsic_now = self._predictor_train_step(cid, obs_tensor)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
-                # применяем pending градиент по pending_log_prob, ПОТОМ
-                # делаем свежий motor forward с grad для текущего тика.
-                # SFNN S1.2 (14.05.2026): развилка по genome.sfnn_enabled.
-                # При True — локальное правило пластичности (без Adam,
-                # без REINFORCE), при False — legacy путь Phase 5d.
+                # SFNN S4 (14.05.2026): motor обучается локальным правилом
+                # пластичности. Под genome.sfnn_enabled=False — forward без
+                # update_step (заморозка весов).
                 org = self.organisms.get(cid)
                 sfnn_on = bool(getattr(getattr(org, "genome", None),
-                                        "sfnn_enabled", False))
+                                        "sfnn_enabled", True))
                 if sfnn_on:
                     self._motor_sfnn_update_step(cid, events_per_cid,
                                                    intrinsic_now)
-                else:
-                    self._motor_reinforce_step(cid, events_per_cid,
-                                                 intrinsic_now)
 
-                # Phase 7 — motor_policy forward с grad → motor_delta [16].
-                # Применяется к первым 16 элементам logits (action-space)
-                # ДО selector. grad через motor_delta нужен для log_prob[a_t]
-                # — на следующем тике REINFORCE возьмёт его в loss. Если
-                # ткани нет (legacy state) — fallback к raw_logits.
+                # motor_policy forward → motor_delta [16] (tanh). hooks
+                # SFNN-стиля захватывают pre/post активации для следующего
+                # update_step. Применяется к первым 16 элементам logits
+                # (action-space). Если ткани нет — fallback к raw_logits.
                 motor_delta = self._motor_forward(cid, obs_tensor)
                 selector = self.action_selectors[cid]
                 if motor_delta is not None:
-                    # logits = [1, 64] no_grad → action_slice [N_ACTIONS] с
-                    # прикреплённым grad-графом через motor_delta.
-                    action_slice = (logits[0, :N_ACTIONS].detach()
-                                     + motor_delta)
+                    action_slice = logits[0, :N_ACTIONS] + motor_delta
                     action = int(selector.select(
-                        action_slice.detach(), n_actions=N_ACTIONS))
-                    # log_prob[a_t] с grad через motor_delta → pending для
-                    # REINFORCE-update на следующем тике.
-                    self._stash_pending_log_prob(cid, action_slice, action)
+                        action_slice, n_actions=N_ACTIONS))
                 else:
                     action = int(selector.select(logits, n_actions=N_ACTIONS))
                 out[cid] = {"action": action, "target_id": None}
@@ -1787,91 +1754,27 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("lang build features %s: %s", cid, e)
 
-    # ── Phase 7 — motor_policy REINFORCE-sidecar ─────────────────────────
+    # ── motor_policy forward (SFNN S4) ───────────────────────────────────
 
     def _motor_forward(self, cid: str, obs_tensor):
-        """Forward motor_policy с grad. Возвращает delta torch.Tensor [16]
-        с прикреплённым grad-графом или None если ткани нет / ошибка.
-
-        Грейд нужен здесь, чтобы при выборе действия с применённой delta
-        log_prob[a_t] нёс градиент в motor_policy weights (REINFORCE).
-        """
+        """Forward motor_policy → tanh-delta [-1, 1]^16. Hooks захватывают
+        pre/post активации для SFNN update_step на следующем тике. Возвращает
+        torch.Tensor [16] или None если ткани нет."""
         torch = self._torch
         tissue = self.motor_policy.get(cid)
         if tissue is None:
             return None
         try:
-            tissue.train()
-            with torch.enable_grad():
+            tissue.eval()
+            with torch.no_grad():
                 out = tissue({"input": obs_tensor.detach()})["output"]
                 delta = (torch.tanh(out[0, :_MOTOR_POLICY_N_ACTIONS])
                           * _MOTOR_POLICY_SCALE)
-            # Snapshot для push на сервер (detached cpu).
             self.last_motor_delta[cid] = delta.detach().cpu()
             return delta
         except Exception as e:
             logger.debug("motor_policy forward %s: %s", cid, e)
             return None
-
-    def _stash_pending_log_prob(self, cid: str, action_slice,
-                                  action: int) -> None:
-        """Сохранить log_prob[a_t] (с grad через motor_delta) для REINFORCE
-        на следующем тике. action_slice — [N_ACTIONS] 1D-тензор raw_logits +
-        motor_delta с прикреплённым grad-графом через motor_delta.
-        """
-        torch = self._torch
-        try:
-            n = int(action_slice.shape[-1])
-            if not (0 <= action < n):
-                return
-            log_probs = torch.log_softmax(action_slice, dim=-1)
-            self.pending_log_prob[cid] = log_probs[action]
-            self.pending_action[cid] = int(action)
-        except Exception as e:
-            logger.debug("stash_pending_log_prob %s: %s", cid, e)
-
-    def _motor_reinforce_step(self, cid: str, events_per_cid,
-                                intrinsic_now: float) -> None:
-        """REINFORCE update от прошлого тика: loss = -log_prob · (r_imm_total
-        - baseline). baseline = intrinsic_ema[cid] (running mean intrinsic).
-        Применяется и опт-шаг, и градиент очищается через opt.zero_grad().
-        Pending_log_prob — scalar tensor с requires_grad, созданный на
-        предыдущем _stash_pending_log_prob.
-
-        14.05.2026: дополнительно вызывает selector.reinforce(advantage,
-        prev_action) — быстрый SFNN-стиль bias на ActionSelector. Bias
-        реагирует немедленно (1 шаг = +lr·reward к выбранному действию),
-        в отличие от motor_policy который обучается через градиент Adam.
-        """
-        pending = self.pending_log_prob.pop(cid, None)
-        prev_action = self.pending_action.pop(cid, None)
-        if pending is None:
-            return
-        if events_per_cid is None:
-            return
-        event = events_per_cid.get(cid)
-        if event is None:
-            return
-        opt = self.motor_policy_opt.get(cid)
-        if opt is None:
-            return
-        try:
-            r_imm = self._compute_immediate_reward(event)
-            r_imm_total = float(r_imm + intrinsic_now)
-            baseline = float(self.intrinsic_ema.get(cid, 0.0))
-            advantage = r_imm_total - baseline
-            # REINFORCE: maximize log_prob · A → minimize -log_prob · A.
-            loss = -pending * advantage
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            self.motor_reinforce_steps += 1
-            # SFNN-стиль reward-modulated bias на ActionSelector.
-            sel = self.action_selectors.get(cid)
-            if sel is not None and prev_action is not None:
-                sel.reinforce(advantage, int(prev_action))
-        except Exception as e:
-            logger.debug("motor_reinforce %s: %s", cid, e)
 
     # Маппинг суффикса имени модуля → имя типа синапса в SFNNRule.
     # Привязан к структуре Tissue 21/3/1 (см. core/tissue.py).
@@ -1963,7 +1866,7 @@ class LocalColonyCompute:
         """SFNN S1.2 (14.05.2026): локальное правило пластичности для
         motor_policy под флагом `genome.sfnn_enabled=True`.
 
-        Заменяет `_motor_reinforce_step` (REINFORCE + Adam). Для каждого
+        SFNN S4 (14.05.2026) — единственный путь обучения motor. Для каждого
         из 6 типов синапсов Tissue 21/3/1 motor_policy применяется:
 
             hebb_A = outer(post, pre) − post²·W       # Oja-стабилизация
@@ -1985,12 +1888,9 @@ class LocalColonyCompute:
         при предыдущем `_motor_forward`. Если активаций нет (первый тик
         или ткани нет) — обновление пропускается.
 
-        Reward-модуляция использует тот же сигнал что REINFORCE: r_imm
-        (immediate reward от событий) + intrinsic_now (surprise predictor).
+        Reward-модуляция: r_imm (immediate reward от событий) +
+        intrinsic_now (surprise predictor).
         """
-        # Чистим pending_log_prob/pending_action — в SFNN они не нужны.
-        self.pending_log_prob.pop(cid, None)
-        self.pending_action.pop(cid, None)
         if events_per_cid is None:
             return
         event = events_per_cid.get(cid)
@@ -2424,7 +2324,6 @@ class LocalColonyCompute:
                 "s2_dopa_td_avg": 0.0,
                 "s2_action_dist_avg": [0.0] * N_ACTIONS,
                 "motor_delta_norm_avg": 0.0,
-                "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
                 "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
                 "motor_sfnn_eta_avg": 0.0,
                 "motor_sfnn_A_avg": 0.0,
@@ -2674,7 +2573,6 @@ class LocalColonyCompute:
             "s2_planner_norm_avg": s2_planner_avg,
             "s2_dmn_floor_avg": s2_dmn_avg,
             "motor_delta_norm_avg": motor_delta_avg,
-            "motor_reinforce_steps_total": int(self.motor_reinforce_steps),
             "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
             "motor_sfnn_eta_avg": motor_sfnn_eta_avg,
             "motor_sfnn_A_avg": motor_sfnn_A_avg,

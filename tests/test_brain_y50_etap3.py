@@ -534,19 +534,9 @@ def test_genome_sfnn_enabled_default_false():
     assert g2.sfnn_enabled is True
 
 
-def test_motor_sfnn_update_step_clears_pending_log_prob(seed_file):
-    """pending_log_prob/pending_action чистятся (как в REINFORCE-пути)."""
-    from utopia_client.seed_loader import load_founders
-    from utopia_client.local_compute import LocalColonyCompute
-    compute = LocalColonyCompute(device="cpu")
-    org = load_founders(seed_file, 1)[0]
-    compute.add_creature("m1", org, hebbian_enabled=True)
-    compute.pending_log_prob["m1"] = "stale"
-    compute.pending_action["m1"] = 7
-    events = {"m1": {"delta_energy": -0.1}}
-    compute._motor_sfnn_update_step("m1", events, intrinsic_now=0.0)
-    assert "m1" not in compute.pending_log_prob
-    assert "m1" not in compute.pending_action
+# SFNN S4 (14.05.2026): тест test_motor_sfnn_update_step_clears_pending_log_prob
+# удалён — pending_log_prob/pending_action больше не существуют (legacy REINFORCE
+# снесён, motor обучается только через SFNN).
 
 
 # ── SFNN S3.0 (14.05.2026) — инфраструктура высших тканей ──────────────
@@ -1231,8 +1221,9 @@ def test_diagnostics_higher_sfnn_enabled_pct(seed_file):
 # SFNN S3.activate (14.05.2026) — manual endpoint + set_higher_sfnn
 # ─────────────────────────────────────────────────────────────────────
 
-def test_s3_activate_default_genome_attached_off(seed_file):
-    """add_creature клеит genome.higher_tissue_sfnn_enabled=False по дефолту."""
+def test_s3_activate_default_genome_attached_on(seed_file):
+    """S4 (14.05.2026): add_creature клеит genome.higher_tissue_sfnn_enabled=True
+    по дефолту (legacy REINFORCE+Adam удалён)."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
@@ -1240,48 +1231,50 @@ def test_s3_activate_default_genome_attached_off(seed_file):
     compute.add_creature("c1", orgs[0], hebbian_enabled=True)
     org = compute.organisms["c1"]
     assert hasattr(org, "genome")
-    assert org.genome.higher_tissue_sfnn_enabled is False
+    assert org.genome.higher_tissue_sfnn_enabled is True
 
 
 def test_s3_activate_set_higher_sfnn_flips_existing(seed_file):
-    """set_higher_sfnn(True) переписывает флаг у всех существующих особей."""
+    """S4 (14.05.2026): set_higher_sfnn(False) переписывает флаг у всех."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     orgs = load_founders(seed_file, 3)
     for i, o in enumerate(orgs):
         compute.add_creature(f"c{i}", o, hebbian_enabled=True)
-    n = compute.set_higher_sfnn(True)
+    # Дефолт = True, флипаем в False
+    n = compute.set_higher_sfnn(False)
     assert n == 3
     for cid in ("c0", "c1", "c2"):
-        assert compute.organisms[cid].genome.higher_tissue_sfnn_enabled is True
+        assert compute.organisms[cid].genome.higher_tissue_sfnn_enabled is False
 
 
 def test_s3_activate_default_propagates_to_new_creatures(seed_file):
-    """После set_higher_sfnn(True) новые особи из add_creature тоже True."""
+    """S4 (14.05.2026): после set_higher_sfnn(False) новые особи тоже False."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
-    compute.set_higher_sfnn(True)
+    compute.set_higher_sfnn(False)
     orgs = load_founders(seed_file, 1)
     compute.add_creature("c1", orgs[0], hebbian_enabled=True)
-    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is False
 
 
 def test_s3_activate_toggle_off_idempotent(seed_file):
-    """Повторный set_higher_sfnn(False) — n_changed=0 после первого вызова."""
+    """S4 (14.05.2026): дефолт = True. set_higher_sfnn(True) идемпотентно,
+    set_higher_sfnn(False) флипает в False, повторный — n=0."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     orgs = load_founders(seed_file, 2)
     for i, o in enumerate(orgs):
         compute.add_creature(f"c{i}", o, hebbian_enabled=True)
-    # дефолт = False, повторный False не меняет ничего
-    n1 = compute.set_higher_sfnn(False)
+    # дефолт = True, повторный True не меняет ничего
+    n1 = compute.set_higher_sfnn(True)
     assert n1 == 0
-    n2 = compute.set_higher_sfnn(True)
+    n2 = compute.set_higher_sfnn(False)
     assert n2 == 2
-    n3 = compute.set_higher_sfnn(True)
+    n3 = compute.set_higher_sfnn(False)
     assert n3 == 0
 
 
@@ -1289,55 +1282,57 @@ def test_s3_activate_toggle_off_idempotent(seed_file):
 # SFNN S3.activate-motor (14.05.2026) — set_motor_sfnn для motor_policy
 # ─────────────────────────────────────────────────────────────────────
 
-def test_s3_activate_motor_default_off(seed_file):
-    """add_creature клеит genome.sfnn_enabled=False по дефолту."""
+def test_s3_activate_motor_default_on(seed_file):
+    """S4 (14.05.2026): add_creature клеит genome.sfnn_enabled=True по дефолту."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     orgs = load_founders(seed_file, 1)
     compute.add_creature("c1", orgs[0], hebbian_enabled=True)
-    assert compute.organisms["c1"].genome.sfnn_enabled is False
+    assert compute.organisms["c1"].genome.sfnn_enabled is True
 
 
 def test_s3_activate_motor_flips_existing(seed_file):
-    """set_motor_sfnn(True) переписывает sfnn_enabled у всех."""
+    """S4 (14.05.2026): set_motor_sfnn(False) переписывает sfnn_enabled у всех."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     orgs = load_founders(seed_file, 3)
     for i, o in enumerate(orgs):
         compute.add_creature(f"c{i}", o, hebbian_enabled=True)
-    n = compute.set_motor_sfnn(True)
+    # Дефолт = True, флипаем в False
+    n = compute.set_motor_sfnn(False)
     assert n == 3
     for cid in ("c0", "c1", "c2"):
-        assert compute.organisms[cid].genome.sfnn_enabled is True
+        assert compute.organisms[cid].genome.sfnn_enabled is False
 
 
 def test_s3_activate_motor_propagates_to_new(seed_file):
-    """После set_motor_sfnn(True) новые особи рождаются с sfnn_enabled=True."""
+    """S4 (14.05.2026): после set_motor_sfnn(False) новые особи родятся с False."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
-    compute.set_motor_sfnn(True)
+    compute.set_motor_sfnn(False)
     orgs = load_founders(seed_file, 1)
     compute.add_creature("c1", orgs[0], hebbian_enabled=True)
-    assert compute.organisms["c1"].genome.sfnn_enabled is True
+    assert compute.organisms["c1"].genome.sfnn_enabled is False
 
 
 def test_s3_activate_motor_independent_of_higher(seed_file):
-    """sfnn_motor и sfnn_higher переключаются независимо."""
+    """S4 (14.05.2026): sfnn_motor и sfnn_higher переключаются независимо.
+    Стартовый дефолт обоих = True."""
     from utopia_client.seed_loader import load_founders
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
     orgs = load_founders(seed_file, 1)
     compute.add_creature("c1", orgs[0], hebbian_enabled=True)
-    compute.set_higher_sfnn(True)
+    compute.set_motor_sfnn(False)
     assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
     assert compute.organisms["c1"].genome.sfnn_enabled is False
-    compute.set_motor_sfnn(True)
-    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is True
-    assert compute.organisms["c1"].genome.sfnn_enabled is True
     compute.set_higher_sfnn(False)
+    assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is False
+    assert compute.organisms["c1"].genome.sfnn_enabled is False
+    compute.set_motor_sfnn(True)
     assert compute.organisms["c1"].genome.higher_tissue_sfnn_enabled is False
     assert compute.organisms["c1"].genome.sfnn_enabled is True
 

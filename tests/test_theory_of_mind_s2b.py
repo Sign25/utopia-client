@@ -236,6 +236,10 @@ def test_handle_tick_without_world_cache_is_noop(seed_file):
 
 def test_handle_tick_with_world_cache_trains_tom(seed_file):
     compute, _ = _compute(seed_file)
+    # S4 (14.05.2026): дефолт higher_tissue_sfnn_enabled=True блокирует
+    # Adam-supervised path в _compute_theory_of_mind (S3.6 Variant 1).
+    # Для проверки legacy Adam-шага выключаем SFNN явно.
+    compute.set_higher_sfnn(False)
     cache = _FakeCache(size=32)
     cache.set_creature("t1", 16, 16)
     cache.set_creature("n1", 18, 16, lineage="wanderer")
