@@ -377,7 +377,8 @@ def test_extract_brain_state_dicts_includes_motor_sfnn_rule(seed_file):
     brain, _ = compute.extract_brain_state_dicts("m1")
     assert "motor_sfnn_rule" in brain
     rd = brain["motor_sfnn_rule"]
-    assert set(rd.keys()) == set(SYNAPSE_TYPES)
+    # S5 (15.05.2026): помимо 6 synapse-ключей добавлен "temperature".
+    assert set(rd.keys()) == set(SYNAPSE_TYPES) | {"temperature"}
     assert rd["input_proj"]["A"] == 0.5
     assert rd["mlp_fc1"]["eta"] == 5e-3
 
@@ -1506,3 +1507,82 @@ def test_s1_2c_oja_subtractive_term_reduces_drift(seed_file):
         assert w_a.norm().item() < w_b.norm().item(), (
             f"{n}: при больших W Oja-вычитающий член должен уменьшать ‖W‖, "
             f"но норма не упала ({w_b.norm():.3f} → {w_a.norm():.3f})")
+
+
+# ── S5 (15.05.2026) — temperature pre-tanh в motor_forward ─────────────
+
+
+def test_s5_motor_forward_uses_rule_temperature(seed_file):
+    """T>1 в SFNNRule делит pre-tanh → меньше насыщения, |delta| меньше
+    при том же сильном входе."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    motor = compute.motor_policy["m1"]
+    # Раздуем веса output_proj, чтобы pre-tanh был большим (насыщение tanh).
+    with torch.no_grad():
+        for n, p in motor.named_parameters():
+            if p.dim() == 2 and n.endswith("output_proj.weight"):
+                p.data.mul_(10.0)
+    torch.manual_seed(0)
+    obs = torch.randn(1, 64)
+    # T=1.0 (дефолт) — tanh насыщён, |delta| близок к scale.
+    compute.motor_sfnn_rule["m1"].temperature = 1.0
+    delta_t1 = compute._motor_forward("m1", obs).clone()
+    # T=5.0 — pre-tanh разделится на 5, выход в линейной зоне, |delta| меньше.
+    compute.motor_sfnn_rule["m1"].temperature = 5.0
+    delta_t5 = compute._motor_forward("m1", obs).clone()
+    assert delta_t5.abs().mean().item() < delta_t1.abs().mean().item(), (
+        f"T=5 должен ослабить |delta| (T=1: {delta_t1.abs().mean():.4f}, "
+        f"T=5: {delta_t5.abs().mean():.4f})")
+
+
+def test_s5_motor_forward_no_rule_uses_T_one(seed_file):
+    """Если SFNNRule отсутствует (легаси-путь) — T=1.0 fallback,
+    forward не падает, delta валидна."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    org = load_founders(seed_file, 1)[0]
+    compute.add_creature("m1", org, hebbian_enabled=True)
+    compute.motor_sfnn_rule.pop("m1", None)
+    delta = compute._motor_forward("m1", torch.randn(1, 64))
+    assert delta is not None
+    assert delta.shape == (16,)
+    assert delta.abs().max().item() <= 1.001  # tanh*scale, scale=1.0
+
+
+def test_s5_diagnostics_includes_motor_sfnn_T_avg(seed_file):
+    """diagnostics() возвращает motor_sfnn_T_avg = среднее T по особям."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 2)
+    compute.add_creature("m1", orgs[0], hebbian_enabled=True)
+    compute.add_creature("m2", orgs[1], hebbian_enabled=True)
+    compute.motor_sfnn_rule["m1"].temperature = 2.0
+    compute.motor_sfnn_rule["m2"].temperature = 3.0
+    diag = compute.diagnostics()
+    assert "motor_sfnn_T_avg" in diag
+    assert diag["motor_sfnn_T_avg"] == pytest.approx(2.5, rel=1e-3)
+
+
+def test_s5_inherit_brain_y50_carries_temperature(seed_file):
+    """Y50-наследование сохраняет T от родителя (mutate σ=0.1 в окрестности).
+    Дефолт ребёнка T=1.0 → после inherit от parent с T=2.5 → child.T ≠ 1.0."""
+    from utopia_client.seed_loader import load_founders
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    orgs = load_founders(seed_file, 2)
+    compute.add_creature("parent", orgs[0], hebbian_enabled=True)
+    compute.add_creature("child", orgs[1], hebbian_enabled=True)
+    compute.motor_sfnn_rule["parent"].temperature = 2.5
+    assert compute.motor_sfnn_rule["child"].temperature == 1.0  # дефолт
+    ok = compute.inherit_brain_y50("parent", "child")
+    assert ok is True
+    child_T = compute.motor_sfnn_rule["child"].temperature
+    # mutate с σ=0.1 от 2.5 → ожидаемый диапазон ~[2.0, 3.0]; clip [0.5, 5.0].
+    assert 0.5 <= child_T <= 5.0
+    assert child_T != 1.0, "child должен унаследовать T от parent, не остаться дефолтным"

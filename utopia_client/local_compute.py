@@ -1759,7 +1759,12 @@ class LocalColonyCompute:
     def _motor_forward(self, cid: str, obs_tensor):
         """Forward motor_policy → tanh-delta [-1, 1]^16. Hooks захватывают
         pre/post активации для SFNN update_step на следующем тике. Возвращает
-        torch.Tensor [16] или None если ткани нет."""
+        torch.Tensor [16] или None если ткани нет.
+
+        S5 (15.05.2026): pre-tanh делится на T из SFNNRule (эволюционирует).
+        T>1 расширяет линейную зону tanh при насыщенных весах
+        (motor_delta_norm≈3.97). T=1.0 (дефолт) — no-op.
+        """
         torch = self._torch
         tissue = self.motor_policy.get(cid)
         if tissue is None:
@@ -1768,7 +1773,9 @@ class LocalColonyCompute:
             tissue.eval()
             with torch.no_grad():
                 out = tissue({"input": obs_tensor.detach()})["output"]
-                delta = (torch.tanh(out[0, :_MOTOR_POLICY_N_ACTIONS])
+                rule = self.motor_sfnn_rule.get(cid)
+                T = rule.temperature if rule is not None else 1.0
+                delta = (torch.tanh(out[0, :_MOTOR_POLICY_N_ACTIONS] / T)
                           * _MOTOR_POLICY_SCALE)
             self.last_motor_delta[cid] = delta.detach().cpu()
             return delta
@@ -2327,6 +2334,7 @@ class LocalColonyCompute:
                 "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
                 "motor_sfnn_eta_avg": 0.0,
                 "motor_sfnn_A_avg": 0.0,
+                "motor_sfnn_T_avg": 0.0,
                 "motor_sfnn_enabled_pct": 0.0,
                 # SFNN S3.diag (14.05.2026): per-tissue для 7 высших.
                 "higher_sfnn": {
@@ -2483,6 +2491,7 @@ class LocalColonyCompute:
         # между особями = эволюция правил активна (см. tz_sfnn_migration.md).
         sfnn_etas: list[float] = []
         sfnn_As: list[float] = []
+        sfnn_Ts: list[float] = []
         sfnn_enabled_n = 0
         for c, rule in self.motor_sfnn_rule.items():
             if rule is None:
@@ -2490,6 +2499,7 @@ class LocalColonyCompute:
             try:
                 sfnn_etas.append(float(rule.mean_eta()))
                 sfnn_As.append(float(rule.mean_A()))
+                sfnn_Ts.append(float(rule.temperature))
             except Exception:
                 continue
             org_c = self.organisms.get(c)
@@ -2500,6 +2510,9 @@ class LocalColonyCompute:
                                 if sfnn_etas else 0.0)
         motor_sfnn_A_avg = (round(sum(sfnn_As) / len(sfnn_As), 4)
                               if sfnn_As else 0.0)
+        # S5 (15.05.2026): средняя T pre-tanh делителя motor_forward.
+        motor_sfnn_T_avg = (round(sum(sfnn_Ts) / len(sfnn_Ts), 4)
+                              if sfnn_Ts else 0.0)
         motor_sfnn_enabled_pct = round(sfnn_enabled_n / max(1, n), 3)
 
         # SFNN S3.diag (14.05.2026): per-tissue агрегация для 7 высших.
@@ -2576,6 +2589,7 @@ class LocalColonyCompute:
             "motor_sfnn_steps_total": int(self.motor_sfnn_steps),
             "motor_sfnn_eta_avg": motor_sfnn_eta_avg,
             "motor_sfnn_A_avg": motor_sfnn_A_avg,
+            "motor_sfnn_T_avg": motor_sfnn_T_avg,
             "motor_sfnn_enabled_pct": motor_sfnn_enabled_pct,
             # SFNN S3.diag (14.05.2026): per-tissue для 7 высших тканей.
             "higher_sfnn": higher_sfnn_block,
