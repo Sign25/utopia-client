@@ -2812,6 +2812,17 @@ class LocalColonyCompute:
                              "A_avg": 0.0}
                        for t in _HIGHER_SFNN_TISSUES},
                 },
+                # SFNN S6.8 (16.05.2026): per-role для 10 базовых.
+                "basic_sfnn": {
+                    "enabled_pct": 0.0,
+                    **{r: {"steps_total": int(
+                                self.basic_tissue_sfnn_steps.get(r, 0)),
+                             "eta_avg": 0.0,
+                             "A_avg": 0.0,
+                             "tau_avg": 0.0,
+                             "w_norm_avg": 0.0}
+                       for r in _BASIC_SFNN_TISSUES},
+                },
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
             }
@@ -3015,6 +3026,70 @@ class LocalColonyCompute:
             **higher_sfnn_per_tissue,
         }
 
+        # SFNN S6.8 (16.05.2026): per-role агрегация для 10 базовых тканей.
+        # eta_avg/A_avg по правилам, tau_avg отдельно, w_norm_avg — Frobenius
+        # ‖W_sub‖ по cell.input_proj/output_proj (regression check на отлёт).
+        basic_sfnn_enabled_n = 0
+        for c in self.organisms:
+            org_c = self.organisms.get(c)
+            if bool(getattr(getattr(org_c, "genome", None),
+                              "basic_tissue_sfnn_enabled", False)):
+                basic_sfnn_enabled_n += 1
+        # Сначала пройдём по hebbian._tissue_info чтобы достать W-нормы.
+        # Структура: per-role список Frobenius norms.
+        torch = self._torch
+        basic_w_norms: dict[str, list[float]] = {
+            r: [] for r in _BASIC_SFNN_TISSUES}
+        for c, heb in self.hebbian.items():
+            if heb is None:
+                continue
+            for info in getattr(heb, "_tissue_info", []):
+                role = info.get('role')
+                if role not in _BASIC_SFNN_TISSUES:
+                    continue
+                cell = info.get('cell')
+                algo = info.get('algorithm')
+                try:
+                    if algo == 'oja_input' and hasattr(cell, 'input_proj'):
+                        W = cell.input_proj.weight.data
+                    elif algo == 'reward_output' and hasattr(cell, 'output_proj'):
+                        W = cell.output_proj.weight.data[:16, :]
+                    else:
+                        continue
+                    basic_w_norms[role].append(float(W.norm().item()))
+                except Exception:
+                    continue
+        basic_sfnn_per_tissue: dict[str, dict] = {}
+        for r in _BASIC_SFNN_TISSUES:
+            etas: list[float] = []
+            As: list[float] = []
+            taus: list[float] = []
+            for rule in self.basic_tissue_sfnn_rule.get(r, {}).values():
+                if rule is None:
+                    continue
+                try:
+                    etas.append(float(rule.mean_eta()))
+                    As.append(float(rule.mean_A()))
+                    taus.append(float(rule.tau))
+                except Exception:
+                    continue
+            wnorms = basic_w_norms.get(r, [])
+            basic_sfnn_per_tissue[r] = {
+                "steps_total": int(self.basic_tissue_sfnn_steps.get(r, 0)),
+                "eta_avg": (round(sum(etas) / len(etas), 6)
+                              if etas else 0.0),
+                "A_avg": (round(sum(As) / len(As), 4)
+                            if As else 0.0),
+                "tau_avg": (round(sum(taus) / len(taus), 3)
+                              if taus else 0.0),
+                "w_norm_avg": (round(sum(wnorms) / len(wnorms), 4)
+                                 if wnorms else 0.0),
+            }
+        basic_sfnn_block: dict = {
+            "enabled_pct": round(basic_sfnn_enabled_n / max(1, n), 3),
+            **basic_sfnn_per_tissue,
+        }
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -3060,6 +3135,8 @@ class LocalColonyCompute:
             "motor_sfnn_enabled_pct": motor_sfnn_enabled_pct,
             # SFNN S3.diag (14.05.2026): per-tissue для 7 высших тканей.
             "higher_sfnn": higher_sfnn_block,
+            # SFNN S6.8 (16.05.2026): per-role для 10 базовых тканей.
+            "basic_sfnn": basic_sfnn_block,
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,
