@@ -22,7 +22,13 @@ import time
 from . import __version__
 from .api import UtopiaAPI
 from .benchmark import estimate_population, run_full
-from .config import DEFAULT_SERVER, get_or_prompt, load_config, save_config
+from .config import (
+    DEFAULT_P40_URL,
+    DEFAULT_SERVER,
+    get_or_prompt,
+    load_config,
+    save_config,
+)
 from .log_buffer import get_ring, setup_logging
 from .ws_client import ColonyWSClient
 from .world_cache import WorldStateCache
@@ -104,11 +110,20 @@ def _ensure_config() -> dict:
 
 
 def _fetch_colony_name(cfg: dict) -> str:
-    """Запросить colony_name из кабинета на VPS. '' при недоступности."""
+    """Запросить colony_name (и user_id) из кабинета на VPS. '' при недоступности.
+
+    Side-effect: при успехе пишет `user_id` в cfg (нужен для Z7.i.b LAN-вызова
+    P40 endpoint `/api/world/upgrade_lineage_to_zodchiy`, у которого нет VPS-auth
+    и который требует явный uuid пользователя).
+    """
     try:
         api = UtopiaAPI(cfg["server"], cfg.get("token", ""))
         ident = api.get_identity() or {}
         name = str(ident.get("colony_name", "")).strip()
+        uid = str(ident.get("user_id", "")).strip()
+        if uid and cfg.get("user_id") != uid:
+            cfg["user_id"] = uid
+            save_config(cfg)
         return name
     except Exception as e:
         logger.warning("colony name fetch failed: %s", e)
@@ -444,6 +459,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_sfnn_motor: bool | None = None
     # SFNN S6.9: то же для 10 базовых тканей.
     applied_sfnn_basic: bool | None = None
+    # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
+    # client_flags. Триггер edge-detect: False/None → True вызывает
+    # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
+    # сбрасывается клиентом; чтобы повторить апгрейд, кабинет должен
+    # сначала вернуть флаг в false, потом снова в true.
+    applied_lineage_upgrade: bool | None = None
     bench = cfg.get("benchmark", {})
     ring = get_ring()
 
@@ -567,6 +588,42 @@ def cmd_run(args: argparse.Namespace) -> int:
                                         target_basic, n)
                         except Exception as e:
                             logger.warning("set_basic_sfnn failed: %s", e)
+
+                    # Z7.i.b (Zodchiy, 16.05.2026): на rising edge флага
+                    # lineage_upgrade_pending дёргаем P40 Z7.g endpoint по
+                    # LAN. Серверный консьюм Z7.f при следующей репродукции
+                    # сделает потомка одного из серверных Странников
+                    # Зодчим. Локальный клиентский Genome-флип — отдельный
+                    # путь (Z7.i.c+); этот коммит только серверный.
+                    target_upgrade = bool(
+                        flags.get("lineage_upgrade_pending", False))
+                    if target_upgrade and applied_lineage_upgrade is not True:
+                        uid = str(cfg.get("user_id", "") or "").strip()
+                        if not uid:
+                            logger.warning(
+                                "lineage_upgrade_pending=True but user_id "
+                                "missing in config — skip P40 call")
+                        else:
+                            p40_url = str(
+                                os.environ.get("UTOPIA_P40_URL")
+                                or cfg.get("p40_url")
+                                or DEFAULT_P40_URL)
+                            resp = api.trigger_p40_lineage_upgrade(p40_url, uid)
+                            if resp is not None:
+                                logger.info(
+                                    "lineage_upgrade_pending → P40 ok: "
+                                    "creature=%s energy=%.1f",
+                                    resp.get("creature_id"),
+                                    float(resp.get("energy", 0.0)))
+                            else:
+                                logger.info(
+                                    "lineage_upgrade_pending → P40 no-op "
+                                    "(unreachable / no server wanderer)")
+                        applied_lineage_upgrade = True
+                    elif not target_upgrade and applied_lineage_upgrade:
+                        # Falling edge: кабинет очистил флаг, сбрасываем
+                        # память, чтобы следующий True → снова триггернул.
+                        applied_lineage_upgrade = False
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:

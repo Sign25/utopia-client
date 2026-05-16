@@ -9,6 +9,12 @@ from pathlib import Path
 
 DEFAULT_SERVER = "https://divisci.com"
 
+# Z7.i.b (Zodchiy, 16.05.2026): LAN-адрес Мира (P40), куда клиент
+# дёргает Z7.g endpoint при обнаружении флага lineage_upgrade_pending.
+# Переопределяется через `~/.utopia-client/config.json` ("p40_url") или
+# env-переменную UTOPIA_P40_URL. Текущий LAN cheef-PC ↔ P40: 192.168.0.7.
+DEFAULT_P40_URL = "http://192.168.0.7:8000"
+
 
 def config_dir() -> Path:
     """Кросс-платформенная папка конфига."""

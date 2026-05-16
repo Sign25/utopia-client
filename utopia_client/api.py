@@ -227,6 +227,45 @@ class UtopiaAPI:
             logger.warning("get_genepool_info error: %s", e)
             return None
 
+    def trigger_p40_lineage_upgrade(
+        self, p40_url: str, user_id: str, timeout: float = 5.0,
+    ) -> dict | None:
+        """Z7.i.b: дёрнуть P40 endpoint Z7.g напрямую по LAN.
+
+        Endpoint: `POST /api/world/upgrade_lineage_to_zodchiy?user_id=<uid>`.
+        На стороне P40 (см. neurocore/server/routes_world.py) под `_world_lock`
+        выбирается самый энергичный *серверный* Странник владельца и помечается
+        `pending_upgrade_to_zodchiy=True` (Z7.f при следующей репродукции
+        превратит его потомка в Зодчего).
+
+        У P40 нет VPS-auth, user_id передаётся явным query-параметром
+        (резолвится из identity-endpoint VPS, см. main._fetch_colony_name).
+
+        Возвращает JSON ответа (dict) при 2xx, None при ошибке/таймауте/404.
+        Не падает: ошибка — soft warning в лог, fallback через client_flags
+        polling сохраняется (флаг VPS останется до явного сброса).
+        """
+        if not user_id:
+            logger.warning("trigger_p40_lineage_upgrade: empty user_id")
+            return None
+        url = f"{p40_url.rstrip('/')}/api/world/upgrade_lineage_to_zodchiy"
+        try:
+            r = requests.post(
+                url, params={"user_id": user_id}, timeout=timeout,
+            )
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    return {}
+            logger.warning(
+                "trigger_p40_lineage_upgrade HTTP %d: %s",
+                r.status_code, r.text[:200])
+            return None
+        except Exception as e:
+            logger.warning("trigger_p40_lineage_upgrade error: %s", e)
+            return None
+
     def fetch_seed(self, dest_path: str) -> bool:
         return self._fetch_seed_url(f"{self.server}/api/seed", dest_path,
                                     label="seed")
