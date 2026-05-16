@@ -704,7 +704,7 @@ def test_s3_1_higher_tissue_sfnn_update_step_changes_weights(seed_file):
                  for n, p in tissue.named_parameters()
                  if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["dopamine"]
-    compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("dopamine", "d1")
     # Хотя бы один вес изменился.
     changed = False
     for n, p in tissue.named_parameters():
@@ -724,7 +724,7 @@ def test_s3_1_update_step_noop_without_acts(seed_file):
     compute.add_creature("d1", org, hebbian_enabled=True)
     # acts пуст — forward не вызывали.
     steps_before = compute.higher_tissue_sfnn_steps["dopamine"]
-    compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("dopamine", "d1")
     assert compute.higher_tissue_sfnn_steps["dopamine"] == steps_before
 
 
@@ -735,8 +735,8 @@ def test_s3_1_update_step_noop_for_unknown_tissue(seed_file):
     compute = LocalColonyCompute(device="cpu")
     org = load_founders(seed_file, 1)[0]
     compute.add_creature("d1", org, hebbian_enabled=True)
-    compute._higher_tissue_sfnn_update_step("nonexistent", "d1", r=0.0)
-    compute._higher_tissue_sfnn_update_step("dopamine", "unknown_cid", r=0.0)
+    compute._higher_tissue_sfnn_update_step("nonexistent", "d1")
+    compute._higher_tissue_sfnn_update_step("dopamine", "unknown_cid")
 
 
 # ── SFNN S3.2 (14.05.2026) — активация imagination ────────────────────────
@@ -784,7 +784,7 @@ def test_s3_2_imagination_update_step_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["imagination"]
-    compute._higher_tissue_sfnn_update_step("imagination", "i1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("imagination", "i1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -835,7 +835,7 @@ def test_s3_3_planner_update_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["planner"]
-    compute._higher_tissue_sfnn_update_step("planner", "p1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("planner", "p1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -883,7 +883,7 @@ def test_s3_4_insula_noop_without_intero(seed_file):
         "s1", torch.zeros(1, 64), intero_tensor=None)
     assert len(compute.higher_tissue_sfnn_acts["insula"]["s1"]) == 0
     steps_before = compute.higher_tissue_sfnn_steps["insula"]
-    compute._higher_tissue_sfnn_update_step("insula", "s1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("insula", "s1")
     assert compute.higher_tissue_sfnn_steps["insula"] == steps_before
 
 
@@ -903,7 +903,7 @@ def test_s3_4_insula_update_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["insula"]
-    compute._higher_tissue_sfnn_update_step("insula", "s1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("insula", "s1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -954,7 +954,7 @@ def test_s3_5_default_mode_update_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["default_mode"]
-    compute._higher_tissue_sfnn_update_step("default_mode", "dm1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("default_mode", "dm1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -1011,7 +1011,7 @@ def test_s3_6_tom_update_step_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["theory_of_mind"]
-    compute._higher_tissue_sfnn_update_step("theory_of_mind", "tm1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("theory_of_mind", "tm1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -1106,7 +1106,7 @@ def test_s3_7_lang_update_step_changes_weights(seed_file):
     w_before = {n: p.detach().clone()
                  for n, p in tissue.named_parameters() if p.dim() == 2}
     steps_before = compute.higher_tissue_sfnn_steps["language"]
-    compute._higher_tissue_sfnn_update_step("language", "lg1", r=0.0)
+    compute._higher_tissue_sfnn_update_step("language", "lg1")
     changed = any(
         not torch.equal(w_before[n], p.detach())
         for n, p in tissue.named_parameters()
@@ -1419,7 +1419,7 @@ def test_s1_2c_dopamine_renorm_keeps_row_norms_stable(seed_file):
     for _ in range(50):
         compute._compute_higher_tissues(
             "d1", torch.randn(1, 64), intero_tensor=None)
-        compute._higher_tissue_sfnn_update_step("dopamine", "d1", r=0.0)
+        compute._higher_tissue_sfnn_update_step("dopamine", "d1")
     for n, base in baseline.items():
         cur = dict(tissue.named_parameters())[n].data.norm(dim=1)
         assert torch.allclose(cur, base, rtol=1e-2), (

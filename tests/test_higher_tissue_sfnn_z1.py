@@ -1,13 +1,13 @@
-"""Z1 (Зодчий, 16.05.2026) — полная S6.5-формула для 7 высших тканей.
+"""Z1 (Зодчий, 16.05.2026) — унифицированный SFNN apply-step для 7 высших.
 
 Что проверяем:
-  - дефолт `_full_sfnn_for_higher_default = False` (не трогает живых Странников)
-  - setter `set_full_sfnn_for_higher` обновляет дефолт и патчит живых
-  - `higher_tissue_sfnn_trace` — стор есть для всех 7 высших тканей
-  - lifecycle: после `remove_creature`/`reset_all` trace очищается
-  - `_higher_tissue_sfnn_update_step(full=True)` накапливает trace и
-    инкрементит `higher_tissue_sfnn_steps`
-  - переключение S3.1 ↔ S6.5 не падает; trace не утекает между ветками
+  - `_higher_tissue_sfnn_update_step` использует ту же S6.5-формулу, что
+    `_basic_sfnn_update_step` (τ-eligibility trace + R3-eff + td_coupling).
+  - `higher_tissue_sfnn_trace` инициализирован для всех 7 высших тканей
+    и накапливает trace при apply-step.
+  - lifecycle: после `remove_creature`/`reset_all` trace очищается.
+  - apply-step инкрементит `higher_tissue_sfnn_steps`.
+  - r_imm_eff с активным w_imm меняет ΔW; trace растёт с decay·prev + new.
 """
 from __future__ import annotations
 
@@ -62,26 +62,6 @@ def _make_compute_with_creature(seed_file, cid="c1"):
     return compute, org
 
 
-def test_full_flag_default_off(seed_file):
-    """По дефолту full_sfnn_for_higher_enabled=False — поведение S3.1."""
-    compute, org = _make_compute_with_creature(seed_file)
-    assert compute._full_sfnn_for_higher_default is False
-    assert getattr(org.genome, "full_sfnn_for_higher_enabled", None) is False
-
-
-def test_setter_updates_default_and_existing(seed_file):
-    """`set_full_sfnn_for_higher(True)` патчит живых + меняет дефолт."""
-    compute, org = _make_compute_with_creature(seed_file)
-    assert org.genome.full_sfnn_for_higher_enabled is False
-    n = compute.set_full_sfnn_for_higher(True)
-    assert n == 1
-    assert compute._full_sfnn_for_higher_default is True
-    assert org.genome.full_sfnn_for_higher_enabled is True
-    # Идемпотентность: повторный вызов с тем же значением — 0 изменений.
-    n2 = compute.set_full_sfnn_for_higher(True)
-    assert n2 == 0
-
-
 def test_trace_store_keys_for_all_higher_tissues(seed_file):
     """`higher_tissue_sfnn_trace` инициализирован для всех 7 тканей."""
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
@@ -90,29 +70,25 @@ def test_trace_store_keys_for_all_higher_tissues(seed_file):
         assert t in compute.higher_tissue_sfnn_trace
 
 
-def test_full_branch_changes_weights_and_steps(seed_file):
-    """С full=True хотя бы одна высшая ткань обновляет веса + steps растут."""
+def test_unified_apply_changes_weights_and_steps(seed_file):
+    """S6.5-формула меняет веса хотя бы у одной высшей + steps растут."""
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
     compute, _ = _make_compute_with_creature(seed_file)
-    # Снимок весов всех 7 высших до second apply.
     snapshots: dict[str, torch.Tensor] = {}
     for t in _HIGHER_SFNN_TISSUES:
         tissue = getattr(compute, t, {}).get("c1")
         if tissue is None:
             continue
-        params = dict(tissue.named_parameters())
-        # Берём первый Linear.weight с dim==2.
-        for pname, p in params.items():
+        for pname, p in tissue.named_parameters():
             if pname.endswith(".weight") and p.dim() == 2:
                 snapshots[t] = p.data.clone()
                 break
     steps_before = dict(compute.higher_tissue_sfnn_steps)
     for t in _HIGHER_SFNN_TISSUES:
         compute._higher_tissue_sfnn_update_step(
-            t, "c1", full=True,
+            t, "c1",
             dopa_td_mult=1.2, r_imm_eff=0.3, r_med_eff=0.0, r_long_eff=0.0,
         )
-    # Хотя бы одна ткань изменила веса.
     changed = []
     for t, before in snapshots.items():
         tissue = getattr(compute, t, {}).get("c1")
@@ -123,23 +99,18 @@ def test_full_branch_changes_weights_and_steps(seed_file):
                 if not torch.equal(before, p.data):
                     changed.append(t)
                 break
-    assert changed, "ни одна высшая ткань не изменила веса под full=True"
-    # Хотя бы у одной ткани step инкрементировался (с учётом возможного
-    # инкремента в handle_tick при включённом higher_sfnn_on).
+    assert changed, "ни одна высшая ткань не изменила веса"
     incremented = [t for t in _HIGHER_SFNN_TISSUES
                    if compute.higher_tissue_sfnn_steps[t] > steps_before[t]]
-    assert incremented, "higher_tissue_sfnn_steps не выросли при full=True"
+    assert incremented, "higher_tissue_sfnn_steps не выросли"
 
 
-def test_full_branch_trace_accumulates(seed_file):
+def test_trace_accumulates_across_steps(seed_file):
     """После двух apply-step trace ткани с активным forward растёт (decay·prev + new)."""
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
     compute, _ = _make_compute_with_creature(seed_file)
-    # Первый apply создаёт trace.
     for t in _HIGHER_SFNN_TISSUES:
-        compute._higher_tissue_sfnn_update_step(
-            t, "c1", full=True, r_imm_eff=0.1)
-    # Ищем ткань с непустым trace.
+        compute._higher_tissue_sfnn_update_step(t, "c1", r_imm_eff=0.1)
     role_with_trace = None
     synapse_with_trace = None
     for t in _HIGHER_SFNN_TISSUES:
@@ -151,12 +122,10 @@ def test_full_branch_trace_accumulates(seed_file):
     assert role_with_trace is not None, "trace не создан ни для одной ткани"
     t1 = compute.higher_tissue_sfnn_trace[role_with_trace]["c1"][
         synapse_with_trace].clone()
-    # Второй apply должен дать decay·t1 + new_hebb_A.
     compute._higher_tissue_sfnn_update_step(
-        role_with_trace, "c1", full=True, r_imm_eff=0.1)
+        role_with_trace, "c1", r_imm_eff=0.1)
     t2 = compute.higher_tissue_sfnn_trace[role_with_trace]["c1"][
         synapse_with_trace]
-    # Trace изменился (либо decay, либо новая компонента).
     assert not torch.equal(t1, t2)
 
 
@@ -165,9 +134,7 @@ def test_remove_creature_clears_trace(seed_file):
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
     compute, _ = _make_compute_with_creature(seed_file)
     for t in _HIGHER_SFNN_TISSUES:
-        compute._higher_tissue_sfnn_update_step(
-            t, "c1", full=True, r_imm_eff=0.1)
-    # Хотя бы один trace создан.
+        compute._higher_tissue_sfnn_update_step(t, "c1", r_imm_eff=0.1)
     has_trace = any(
         compute.higher_tissue_sfnn_trace.get(t, {}).get("c1")
         for t in _HIGHER_SFNN_TISSUES)
@@ -182,48 +149,45 @@ def test_reset_all_clears_trace(seed_file):
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
     compute, _ = _make_compute_with_creature(seed_file)
     for t in _HIGHER_SFNN_TISSUES:
-        compute._higher_tissue_sfnn_update_step(
-            t, "c1", full=True, r_imm_eff=0.1)
+        compute._higher_tissue_sfnn_update_step(t, "c1", r_imm_eff=0.1)
     compute.reset_all()
     for t in _HIGHER_SFNN_TISSUES:
         assert compute.higher_tissue_sfnn_trace[t] == {}
 
 
-def test_full_off_equivalent_to_legacy_s3_1(seed_file):
-    """full=False даёт тот же ΔW, что и S3.1-формула (regression)."""
+def test_r_imm_weight_modulates_dw(seed_file):
+    """При rule.r_imm_weight>0 r_imm_eff>0 меняет ΔW vs r_imm_eff=0."""
     from utopia_client.local_compute import _HIGHER_SFNN_TISSUES
     compute, _ = _make_compute_with_creature(seed_file)
-    # Снимок весов до.
-    snaps_a: dict[str, torch.Tensor] = {}
+    # Найдём ткань с активным forward (acts заполнены).
+    target_role = None
     for t in _HIGHER_SFNN_TISSUES:
-        tissue = getattr(compute, t, {}).get("c1")
-        if tissue is None:
-            continue
-        for pname, p in tissue.named_parameters():
-            if pname.endswith(".weight") and p.dim() == 2:
-                snaps_a[t] = p.data.clone()
-                break
-    # Прогоняем full=False с r=0.1 (S3.1).
-    for t in _HIGHER_SFNN_TISSUES:
-        compute._higher_tissue_sfnn_update_step(t, "c1", r=0.1, full=False)
-    # Снимок весов после S3.1.
-    snaps_b: dict[str, torch.Tensor] = {}
-    for t in _HIGHER_SFNN_TISSUES:
-        tissue = getattr(compute, t, {}).get("c1")
-        if tissue is None:
-            continue
-        for pname, p in tissue.named_parameters():
-            if pname.endswith(".weight") and p.dim() == 2:
-                snaps_b[t] = p.data.clone()
-                break
-    # Откатываем веса и проверяем, что full=False с r=0.1 не делает trace
-    # (trace создаётся только для full=True).
-    for t in snaps_a:
-        tissue = getattr(compute, t, {}).get("c1")
-        for pname, p in tissue.named_parameters():
-            if pname.endswith(".weight") and p.dim() == 2:
-                p.data.copy_(snaps_a[t])
-                break
-    # full=False НЕ должен трогать higher_tissue_sfnn_trace.
-    for t in _HIGHER_SFNN_TISSUES:
-        assert compute.higher_tissue_sfnn_trace[t].get("c1") in (None, {})
+        acts = compute.higher_tissue_sfnn_acts.get(t, {}).get("c1")
+        if acts:
+            target_role = t
+            break
+    assert target_role is not None, "ни одной активной высшей ткани"
+    # Активируем w_imm у правила (стартует с 0 в ROLE_DEFAULTS).
+    rule = compute.higher_tissue_sfnn_rule[target_role]["c1"]
+    rule.r_imm_weight = 0.5
+    # Снимок весов.
+    tissue = compute.__dict__[target_role]["c1"]
+    w_before = {n: p.data.clone()
+                 for n, p in tissue.named_parameters() if p.dim() == 2}
+    # apply с r_imm_eff=0.0.
+    compute._higher_tissue_sfnn_update_step(
+        target_role, "c1", r_imm_eff=0.0)
+    w_zero = {n: p.data.clone()
+              for n, p in tissue.named_parameters() if p.dim() == 2}
+    # Откат + apply с r_imm_eff=1.0.
+    for n, p in tissue.named_parameters():
+        if p.dim() == 2:
+            p.data.copy_(w_before[n])
+    # Очистим trace, иначе вторая ветка получит унаследованную историю.
+    compute.higher_tissue_sfnn_trace[target_role]["c1"] = {}
+    compute._higher_tissue_sfnn_update_step(
+        target_role, "c1", r_imm_eff=1.0)
+    w_one = {n: p.data.clone()
+              for n, p in tissue.named_parameters() if p.dim() == 2}
+    diff_any = any(not torch.equal(w_zero[n], w_one[n]) for n in w_zero)
+    assert diff_any, "r_imm_weight>0 не модулирует ΔW"
