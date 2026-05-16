@@ -1169,6 +1169,38 @@ class LocalColonyCompute:
                     on, n_changed, len(self.organisms))
         return n_changed
 
+    def set_basic_sfnn(self, on: bool) -> int:
+        """SFNN S6.9 (16.05.2026): включить/выключить basic_tissue_sfnn_enabled
+        у всех owned особей.
+
+        Зеркало `set_higher_sfnn` для 10 базовых тканей organism graph
+        (sensory/attention/brain/memory/consciousness/communication/motor/
+        manipulator/digestive/immune). Дефолт колонии обновляется → новые
+        особи в `add_creature` родятся с этим значением. Существующие —
+        патчатся in-place через `org.genome.basic_tissue_sfnn_enabled`.
+        Возвращает число изменённых.
+        """
+        on = bool(on)
+        self._basic_sfnn_default = on
+        n_changed = 0
+        for cid, org in self.organisms.items():
+            if not hasattr(org, "genome"):
+                org.genome = types.SimpleNamespace(
+                    higher_tissue_sfnn_enabled=self._higher_sfnn_default,
+                    sfnn_enabled=False,
+                    basic_tissue_sfnn_enabled=on,
+                )
+                n_changed += 1
+                continue
+            prev = bool(getattr(org.genome,
+                                 "basic_tissue_sfnn_enabled", False))
+            if prev != on:
+                org.genome.basic_tissue_sfnn_enabled = on
+                n_changed += 1
+        logger.info("set_basic_sfnn(%s) — changed %d / %d organisms",
+                    on, n_changed, len(self.organisms))
+        return n_changed
+
     def set_motor_sfnn(self, on: bool) -> int:
         """Включить/выключить motor sfnn_enabled у всех owned особей.
 

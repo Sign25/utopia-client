@@ -438,6 +438,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_sfnn_higher: bool | None = None
     # SFNN S3.activate-motor: то же для motor_policy ветки.
     applied_sfnn_motor: bool | None = None
+    # SFNN S6.9: то же для 10 базовых тканей.
+    applied_sfnn_basic: bool | None = None
     bench = cfg.get("benchmark", {})
     ring = get_ring()
 
@@ -551,6 +553,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                                         target_motor, n)
                         except Exception as e:
                             logger.warning("set_motor_sfnn failed: %s", e)
+                    target_basic = bool(flags.get("sfnn_basic", False))
+                    if target_basic != applied_sfnn_basic and ws is not None \
+                            and ws.compute is not None:
+                        try:
+                            n = ws.compute.set_basic_sfnn(target_basic)
+                            applied_sfnn_basic = target_basic
+                            logger.info("sfnn_basic → %s (%d organisms)",
+                                        target_basic, n)
+                        except Exception as e:
+                            logger.warning("set_basic_sfnn failed: %s", e)
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
