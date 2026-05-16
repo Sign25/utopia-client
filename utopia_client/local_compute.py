@@ -345,6 +345,14 @@ class LocalColonyCompute:
         # Дефолт флага `basic_tissue_sfnn_enabled` для новых особей — False.
         # В S6.9 будет CLI cabinet.sh sfnn-basic on|off.
         self._basic_sfnn_default: bool = False
+        # SFNN S6.5 (16.05.2026): eligibility trace per (role, cid). Tensor
+        # формы W_sub (slice матрицы, к которой применяется ΔW). decay = exp(-1/τ)
+        # из SFNNRule.tau. Эфемерное — ресет при рестарте клиента и при
+        # `reset_all()`. Хранится отдельно от HebbianController._tissue_info[trace],
+        # т.к. классика этих ролей не трогает (skip_roles).
+        self.basic_tissue_sfnn_trace: dict[str, dict] = {
+            t: {} for t in _BASIC_SFNN_TISSUES
+        }
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -609,6 +617,9 @@ class LocalColonyCompute:
         # SFNN S6.4: вычистить правила 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
             self.basic_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
+        # SFNN S6.5: вычистить eligibility traces 10 базовых тканей.
+        for _t in _BASIC_SFNN_TISSUES:
+            self.basic_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
         # SFNN S3.1: снять forward-hooks и забыть кешированные активации
         # всех зарегистрированных в S3.x тканей. Пока активна dopamine;
         # cleanup для остальных no-op до S3.2+.
@@ -636,6 +647,9 @@ class LocalColonyCompute:
         # SFNN S6.4: сбросить счётчики 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
             self.basic_tissue_sfnn_steps[_t] = 0
+        # SFNN S6.5: сбросить eligibility traces 10 базовых тканей.
+        for _t in _BASIC_SFNN_TISSUES:
+            self.basic_tissue_sfnn_trace[_t] = {}
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -2348,6 +2362,126 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("higher_sfnn_update %s/%s: %s",
                           tissue_name, cid, e)
+
+    def _basic_sfnn_update_step(self, cid: str, hebbian, *,
+                                  dopa_td_mult: float = 1.0,
+                                  r_imm_eff: float = 0.0,
+                                  r_med_eff: float = 0.0,
+                                  r_long_eff: float = 0.0) -> None:
+        """SFNN S6.5 (16.05.2026): унифицированный apply-step для 10 базовых
+        тканей organism graph (sensory, attention, brain, memory, consciousness,
+        communication, motor, manipulator, digestive, immune).
+
+        Формула:
+            e_t   = exp(-1/τ)·e_{t-1} + (outer(post_c, pre_c) − post_c²·W_sub)
+            r_eff = w_imm·r_imm_eff + w_med·r_med_eff + w_long·r_long_eff
+            η_eff = η · (1 + td_coupling · (dopa_td_mult − 1))
+            ΔW    = clip(η_eff · (1 + r_eff) · (A·e + B·post + C·pre + D), ±0.01)
+            W    ← W + ΔW
+
+        Источник pre/post:
+          oja_input    → pre = heb._last_input,  W = cell.input_proj.weight
+          reward_output → pre = heb._last_output, W = cell.output_proj.weight[:16]
+
+        Эти роли должны быть переданы как `skip_roles` в heb.update() (S6.6),
+        иначе классика обновит W параллельно и эволюционируемое правило тонет
+        в Phase 5d-шуме. r_*_eff подаются вызывающим как baseline-subtracted
+        (heb внутри уже считает baseline EMA → r_imm_eff = r_imm − baseline_imm).
+        """
+        if hebbian is None:
+            return
+        if hebbian._last_input is None or hebbian._last_output is None:
+            return
+        torch = self._torch
+        clip_val = self._MOTOR_SFNN_DW_CLIP
+        for info in hebbian._tissue_info:
+            role = info['role']
+            if role not in _BASIC_SFNN_TISSUES:
+                continue
+            rule_store = self.basic_tissue_sfnn_rule.get(role)
+            if rule_store is None:
+                continue
+            rule = rule_store.get(cid)
+            if rule is None:
+                continue
+            cell = info['cell']
+            algorithm = info['algorithm']
+            try:
+                if algorithm == 'oja_input':
+                    if not hasattr(cell, 'input_proj'):
+                        continue
+                    synapse_type = 'input_proj'
+                    W_full = cell.input_proj.weight.data
+                    x = hebbian._last_input  # [1, 64]
+                    data_cols = min(x.shape[1], W_full.shape[1])
+                    W_sub = W_full[:, :data_cols]
+                    pre = x[0, :data_cols]
+                    post = W_sub @ pre
+                elif algorithm == 'reward_output':
+                    if not hasattr(cell, 'output_proj'):
+                        continue
+                    synapse_type = 'output_proj'
+                    W_full = cell.output_proj.weight.data
+                    x = hebbian._last_output  # [1, 64]
+                    n_embd = W_full.shape[1]
+                    n_actions = min(16, W_full.shape[0])
+                    W_sub = W_full[:n_actions, :]
+                    pre = x[0, :n_embd]
+                    post = W_sub @ pre
+                else:
+                    continue
+
+                coef = rule.coeffs.get(synapse_type)
+                if coef is None:
+                    continue
+
+                eta = float(coef.eta)
+                A = float(coef.A)
+                B = float(coef.B)
+                C = float(coef.C)
+                D = float(coef.D)
+
+                # Oja-style Hebb-A с mean-centering (S1.2c).
+                post_c = post - post.mean()
+                pre_c = pre - pre.mean()
+                hebb_A = (torch.outer(post_c, pre_c)
+                            - post_c.square().unsqueeze(1) * W_sub)
+
+                # Eligibility trace, decay = exp(-1/τ).
+                tau = max(1.0, float(rule.tau))
+                decay = math.exp(-1.0 / tau)
+                trace_store = self.basic_tissue_sfnn_trace[role]
+                trace = trace_store.get(cid)
+                if trace is None or trace.shape != hebb_A.shape:
+                    trace = torch.zeros_like(hebb_A)
+                else:
+                    trace.mul_(decay)
+                trace.add_(hebb_A)
+                trace_store[cid] = trace
+
+                # r_eff от правила (per-role веса R3 горизонтов).
+                r_eff = (rule.r_imm_weight * float(r_imm_eff)
+                          + rule.r_med_weight * float(r_med_eff)
+                          + rule.r_long_weight * float(r_long_eff))
+                # η_eff = η · (1 + td_coupling · (dopa_td_mult − 1)).
+                eta_eff = eta * (1.0 + rule.td_coupling
+                                  * (float(dopa_td_mult) - 1.0))
+                reward_gain = 1.0 + r_eff
+
+                dW = A * trace
+                if B != 0.0:
+                    dW = dW + B * post.unsqueeze(1).expand_as(W_sub)
+                if C != 0.0:
+                    dW = dW + C * pre.unsqueeze(0).expand_as(W_sub)
+                if D != 0.0:
+                    dW = dW + D
+                dW = dW * (eta_eff * reward_gain)
+                dW.clamp_(-clip_val, clip_val)
+                W_sub.add_(dW)
+                self.basic_tissue_sfnn_steps[role] = (
+                    self.basic_tissue_sfnn_steps.get(role, 0) + 1)
+            except Exception as e:
+                logger.debug("basic_sfnn_update %s/%s: %s", role, cid, e)
 
     def _predictor_train_step(self, cid: str, obs_tensor) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
