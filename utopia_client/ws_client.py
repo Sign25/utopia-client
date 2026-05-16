@@ -689,6 +689,23 @@ class ColonyWSClient:
         sources.append(("p40-seed", p40_bytes))
 
         from .seed_loader import organism_from_weights, seed_cache_path
+        # Z7.i.d (16.05.2026): lineage из meta (P40 шлёт в seed_pack) с
+        # fallback на WorldStateCache.creature_tom (Мир-снапшот). При
+        # lineage="zodchiy" compute.add_creature развернёт 3 уникальные
+        # ткани (cerebellum/amygdala/episodic). Дефолт "wanderer" —
+        # клиентские особи (P40 owned) почти всегда Странники.
+        lineage = str(meta.get("lineage", "") or "")
+        if not lineage:
+            try:
+                wc = getattr(self.compute, "world_cache", None)
+                if wc is not None:
+                    tom_e = wc.creature_tom.get(cid)
+                    if tom_e:
+                        lineage = str(tom_e[0]) or ""
+            except Exception:
+                pass
+        if not lineage:
+            lineage = "wanderer"
         loaded = False
         for src, weights in sources:
             try:
@@ -699,6 +716,7 @@ class ColonyWSClient:
                     hebbian_enabled=True,
                     learning_rate=float(meta.get("learning_rate", 1e-4)),
                     trace_decay=float(meta.get("trace_decay", 0.9)),
+                    lineage=lineage,
                 )
                 self.compute.apply_inherited_state(cid, payload)
                 # S6.0b-B (16.05.2026): persistent SFNN-state восстановление.
@@ -959,12 +977,29 @@ class ColonyWSClient:
             cfg = getattr(ctrl, "config", None) if ctrl is not None else None
             lr = float(getattr(cfg, "lr_reward", 1e-4)) if cfg else 1e-4
             decay = float(getattr(cfg, "eligibility_decay", 0.9)) if cfg else 0.9
+            # Z7.i.d: lineage из snap'а (CreatureState.lineage). Дети
+            # унаследуют lineage родителя; Z7.f hook на сервере уже мог
+            # upgrade'нуть в "zodchiy", если parent.pending_upgrade_to_zodchiy
+            # был выставлен. Читаем child's lineage напрямую из creature_tom.
+            lineage = str(c.get("lineage", "") or "")
+            if not lineage:
+                try:
+                    wc = getattr(self.compute, "world_cache", None)
+                    if wc is not None:
+                        tom_e = wc.creature_tom.get(cid_s)
+                        if tom_e:
+                            lineage = str(tom_e[0]) or ""
+                except Exception:
+                    pass
+            if not lineage:
+                lineage = "wanderer"
             try:
                 self.compute.add_creature(
                     cid_s, child_org,
                     hebbian_enabled=True,
                     learning_rate=lr,
                     trace_decay=decay,
+                    lineage=lineage,
                 )
                 self._newborn_attached += 1
             except Exception as e:

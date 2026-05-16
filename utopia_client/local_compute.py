@@ -149,6 +149,20 @@ _BASIC_SFNN_TISSUES: tuple[str, ...] = (
     "immune",
 )
 
+# Z7.i.d (16.05.2026, Зодчий): три уникальные высшие ткани третьей линии.
+# Создаются client-side в add_creature только для lineage="zodchiy". Sidecar-
+# storage, как dopamine/imagination — НЕ часть organism graph (на P40 живёт
+# CreatureState с lineage, тканей нет — все ткани клиентские). Аналог
+# `_build_zodchiy_connections` (workbench), но без полного rebuild графа:
+# Tissue 21/3/1 на cid → forward в _compute_higher_tissues + SFNN-rule
+# storage. NEAT межтканевой топологии (Z2.b apply_topology_overlay) пока не
+# подключён — z-ткани живут как hookable sidecar-форма для будущего Z3/Z5.
+_ZODCHIY_EXTRA_TISSUES: tuple[str, ...] = (
+    "cerebellum",
+    "amygdala",
+    "episodic",
+)
+
 # Маппинг "роль в organism graph" → "поле в Genome" с сериализованным
 # SFNNRule (см. core/organism.py:Genome). "motor" в graph ≠ motor_policy
 # sidecar, поэтому поле зовётся `motor_low_sfnn_rule`.
@@ -363,13 +377,39 @@ class LocalColonyCompute:
             t: {} for t in _BASIC_SFNN_TISSUES
         }
 
+        # Z7.i.d (16.05.2026, Зодчий): sidecar Tissue-storage'ы для трёх
+        # уникальных тканей Зодчего. Заполняются только в add_creature при
+        # lineage="zodchiy"; для elder/wanderer остаются пустыми. Геометрия
+        # та же, что у dopamine/imagination — Tissue 21/3/1, data_dim=64.
+        self.cerebellum: dict = {}    # cid → Tissue (motor error-loop)
+        self.amygdala: dict = {}      # cid → Tissue (valence)
+        self.episodic: dict = {}      # cid → Tissue (long-term memory)
+        # Per-zodchiy-tissue SFNNRule storage. Дефолт SFNNRule.default() —
+        # эквивалент Phase 5d Hebb; σ-мутация τ/R3/TD активирует полную
+        # S6.5-формулу. Пока apply-step выключен (Z3 hookup в forward —
+        # отдельная подфаза); здесь — только plumbing + Y50-наследование.
+        self.zodchiy_extra_sfnn_rule: dict[str, dict] = {
+            t: {} for t in _ZODCHIY_EXTRA_TISSUES
+        }
+        self.zodchiy_extra_sfnn_steps: dict[str, int] = {
+            t: 0 for t in _ZODCHIY_EXTRA_TISSUES
+        }
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
 
     def add_creature(self, cid: str, organism, *, hebbian_enabled: bool = True,
-                     learning_rate: float = 1e-4, trace_decay: float = 0.9) -> None:
-        """Зарегистрировать особь. Organism — CompositeOrganism из seed_loader."""
+                     learning_rate: float = 1e-4, trace_decay: float = 0.9,
+                     lineage: str = "wanderer") -> None:
+        """Зарегистрировать особь. Organism — CompositeOrganism из seed_loader.
+
+        `lineage` (Z7.i.d, 16.05.2026): "elder" | "wanderer" | "zodchiy".
+        Управляет составом sidecar-тканей. Дефолт "wanderer" — текущее
+        поведение (5 brain + motor + ToM + language). При "zodchiy"
+        дополнительно создаются 3 уникальные ткани третьей линии
+        (cerebellum, amygdala, episodic) с дефолтным SFNN-правилом.
+        """
         from core.action_selector import ActionSelector
 
         if hasattr(organism, "to"):
@@ -562,10 +602,31 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("add_creature %s language sfnn hooks: %s",
                               cid, e)
+        # Z7.i.d (16.05.2026, Зодчий): для lineage="zodchiy" создаём три
+        # уникальные ткани третьей линии — cerebellum/amygdala/episodic.
+        # Forward в _compute_higher_tissues и SFNN apply-step появятся в
+        # последующих подфазах (Z3 hookup); здесь — plumbing + дефолтные
+        # SFNNRule для эволюционируемого правила и Y50-наследования.
+        if str(lineage) == "zodchiy":
+            try:
+                self.cerebellum[cid] = self._make_higher_tissue("cerebellum")
+                self.amygdala[cid] = self._make_higher_tissue("amygdala")
+                self.episodic[cid] = self._make_higher_tissue("episodic")
+            except Exception as e:
+                logger.warning("add_creature %s zodchiy tissues: %s", cid, e)
+            try:
+                from core.sfnn_rule import SFNNRule
+                for _t in _ZODCHIY_EXTRA_TISSUES:
+                    self.zodchiy_extra_sfnn_rule[_t].setdefault(
+                        cid, SFNNRule.default())
+            except Exception as e:
+                logger.debug(
+                    "add_creature %s zodchiy_extra_sfnn_rule init: %s", cid, e)
         logger.info(
-            "add_creature %s n_tissues=%d predictor=%s S2=%s",
-            cid, getattr(organism, "n_tissues", 0), pred is not None,
-            all(self.dopamine.get(cid) is not None for _ in [0]))
+            "add_creature %s lineage=%s n_tissues=%d predictor=%s S2=%s zodchiy=%s",
+            cid, lineage, getattr(organism, "n_tissues", 0), pred is not None,
+            all(self.dopamine.get(cid) is not None for _ in [0]),
+            self.cerebellum.get(cid) is not None)
 
     def remove_creature(self, cid: str) -> None:
         self.organisms.pop(cid, None)
@@ -644,6 +705,12 @@ class LocalColonyCompute:
             self.higher_tissue_sfnn_row_norms.get(_t, {}).pop(cid, None)
             # Z1 (Зодчий, 16.05.2026): eligibility trace тоже эфемерно.
             self.higher_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
+        # Z7.i.d (16.05.2026): три zodchiy-ткани и их SFNN-правила.
+        self.cerebellum.pop(cid, None)
+        self.amygdala.pop(cid, None)
+        self.episodic.pop(cid, None)
+        for _t in _ZODCHIY_EXTRA_TISSUES:
+            self.zodchiy_extra_sfnn_rule.get(_t, {}).pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -664,6 +731,11 @@ class LocalColonyCompute:
         # Z1 (Зодчий, 16.05.2026): сбросить eligibility traces 7 высших тканей.
         for _t in _HIGHER_SFNN_TISSUES:
             self.higher_tissue_sfnn_trace[_t] = {}
+        # Z7.i.d (16.05.2026): сбросить счётчики и SFNN-rule storage'ы
+        # трёх zodchiy-тканей (cerebellum/amygdala/episodic).
+        for _t in _ZODCHIY_EXTRA_TISSUES:
+            self.zodchiy_extra_sfnn_steps[_t] = 0
+            self.zodchiy_extra_sfnn_rule[_t] = {}
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
