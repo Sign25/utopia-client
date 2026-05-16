@@ -111,6 +111,24 @@ _HIGHER_SFNN_TISSUES: tuple[str, ...] = (
     "language",
 )
 
+# S6.0 (16.05.2026): Роли, для которых веса обновляются SFNN-правилом,
+# а НЕ классическим HebbianController. Передаются как `skip_roles` в
+# `heb.update(...)` — иначе один и тот же тик апдейтит веса дважды
+# (классика + SFNN), и эволюционируемое правило тонет в шуме базовой
+# Phase 5d-механики. "motor" — это базовая ткань в organism graph
+# (motor_policy на клиенте — отдельный sidecar, не в graph). 7 высших
+# тоже формально в TISSUE_ROLES, поэтому попадают в _tissue_info heb'а.
+_SFNN_MIGRATED_ROLES: set[str] = {
+    "motor",
+    "dopamine",
+    "imagination",
+    "planner",
+    "insula",
+    "default_mode",
+    "theory_of_mind",
+    "language",
+}
+
 
 class LocalColonyCompute:
     """Локальная колония: forward + Hebbian + ActionSelector per-creature.
@@ -1248,13 +1266,15 @@ class LocalColonyCompute:
                             heb.update(logits,
                                        {"immediate": r_imm_total,
                                         "medium": 0.0, "long": 0.0},
-                                       dopa_td_mult=td_mult)
+                                       dopa_td_mult=td_mult,
+                                       skip_roles=_SFNN_MIGRATED_ROLES)
                             self.hebbian_updates += 1
                         except TypeError:
                             try:
                                 heb.update(logits,
                                            {"immediate": r_imm_total,
-                                            "medium": 0.0, "long": 0.0})
+                                            "medium": 0.0, "long": 0.0},
+                                           skip_roles=_SFNN_MIGRATED_ROLES)
                                 self.hebbian_updates += 1
                             except Exception as e:
                                 logger.debug("hebbian update %s: %s", cid, e)
