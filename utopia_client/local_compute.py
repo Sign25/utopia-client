@@ -1215,6 +1215,49 @@ class LocalColonyCompute:
                     on, n_changed, len(self.organisms))
         return n_changed
 
+    # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
+
+    def set_lineage_upgrade_pending(self, on: bool) -> int:
+        """One-shot Genome-флип `lineage_upgrade_to_zodchiy` у owned особей.
+
+        Z7.i.c — клиентская сторона апгрейда Странник→Зодчий.
+        В отличие от `set_*_sfnn` дефолт колонии НЕ обновляется (это разовый
+        триггер, а не постоянный признак). Просто патчит атрибут у всех
+        существующих organisms через `org.genome.lineage_upgrade_to_zodchiy`.
+
+        Если у организма нет `genome`, навешиваем SimpleNamespace по той же
+        схеме, что и `add_creature` (с текущими SFNN-дефолтами).
+
+        Z7.c.apply_lineage_upgrade при следующей репродукции гейтит по
+        `parent.lineage == "wanderer"`, поэтому ставить флаг на elder/zodchiy
+        безопасно — Z7.c сбросит флаг без апгрейда. Клиент не знает lineage
+        своих особей (P40 не шлёт его в owned-payload), поэтому ставим на
+        всех — а гейтинг делает pure-уровень.
+
+        Возвращает число изменённых организмов.
+        """
+        on = bool(on)
+        n_changed = 0
+        for cid, org in self.organisms.items():
+            if not hasattr(org, "genome"):
+                org.genome = types.SimpleNamespace(
+                    higher_tissue_sfnn_enabled=self._higher_sfnn_default,
+                    sfnn_enabled=self._motor_sfnn_default,
+                    basic_tissue_sfnn_enabled=self._basic_sfnn_default,
+                    lineage_upgrade_to_zodchiy=on,
+                )
+                n_changed += 1
+                continue
+            prev = bool(getattr(org.genome,
+                                 "lineage_upgrade_to_zodchiy", False))
+            if prev != on:
+                org.genome.lineage_upgrade_to_zodchiy = on
+                n_changed += 1
+        logger.info(
+            "set_lineage_upgrade_pending(%s) — changed %d / %d organisms",
+            on, n_changed, len(self.organisms))
+        return n_changed
+
     def set_motor_sfnn(self, on: bool) -> int:
         """Включить/выключить motor sfnn_enabled у всех owned особей.
 

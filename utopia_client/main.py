@@ -589,12 +589,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                         except Exception as e:
                             logger.warning("set_basic_sfnn failed: %s", e)
 
-                    # Z7.i.b (Zodchiy, 16.05.2026): на rising edge флага
-                    # lineage_upgrade_pending дёргаем P40 Z7.g endpoint по
-                    # LAN. Серверный консьюм Z7.f при следующей репродукции
-                    # сделает потомка одного из серверных Странников
-                    # Зодчим. Локальный клиентский Genome-флип — отдельный
-                    # путь (Z7.i.c+); этот коммит только серверный.
+                    # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
+                    # lineage_upgrade_pending делаем ДВА действия:
+                    #   (Z7.i.b) — дёргаем P40 Z7.g endpoint по LAN.
+                    #             Серверный консьюм Z7.f при следующей
+                    #             репродукции сделает потомка серверного
+                    #             Странника Зодчим. Сейчас почти всегда
+                    #             no-op (у Шефа все Странники клиентские).
+                    #   (Z7.i.c) — клиентский Genome-флип
+                    #             `lineage_upgrade_to_zodchiy=True` на всех
+                    #             owned organisms. Pure-Z7.c гейтит по
+                    #             lineage="wanderer" → не-Странников
+                    #             сбросит без апгрейда.
                     target_upgrade = bool(
                         flags.get("lineage_upgrade_pending", False))
                     if target_upgrade and applied_lineage_upgrade is not True:
@@ -619,10 +625,34 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 logger.info(
                                     "lineage_upgrade_pending → P40 no-op "
                                     "(unreachable / no server wanderer)")
+                        # Z7.i.c: client-side Genome-флип независимо от
+                        # успеха P40-call'а (у Шефа все Странники
+                        # клиентские — это primary path).
+                        if ws is not None and ws.compute is not None:
+                            try:
+                                n_flipped = ws.compute \
+                                    .set_lineage_upgrade_pending(True)
+                                logger.info(
+                                    "lineage_upgrade_pending → client "
+                                    "Genome-flip on %d organisms", n_flipped)
+                            except Exception as e:
+                                logger.warning(
+                                    "set_lineage_upgrade_pending(True) "
+                                    "failed: %s", e)
                         applied_lineage_upgrade = True
                     elif not target_upgrade and applied_lineage_upgrade:
                         # Falling edge: кабинет очистил флаг, сбрасываем
                         # память, чтобы следующий True → снова триггернул.
+                        # Заодно гасим клиентский Genome-флаг — если pure-Z7.c
+                        # не успел consume (нет репродукции между rising
+                        # и falling edge), флаг должен исчезнуть.
+                        if ws is not None and ws.compute is not None:
+                            try:
+                                ws.compute.set_lineage_upgrade_pending(False)
+                            except Exception as e:
+                                logger.warning(
+                                    "set_lineage_upgrade_pending(False) "
+                                    "failed: %s", e)
                         applied_lineage_upgrade = False
 
             # Heartbeat
