@@ -706,6 +706,26 @@ class LocalColonyCompute:
                 logger.warning(
                     "apply_inherited_state %s higher_tissue_sfnn_rules: %s",
                     cid, e)
+        # SFNN S6.7 (16.05.2026): аналогичное наследование 10 базовых тканей
+        # (sensory/attention/brain/memory/consciousness/communication/motor/
+        # manipulator/digestive/immune). Ключ "basic_tissue_sfnn_rules" в
+        # payload — словарь {role: SFNNRule.to_dict()}, σ=0.1 мутация.
+        basic_rules_d = payload.get("basic_tissue_sfnn_rules")
+        if basic_rules_d:
+            try:
+                from core.sfnn_rule import SFNNRule
+                for _role, _rule_d in basic_rules_d.items():
+                    if _role not in self.basic_tissue_sfnn_rule:
+                        continue
+                    if self.basic_tissue_sfnn_rule[_role].get(cid) is None:
+                        continue
+                    parent_rule = SFNNRule.from_dict(_rule_d)
+                    self.basic_tissue_sfnn_rule[_role][cid] = (
+                        parent_rule.mutate(sigma=0.1))
+            except Exception as e:
+                logger.warning(
+                    "apply_inherited_state %s basic_tissue_sfnn_rules: %s",
+                    cid, e)
         # Phase 1 — Y50 наследование predictor от родителя.
         pred_sd = payload.get("predictor")
         if pred_sd is not None and self.predictor.get(cid) is not None:
@@ -832,6 +852,19 @@ class LocalColonyCompute:
                 except Exception as e:
                     logger.warning(
                         "restore_sfnn_state %s higher %s: %s", cid, _t, e)
+        # SFNN S6.7: восстановить 10 базовых правил без мутации.
+        basic_d = sfnn_state.get("basic_tissue_sfnn_rules") or {}
+        if isinstance(basic_d, dict):
+            for _role, _rule_d in basic_d.items():
+                if _role not in self.basic_tissue_sfnn_rule:
+                    continue
+                if self.basic_tissue_sfnn_rule[_role].get(cid) is None:
+                    continue
+                try:
+                    self.basic_tissue_sfnn_rule[_role][cid] = SFNNRule.from_dict(_rule_d)
+                except Exception as e:
+                    logger.warning(
+                        "restore_sfnn_state %s basic %s: %s", cid, _role, e)
         steps = sfnn_state.get("motor_sfnn_steps")
         if isinstance(steps, int) and steps > self.motor_sfnn_steps:
             self.motor_sfnn_steps = steps
@@ -842,6 +875,14 @@ class LocalColonyCompute:
                     prev = int(self.higher_tissue_sfnn_steps.get(_t, 0))
                     if _s > prev:
                         self.higher_tissue_sfnn_steps[_t] = _s
+        # SFNN S6.7: max-reduce восстановление счётчиков 10 базовых.
+        basic_steps = sfnn_state.get("basic_tissue_sfnn_steps") or {}
+        if isinstance(basic_steps, dict):
+            for _role, _s in basic_steps.items():
+                if _role in _BASIC_SFNN_TISSUES and isinstance(_s, int):
+                    prev = int(self.basic_tissue_sfnn_steps.get(_role, 0))
+                    if _s > prev:
+                        self.basic_tissue_sfnn_steps[_role] = _s
 
     def collect_sfnn_state_sync_items(self) -> list[dict]:
         """S6.0b-B: собрать snapshot SFNN-правил всех живых cid для
@@ -865,6 +906,8 @@ class LocalColonyCompute:
         motor_steps = int(self.motor_sfnn_steps)
         higher_steps = {t: int(self.higher_tissue_sfnn_steps.get(t, 0))
                          for t in _HIGHER_SFNN_TISSUES}
+        basic_steps = {t: int(self.basic_tissue_sfnn_steps.get(t, 0))
+                        for t in _BASIC_SFNN_TISSUES}
         for cid in list(self.organisms.keys()):
             entry: dict = {"cid": cid}
             rule = self.motor_sfnn_rule.get(cid)
@@ -884,8 +927,20 @@ class LocalColonyCompute:
                     pass
             if higher:
                 entry["higher_tissue_sfnn_rules"] = higher
+            basic: dict = {}
+            for _role in _BASIC_SFNN_TISSUES:
+                r = self.basic_tissue_sfnn_rule.get(_role, {}).get(cid)
+                if r is None:
+                    continue
+                try:
+                    basic[_role] = r.to_dict()
+                except Exception:
+                    pass
+            if basic:
+                entry["basic_tissue_sfnn_rules"] = basic
             entry["motor_sfnn_steps"] = motor_steps
             entry["higher_tissue_sfnn_steps"] = dict(higher_steps)
+            entry["basic_tissue_sfnn_steps"] = dict(basic_steps)
             items.append(entry)
         return items
 
@@ -924,6 +979,32 @@ class LocalColonyCompute:
                 brain["motor_sfnn_rule"] = sfnn_rule.to_dict()
             except Exception as e:
                 logger.debug("extract_brain_state_dicts motor_sfnn_rule: %s", e)
+        # SFNN S3.0: 7 высших правил.
+        higher_rules_out: dict = {}
+        for _t in _HIGHER_SFNN_TISSUES:
+            _r = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
+            if _r is None or not hasattr(_r, "to_dict"):
+                continue
+            try:
+                higher_rules_out[_t] = _r.to_dict()
+            except Exception as e:
+                logger.debug(
+                    "extract_brain_state_dicts higher %s: %s", _t, e)
+        if higher_rules_out:
+            brain["higher_tissue_sfnn_rules"] = higher_rules_out
+        # SFNN S6.7: 10 базовых правил.
+        basic_rules_out: dict = {}
+        for _role in _BASIC_SFNN_TISSUES:
+            _r = self.basic_tissue_sfnn_rule.get(_role, {}).get(cid)
+            if _r is None or not hasattr(_r, "to_dict"):
+                continue
+            try:
+                basic_rules_out[_role] = _r.to_dict()
+            except Exception as e:
+                logger.debug(
+                    "extract_brain_state_dicts basic %s: %s", _role, e)
+        if basic_rules_out:
+            brain["basic_tissue_sfnn_rules"] = basic_rules_out
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
@@ -1019,6 +1100,21 @@ class LocalColonyCompute:
                     _t, e)
         if higher_rules_dump:
             payload["higher_tissue_sfnn_rules"] = higher_rules_dump
+        # SFNN S6.7 (16.05.2026): 10 базовых правил родителя → ребёнку.
+        basic_rules_dump: dict = {}
+        for _role in _BASIC_SFNN_TISSUES:
+            _parent_rule = self.basic_tissue_sfnn_rule.get(_role, {}).get(
+                parent_cid)
+            if _parent_rule is None or not hasattr(_parent_rule, "to_dict"):
+                continue
+            try:
+                basic_rules_dump[_role] = _parent_rule.to_dict()
+            except Exception as e:
+                logger.debug(
+                    "inherit_brain_y50 parent basic_tissue_sfnn_rule[%s]: %s",
+                    _role, e)
+        if basic_rules_dump:
+            payload["basic_tissue_sfnn_rules"] = basic_rules_dump
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
