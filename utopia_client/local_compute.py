@@ -129,6 +129,42 @@ _SFNN_MIGRATED_ROLES: set[str] = {
     "language",
 }
 
+# S6.4 (16.05.2026): 10 базовых тканей organism graph, которые в S6
+# мигрируют на унифицированное SFNN apply-step (eligibility trace + R3
+# + TD-coupling). Веса каждой роли живут в HebbianController._tissue_info
+# (один heb на cid). Под флагом `genome.basic_tissue_sfnn_enabled=True`
+# классический Hebbian для этих ролей пропускается через
+# `heb.update(skip_roles=…)` (S6.6), а SFNN apply-step применяет ΔW из
+# pre/post, накопленных самим heb'ом (S6.5).
+_BASIC_SFNN_TISSUES: tuple[str, ...] = (
+    "sensory",
+    "attention",
+    "brain",
+    "memory",
+    "consciousness",
+    "communication",
+    "motor",
+    "manipulator",
+    "digestive",
+    "immune",
+)
+
+# Маппинг "роль в organism graph" → "поле в Genome" с сериализованным
+# SFNNRule (см. core/organism.py:Genome). "motor" в graph ≠ motor_policy
+# sidecar, поэтому поле зовётся `motor_low_sfnn_rule`.
+_BASIC_SFNN_GENOME_FIELD: dict[str, str] = {
+    "sensory":        "sensory_sfnn_rule",
+    "attention":      "attention_sfnn_rule",
+    "brain":          "brain_sfnn_rule",
+    "memory":         "memory_sfnn_rule",
+    "consciousness":  "consciousness_sfnn_rule",
+    "communication":  "communication_sfnn_rule",
+    "motor":          "motor_low_sfnn_rule",
+    "manipulator":    "manipulator_sfnn_rule",
+    "digestive":      "digestive_sfnn_rule",
+    "immune":         "immune_sfnn_rule",
+}
+
 
 class LocalColonyCompute:
     """Локальная колония: forward + Hebbian + ActionSelector per-creature.
@@ -294,6 +330,22 @@ class LocalColonyCompute:
         self._higher_sfnn_default: bool = True
         self._motor_sfnn_default: bool = True
 
+        # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
+        # organism graph. Веса самих тканей живут в HebbianController; здесь
+        # хранится только evolvable rule (A/B/C/D/η + τ + R3 + td_coupling +
+        # algorithm). В S6.5 будет apply-step через eligibility trace, в
+        # S6.6 — диспетчер под флагом `genome.basic_tissue_sfnn_enabled`.
+        self.basic_tissue_sfnn_rule: dict[str, dict] = {
+            t: {} for t in _BASIC_SFNN_TISSUES
+        }
+        # Per-tissue счётчик SFNN apply-step'ов (S6.5+). В S6.4 — нули.
+        self.basic_tissue_sfnn_steps: dict[str, int] = {
+            t: 0 for t in _BASIC_SFNN_TISSUES
+        }
+        # Дефолт флага `basic_tissue_sfnn_enabled` для новых особей — False.
+        # В S6.9 будет CLI cabinet.sh sfnn-basic on|off.
+        self._basic_sfnn_default: bool = False
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -315,6 +367,7 @@ class LocalColonyCompute:
             organism.genome = types.SimpleNamespace(
                 higher_tissue_sfnn_enabled=self._higher_sfnn_default,
                 sfnn_enabled=self._motor_sfnn_default,
+                basic_tissue_sfnn_enabled=self._basic_sfnn_default,
             )
         self.action_selectors[cid] = ActionSelector()
         self.hebbian[cid] = self._make_hebbian(organism, hebbian_enabled,
@@ -398,6 +451,29 @@ class LocalColonyCompute:
                         cid, SFNNRule.default())
         except Exception as e:
             logger.debug("add_creature %s higher_tissue_sfnn_rule init: %s", cid, e)
+        # SFNN S6.4 (16.05.2026): per-role SFNNRule для 10 базовых тканей
+        # organism graph. Источник: серийный dict в genome.<role>_sfnn_rule
+        # (если есть и валидный) → SFNNRule.from_dict; иначе — дефолты
+        # ROLE_DEFAULTS через SFNNRule.for_role(role). Storage идемпотентен
+        # к повторному add_creature (broker re-announce) — setdefault.
+        try:
+            from core.sfnn_rule import SFNNRule
+            for _role, _field in _BASIC_SFNN_GENOME_FIELD.items():
+                _rule_d = getattr(organism.genome, _field, None)
+                if isinstance(_rule_d, dict):
+                    try:
+                        _rule = SFNNRule.from_dict(_rule_d)
+                    except Exception as _e:
+                        logger.debug(
+                            "add_creature %s basic_sfnn %s decode: %s — using role defaults",
+                            cid, _role, _e)
+                        _rule = SFNNRule.for_role(_role)
+                else:
+                    _rule = SFNNRule.for_role(_role)
+                self.basic_tissue_sfnn_rule[_role].setdefault(cid, _rule)
+        except Exception as e:
+            logger.debug("add_creature %s basic_tissue_sfnn_rule init: %s",
+                          cid, e)
         # SFNN S3.1 (14.05.2026): hooks для dopamine — первой активной высшей
         # ткани под флагом higher_tissue_sfnn_enabled. Hooks дёшевы и
         # регистрируются всегда (при выключенном флаге активации просто
@@ -530,6 +606,9 @@ class LocalColonyCompute:
         # SFNN S3.0: вычистить правила высших тканей.
         for _t in _HIGHER_SFNN_TISSUES:
             self.higher_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
+        # SFNN S6.4: вычистить правила 10 базовых тканей.
+        for _t in _BASIC_SFNN_TISSUES:
+            self.basic_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
         # SFNN S3.1: снять forward-hooks и забыть кешированные активации
         # всех зарегистрированных в S3.x тканей. Пока активна dopamine;
         # cleanup для остальных no-op до S3.2+.
@@ -554,6 +633,9 @@ class LocalColonyCompute:
         # SFNN S3.0: сбросить счётчики апдейтов всех 7 высших тканей.
         for _t in _HIGHER_SFNN_TISSUES:
             self.higher_tissue_sfnn_steps[_t] = 0
+        # SFNN S6.4: сбросить счётчики 10 базовых тканей.
+        for _t in _BASIC_SFNN_TISSUES:
+            self.basic_tissue_sfnn_steps[_t] = 0
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:

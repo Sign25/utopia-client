@@ -378,7 +378,11 @@ def test_extract_brain_state_dicts_includes_motor_sfnn_rule(seed_file):
     assert "motor_sfnn_rule" in brain
     rd = brain["motor_sfnn_rule"]
     # S5 (15.05.2026): помимо 6 synapse-ключей добавлен "temperature".
-    assert set(rd.keys()) == set(SYNAPSE_TYPES) | {"temperature"}
+    # S6.2 (16.05.2026): + tau, r_imm/med/long_weight, td_coupling, algorithm.
+    assert set(rd.keys()) == set(SYNAPSE_TYPES) | {
+        "temperature", "tau", "r_imm_weight", "r_med_weight",
+        "r_long_weight", "td_coupling", "algorithm",
+    }
     assert rd["input_proj"]["A"] == 0.5
     assert rd["mlp_fc1"]["eta"] == 5e-3
 
