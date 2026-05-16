@@ -616,9 +616,15 @@ class LocalColonyCompute:
                 logger.warning("add_creature %s zodchiy tissues: %s", cid, e)
             try:
                 from core.sfnn_rule import SFNNRule
+                # Z7.i.d.1 (16.05.2026): ROLE_DEFAULTS для Зодчий-тканей несут
+                # ненулевые R3/TD/τ (cerebellum τ=21/imm=0.7/td=1.0,
+                # amygdala τ=233/med=0.6/td=1.0, episodic τ=233/long=0.6/td=0).
+                # `default()` обнулил бы их → правило стартовало бы как
+                # classical Hebbian и эволюция тратила бы время на дрейф к
+                # роль-специфичным значениям. `for_role` поднимает их сразу.
                 for _t in _ZODCHIY_EXTRA_TISSUES:
                     self.zodchiy_extra_sfnn_rule[_t].setdefault(
-                        cid, SFNNRule.default())
+                        cid, SFNNRule.for_role(_t))
             except Exception as e:
                 logger.debug(
                     "add_creature %s zodchiy_extra_sfnn_rule init: %s", cid, e)

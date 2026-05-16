@@ -132,3 +132,28 @@ def test_zodchiy_extra_tissues_const_is_three(seed_file):
     """Хранители-constant: 3 ткани, имена точны (исключает опечатки)."""
     from utopia_client.local_compute import _ZODCHIY_EXTRA_TISSUES
     assert _ZODCHIY_EXTRA_TISSUES == ("cerebellum", "amygdala", "episodic")
+
+
+def test_zodchiy_sfnn_rule_uses_for_role_defaults(seed_file):
+    """Z7.i.d.1: SFNNRule.for_role применён (не default), R3/TD ненулевые
+    для cerebellum/amygdala/episodic по таблице ROLE_DEFAULTS."""
+    compute, org = _make_compute(seed_file)
+    compute.add_creature("c1", org, lineage="zodchiy")
+    # cerebellum: τ=21, immediate-R3=0.7, td=1.0
+    cer = compute.zodchiy_extra_sfnn_rule["cerebellum"]["c1"]
+    assert abs(cer.tau - 21.0) < 1e-6
+    assert abs(cer.r_imm_weight - 0.7) < 1e-6
+    assert abs(cer.td_coupling - 1.0) < 1e-6
+    assert cer.algorithm == "reward_output"
+    # amygdala: τ=233, medium-R3=0.6, td=1.0
+    amy = compute.zodchiy_extra_sfnn_rule["amygdala"]["c1"]
+    assert abs(amy.tau - 233.0) < 1e-6
+    assert abs(amy.r_med_weight - 0.6) < 1e-6
+    assert abs(amy.td_coupling - 1.0) < 1e-6
+    assert amy.algorithm == "reward_output"
+    # episodic: τ=233, long-R3=0.6, td=0
+    epi = compute.zodchiy_extra_sfnn_rule["episodic"]["c1"]
+    assert abs(epi.tau - 233.0) < 1e-6
+    assert abs(epi.r_long_weight - 0.6) < 1e-6
+    assert abs(epi.td_coupling - 0.0) < 1e-6
+    assert epi.algorithm == "oja_input"
