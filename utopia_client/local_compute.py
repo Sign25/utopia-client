@@ -273,6 +273,14 @@ class LocalColonyCompute:
         self.higher_tissue_sfnn_row_norms: dict[str, dict] = {
             t: {} for t in _HIGHER_SFNN_TISSUES
         }
+        # Z1 (16.05.2026, Зодчий) — eligibility trace per (tissue, cid) для
+        # унифицированной S6.5-формулы на 7 высших тканях. Активен только
+        # под флагом genome.full_sfnn_for_higher_enabled. Tensor формы W
+        # каждой Linear-матрицы внутри ткани (под ключом synapse_type).
+        # Эфемерное — ресет при рестарте клиента и при reset_all().
+        self.higher_tissue_sfnn_trace: dict[str, dict] = {
+            t: {} for t in _HIGHER_SFNN_TISSUES
+        }
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
         self.theory_of_mind: dict = {}      # cid → Tissue (S2.B)
@@ -329,6 +337,11 @@ class LocalColonyCompute:
         # пути это "заморозить веса" (forward без update_step).
         self._higher_sfnn_default: bool = True
         self._motor_sfnn_default: bool = True
+        # Z1 (16.05.2026, Зодчий): дефолт флага full_sfnn_for_higher. False
+        # сохраняет S3.1-формулу для живых Странников; True включает S6.5
+        # (τ-trace + R3 + td_coupling) на 7 высших тканях. Включается через
+        # set_full_sfnn_for_higher(True) из cabinet.sh или geneticно у Зодчего.
+        self._full_sfnn_for_higher_default: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -378,6 +391,8 @@ class LocalColonyCompute:
                 higher_tissue_sfnn_enabled=self._higher_sfnn_default,
                 sfnn_enabled=self._motor_sfnn_default,
                 basic_tissue_sfnn_enabled=self._basic_sfnn_default,
+                full_sfnn_for_higher_enabled=(
+                    self._full_sfnn_for_higher_default),
             )
         self.action_selectors[cid] = ActionSelector()
         self.hebbian[cid] = self._make_hebbian(organism, hebbian_enabled,
@@ -635,6 +650,8 @@ class LocalColonyCompute:
             self.higher_tissue_sfnn_acts.get(_t, {}).pop(cid, None)
             # SFNN S1.2c: cleanup baseline row-norms каждой высшей ткани.
             self.higher_tissue_sfnn_row_norms.get(_t, {}).pop(cid, None)
+            # Z1 (Зодчий, 16.05.2026): eligibility trace тоже эфемерно.
+            self.higher_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -652,6 +669,9 @@ class LocalColonyCompute:
         # SFNN S6.5: сбросить eligibility traces 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
             self.basic_tissue_sfnn_trace[_t] = {}
+        # Z1 (Зодчий, 16.05.2026): сбросить eligibility traces 7 высших тканей.
+        for _t in _HIGHER_SFNN_TISSUES:
+            self.higher_tissue_sfnn_trace[_t] = {}
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -1230,6 +1250,42 @@ class LocalColonyCompute:
                     on, n_changed, len(self.organisms))
         return n_changed
 
+    def set_full_sfnn_for_higher(self, on: bool) -> int:
+        """Z1 (Зодчий, 16.05.2026): включить/выключить полную S6.5-формулу
+        (eligibility trace + R3 + td_coupling) для 7 высших тканей.
+
+        При `on=False` (дефолт Странника) — apply-step S3.1 без τ/R3/TD.
+        При `on=True` — те же поля SFNNRule, что уже мутируются у Странника
+        (r_imm_weight/r_med_weight/r_long_weight/td_coupling/tau), начинают
+        реально влиять на ΔW. Eligibility trace эфемерный, набирается заново
+        после переключения.
+
+        Дефолт колонии обновляется (новые особи родятся с этим значением);
+        существующие — патчатся через `org.genome.full_sfnn_for_higher_enabled`.
+        Возвращает число изменённых.
+        """
+        on = bool(on)
+        self._full_sfnn_for_higher_default = on
+        n_changed = 0
+        for cid, org in self.organisms.items():
+            if not hasattr(org, "genome"):
+                org.genome = types.SimpleNamespace(
+                    higher_tissue_sfnn_enabled=self._higher_sfnn_default,
+                    sfnn_enabled=self._motor_sfnn_default,
+                    basic_tissue_sfnn_enabled=self._basic_sfnn_default,
+                    full_sfnn_for_higher_enabled=on,
+                )
+                n_changed += 1
+                continue
+            prev = bool(getattr(org.genome,
+                                 "full_sfnn_for_higher_enabled", False))
+            if prev != on:
+                org.genome.full_sfnn_for_higher_enabled = on
+                n_changed += 1
+        logger.info("set_full_sfnn_for_higher(%s) — changed %d / %d organisms",
+                    on, n_changed, len(self.organisms))
+        return n_changed
+
     @property
     def n_alive(self) -> int:
         return len(self.organisms)
@@ -1430,7 +1486,13 @@ class LocalColonyCompute:
                 higher_sfnn_on = bool(getattr(
                     getattr(org, "genome", None),
                     "higher_tissue_sfnn_enabled", False))
-                if higher_sfnn_on:
+                # Z1 (Зодчий, 16.05.2026): full_sfnn_for_higher_enabled →
+                # apply-step переезжает во второй проход после heb.update,
+                # где доступны r_imm_total и td_mult. Здесь — S3.1 ветка.
+                full_higher_on = bool(getattr(
+                    getattr(org, "genome", None),
+                    "full_sfnn_for_higher_enabled", False))
+                if higher_sfnn_on and not full_higher_on:
                     self._higher_tissue_sfnn_update_step(
                         "dopamine", cid, r=0.0)
                     # SFNN S3.2 (14.05.2026): imagination — вторая активная
@@ -1455,7 +1517,7 @@ class LocalColonyCompute:
                 # forward без Adam-шага → hooks стреляют → update_step
                 # применяет ΔW локальным правилом.
                 self._compute_theory_of_mind(cid)
-                if higher_sfnn_on:
+                if higher_sfnn_on and not full_higher_on:
                     self._higher_tissue_sfnn_update_step(
                         "theory_of_mind", cid, r=0.0)
 
@@ -1467,7 +1529,7 @@ class LocalColonyCompute:
                 lang_event = (events_per_cid.get(cid)
                               if events_per_cid is not None else None)
                 self._compute_language(cid, lang_event)
-                if higher_sfnn_on:
+                if higher_sfnn_on and not full_higher_on:
                     self._higher_tissue_sfnn_update_step(
                         "language", cid, r=0.0)
 
@@ -1532,6 +1594,28 @@ class LocalColonyCompute:
                                 )
                             except Exception as e:
                                 logger.debug("basic_sfnn step %s: %s", cid, e)
+                        # Z1 (Зодчий, 16.05.2026): apply-step 7 высших с
+                        # полной S6.5-формулой (τ-trace + R3 + td_coupling)
+                        # под флагом genome.full_sfnn_for_higher_enabled.
+                        # Запускается после heb.update, как basic_sfnn —
+                        # к этому моменту все 7 высших уже отстреляли forward
+                        # в _compute_higher_tissues / _compute_theory_of_mind /
+                        # _compute_language, acts актуальны.
+                        if higher_sfnn_on and full_higher_on:
+                            for _t in _HIGHER_SFNN_TISSUES:
+                                try:
+                                    self._higher_tissue_sfnn_update_step(
+                                        _t, cid,
+                                        full=True,
+                                        dopa_td_mult=td_mult,
+                                        r_imm_eff=r_imm_total,
+                                        r_med_eff=0.0,
+                                        r_long_eff=0.0,
+                                    )
+                                except Exception as e:
+                                    logger.debug(
+                                        "higher_sfnn full step %s/%s: %s",
+                                        _t, cid, e)
                         # Phase 6 — reward_var_ema по последним 10 r_imm.
                         self._update_reward_var_ema(cid, r_imm_total)
                 # Phase 6 — trace_norm_ema по Hebbian-traces.
@@ -2424,17 +2508,34 @@ class LocalColonyCompute:
 
     def _higher_tissue_sfnn_update_step(self, tissue_name: str,
                                           cid: str,
-                                          r: float = 0.0) -> None:
-        """SFNN S3.1 (14.05.2026): локальное правило пластичности для одной
-        высшей ткани под флагом `genome.higher_tissue_sfnn_enabled=True`.
+                                          r: float = 0.0,
+                                          *,
+                                          full: bool = False,
+                                          dopa_td_mult: float = 1.0,
+                                          r_imm_eff: float = 0.0,
+                                          r_med_eff: float = 0.0,
+                                          r_long_eff: float = 0.0) -> None:
+        """SFNN apply-step для одной высшей ткани.
 
-        Идентично `_motor_sfnn_update_step`, кроме reward-модуляции:
-        в S3.1 для всех 7 тканей r=0.0 (чистая Hebb без модуляции).
-        Поэтому reward_gain = 1.0, и формула:
-            hebb_A = outer(post, pre) − post²·W       # Oja S1.2c
-            ΔW = η · (A·hebb_A + B·post + C·pre + D)
-            ΔW ← clip(ΔW, ±0.01)
-            W  ← W + ΔW
+        Две ветки:
+
+        * `full=False` (S3.1, 14.05.2026, дефолт Странника) — без τ/R3/TD:
+              hebb_A = outer(post_c, pre_c) − post_c²·W       # Oja S1.2c
+              ΔW = η · (1+r) · (A·hebb_A + B·post + C·pre + D)
+              ΔW ← clip(ΔW, ±0.01)
+              W  ← W + ΔW
+
+        * `full=True`  (Z1 Зодчий, 16.05.2026) — полная S6.5-формула:
+              e_t   = exp(-1/τ)·e_{t-1} + hebb_A
+              r_eff = w_imm·r_imm_eff + w_med·r_med_eff + w_long·r_long_eff
+              η_eff = η · (1 + td_coupling · (dopa_td_mult − 1))
+              ΔW    = clip(η_eff · (1 + r_eff) · (A·e + B·post + C·pre + D), ±0.01)
+              W    ← W + ΔW
+
+        Поля τ/R3/TD у 7 высших уже мутируются в SFNNRule (ROLE_DEFAULTS),
+        но в S3.1-формуле они «крутятся вхолостую». Под флагом Z1 они
+        начинают реально влиять на ΔW. r_*_eff подаются вызывающим как
+        baseline-subtracted (heb.update внутри обновил baseline EMA).
 
         pre/post захватываются forward-hooks при предыдущем
         `_compute_higher_tissues` (если ткань активна — был forward,
@@ -2460,9 +2561,22 @@ class LocalColonyCompute:
         row_norms = (self.higher_tissue_sfnn_row_norms.get(tissue_name, {})
                        .get(cid))
         try:
-            reward_gain = 1.0 + float(r)
             clip_val = self._MOTOR_SFNN_DW_CLIP
             eps = self._MOTOR_SFNN_RENORM_EPS
+            if full:
+                # Z1: общие коэффициенты, не зависящие от synapse_type.
+                tau = max(1.0, float(rule.tau))
+                decay = math.exp(-1.0 / tau)
+                r_eff = (rule.r_imm_weight * float(r_imm_eff)
+                          + rule.r_med_weight * float(r_med_eff)
+                          + rule.r_long_weight * float(r_long_eff))
+                td_gain = (1.0 + rule.td_coupling
+                            * (float(dopa_td_mult) - 1.0))
+                reward_gain = 1.0 + r_eff
+                trace_store = self.higher_tissue_sfnn_trace[tissue_name]
+                trace_per_cid = trace_store.setdefault(cid, {})
+            else:
+                reward_gain = 1.0 + float(r)
             with torch.no_grad():
                 params = dict(tissue.named_parameters())
                 for module_name, synapse_type in self._MOTOR_SFNN_SYNAPSE_MAP:
@@ -2496,14 +2610,28 @@ class LocalColonyCompute:
                     pre_c = pre - pre.mean()
                     hebb_A = (torch.outer(post_c, pre_c)
                               - post_c.square().unsqueeze(1) * W.data)
-                    dW = A * hebb_A
+                    if full:
+                        # Z1: per-(tissue,cid,synapse) eligibility trace.
+                        trace = trace_per_cid.get(synapse_type)
+                        if trace is None or trace.shape != hebb_A.shape:
+                            trace = torch.zeros_like(hebb_A)
+                        else:
+                            trace.mul_(decay)
+                        trace.add_(hebb_A)
+                        trace_per_cid[synapse_type] = trace
+                        dW = A * trace
+                    else:
+                        dW = A * hebb_A
                     if B != 0.0:
                         dW = dW + B * post.unsqueeze(1).expand_as(W)
                     if C != 0.0:
                         dW = dW + C * pre.unsqueeze(0).expand_as(W)
                     if D != 0.0:
                         dW = dW + D
-                    dW = dW * (eta * reward_gain)
+                    if full:
+                        dW = dW * (eta * td_gain * reward_gain)
+                    else:
+                        dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     W.data.add_(dW)
                     # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
