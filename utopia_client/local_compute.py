@@ -342,9 +342,11 @@ class LocalColonyCompute:
         self.basic_tissue_sfnn_steps: dict[str, int] = {
             t: 0 for t in _BASIC_SFNN_TISSUES
         }
-        # Дефолт флага `basic_tissue_sfnn_enabled` для новых особей — False.
-        # В S6.9 будет CLI cabinet.sh sfnn-basic on|off.
-        self._basic_sfnn_default: bool = False
+        # Дефолт флага `basic_tissue_sfnn_enabled` для новых особей.
+        # S6.11 (16.05.2026): переключён на True — миграция завершена,
+        # 10 базовых ролей по умолчанию на SFNN-плейстике. cabinet.sh
+        # sfnn-basic off — kill-switch для regression-debug.
+        self._basic_sfnn_default: bool = True
         # SFNN S6.5 (16.05.2026): eligibility trace per (role, cid). Tensor
         # формы W_sub (slice матрицы, к которой применяется ΔW). decay = exp(-1/τ)
         # из SFNNRule.tau. Эфемерное — ресет при рестарте клиента и при

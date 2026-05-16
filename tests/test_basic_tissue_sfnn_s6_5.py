@@ -65,6 +65,10 @@ def _compute_with_tick(seed_file, cid="c1"):
 
 def test_apply_step_noop_without_heb(seed_file):
     compute, _ = _compute_with_tick(seed_file)
+    # S6.11: дефолт sfnn-basic=on → handle_tick уже дёргал apply-step,
+    # обнуляем счётчики чтобы протестировать noop-ветку напрямую.
+    for r in compute.basic_tissue_sfnn_steps:
+        compute.basic_tissue_sfnn_steps[r] = 0
     # Очищаем heb._last_input — apply-step должен молча выйти.
     compute.hebbian["c1"]._last_input = None
     compute._basic_sfnn_update_step("c1", compute.hebbian["c1"])

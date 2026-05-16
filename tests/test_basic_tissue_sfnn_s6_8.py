@@ -72,9 +72,10 @@ def test_diagnostics_basic_sfnn_enabled_pct(seed_file):
     compute = LocalColonyCompute(device="cpu")
     org1 = load_founders(seed_file, 1)[0]
     org2 = load_founders(seed_file, 1)[0]
+    compute.set_basic_sfnn(False)  # S6.11: дефолт True, сбрасываем для теста
     compute.add_creature("c1", org1, hebbian_enabled=True)
     compute.add_creature("c2", org2, hebbian_enabled=True)
-    # По дефолту флаг False у всех → enabled_pct = 0.
+    # После сброса флаг False у всех → enabled_pct = 0.
     d = compute.diagnostics()
     assert d["basic_sfnn"]["enabled_pct"] == pytest.approx(0.0)
     # Включаем флаг у одной → 0.5.

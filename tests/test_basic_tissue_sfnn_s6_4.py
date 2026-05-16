@@ -167,10 +167,10 @@ def test_basic_sfnn_reset_all_zeros_steps(seed_file):
         assert compute.basic_tissue_sfnn_steps[role] == 0
 
 
-def test_basic_sfnn_default_flag_off(seed_file):
-    """_basic_sfnn_default стартует выключенным — в S6.4 ничего не активно."""
+def test_basic_sfnn_default_flag_on(seed_file):
+    """S6.11: _basic_sfnn_default стартует включённым — миграция завершена."""
     compute, _ = _compute(seed_file)
-    assert compute._basic_sfnn_default is False
+    assert compute._basic_sfnn_default is True
 
 
 def test_basic_sfnn_genome_attr_synth_when_missing(seed_file):
@@ -184,4 +184,5 @@ def test_basic_sfnn_genome_attr_synth_when_missing(seed_file):
         del org.genome
     compute.add_creature("c1", org)
     assert hasattr(org.genome, "basic_tissue_sfnn_enabled")
-    assert org.genome.basic_tissue_sfnn_enabled is False
+    # S6.11: дефолт True.
+    assert org.genome.basic_tissue_sfnn_enabled is True

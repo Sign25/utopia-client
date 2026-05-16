@@ -44,21 +44,21 @@ def seed_file(tmp_path, monkeypatch):
     return client_seed
 
 
-def test_default_basic_sfnn_is_off(seed_file):
-    """_basic_sfnn_default стартует False (обратная совместимость)."""
+def test_default_basic_sfnn_is_on(seed_file):
+    """S6.11: _basic_sfnn_default стартует True — миграция завершена."""
     from utopia_client.local_compute import LocalColonyCompute
     compute = LocalColonyCompute(device="cpu")
-    assert compute._basic_sfnn_default is False
+    assert compute._basic_sfnn_default is True
 
 
 def test_set_basic_sfnn_flips_all_genomes(seed_file):
-    """set_basic_sfnn(True) патчит флаг у всех owned особей."""
+    """set_basic_sfnn(False) → set_basic_sfnn(True) патчит флаг у всех owned."""
     from utopia_client.local_compute import LocalColonyCompute
     from utopia_client.seed_loader import load_founders
     compute = LocalColonyCompute(device="cpu")
+    compute.set_basic_sfnn(False)  # сбросим дефолт перед заселением
     for i, org in enumerate(load_founders(seed_file, 3)):
         compute.add_creature(f"c{i}", org, hebbian_enabled=True)
-    # До: все по дефолту False.
     for org in compute.organisms.values():
         assert org.genome.basic_tissue_sfnn_enabled is False
     n = compute.set_basic_sfnn(True)
@@ -72,6 +72,7 @@ def test_set_basic_sfnn_idempotent(seed_file):
     from utopia_client.local_compute import LocalColonyCompute
     from utopia_client.seed_loader import load_founders
     compute = LocalColonyCompute(device="cpu")
+    compute.set_basic_sfnn(False)  # S6.11: дефолт True, сбрасываем для теста
     org = load_founders(seed_file, 1)[0]
     compute.add_creature("c1", org, hebbian_enabled=True)
     assert compute.set_basic_sfnn(True) == 1
