@@ -1358,24 +1358,50 @@ class LocalColonyCompute:
                         # TypeError → fallback на безмодуляторный вызов.
                         td = self.dopamine_td.get(cid, 0.0)
                         td_mult = 1.0 + max(-0.5, min(0.5, td))
+                        # SFNN S6.6 (16.05.2026): под флагом
+                        # genome.basic_tissue_sfnn_enabled расширяем skip_roles
+                        # на 10 базовых тканей — классика их больше не пишет.
+                        basic_sfnn_on = bool(getattr(
+                            getattr(org, "genome", None),
+                            "basic_tissue_sfnn_enabled", False))
+                        if basic_sfnn_on:
+                            heb_skip = (_SFNN_MIGRATED_ROLES
+                                         | set(_BASIC_SFNN_TISSUES))
+                        else:
+                            heb_skip = _SFNN_MIGRATED_ROLES
                         try:
                             heb.update(logits,
                                        {"immediate": r_imm_total,
                                         "medium": 0.0, "long": 0.0},
                                        dopa_td_mult=td_mult,
-                                       skip_roles=_SFNN_MIGRATED_ROLES)
+                                       skip_roles=heb_skip)
                             self.hebbian_updates += 1
                         except TypeError:
                             try:
                                 heb.update(logits,
                                            {"immediate": r_imm_total,
                                             "medium": 0.0, "long": 0.0},
-                                           skip_roles=_SFNN_MIGRATED_ROLES)
+                                           skip_roles=heb_skip)
                                 self.hebbian_updates += 1
                             except Exception as e:
                                 logger.debug("hebbian update %s: %s", cid, e)
                         except Exception as e:
                             logger.debug("hebbian update %s: %s", cid, e)
+                        # SFNN S6.6 (16.05.2026): apply-step 10 базовых ролей.
+                        # Запускается после heb.update — _last_input/_last_output
+                        # уже проставлены. r_imm_eff = r_imm_total как baseline-
+                        # subtracted сигнал (heb внутри обновил _baseline_imm).
+                        if basic_sfnn_on:
+                            try:
+                                self._basic_sfnn_update_step(
+                                    cid, heb,
+                                    dopa_td_mult=td_mult,
+                                    r_imm_eff=r_imm_total,
+                                    r_med_eff=0.0,
+                                    r_long_eff=0.0,
+                                )
+                            except Exception as e:
+                                logger.debug("basic_sfnn step %s: %s", cid, e)
                         # Phase 6 — reward_var_ema по последним 10 r_imm.
                         self._update_reward_var_ema(cid, r_imm_total)
                 # Phase 6 — trace_norm_ema по Hebbian-traces.
