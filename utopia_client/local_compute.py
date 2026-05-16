@@ -330,8 +330,14 @@ class LocalColonyCompute:
         if motor is not None:
             self.motor_policy[cid] = motor
             # SFNN S1.1: дефолтное правило (Phase 5d-эквивалент).
+            # S6.0b-A (16.05.2026): setdefault вместо прямой записи —
+            # add_creature идемпотентен по SFNN-правилам. При reseed после
+            # broker re-announce сервер вызывает add_creature повторно для
+            # того же cid; раньше это стирало эволюционировавшее правило
+            # к дефолту. apply_inherited_state ниже / mate-pair / asexual
+            # перезапишут правило явно от родителя (через .pop+set).
             from core.sfnn_rule import SFNNRule
-            self.motor_sfnn_rule[cid] = SFNNRule.default()
+            self.motor_sfnn_rule.setdefault(cid, SFNNRule.default())
             # SFNN S1.2b: hooks для захвата pre/post 6 Linear motor_policy.
             # Регистрируются всегда (overhead — копия (pre,post) на forward),
             # используются только при genome.sfnn_enabled=True.
@@ -369,7 +375,9 @@ class LocalColonyCompute:
             )
             for _name, _store in _tissue_stores:
                 if _store.get(cid) is not None:
-                    self.higher_tissue_sfnn_rule[_name][cid] = SFNNRule.default()
+                    # S6.0b-A: setdefault — идемпотентность по правилам.
+                    self.higher_tissue_sfnn_rule[_name].setdefault(
+                        cid, SFNNRule.default())
         except Exception as e:
             logger.debug("add_creature %s higher_tissue_sfnn_rule init: %s", cid, e)
         # SFNN S3.1 (14.05.2026): hooks для dopamine — первой активной высшей
@@ -665,6 +673,107 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("apply_inherited_state %s language: %s",
                                 cid, e)
+
+    def restore_sfnn_state(self, cid: str, sfnn_state: dict) -> None:
+        """S6.0b-B (16.05.2026): восстановить SFNN-правила из persistent-store.
+
+        В отличие от `apply_inherited_state` (родительское правило + σ=0.1
+        мутация), это «верни мне моё» — без мутации. Используется при
+        legitimate reset (hello_recovery / admin_respawn): сервер
+        подкладывает в seed_chunk[payload]['sfnn_state'] последний blob,
+        который клиент сам отправил через `client_state_sync`.
+
+        Структура sfnn_state:
+          motor_sfnn_rule: dict          # SFNNRule.to_dict()
+          higher_tissue_sfnn_rules: dict  # {tissue: SFNNRule.to_dict()}
+          motor_sfnn_steps: int           # глобальный счётчик (не per-cid)
+          higher_tissue_sfnn_steps: dict  # {tissue: int}
+
+        Счётчики восстанавливаются на глобальном уровне (a max-reduce, если
+        вызовов несколько за один restore: берём максимум).
+        """
+        if cid not in self.organisms or not isinstance(sfnn_state, dict):
+            return
+        try:
+            from core.sfnn_rule import SFNNRule
+        except Exception as e:
+            logger.warning("restore_sfnn_state %s: import SFNNRule: %s", cid, e)
+            return
+        rule_d = sfnn_state.get("motor_sfnn_rule")
+        if isinstance(rule_d, dict) and self.motor_sfnn_rule.get(cid) is not None:
+            try:
+                self.motor_sfnn_rule[cid] = SFNNRule.from_dict(rule_d)
+            except Exception as e:
+                logger.warning("restore_sfnn_state %s motor_sfnn_rule: %s",
+                                cid, e)
+        higher_d = sfnn_state.get("higher_tissue_sfnn_rules") or {}
+        if isinstance(higher_d, dict):
+            for _t, _rule_d in higher_d.items():
+                if _t not in self.higher_tissue_sfnn_rule:
+                    continue
+                if self.higher_tissue_sfnn_rule[_t].get(cid) is None:
+                    continue
+                try:
+                    self.higher_tissue_sfnn_rule[_t][cid] = SFNNRule.from_dict(_rule_d)
+                except Exception as e:
+                    logger.warning(
+                        "restore_sfnn_state %s higher %s: %s", cid, _t, e)
+        steps = sfnn_state.get("motor_sfnn_steps")
+        if isinstance(steps, int) and steps > self.motor_sfnn_steps:
+            self.motor_sfnn_steps = steps
+        higher_steps = sfnn_state.get("higher_tissue_sfnn_steps") or {}
+        if isinstance(higher_steps, dict):
+            for _t, _s in higher_steps.items():
+                if _t in _HIGHER_SFNN_TISSUES and isinstance(_s, int):
+                    prev = int(self.higher_tissue_sfnn_steps.get(_t, 0))
+                    if _s > prev:
+                        self.higher_tissue_sfnn_steps[_t] = _s
+
+    def collect_sfnn_state_sync_items(self) -> list[dict]:
+        """S6.0b-B: собрать snapshot SFNN-правил всех живых cid для
+        отправки на P40 через `client_state_sync`.
+
+        Возвращает список dict (по одному на cid):
+          {
+            "cid": str,
+            "motor_sfnn_rule": dict,
+            "higher_tissue_sfnn_rules": {tissue: dict},
+            "motor_sfnn_steps": int,
+            "higher_tissue_sfnn_steps": {tissue: int},
+          }
+
+        Счётчики на клиенте — глобальные (один на компьют, не per-cid).
+        Чтобы все cid не «делили» один счётчик — пишем одинаковое значение
+        каждому; сервер upsert per-cid сохранит как есть, а P40-сторона
+        восстановит max-reduce из first cid в restore_sfnn_state.
+        """
+        items: list[dict] = []
+        motor_steps = int(self.motor_sfnn_steps)
+        higher_steps = {t: int(self.higher_tissue_sfnn_steps.get(t, 0))
+                         for t in _HIGHER_SFNN_TISSUES}
+        for cid in list(self.organisms.keys()):
+            entry: dict = {"cid": cid}
+            rule = self.motor_sfnn_rule.get(cid)
+            if rule is not None:
+                try:
+                    entry["motor_sfnn_rule"] = rule.to_dict()
+                except Exception:
+                    pass
+            higher: dict = {}
+            for _t in _HIGHER_SFNN_TISSUES:
+                r = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
+                if r is None:
+                    continue
+                try:
+                    higher[_t] = r.to_dict()
+                except Exception:
+                    pass
+            if higher:
+                entry["higher_tissue_sfnn_rules"] = higher
+            entry["motor_sfnn_steps"] = motor_steps
+            entry["higher_tissue_sfnn_steps"] = dict(higher_steps)
+            items.append(entry)
+        return items
 
     def extract_brain_state_dicts(self, cid: str) -> tuple[dict, dict]:
         """Brain migration Etap 3.2 (11.05.2026): собрать state_dict мозга

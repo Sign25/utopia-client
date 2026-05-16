@@ -30,6 +30,10 @@ LOCAL_SAVE_INTERVAL_SEC = 60.0
 EMPTY_WORLD_GRACE_SEC = 120.0
 EMPTY_WORLD_RETRY_SEC = 300.0
 EMPTY_WORLD_CHECK_SEC = 30.0
+# S6.0b-B (16.05.2026): период отправки `client_state_sync` (snapshot
+# SFNN-правил на P40 → diskstore → возврат в seed_pack). 2 мин —
+# компромисс между свежестью при reannounce и нагрузкой на БД.
+STATE_SYNC_INTERVAL_SEC = 120.0
 
 
 class ColonyWSClient:
@@ -267,6 +271,7 @@ class ColonyWSClient:
             ping_task = asyncio.create_task(self._ping_loop(ws))
             save_task = asyncio.create_task(self._save_loop())
             empty_task = asyncio.create_task(self._empty_world_loop())
+            sync_task = asyncio.create_task(self._state_sync_loop(ws))
             try:
                 async for raw in ws:
                     try:
@@ -284,7 +289,8 @@ class ColonyWSClient:
                 ping_task.cancel()
                 save_task.cancel()
                 empty_task.cancel()
-                for t in (ping_task, save_task, empty_task):
+                sync_task.cancel()
+                for t in (ping_task, save_task, empty_task, sync_task):
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):
@@ -339,6 +345,37 @@ class ColonyWSClient:
                 logger.debug("periodic local-save: %d creatures", n)
             except Exception as e:
                 logger.warning("periodic save_all_states failed: %s", e)
+
+    async def _state_sync_loop(self, ws) -> None:
+        """S6.0b-B2 (16.05.2026): periodic SFNN-state snapshot → P40.
+
+        Раз в STATE_SYNC_INTERVAL_SEC клиент шлёт `client_state_sync` с
+        текущими motor_sfnn_rule/higher_tissue_sfnn_rules и счётчиками
+        per cid. Сервер кладёт blob на диск (sfnn_state_store) и подкладывает
+        в seed_pack при следующем hello_recovery / admin_respawn.
+        Это страхует от потери эволюционных коэффициентов при legitimate
+        reset (для broker re-announce есть отдельный guard S6.0b-A).
+        """
+        while True:
+            await asyncio.sleep(STATE_SYNC_INTERVAL_SEC)
+            if self.compute is None:
+                continue
+            try:
+                items = self.compute.collect_sfnn_state_sync_items()
+            except Exception as e:
+                logger.warning("collect_sfnn_state_sync_items failed: %s", e)
+                continue
+            if not items:
+                continue
+            try:
+                await ws.send(json.dumps({
+                    "type": "client_state_sync",
+                    "items": items,
+                }))
+                logger.debug("client_state_sync sent: n=%d", len(items))
+            except Exception as e:
+                logger.warning("client_state_sync send failed: %s", e)
+                return
 
     async def _maybe_request_respawn(self, connect_ts: float) -> bool:
         """Phase G.3: одна проверка watchdog'а.
@@ -664,6 +701,18 @@ class ColonyWSClient:
                     trace_decay=float(meta.get("trace_decay", 0.9)),
                 )
                 self.compute.apply_inherited_state(cid, payload)
+                # S6.0b-B (16.05.2026): persistent SFNN-state восстановление.
+                # Сервер кладёт сохранённое правило клиента в payload['sfnn_state']
+                # (через `client_state_sync` ← N тиков назад). После reset_all
+                # / hello_recovery это единственный путь вернуть накопленную
+                # эволюцию правил.
+                sfnn_state = payload.get("sfnn_state") if isinstance(payload, dict) else None
+                if sfnn_state and hasattr(self.compute, "restore_sfnn_state"):
+                    try:
+                        self.compute.restore_sfnn_state(cid, sfnn_state)
+                    except Exception as e:
+                        logger.warning(
+                            "restore_sfnn_state cid=%s failed: %s", cid, e)
                 self._seed_accepted += 1
                 logger.info("seed accepted cid=%s seed_id=%d bytes=%d source=%s",
                             cid, seed_id, len(weights), src)
