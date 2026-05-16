@@ -37,6 +37,10 @@ SELFUPDATE_CHECK_SEC = 60.0
 
 logger = logging.getLogger("utopia_client")
 
+# Uptime процесса utopia-client — отправляется в ColonyDiagnostics для
+# UI StatsPage (карточка «Клиент: Xч Ym»).
+_PROCESS_STARTED_AT: float = time.monotonic()
+
 
 def _state_dir() -> pathlib.Path:
     """Каталог для local heartbeat/pid (watchdog читает оттуда)."""
@@ -595,6 +599,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     diag = ws.compute.diagnostics()
                     diag["world_tick"] = ws.last_world_tick
                     diag["dump"] = ws.compute._dump_state()
+                    # 16.05.2026: uptime процесса клиента (сек) для UI.
+                    diag["client_uptime_sec"] = int(
+                        time.monotonic() - _PROCESS_STARTED_AT)
                     # Фаза 3.3A: метрики client-built obs vs server obs.
                     shadow = {
                         "built": ws._client_obs_built,
