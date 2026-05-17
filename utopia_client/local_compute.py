@@ -403,14 +403,15 @@ class LocalColonyCompute:
 
     def add_creature(self, cid: str, organism, *, hebbian_enabled: bool = True,
                      learning_rate: float = 1e-4, trace_decay: float = 0.9,
-                     lineage: str = "wanderer") -> None:
+                     lineage: str = "zodchiy") -> None:
         """Зарегистрировать особь. Organism — CompositeOrganism из seed_loader.
 
         `lineage` (Z7.i.d, 16.05.2026): "elder" | "wanderer" | "zodchiy".
-        Управляет составом sidecar-тканей. Дефолт "wanderer" — текущее
-        поведение (5 brain + motor + ToM + language). При "zodchiy"
-        дополнительно создаются 3 уникальные ткани третьей линии
-        (cerebellum, amygdala, episodic) с дефолтным SFNN-правилом.
+        Z8 (17.05.2026): дефолт переключён "wanderer" → "zodchiy". Новые
+        клиентские особи стартуют с 20 тканями (5 brain + motor + 7 высших
+        + 3 sidecar) и telomere ×φ³. Странники, оставшиеся живыми, доживают
+        естественно. Explicit lineage="wanderer" нужен только в тестах,
+        которые проверяют старое поведение.
         """
         from core.action_selector import ActionSelector
 

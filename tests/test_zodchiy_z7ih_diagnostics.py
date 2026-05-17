@@ -86,9 +86,9 @@ def test_diagnostics_empty_has_zodchiy_block(seed_file):
 
 
 def test_diagnostics_wanderer_only(seed_file):
-    """Wanderer (default) → n_active=0, аггрегаты нули."""
+    """Wanderer (explicit, Z8: дефолт сменился на zodchiy) → n_active=0."""
     compute, orgs = _make_compute_with(seed_file, 1)
-    compute.add_creature("w1", orgs[0])  # default lineage="wanderer"
+    compute.add_creature("w1", orgs[0], lineage="wanderer")  # explicit
     compute._compute_higher_tissues("w1", _obs(compute))
     d = compute.diagnostics()
     block = d["zodchiy_sidecar"]
@@ -124,7 +124,7 @@ def test_diagnostics_zodchiy_aggregates(seed_file):
 def test_diagnostics_mixed_lineages(seed_file):
     """1 wanderer + 1 zodchiy → n_active=1 (только Зодчий несёт snapshot)."""
     compute, orgs = _make_compute_with(seed_file, 2)
-    compute.add_creature("w1", orgs[0])
+    compute.add_creature("w1", orgs[0], lineage="wanderer")  # explicit (Z8)
     compute.add_creature("z1", orgs[1], lineage="zodchiy")
     compute._compute_higher_tissues("w1", _obs(compute))
     compute._compute_higher_tissues("z1", _obs(compute))
@@ -139,7 +139,7 @@ def test_diagnostics_mixed_lineages(seed_file):
 def test_per_creature_wanderer_zero_fields(seed_file):
     """Wanderer в _per_creature_stats — 3 Зодчий-поля = 0.0."""
     compute, orgs = _make_compute_with(seed_file, 1)
-    compute.add_creature("w1", orgs[0])
+    compute.add_creature("w1", orgs[0], lineage="wanderer")
     compute._compute_higher_tissues("w1", _obs(compute))
     d = compute.diagnostics()
     creatures = d.get("creatures", [])

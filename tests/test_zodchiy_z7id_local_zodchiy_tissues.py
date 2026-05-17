@@ -72,9 +72,10 @@ def _make_compute(seed_file):
 
 
 def test_wanderer_default_has_no_zodchiy_tissues(seed_file):
-    """Default lineage="wanderer" → ни одной Зодчий-ткани."""
+    """Explicit lineage="wanderer" (Z8: дефолт сменился на zodchiy) →
+    ни одной Зодчий-ткани."""
     compute, org = _make_compute(seed_file)
-    compute.add_creature("c1", org)  # default
+    compute.add_creature("c1", org, lineage="wanderer")
     assert compute.cerebellum.get("c1") is None
     assert compute.amygdala.get("c1") is None
     assert compute.episodic.get("c1") is None
@@ -106,10 +107,10 @@ def test_zodchiy_sfnn_rule_populated(seed_file):
 
 
 def test_zodchiy_sfnn_rule_not_created_for_wanderer(seed_file):
-    """Wanderer не получает Zodchiy-sfnn-rule (но dict-ключи tissues живут)."""
+    """Wanderer (explicit, Z8: дефолт сменился) не получает Zodchiy-sfnn-rule."""
     from utopia_client.local_compute import _ZODCHIY_EXTRA_TISSUES
     compute, org = _make_compute(seed_file)
-    compute.add_creature("c1", org)
+    compute.add_creature("c1", org, lineage="wanderer")
     for t in _ZODCHIY_EXTRA_TISSUES:
         # Хранилище инициализировано ({}) в __init__, но cid в нём нет.
         assert "c1" not in compute.higher_tissue_sfnn_rule[t]
@@ -195,9 +196,9 @@ def test_zodchiy_forward_populates_last_snapshots(seed_file):
 
 
 def test_zodchiy_forward_noop_for_wanderer(seed_file):
-    """Wanderer: forward не пишет в zodchiy-snapshot store'ы."""
+    """Wanderer (explicit, Z8): forward не пишет в zodchiy-snapshot store'ы."""
     compute, org = _make_compute(seed_file)
-    compute.add_creature("c1", org)  # default lineage
+    compute.add_creature("c1", org, lineage="wanderer")
     obs = _make_obs_tensor(compute)
     compute._compute_higher_tissues("c1", obs)
     assert compute.last_cerebellum_delta.get("c1") is None
@@ -296,7 +297,7 @@ def test_zodchiy_phase_emas_pushes_three_fields(seed_file):
 def test_zodchiy_phase_emas_skip_for_wanderer(seed_file):
     """Z7.i.f: wanderer не получает Зодчий-полей в phase_emas."""
     compute, org = _make_compute(seed_file)
-    compute.add_creature("c1", org)  # default lineage="wanderer"
+    compute.add_creature("c1", org, lineage="wanderer")  # explicit (Z8 default = zodchiy)
     obs = _make_obs_tensor(compute)
     compute._compute_higher_tissues("c1", obs)
     emas = compute.get_phase_emas("c1") or {}
