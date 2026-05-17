@@ -3198,23 +3198,64 @@ class LocalColonyCompute:
             return round(sum(vals) / len(vals), 6) if vals else 0.0
 
         # Phase 4 — specialization_avg агрегат по ролям.
+        # S6.11+ (16.05.2026): с `basic_tissue_sfnn_enabled=True` и
+        # `higher_tissue_sfnn_enabled=True` классический heb.update пропускает
+        # все 10 базовых + 7 высших + 3 sidecar Зодчего, traces в
+        # _tissue_info[trace] не растут и tissue_specialization() возвращает
+        # {}. Реальные traces теперь живут в basic/higher_tissue_sfnn_trace.
+        # Считаем долю каждой роли по сумме L2-норм SFNN-trace по всем cids,
+        # с fallback на классический trace для совместимости (если SFNN off).
         spec_sums: dict[str, float] = {}
-        spec_counts: dict[str, int] = {}
-        for ctrl in self.hebbian.values():
-            if ctrl is None or not hasattr(ctrl, "tissue_specialization"):
-                continue
-            try:
-                shares = ctrl.tissue_specialization()
-            except Exception:
-                continue
-            for role, share in shares.items():
-                spec_sums[role] = spec_sums.get(role, 0.0) + float(share)
-                spec_counts[role] = spec_counts.get(role, 0) + 1
-        specialization_avg = {
-            role: round(spec_sums[role] / spec_counts[role], 4)
-            for role in spec_sums
-            if spec_counts[role] > 0
-        }
+        # 1) Basic tissues (10 базовых ролей organism graph).
+        for role, per_cid in self.basic_tissue_sfnn_trace.items():
+            for trace in per_cid.values():
+                if trace is None:
+                    continue
+                try:
+                    spec_sums[role] = (spec_sums.get(role, 0.0)
+                                        + float(trace.norm().item()))
+                except Exception:
+                    continue
+        # 2) Higher tissues (7 высших + 3 Зодчий sidecar): trace per synapse.
+        for role, per_cid in self.higher_tissue_sfnn_trace.items():
+            for trace_dict in per_cid.values():
+                if not isinstance(trace_dict, dict):
+                    continue
+                for trace in trace_dict.values():
+                    if trace is None:
+                        continue
+                    try:
+                        spec_sums[role] = (spec_sums.get(role, 0.0)
+                                            + float(trace.norm().item()))
+                    except Exception:
+                        continue
+        # 3) Fallback на классику (если SFNN off — собираем как раньше).
+        if not spec_sums:
+            counts: dict[str, int] = {}
+            for ctrl in self.hebbian.values():
+                if ctrl is None or not hasattr(ctrl, "tissue_specialization"):
+                    continue
+                try:
+                    shares = ctrl.tissue_specialization()
+                except Exception:
+                    continue
+                for role, share in shares.items():
+                    spec_sums[role] = spec_sums.get(role, 0.0) + float(share)
+                    counts[role] = counts.get(role, 0) + 1
+            specialization_avg = {
+                role: round(spec_sums[role] / counts[role], 4)
+                for role in spec_sums
+                if counts[role] > 0
+            }
+        else:
+            # Нормализуем в доли (сумма == 1.0 при наличии traces).
+            total = sum(spec_sums.values())
+            if total < 1e-9:
+                specialization_avg = {r: 0.0 for r in spec_sums}
+            else:
+                specialization_avg = {
+                    r: round(v / total, 4) for r, v in spec_sums.items()
+                }
 
         # Brain migration: средние по высшим тканям S2.E/G/A/F.
         beta_vals = list(self.last_beta_local.values())
