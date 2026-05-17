@@ -1503,6 +1503,36 @@ class LocalColonyCompute:
                     out["client_motor_delta"] = vals_m
             except Exception:
                 pass
+        # Z7.i.f (16.05.2026, Зодчий) — push Зодчий-снапшотов в phase_emas.
+        # Заполняются только для lineage="zodchiy" (forward в _compute_higher_
+        # tissues создаёт записи только когда соответствующая ткань создана
+        # в add_creature). Для wanderer/elder dict'ы пустые → ключ не появится.
+        # Cerebellum/episodic — векторы [16]/[64], отдаём L2-норму (скаляр).
+        # Amygdala — уже скалярный valence ∈ [-1, 1].
+        cer = self.last_cerebellum_delta.get(cid)
+        if cer is not None:
+            try:
+                norm = float(cer.norm().item())
+                if math.isfinite(norm):
+                    out["client_cerebellum_delta_norm"] = norm
+            except Exception:
+                pass
+        val = self.last_amygdala_valence.get(cid)
+        if val is not None:
+            try:
+                vf = float(val)
+                if math.isfinite(vf) and -1.0 <= vf <= 1.0:
+                    out["client_amygdala_valence"] = vf
+            except Exception:
+                pass
+        epi = self.last_episodic_recall.get(cid)
+        if epi is not None:
+            try:
+                norm = float(epi.norm().item())
+                if math.isfinite(norm):
+                    out["client_episodic_recall_norm"] = norm
+            except Exception:
+                pass
         return out or None
 
     # ── Tick ─────────────────────────────────────────────────────────────

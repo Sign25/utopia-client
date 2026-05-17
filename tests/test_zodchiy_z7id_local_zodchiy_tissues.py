@@ -1,4 +1,4 @@
-"""Z7.i.d/Z7.i.e (Зодчий, 16.05.2026) — клиентский plumbing уникальных тканей.
+"""Z7.i.d/Z7.i.e/Z7.i.f (Зодчий, 16.05.2026) — клиентский plumbing уник. тканей.
 
 Что проверяем:
   Z7.i.d (plumbing):
@@ -20,6 +20,13 @@
   - `_higher_tissue_sfnn_update_step` инкрементит
     higher_tissue_sfnn_steps[t] и накапливает trace в
     higher_tissue_sfnn_trace[t][cid].
+
+  Z7.i.f (phase_emas push):
+  - `get_phase_emas` после Zodchiy forward возвращает 3 поля:
+    client_cerebellum_delta_norm (L2), client_amygdala_valence (scalar),
+    client_episodic_recall_norm (L2).
+  - Для wanderer/elder поля отсутствуют (forward не выполнялся → snapshot
+    store'ы пусты).
 """
 from __future__ import annotations
 
@@ -265,3 +272,66 @@ def test_zodchiy_remove_clears_hooks_and_trace(seed_file):
         assert "c1" not in compute.higher_tissue_sfnn_hook_handles.get(t, {})
         assert "c1" not in compute.higher_tissue_sfnn_trace.get(t, {})
         assert "c1" not in compute.higher_tissue_sfnn_row_norms.get(t, {})
+
+
+# ── Z7.i.f: phase_emas push ───────────────────────────────────────────────
+
+
+def test_zodchiy_phase_emas_pushes_three_fields(seed_file):
+    """Z7.i.f: после Zodchiy forward в get_phase_emas есть 3 Зодчий-поля."""
+    compute, org = _make_compute(seed_file)
+    compute.add_creature("c1", org, lineage="zodchiy")
+    obs = _make_obs_tensor(compute)
+    compute._compute_higher_tissues("c1", obs)
+    emas = compute.get_phase_emas("c1") or {}
+    assert "client_cerebellum_delta_norm" in emas
+    assert "client_amygdala_valence" in emas
+    assert "client_episodic_recall_norm" in emas
+    # Норма ≥ 0, valence ∈ [-1, 1].
+    assert emas["client_cerebellum_delta_norm"] >= 0.0
+    assert -1.0 <= emas["client_amygdala_valence"] <= 1.0
+    assert emas["client_episodic_recall_norm"] >= 0.0
+
+
+def test_zodchiy_phase_emas_skip_for_wanderer(seed_file):
+    """Z7.i.f: wanderer не получает Зодчий-полей в phase_emas."""
+    compute, org = _make_compute(seed_file)
+    compute.add_creature("c1", org)  # default lineage="wanderer"
+    obs = _make_obs_tensor(compute)
+    compute._compute_higher_tissues("c1", obs)
+    emas = compute.get_phase_emas("c1") or {}
+    assert "client_cerebellum_delta_norm" not in emas
+    assert "client_amygdala_valence" not in emas
+    assert "client_episodic_recall_norm" not in emas
+
+
+def test_zodchiy_phase_emas_skip_before_forward(seed_file):
+    """Z7.i.f: zodchiy без forward — snapshot пуст, полей нет."""
+    compute, org = _make_compute(seed_file)
+    compute.add_creature("c1", org, lineage="zodchiy")
+    # forward НЕ вызываем — snapshot store'ы пусты.
+    emas = compute.get_phase_emas("c1") or {}
+    assert "client_cerebellum_delta_norm" not in emas
+    assert "client_amygdala_valence" not in emas
+    assert "client_episodic_recall_norm" not in emas
+
+
+def test_zodchiy_phase_emas_norm_consistency(seed_file):
+    """Z7.i.f: client_cerebellum_delta_norm == L2(last_cerebellum_delta)."""
+    import math
+    compute, org = _make_compute(seed_file)
+    compute.add_creature("c1", org, lineage="zodchiy")
+    obs = _make_obs_tensor(compute)
+    compute._compute_higher_tissues("c1", obs)
+    emas = compute.get_phase_emas("c1") or {}
+    cer_tensor = compute.last_cerebellum_delta["c1"]
+    expected_cer = float(cer_tensor.norm().item())
+    assert math.isclose(
+        emas["client_cerebellum_delta_norm"], expected_cer, rel_tol=1e-6)
+    epi_tensor = compute.last_episodic_recall["c1"]
+    expected_epi = float(epi_tensor.norm().item())
+    assert math.isclose(
+        emas["client_episodic_recall_norm"], expected_epi, rel_tol=1e-6)
+    assert math.isclose(
+        emas["client_amygdala_valence"],
+        float(compute.last_amygdala_valence["c1"]), rel_tol=1e-6)
