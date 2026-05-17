@@ -3125,6 +3125,14 @@ class LocalColonyCompute:
                              "w_norm_avg": 0.0}
                        for r in _BASIC_SFNN_TISSUES},
                 },
+                # Z7.i.h (17.05.2026, Зодчий): per-tissue snapshot-аггрегаты
+                # для 3 sidecar-тканей. n_active=0 пока нет живых Зодчих.
+                "zodchiy_sidecar": {
+                    "n_active": 0,
+                    "cerebellum_delta_norm_avg": 0.0,
+                    "amygdala_valence_avg": 0.0,
+                    "episodic_recall_norm_avg": 0.0,
+                },
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
             }
@@ -3392,6 +3400,45 @@ class LocalColonyCompute:
             **basic_sfnn_per_tissue,
         }
 
+        # Z7.i.h (17.05.2026, Зодчий): colony-level аггрегаты по 3 sidecar-
+        # тканям. n_active = количество cid'ов с заполненными snapshot'ами
+        # (forward уже прошёл). Норму считаем L2 от вектора, valence — float.
+        cer_norms: list[float] = []
+        for cer_t in self.last_cerebellum_delta.values():
+            try:
+                cer_norms.append(float(cer_t.norm().item()))
+            except Exception:
+                continue
+        amy_vals: list[float] = []
+        for amy_v in self.last_amygdala_valence.values():
+            try:
+                amy_vals.append(float(amy_v))
+            except Exception:
+                continue
+        epi_norms: list[float] = []
+        for epi_t in self.last_episodic_recall.values():
+            try:
+                epi_norms.append(float(epi_t.norm().item()))
+            except Exception:
+                continue
+        # n_active = объединение cid'ов, у которых заполнена хотя бы одна
+        # Зодчий-снапшот-ткань. Обычно все три у одной особи.
+        zodchiy_cids = (set(self.last_cerebellum_delta.keys())
+                         | set(self.last_amygdala_valence.keys())
+                         | set(self.last_episodic_recall.keys()))
+        zodchiy_block: dict = {
+            "n_active": len(zodchiy_cids),
+            "cerebellum_delta_norm_avg": (
+                round(sum(cer_norms) / len(cer_norms), 4)
+                if cer_norms else 0.0),
+            "amygdala_valence_avg": (
+                round(sum(amy_vals) / len(amy_vals), 4)
+                if amy_vals else 0.0),
+            "episodic_recall_norm_avg": (
+                round(sum(epi_norms) / len(epi_norms), 4)
+                if epi_norms else 0.0),
+        }
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
@@ -3439,6 +3486,8 @@ class LocalColonyCompute:
             "higher_sfnn": higher_sfnn_block,
             # SFNN S6.8 (16.05.2026): per-role для 10 базовых тканей.
             "basic_sfnn": basic_sfnn_block,
+            # Z7.i.h (17.05.2026, Зодчий): 3 sidecar-ткани, snapshot-аггрегаты.
+            "zodchiy_sidecar": zodchiy_block,
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,
@@ -3552,5 +3601,15 @@ class LocalColonyCompute:
                     float(self.dopamine_td.get(cid, 0.0)), 6),
                 "client_action_dist": action_dists.get(cid, empty_dist),
                 "client_bias_max": bias_max.get(cid, 0.0),
+                # Z7.i.h (17.05.2026, Зодчий): per-cid snapshot-нормы 3 ткани.
+                # Для wanderer/elder остаются 0.0 (snapshot store'ы пусты).
+                "client_cerebellum_delta_norm": (
+                    round(float(self.last_cerebellum_delta[cid].norm().item()), 4)
+                    if cid in self.last_cerebellum_delta else 0.0),
+                "client_amygdala_valence": round(
+                    float(self.last_amygdala_valence.get(cid, 0.0)), 4),
+                "client_episodic_recall_norm": (
+                    round(float(self.last_episodic_recall[cid].norm().item()), 4)
+                    if cid in self.last_episodic_recall else 0.0),
             })
         return out
