@@ -3107,13 +3107,17 @@ class LocalColonyCompute:
                 "motor_sfnn_T_avg": 0.0,
                 "motor_sfnn_enabled_pct": 0.0,
                 # SFNN S3.diag (14.05.2026): per-tissue для 7 высших.
+                # Z3.B (17.05.2026, Зодчий): расширено на 3 zodchiy-ткани
+                # (cerebellum/amygdala/episodic). Для не-Зодчих cid'ов
+                # `higher_tissue_sfnn_steps` по этим ключам остаётся 0.
                 "higher_sfnn": {
                     "enabled_pct": 0.0,
                     **{t: {"steps_total": int(
                                 self.higher_tissue_sfnn_steps.get(t, 0)),
                              "eta_avg": 0.0,
                              "A_avg": 0.0}
-                       for t in _HIGHER_SFNN_TISSUES},
+                       for t in (_HIGHER_SFNN_TISSUES
+                                 + _ZODCHIY_EXTRA_TISSUES)},
                 },
                 # SFNN S6.8 (16.05.2026): per-role для 10 базовых.
                 "basic_sfnn": {
@@ -3354,8 +3358,14 @@ class LocalColonyCompute:
             if bool(getattr(getattr(org_c, "genome", None),
                               "higher_tissue_sfnn_enabled", False)):
                 higher_sfnn_enabled_n += 1
+        # Z3.B (17.05.2026, Зодчий): обходим 7 высших + 3 zodchiy-ткани.
+        # rule_store / steps по `_ZODCHIY_EXTRA_TISSUES` инициализированы для
+        # всех cid'ов через `_ALL_HIGHER` (строки 269+), но реально заполнены
+        # только у тех, кому в `add_creature(lineage="zodchiy")` пришёл
+        # `SFNNRule.for_role(_t)`. Для не-Зодчих etas/As останутся пустыми →
+        # eta_avg/A_avg = 0.0, steps_total = 0.
         higher_sfnn_per_tissue: dict[str, dict] = {}
-        for t in _HIGHER_SFNN_TISSUES:
+        for t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             etas: list[float] = []
             As: list[float] = []
             for rule in self.higher_tissue_sfnn_rule.get(t, {}).values():
