@@ -263,36 +263,40 @@ class LocalColonyCompute:
         # genome.higher_tissue_sfnn_enabled (дефолт False) сейчас только
         # storage + Y50-наследование, активное применение — S3.1+.
         # predictor сюда не входит — остаётся на Adam (supervised).
+        # Z7.i.e (16.05.2026): расширен на 3 Зодчий-ткани (cerebellum/
+        # amygdala/episodic) — apply-step `_higher_tissue_sfnn_update_step`
+        # полностью generic (getattr(self, tissue_name)), переиспользуется.
+        _ALL_HIGHER = _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES
         self.higher_tissue_sfnn_rule: dict[str, dict] = {
-            t: {} for t in _HIGHER_SFNN_TISSUES
+            t: {} for t in _ALL_HIGHER
         }
         # Per-tissue счётчик SFNN-апдейтов (заполняется в S3.1+ при включении
         # дисптача). Используется в diagnostics для отслеживания активности.
         self.higher_tissue_sfnn_steps: dict[str, int] = {
-            t: 0 for t in _HIGHER_SFNN_TISSUES
+            t: 0 for t in _ALL_HIGHER
         }
         # SFNN S3.1 (14.05.2026) — forward-hooks pre/post активаций 6 Linear
         # для каждой из 7 высших тканей. Регистрируются в add_creature только
         # для активных-в-S3.x тканей; cleanup в remove_creature. Per tissue:
         # {cid → list[hook handle]} и {cid → {synapse_type → (pre, post)}}.
         self.higher_tissue_sfnn_hook_handles: dict[str, dict] = {
-            t: {} for t in _HIGHER_SFNN_TISSUES
+            t: {} for t in _ALL_HIGHER
         }
         self.higher_tissue_sfnn_acts: dict[str, dict] = {
-            t: {} for t in _HIGHER_SFNN_TISSUES
+            t: {} for t in _ALL_HIGHER
         }
         # SFNN S1.2c (14.05.2026) — baseline row-norms 6 weight matrices
         # каждой из 7 высших тканей. Та же защита от взрыва весов, что и
         # для motor_policy. {tissue → {cid → {synapse → Tensor[rows]}}}.
         self.higher_tissue_sfnn_row_norms: dict[str, dict] = {
-            t: {} for t in _HIGHER_SFNN_TISSUES
+            t: {} for t in _ALL_HIGHER
         }
         # Z1 (16.05.2026, Зодчий) — eligibility trace per (tissue, cid) для
         # унифицированной S6.5-формулы на 7 высших тканях. Tensor формы W
         # каждой Linear-матрицы внутри ткани (под ключом synapse_type).
         # Эфемерное — ресет при рестарте клиента и при reset_all().
         self.higher_tissue_sfnn_trace: dict[str, dict] = {
-            t: {} for t in _HIGHER_SFNN_TISSUES
+            t: {} for t in _ALL_HIGHER
         }
         # S2.B (13.05.2026) — theory_of_mind: supervised predict 8 motor-action
         # ближайшего соседа по Δposition (data_dim=52, 4 neighbors × 13 feat).
@@ -381,19 +385,17 @@ class LocalColonyCompute:
         # уникальных тканей Зодчего. Заполняются только в add_creature при
         # lineage="zodchiy"; для elder/wanderer остаются пустыми. Геометрия
         # та же, что у dopamine/imagination — Tissue 21/3/1, data_dim=64.
+        # Z7.i.e (16.05.2026): forward + apply-step активированы;
+        # SFNNRule / step-counters / hooks / acts / row_norms / trace —
+        # все в общих `higher_tissue_sfnn_*` dict'ах (см. _ALL_HIGHER выше),
+        # update_step переиспользует `_higher_tissue_sfnn_update_step`.
         self.cerebellum: dict = {}    # cid → Tissue (motor error-loop)
         self.amygdala: dict = {}      # cid → Tissue (valence)
         self.episodic: dict = {}      # cid → Tissue (long-term memory)
-        # Per-zodchiy-tissue SFNNRule storage. Дефолт SFNNRule.default() —
-        # эквивалент Phase 5d Hebb; σ-мутация τ/R3/TD активирует полную
-        # S6.5-формулу. Пока apply-step выключен (Z3 hookup в forward —
-        # отдельная подфаза); здесь — только plumbing + Y50-наследование.
-        self.zodchiy_extra_sfnn_rule: dict[str, dict] = {
-            t: {} for t in _ZODCHIY_EXTRA_TISSUES
-        }
-        self.zodchiy_extra_sfnn_steps: dict[str, int] = {
-            t: 0 for t in _ZODCHIY_EXTRA_TISSUES
-        }
+        # Last-snapshot Зодчий-ткани → push в actions_batch.phase_emas (Z3).
+        self.last_cerebellum_delta: dict = {}  # cid → torch.Tensor [16]
+        self.last_amygdala_valence: dict = {}  # cid → float ∈ [-1, 1]
+        self.last_episodic_recall: dict = {}   # cid → torch.Tensor [64]
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -604,9 +606,10 @@ class LocalColonyCompute:
                               cid, e)
         # Z7.i.d (16.05.2026, Зодчий): для lineage="zodchiy" создаём три
         # уникальные ткани третьей линии — cerebellum/amygdala/episodic.
-        # Forward в _compute_higher_tissues и SFNN apply-step появятся в
-        # последующих подфазах (Z3 hookup); здесь — plumbing + дефолтные
-        # SFNNRule для эволюционируемого правила и Y50-наследования.
+        # Z7.i.e (16.05.2026): forward + SFNN apply-step активны.
+        # Tissue 21/3/1 data_dim=64, SFNN-правило берём из ROLE_DEFAULTS
+        # через for_role (τ/R3/TD/algorithm), hooks регистрируются всегда —
+        # apply-step гейтит флаг `genome.higher_tissue_sfnn_enabled`.
         if str(lineage) == "zodchiy":
             try:
                 self.cerebellum[cid] = self._make_higher_tissue("cerebellum")
@@ -623,11 +626,25 @@ class LocalColonyCompute:
                 # classical Hebbian и эволюция тратила бы время на дрейф к
                 # роль-специфичным значениям. `for_role` поднимает их сразу.
                 for _t in _ZODCHIY_EXTRA_TISSUES:
-                    self.zodchiy_extra_sfnn_rule[_t].setdefault(
-                        cid, SFNNRule.for_role(_t))
+                    if getattr(self, _t).get(cid) is not None:
+                        self.higher_tissue_sfnn_rule[_t].setdefault(
+                            cid, SFNNRule.for_role(_t))
             except Exception as e:
                 logger.debug(
-                    "add_creature %s zodchiy_extra_sfnn_rule init: %s", cid, e)
+                    "add_creature %s zodchiy higher_tissue_sfnn_rule init: %s",
+                    cid, e)
+            # Z7.i.e (16.05.2026): forward-hooks для 3 Зодчий-тканей. Та же
+            # логика, что и у 7 высших Странника — hooks дёшевы, регистрируем
+            # всегда; apply-step гейтит флаг higher_tissue_sfnn_enabled.
+            for _t in _ZODCHIY_EXTRA_TISSUES:
+                _tissue = getattr(self, _t).get(cid)
+                if _tissue is None:
+                    continue
+                try:
+                    self._register_higher_tissue_sfnn_hooks(_t, cid, _tissue)
+                except Exception as e:
+                    logger.debug(
+                        "add_creature %s %s sfnn hooks: %s", cid, _t, e)
         logger.info(
             "add_creature %s lineage=%s n_tissues=%d predictor=%s S2=%s zodchiy=%s",
             cid, lineage, getattr(organism, "n_tissues", 0), pred is not None,
@@ -688,7 +705,9 @@ class LocalColonyCompute:
         self.last_lang_acc.pop(cid, None)
         self._lang_prev_context.pop(cid, None)
         # SFNN S3.0: вычистить правила высших тканей.
-        for _t in _HIGHER_SFNN_TISSUES:
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани (cerebellum/amygdala/episodic)
+        # — их state теперь в общих higher_tissue_sfnn_* dict'ах.
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             self.higher_tissue_sfnn_rule.get(_t, {}).pop(cid, None)
         # SFNN S6.4: вычистить правила 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
@@ -697,9 +716,9 @@ class LocalColonyCompute:
         for _t in _BASIC_SFNN_TISSUES:
             self.basic_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
         # SFNN S3.1: снять forward-hooks и забыть кешированные активации
-        # всех зарегистрированных в S3.x тканей. Пока активна dopamine;
-        # cleanup для остальных no-op до S3.2+.
-        for _t in _HIGHER_SFNN_TISSUES:
+        # всех зарегистрированных в S3.x тканей.
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани через _ALL_HIGHER.
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             for h in (self.higher_tissue_sfnn_hook_handles.get(_t, {})
                       .pop(cid, []) or []):
                 try:
@@ -711,12 +730,13 @@ class LocalColonyCompute:
             self.higher_tissue_sfnn_row_norms.get(_t, {}).pop(cid, None)
             # Z1 (Зодчий, 16.05.2026): eligibility trace тоже эфемерно.
             self.higher_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
-        # Z7.i.d (16.05.2026): три zodchiy-ткани и их SFNN-правила.
+        # Z7.i.d (16.05.2026): три zodchiy-ткани (только Tissue + last-snap).
         self.cerebellum.pop(cid, None)
         self.amygdala.pop(cid, None)
         self.episodic.pop(cid, None)
-        for _t in _ZODCHIY_EXTRA_TISSUES:
-            self.zodchiy_extra_sfnn_rule.get(_t, {}).pop(cid, None)
+        self.last_cerebellum_delta.pop(cid, None)
+        self.last_amygdala_valence.pop(cid, None)
+        self.last_episodic_recall.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -726,7 +746,8 @@ class LocalColonyCompute:
         self.predictor_steps = 0
         self.motor_sfnn_steps = 0
         # SFNN S3.0: сбросить счётчики апдейтов всех 7 высших тканей.
-        for _t in _HIGHER_SFNN_TISSUES:
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани в общем _ALL_HIGHER.
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             self.higher_tissue_sfnn_steps[_t] = 0
         # SFNN S6.4: сбросить счётчики 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
@@ -734,14 +755,10 @@ class LocalColonyCompute:
         # SFNN S6.5: сбросить eligibility traces 10 базовых тканей.
         for _t in _BASIC_SFNN_TISSUES:
             self.basic_tissue_sfnn_trace[_t] = {}
-        # Z1 (Зодчий, 16.05.2026): сбросить eligibility traces 7 высших тканей.
-        for _t in _HIGHER_SFNN_TISSUES:
+        # Z1 (Зодчий, 16.05.2026): сбросить eligibility traces высших тканей.
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани в общем _ALL_HIGHER.
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             self.higher_tissue_sfnn_trace[_t] = {}
-        # Z7.i.d (16.05.2026): сбросить счётчики и SFNN-rule storage'ы
-        # трёх zodchiy-тканей (cerebellum/amygdala/episodic).
-        for _t in _ZODCHIY_EXTRA_TISSUES:
-            self.zodchiy_extra_sfnn_steps[_t] = 0
-            self.zodchiy_extra_sfnn_rule[_t] = {}
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -849,12 +866,18 @@ class LocalColonyCompute:
                         pass
         # Brain migration (10.05.2026): Y50 для высших тканей S2.E/G/A/F.
         # 13.05.2026: + default_mode (S2.D мигрирована с P40 на клиент).
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани (Y50 применяется только если
+        # ткань уже создана у child'а через add_creature(lineage="zodchiy");
+        # для wanderer/elder store.get(cid) is None → skip).
         for key, store in (
             ("dopamine", self.dopamine),
             ("imagination", self.imagination),
             ("planner", self.planner),
             ("insula", self.insula),
             ("default_mode", self.default_mode),
+            ("cerebellum", self.cerebellum),
+            ("amygdala", self.amygdala),
+            ("episodic", self.episodic),
         ):
             sd = payload.get(key)
             tissue = store.get(cid)
@@ -962,8 +985,10 @@ class LocalColonyCompute:
             self.motor_sfnn_steps = steps
         higher_steps = sfnn_state.get("higher_tissue_sfnn_steps") or {}
         if isinstance(higher_steps, dict):
+            # Z7.i.e (16.05.2026): _ALL_HIGHER принимает счётчики 3 Зодчий-тканей.
+            _all_higher = _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES
             for _t, _s in higher_steps.items():
-                if _t in _HIGHER_SFNN_TISSUES and isinstance(_s, int):
+                if _t in _all_higher and isinstance(_s, int):
                     prev = int(self.higher_tissue_sfnn_steps.get(_t, 0))
                     if _s > prev:
                         self.higher_tissue_sfnn_steps[_t] = _s
@@ -996,8 +1021,10 @@ class LocalColonyCompute:
         """
         items: list[dict] = []
         motor_steps = int(self.motor_sfnn_steps)
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани в общий dump.
         higher_steps = {t: int(self.higher_tissue_sfnn_steps.get(t, 0))
-                         for t in _HIGHER_SFNN_TISSUES}
+                         for t in _HIGHER_SFNN_TISSUES
+                                  + _ZODCHIY_EXTRA_TISSUES}
         basic_steps = {t: int(self.basic_tissue_sfnn_steps.get(t, 0))
                         for t in _BASIC_SFNN_TISSUES}
         for cid in list(self.organisms.keys()):
@@ -1009,7 +1036,7 @@ class LocalColonyCompute:
                 except Exception:
                     pass
             higher: dict = {}
-            for _t in _HIGHER_SFNN_TISSUES:
+            for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
                 r = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
                 if r is None:
                     continue
@@ -1072,8 +1099,10 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("extract_brain_state_dicts motor_sfnn_rule: %s", e)
         # SFNN S3.0: 7 высших правил.
+        # Z7.i.e (16.05.2026): + 3 Зодчий-правила в общем dict (для lineage
+        # != "zodchiy" cid там не появится — пропадает естественно).
         higher_rules_out: dict = {}
-        for _t in _HIGHER_SFNN_TISSUES:
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             _r = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
             if _r is None or not hasattr(_r, "to_dict"):
                 continue
@@ -1106,6 +1135,11 @@ class LocalColonyCompute:
             ("default_mode", self.default_mode),
             ("theory_of_mind", self.theory_of_mind),
             ("language", self.language),
+            # Z7.i.e (16.05.2026): 3 Зодчий-ткани (для wanderer/elder
+            # store.get(cid) is None — естественно skip).
+            ("cerebellum", self.cerebellum),
+            ("amygdala", self.amygdala),
+            ("episodic", self.episodic),
         ):
             tissue = store.get(cid)
             if tissue is None:
@@ -1179,8 +1213,10 @@ class LocalColonyCompute:
         # SFNN S3.0: 7 правил высших тканей родителя → дочерней особи (mutate
         # σ=0.1 уже в apply_inherited_state). Дефолтное правило ребёнка из
         # add_creature перезаписывается родительским только если оно есть.
+        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани (для wanderer/elder rule
+        # is None → пропадает естественно).
         higher_rules_dump: dict = {}
-        for _t in _HIGHER_SFNN_TISSUES:
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             _parent_rule = self.higher_tissue_sfnn_rule.get(_t, {}).get(parent_cid)
             if _parent_rule is None or not hasattr(_parent_rule, "to_dict"):
                 continue
@@ -1216,6 +1252,10 @@ class LocalColonyCompute:
             ("default_mode", self.default_mode),
             ("theory_of_mind", self.theory_of_mind),
             ("language", self.language),
+            # Z7.i.e (16.05.2026): 3 Зодчий-ткани (wanderer/elder skip).
+            ("cerebellum", self.cerebellum),
+            ("amygdala", self.amygdala),
+            ("episodic", self.episodic),
         ):
             tissue = store.get(parent_cid)
             if tissue is None:
@@ -1642,8 +1682,13 @@ class LocalColonyCompute:
                         # к этому моменту все 7 высших уже отстреляли forward
                         # в _compute_higher_tissues / _compute_theory_of_mind /
                         # _compute_language, acts актуальны.
+                        # Z7.i.e (16.05.2026): + 3 Зодчий-ткани. Для cid с
+                        # lineage != "zodchiy" rule_store пустой по этим
+                        # ключам → update_step делает early return на rule
+                        # is None. Apply-step generic, переиспользуется.
                         if higher_sfnn_on:
-                            for _t in _HIGHER_SFNN_TISSUES:
+                            for _t in (_HIGHER_SFNN_TISSUES
+                                       + _ZODCHIY_EXTRA_TISSUES):
                                 try:
                                     self._higher_tissue_sfnn_update_step(
                                         _t, cid,
@@ -1706,8 +1751,10 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("save_state %s motor_sfnn_rule: %s", cid, e)
         # SFNN S3.0: 7 правил высших тканей в seed_pack для reconnect.
+        # Z7.i.e (16.05.2026): + 3 Зодчий-правила (для elder/wanderer
+        # rule is None → пропадают естественно).
         higher_rules_dump: dict = {}
-        for _t in _HIGHER_SFNN_TISSUES:
+        for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             _rule = self.higher_tissue_sfnn_rule.get(_t, {}).get(cid)
             if _rule is None or not hasattr(_rule, "to_dict"):
                 continue
@@ -1974,6 +2021,44 @@ class LocalColonyCompute:
                     self.last_dmn_floor[cid] = dmn * _DEFAULT_MODE_FLOOR_MAX
             except Exception as e:
                 logger.debug("default_mode forward %s: %s", cid, e)
+        # Z7.i.e (16.05.2026, Зодчий) — 3 уникальные ткани третьей линии.
+        # Forward выполняется ТОЛЬКО для lineage="zodchiy" (для elder/wanderer
+        # tissue is None — store пустой). Снимки → last_*_*; apply-step
+        # переиспользует `_higher_tissue_sfnn_update_step` (см. handle_tick).
+        # Cerebellum: motor error-loop, delta = tanh(out[0, :16]) ∈ [-1, 1]^16.
+        # Аналог planner, но другая роль/τ (21 vs 233) — мутирует независимо.
+        cer_tissue = self.cerebellum.get(cid)
+        if cer_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = cer_tissue({"input": obs_tensor.detach()})["output"]
+                    delta = torch.tanh(out[0, :_PLANNER_N_ACTIONS])
+                    self.last_cerebellum_delta[cid] = delta.detach().cpu()
+            except Exception as e:
+                logger.debug("cerebellum forward %s: %s", cid, e)
+        # Amygdala: valence ∈ [-1, 1], tanh(out[0, 0]). Используется как
+        # эмоциональный gating (negative → стресс, positive → reward).
+        amy_tissue = self.amygdala.get(cid)
+        if amy_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = amy_tissue({"input": obs_tensor.detach()})["output"]
+                    valence = float(torch.tanh(out[0, 0]).item())
+                    self.last_amygdala_valence[cid] = valence
+            except Exception as e:
+                logger.debug("amygdala forward %s: %s", cid, e)
+        # Episodic: long-term recall, vector [64] ∈ [-1, 1]^64. Полное окно
+        # выходных каналов — позже служит для associative-retrieval (Z5+),
+        # сейчас snapshot для apply-step + диагностики.
+        epi_tissue = self.episodic.get(cid)
+        if epi_tissue is not None:
+            try:
+                with torch.no_grad():
+                    out = epi_tissue({"input": obs_tensor.detach()})["output"]
+                    recall = torch.tanh(out[0, :64])
+                    self.last_episodic_recall[cid] = recall.detach().cpu()
+            except Exception as e:
+                logger.debug("episodic forward %s: %s", cid, e)
 
     # ── S2.B — theory_of_mind supervised sidecar ─────────────────────────
 
