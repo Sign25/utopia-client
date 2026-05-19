@@ -742,6 +742,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                         except Exception:
                             pass
                     diag["shadow_obs"] = shadow
+                    # Variant B leak fix (19.05.2026): метрики GC ghost'ов.
+                    # tracked — сколько cid под наблюдением, total_removed —
+                    # сколько уже выкосили. Если total_removed растёт но
+                    # n_alive не падает — GC работает, утечка реальна.
+                    diag["cid_gc"] = {
+                        "total_removed": getattr(ws, "_cid_gc_total", 0),
+                        "tracked": len(
+                            getattr(ws, "_cid_last_seen_tick", {}) or {}),
+                        "last_run_tick": getattr(
+                            ws, "_cid_gc_last_run_tick", 0),
+                    }
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)

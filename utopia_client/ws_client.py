@@ -34,6 +34,12 @@ EMPTY_WORLD_CHECK_SEC = 30.0
 # SFNN-правил на P40 → diskstore → возврат в seed_pack). 2 мин —
 # компромисс между свежестью при reannounce и нагрузкой на БД.
 STATE_SYNC_INTERVAL_SEC = 120.0
+# Variant B leak fix (19.05.2026): cid считается мёртвым, если не появлялся
+# в obs_batch STALE_CID_TICKS подряд. P40 World ~25 TPS — 1500 тиков ≈ 60с
+# с запасом против транзитных гэпов obs_batch. GC запускается не чаще
+# CID_GC_INTERVAL_TICKS ≈ 10с — дёшево, но успевает реагировать.
+STALE_CID_TICKS = 1500
+CID_GC_INTERVAL_TICKS = 250
 
 
 class ColonyWSClient:
@@ -145,6 +151,14 @@ class ColonyWSClient:
         # Phase 3.3B: счётчик локальной сборки obs (когда сервер не прислал).
         # Помогает понять, сколько живой колонии работает через client builder.
         self._client_obs_local_built: int = 0
+        # Variant B leak fix (19.05.2026): per-cid last world_tick seen в
+        # obs_batch. P40 World удаляет мёртвых тихо — death-сообщения летят
+        # только client → P40 (Phase F3.6). Без GC LocalColonyCompute копит
+        # ghost'ов (наблюдали 2465 cid vs 10 live в Мире 19.05). Каждый
+        # ghost держит organism + predictor + hebbian + SFNN-rules.
+        self._cid_last_seen_tick: dict[str, int] = {}
+        self._cid_gc_total: int = 0
+        self._cid_gc_last_run_tick: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -607,6 +621,9 @@ class ColonyWSClient:
             n_dropped = self.compute.reset_all()
         self._seed_buffers.clear()
         self._seed_meta.clear()
+        # Variant B (19.05.2026): reset_all() выбросил все organisms — стираем
+        # last_seen, чтобы tracking начался с нуля при новом seed_pack.
+        self._cid_last_seen_tick.clear()
         # Phase G.3: новый seed едет — снимаем awaiting/respawn-cooldown,
         # обновляем «последний раз alive», чтобы grace отсчитался заново.
         self._welcome_mode = ""
@@ -718,6 +735,10 @@ class ColonyWSClient:
                     trace_decay=float(meta.get("trace_decay", 0.9)),
                     lineage=lineage,
                 )
+                # Variant B (19.05.2026): grace-метка, чтобы свежий cid не
+                # был сразу убран GC при world_tick > STALE_CID_TICKS. Если
+                # cid живой — следующий obs_batch обновит last_seen.
+                self._cid_last_seen_tick[cid] = self.last_world_tick
                 self.compute.apply_inherited_state(cid, payload)
                 # S6.0b-B (16.05.2026): persistent SFNN-state восстановление.
                 # Сервер кладёт сохранённое правило клиента в payload['sfnn_state']
@@ -1001,6 +1022,8 @@ class ColonyWSClient:
                     trace_decay=decay,
                     lineage=lineage,
                 )
+                # Variant B (19.05.2026): grace-метка для новорождённого.
+                self._cid_last_seen_tick[cid_s] = self.last_world_tick
                 self._newborn_attached += 1
             except Exception as e:
                 logger.warning("attach newborn %s: %s", cid_s, e)
@@ -1239,6 +1262,14 @@ class ColonyWSClient:
         # obs и сервер перестаёт его слать для owned.
         self._compare_shadow_obs(creatures, obs_per_cid,
                                    server_world_tick=world_tick)
+        # Variant B (19.05.2026): фиксируем last_seen и запускаем GC ghost'ов.
+        # world_tick==0 бывает только до welcome — на этой стадии compute
+        # пуст и GC всё равно не нужен.
+        if world_tick > 0:
+            self.last_world_tick = world_tick
+            for cid in obs_per_cid:
+                self._cid_last_seen_tick[cid] = world_tick
+            self._gc_orphan_cids(world_tick)
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,
@@ -1277,6 +1308,51 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+
+    # ── Variant B (19.05.2026): GC ghost'ов в LocalColonyCompute ─────────
+
+    def _gc_orphan_cids(self, world_tick: int) -> None:
+        """Чистим LocalColonyCompute от cid'ов, которых давно нет в obs_batch.
+
+        P40 удаляет умерших из World молча (Phase F3.6 шлёт death только
+        client → P40, не наоборот). Без GC `self.compute.organisms` и
+        параллельные structures (predictor / hebbian / motor_sfnn_rule /
+        higher_tissue_sfnn_*) растут до OOM. На cheef-PC 19.05 наблюдали
+        2465 cid vs 10 live → ghost-leak ~85МБ предикторов.
+
+        Запускается не чаще CID_GC_INTERVAL_TICKS, чистит cid с
+        last_seen < world_tick - STALE_CID_TICKS либо отсутствующий
+        в _cid_last_seen_tick совсем (значит не появлялся ни разу).
+        """
+        compute = self.compute
+        if compute is None:
+            return
+        if world_tick - self._cid_gc_last_run_tick < CID_GC_INTERVAL_TICKS:
+            return
+        self._cid_gc_last_run_tick = world_tick
+        threshold = world_tick - STALE_CID_TICKS
+        if threshold <= 0:
+            # World моложе grace-периода — рано GC, новорождённые могли
+            # ещё не попасть в obs_batch.
+            return
+        orphans: list[str] = []
+        for cid in list(compute.organisms.keys()):
+            last = self._cid_last_seen_tick.get(cid)
+            if last is None or last < threshold:
+                orphans.append(cid)
+        if not orphans:
+            return
+        for cid in orphans:
+            try:
+                compute.remove_creature(cid)
+            except Exception as e:
+                logger.warning("remove_creature %s failed: %s", cid, e)
+            self._cid_last_seen_tick.pop(cid, None)
+        self._cid_gc_total += len(orphans)
+        logger.info(
+            "cid GC: removed %d orphan(s), live=%d, total_gc=%d, threshold=%d",
+            len(orphans), len(compute.organisms),
+            self._cid_gc_total, threshold)
 
     # ── Phase F3.3.a: weights_request → weights_dump ─────────────────────
 
