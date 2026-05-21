@@ -753,6 +753,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                         "last_run_tick": getattr(
                             ws, "_cid_gc_last_run_tick", 0),
                     }
+                    # 0.10.9 (21.05.2026): orphan-obs backstop observability.
+                    # streak — текущая последовательность obs_batch'ей без
+                    # совпадения, respawns_sent — сколько раз пришлось дёрнуть
+                    # P40 за seed_pack.
+                    diag["orphan_obs"] = {
+                        "streak": getattr(ws, "_orphan_obs_streak", 0),
+                        "respawns_sent": getattr(
+                            ws, "_orphan_obs_respawns_sent", 0),
+                    }
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)

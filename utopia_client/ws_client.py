@@ -40,6 +40,13 @@ STATE_SYNC_INTERVAL_SEC = 120.0
 # CID_GC_INTERVAL_TICKS ≈ 10с — дёшево, но успевает реагировать.
 STALE_CID_TICKS = 1500
 CID_GC_INTERVAL_TICKS = 250
+# 0.10.9 (21.05.2026): backstop respawn-запроса, если obs_batch'и идут, а
+# compute.organisms пуст (или все obs_per_cid orphan). Без него цикл
+# disconnect/reconnect без re-seed (push_owned_seed re-announce filter,
+# 1.4.83) оставляет cheef-PC в silent: handle_tick возвращает {} → P40
+# никогда не получает actions_batch → silent fallback на brain. Порог
+# 10 obs_batch ≈ 2с при 5 obs/s — достаточно, чтобы переждать stagger.
+ORPHAN_OBS_RESPAWN_THRESHOLD = 10
 
 
 class ColonyWSClient:
@@ -159,6 +166,11 @@ class ColonyWSClient:
         self._cid_last_seen_tick: dict[str, int] = {}
         self._cid_gc_total: int = 0
         self._cid_gc_last_run_tick: int = 0
+        # 0.10.9 (21.05.2026): счётчик последовательных obs_batch'ей, у которых
+        # ни один cid не зарегистрирован в compute.organisms. Триггерит
+        # respawn_owned_request при достижении ORPHAN_OBS_RESPAWN_THRESHOLD.
+        self._orphan_obs_streak: int = 0
+        self._orphan_obs_respawns_sent: int = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -465,6 +477,18 @@ class ColonyWSClient:
                 self.last_world_tick = wt
             mode = str(msg.get("mode", "") or "")
             self._welcome_mode = mode
+            # 0.10.9 (21.05.2026): после reconnect (broker keepalive re-announce
+            # без colony_reset) world_tick может перескочить вперёд на N тиков,
+            # пока ws_client ловит первый obs_batch. Если diff > STALE_CID_TICKS
+            # — _gc_orphan_cids снесёт всех живых organisms. Промотаем grace на
+            # текущий welcome.world_tick для cid'ов, уже хранящихся в compute.
+            if (isinstance(wt, int) and wt > 0
+                    and self.compute is not None):
+                try:
+                    for cid in list(self.compute.organisms.keys()):
+                        self._cid_last_seen_tick[cid] = wt
+                except Exception:
+                    pass
             logger.info(
                 "welcome: world_tick=%s server_time=%s n_creatures=%s mode=%s",
                 wt, msg.get("server_time"), n, mode or "normal")
@@ -1270,6 +1294,27 @@ class ColonyWSClient:
             for cid in obs_per_cid:
                 self._cid_last_seen_tick[cid] = world_tick
             self._gc_orphan_cids(world_tick)
+        # 0.10.9 (21.05.2026): orphan-obs backstop. Если ни один cid из
+        # obs_per_cid не зарегистрирован в compute.organisms — handle_tick
+        # вернёт {} → ws.send actions_batch не сработает → P40 пометит
+        # silent → brain fallback. Это и был cheef-PC залип 21.05 после
+        # broker keepalive re-announce без re-seed (push фильтр 1.4.83).
+        # Запрашиваем respawn у P40, чтобы тот заново прислал seed_pack.
+        try:
+            organisms = self.compute.organisms
+            known = sum(1 for cid in obs_per_cid if cid in organisms)
+            if known == 0:
+                self._orphan_obs_streak += 1
+                if (self._orphan_obs_streak
+                        >= ORPHAN_OBS_RESPAWN_THRESHOLD):
+                    self._orphan_obs_streak = 0
+                    self._orphan_obs_respawns_sent += 1
+                    asyncio.create_task(
+                        self._request_orphan_respawn(world_tick))
+            else:
+                self._orphan_obs_streak = 0
+        except Exception:
+            self._orphan_obs_streak = 0
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,
@@ -1308,6 +1353,44 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+
+    async def _request_orphan_respawn(self, world_tick: int) -> None:
+        """0.10.9 (21.05.2026): запросить у P40 повторную рассылку seed_pack.
+
+        Триггерится в `_handle_obs_batch`, когда подряд ORPHAN_OBS_RESPAWN_THRESHOLD
+        тиков ни один cid из obs_per_cid не оказался в `compute.organisms`.
+        Используем тот же envelope, что и watchdog (`respawn_owned_request`):
+        P40 шедулит `_async_respawn` (load_personal / genesis_personal) и
+        присылает обычный seed_pack + colony_reset. Side-effect: cooldown через
+        `_last_respawn_request_ts`, чтобы не штурмовать P40 при затяжной
+        проблеме.
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        now = time.time()
+        if (self._last_respawn_request_ts > 0
+                and now - self._last_respawn_request_ts
+                < EMPTY_WORLD_RETRY_SEC):
+            return
+        try:
+            await ws.send(json.dumps({
+                "type": "respawn_owned_request",
+                "colony_name": self.colony_name,
+                "mode": self.genesis_mode,
+                "n": 8,
+                "ts": int(now * 1000),
+                "reason": "orphan_obs",
+            }))
+        except Exception as e:
+            logger.warning("orphan respawn send failed: %s", e)
+            return
+        self._last_respawn_request_ts = now
+        logger.warning(
+            "orphan-obs backstop: respawn_owned_request sent "
+            "(streak=%d, world_tick=%d, sent_total=%d)",
+            ORPHAN_OBS_RESPAWN_THRESHOLD, world_tick,
+            self._orphan_obs_respawns_sent)
 
     # ── Variant B (19.05.2026): GC ghost'ов в LocalColonyCompute ─────────
 
