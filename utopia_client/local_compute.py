@@ -179,6 +179,18 @@ _BASIC_SFNN_GENOME_FIELD: dict[str, str] = {
     "immune":         "immune_sfnn_rule",
 }
 
+# TZ B Phase 2 (26.05.2026, Бендер): per-role Hebbian metrics tracker для
+# observability обучения в Mode E (cheef-PC online). 20 ролей = 10 basic +
+# 7 higher + 3 zodchiy sidecar. Schema: Option B (extend diagnostics),
+# согласовано с Хьюбертом, ТЗ §3.2 commit 8238b06.
+_HEB_PT_ALL_ROLES: tuple[str, ...] = (
+    _BASIC_SFNN_TISSUES + _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES
+)
+# Порог "учится vs не учится". |delta| > epsilon → n_learning++. Epsilon
+# мал (1e-9): SFNN traces после первого update имеют norm порядка lr_oja
+# (~1e-4), zero только при reset/первом тике. Reasonable separation.
+_HEB_PT_EPSILON: float = 1e-9
+
 
 class LocalColonyCompute:
     """Локальная колония: forward + Hebbian + ActionSelector per-creature.
@@ -396,6 +408,19 @@ class LocalColonyCompute:
         self.last_cerebellum_delta: dict = {}  # cid → torch.Tensor [16]
         self.last_amygdala_valence: dict = {}  # cid → float ∈ [-1, 1]
         self.last_episodic_recall: dict = {}   # cid → torch.Tensor [64]
+
+        # TZ B Phase 2 (26.05.2026, Бендер): per-role Hebbian-learning
+        # accumulators для observability. Накапливаются между emit cycles
+        # (30с push_diagnostics) и сбрасываются в _build_hebbian_per_tissue_
+        # snapshot(). См. _record_hebbian_per_tissue_sample (hook в handle_tick).
+        self._heb_pt_n_total: dict[str, int] = {
+            r: 0 for r in _HEB_PT_ALL_ROLES}
+        self._heb_pt_n_learning: dict[str, int] = {
+            r: 0 for r in _HEB_PT_ALL_ROLES}
+        self._heb_pt_delta_sum: dict[str, float] = {
+            r: 0.0 for r in _HEB_PT_ALL_ROLES}
+        self._heb_pt_samples: dict[str, int] = {
+            r: 0 for r in _HEB_PT_ALL_ROLES}
 
         logger.info("LocalColonyCompute device=%s", self.device)
 
@@ -760,6 +785,12 @@ class LocalColonyCompute:
         # Z7.i.e (16.05.2026): + 3 Зодчий-ткани в общем _ALL_HIGHER.
         for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             self.higher_tissue_sfnn_trace[_t] = {}
+        # TZ B Phase 2 (26.05.2026, Бендер): сбросить per-role tracker.
+        for _r in _HEB_PT_ALL_ROLES:
+            self._heb_pt_n_total[_r] = 0
+            self._heb_pt_n_learning[_r] = 0
+            self._heb_pt_delta_sum[_r] = 0.0
+            self._heb_pt_samples[_r] = 0
         return n
 
     def apply_inherited_state(self, cid: str, payload: dict) -> None:
@@ -1736,6 +1767,11 @@ class LocalColonyCompute:
                         self._update_reward_var_ema(cid, r_imm_total)
                 # Phase 6 — trace_norm_ema по Hebbian-traces.
                 self._update_trace_norm_ema(cid, heb)
+                # TZ B Phase 2 (Бендер, 26.05.2026): per-role tracker sample.
+                # Накапливает n_learning/n_total/delta_sum для observability;
+                # snapshot emit'ится в diagnostics() каждые 30с (DIAGNOSTICS_
+                # PUSH_SEC из main.py). Source приоритет: SFNN → classic.
+                self._record_hebbian_per_tissue_sample(cid)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
@@ -3012,6 +3048,118 @@ class LocalColonyCompute:
             (1 - _EMA_ALPHA) * self.reward_var_ema[cid] + _EMA_ALPHA * rv
         )
 
+    # ── TZ B Phase 2 (26.05.2026, Бендер): per-role Hebbian metrics ─────
+
+    def _record_hebbian_per_tissue_sample(self, cid: str) -> None:
+        """Записать per-role learning sample для cid после Hebbian/SFNN update.
+
+        Hook в `handle_tick` per-cid loop. Источники (приоритет SFNN над
+        classic — у одной роли учится ровно один путь за update):
+          1. SFNN basic: `self.basic_tissue_sfnn_trace[role][cid]` — Tensor
+          2. SFNN higher (+ zodchiy): `self.higher_tissue_sfnn_trace[role][cid]`
+             — dict synapse → Tensor; берём сумму norms.
+          3. Classic Hebbian: `heb._tissue_info[].trace` для ролей вне SFNN
+             (когда `basic_sfnn_off` — 9 базовых учатся классикой).
+
+        Per-role: `n_total += 1`, `n_learning += 1` если |norm| > epsilon,
+        `delta_sum += norm`. Алиасы ('hippocampus' и др. вне 20 known)
+        тихо игнорируются. heb is None (NEAT-only creature) — classic путь
+        пропущен, SFNN traces всё равно проверены.
+
+        Safety: try/except — никогда не ломает handle_tick.
+        """
+        try:
+            heb = self.hebbian.get(cid)
+            seen_roles: set[str] = set()
+
+            # 1) SFNN basic (10 ролей: один Tensor per role per cid).
+            for role in _BASIC_SFNN_TISSUES:
+                trace = self.basic_tissue_sfnn_trace.get(role, {}).get(cid)
+                if trace is None:
+                    continue
+                try:
+                    norm = float(trace.norm().item())
+                except Exception:
+                    continue
+                self._heb_pt_n_total[role] += 1
+                if norm > _HEB_PT_EPSILON:
+                    self._heb_pt_n_learning[role] += 1
+                self._heb_pt_delta_sum[role] += norm
+                self._heb_pt_samples[role] += 1
+                seen_roles.add(role)
+
+            # 2) SFNN higher + zodchiy (10 ролей: dict synapse → Tensor).
+            for role in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
+                trace_dict = (self.higher_tissue_sfnn_trace
+                              .get(role, {}).get(cid))
+                if not isinstance(trace_dict, dict) or not trace_dict:
+                    continue
+                try:
+                    norm_sum = sum(
+                        float(t.norm().item()) for t in trace_dict.values()
+                        if t is not None
+                    )
+                except Exception:
+                    continue
+                self._heb_pt_n_total[role] += 1
+                if norm_sum > _HEB_PT_EPSILON:
+                    self._heb_pt_n_learning[role] += 1
+                self._heb_pt_delta_sum[role] += norm_sum
+                self._heb_pt_samples[role] += 1
+                seen_roles.add(role)
+
+            # 3) Classic Hebbian fallback для ролей вне SFNN (например basic
+            # когда `basic_sfnn_off`). `_tissue_info[].trace` — eligibility
+            # trace, обновляемая внутри HebbianController.update().
+            if heb is not None:
+                for info in getattr(heb, "_tissue_info", []):
+                    role = info.get('role')
+                    if not role or role in seen_roles:
+                        continue
+                    if role not in self._heb_pt_n_total:
+                        continue  # роль вне 20 known (например 'hippocampus')
+                    trace = info.get('trace')
+                    norm = 0.0
+                    if trace is not None:
+                        try:
+                            norm = float(trace.norm().item())
+                        except Exception:
+                            norm = 0.0
+                    self._heb_pt_n_total[role] += 1
+                    if norm > _HEB_PT_EPSILON:
+                        self._heb_pt_n_learning[role] += 1
+                    self._heb_pt_delta_sum[role] += norm
+                    self._heb_pt_samples[role] += 1
+        except Exception as e:
+            logger.debug("hebbian_per_tissue record failed cid=%s: %s", cid, e)
+
+    def _build_hebbian_per_tissue_snapshot(self) -> dict:
+        """Построить snapshot per-role metrics и сбросить accumulators.
+
+        Возвращает `{role: {n_learning, n_total, delta_mean}}` для всех
+        20 ролей. Если samples=0 в окне — все нули, но ключ присутствует
+        (backward compat для merge-агрегации на VPS).
+
+        После вызова все 4 accumulator-dict'а обнуляются — следующий emit
+        цикл стартует с чистого листа (per-period semantics).
+        """
+        snap: dict[str, dict] = {}
+        for role in _HEB_PT_ALL_ROLES:
+            samples = self._heb_pt_samples[role]
+            delta_mean = (round(self._heb_pt_delta_sum[role] / samples, 6)
+                          if samples > 0 else 0.0)
+            snap[role] = {
+                "n_learning": int(self._heb_pt_n_learning[role]),
+                "n_total": int(self._heb_pt_n_total[role]),
+                "delta_mean": delta_mean,
+            }
+        for role in _HEB_PT_ALL_ROLES:
+            self._heb_pt_n_total[role] = 0
+            self._heb_pt_n_learning[role] = 0
+            self._heb_pt_delta_sum[role] = 0.0
+            self._heb_pt_samples[role] = 0
+        return snap
+
     # ── Diagnostics aggregation ──────────────────────────────────────────
 
     def _dump_state(self) -> dict:
@@ -3137,6 +3285,13 @@ class LocalColonyCompute:
                     "cerebellum_delta_norm_avg": 0.0,
                     "amygdala_valence_avg": 0.0,
                     "episodic_recall_norm_avg": 0.0,
+                },
+                # TZ B Phase 2 (Бендер, 26.05.2026): per-role Hebbian metrics
+                # для UI "Тренировка мозга". Пустой stub: 20 ролей с нулями
+                # (ключи присутствуют — backward compat для VPS merge).
+                "hebbian_per_tissue": {
+                    r: {"n_learning": 0, "n_total": 0, "delta_mean": 0.0}
+                    for r in _HEB_PT_ALL_ROLES
                 },
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
@@ -3540,6 +3695,10 @@ class LocalColonyCompute:
             "basic_sfnn": basic_sfnn_block,
             # Z7.i.h (17.05.2026, Зодчий): 3 sidecar-ткани, snapshot-аггрегаты.
             "zodchiy_sidecar": zodchiy_block,
+            # TZ B Phase 2 (Бендер, 26.05.2026): per-role Hebbian metrics
+            # для UI "Тренировка мозга" combined Mode E + Mode M. Build +
+            # reset accumulators — следующий emit cycle с чистого листа.
+            "hebbian_per_tissue": self._build_hebbian_per_tissue_snapshot(),
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,
