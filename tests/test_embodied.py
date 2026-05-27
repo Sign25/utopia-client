@@ -320,17 +320,56 @@ def test_on_observation_missing_world_tick_keeps_previous():
 
 
 def test_stats_includes_ws_substats_and_counters():
-    """stats() возвращает вложенный ws-блок + наши счётчики."""
+    """stats(): flat top-level + nested ws-блок для debugging.
+
+    Convention (для VPS-side observability, Фрай review 27.05.2026):
+    latency_* и основные счётчики на верхнем уровне `embodied.*`,
+    granular ws-блок остаётся вложенным.
+    """
     compute = MagicMock()
     compute._obs_pos_cache = {}
     ws = EmbodiedWSClient("https://test.local", "fake_token")
     eo = EmbodiedOrganism(compute, ws)
     s = eo.stats()
-    assert "ws" in s
-    assert "connected" in s["ws"]
-    assert "states_sent" in s["ws"]
+    # Flat top-level — convention для Хьюберта VPS-side
+    assert "connected" in s
+    assert "states_sent" in s
+    assert "observations_received" in s
+    assert "errors_total" in s
+    # Этот слой
     assert s["observations_with_echo"] == 0
     assert s["last_world_tick_from_p40"] == 0
+    # Granular ws-блок ещё доступен
+    assert "ws" in s
+    assert "url" in s["ws"]
+
+
+def test_stats_flat_latency_when_samples_present():
+    """С samples в EmbodiedWSClient — latency_mean_ms / latency_p95_ms
+    появляются на верхнем уровне `embodied.*` (не только в ws-блоке)."""
+    compute = MagicMock()
+    compute._obs_pos_cache = {}
+    ws = EmbodiedWSClient("https://test.local", "fake_token")
+    ws._latencies_ms.extend([50.0, 100.0, 150.0, 200.0, 250.0])
+    eo = EmbodiedOrganism(compute, ws)
+    s = eo.stats()
+    assert "latency_mean_ms" in s
+    assert s["latency_mean_ms"] == 150.0
+    assert "latency_p95_ms" in s
+    assert "latency_max_ms" in s
+    assert s["latency_samples"] == 5
+
+
+def test_stats_flat_no_latency_keys_when_no_samples():
+    """Без samples — latency_* отсутствуют на верхнем уровне (по contract
+    EmbodiedWSClient.stats() который их не включает при пустом окне)."""
+    compute = MagicMock()
+    compute._obs_pos_cache = {}
+    ws = EmbodiedWSClient("https://test.local", "fake_token")
+    eo = EmbodiedOrganism(compute, ws)
+    s = eo.stats()
+    assert "latency_mean_ms" not in s
+    assert s["latency_samples"] == 0
 
 
 # ── Reconnect backoff (mock websockets.connect) ────────────────────────────

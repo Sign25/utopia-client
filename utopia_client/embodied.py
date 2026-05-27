@@ -146,8 +146,38 @@ class EmbodiedOrganism:
     # ── stats ───────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        return {
-            "ws": self.ws.stats(),
+        """Snapshot для diagnostics push.
+
+        Структура (для convention compliance — Хьюберт смотрит верхний
+        уровень `embodied.*`):
+          - connected, states_sent, observations_received, errors_total,
+            pings_handled, latency_* — flat на верхнем уровне, скопированы
+            из `EmbodiedWSClient.stats()`
+          - ws — вложенный полный snapshot для granular debugging
+            (URL, last_error, и т.д.)
+          - observations_with_echo, last_world_tick_from_p40 — счётчики
+            этого слоя.
+        """
+        ws_stats = self.ws.stats()
+        out: dict = {
             "observations_with_echo": self.observations_with_echo,
             "last_world_tick_from_p40": self.last_world_tick_from_p40,
         }
+        # Flatten основных полей на верхний уровень `embodied.*`.
+        for key in (
+            "connected",
+            "states_sent",
+            "observations_received",
+            "errors_total",
+            "pings_handled",
+            "latency_samples",
+            "latency_mean_ms",
+            "latency_p50_ms",
+            "latency_p95_ms",
+            "latency_max_ms",
+        ):
+            if key in ws_stats:
+                out[key] = ws_stats[key]
+        # Полный ws-блок для debugging (URL, last_error и пр.).
+        out["ws"] = ws_stats
+        return out
