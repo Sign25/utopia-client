@@ -695,9 +695,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                                     "failed: %s", e)
                         applied_lineage_upgrade = False
 
-            # Body Migration Phase 1: эмитим embodied/state каждый
-            # iteration (~1с), throttle внутри emit_alive_owned гарантирует
-            # period_sec. world_tick — последний известный от P40 (world_feed).
+            # Body Migration Phase 1: lazy-attach + emit embodied/state.
+            # Fix 27.05.2026: при idle→run `ws.compute` ещё None (compute
+            # создаётся внутри ColonyWSClient после seed_complete от P40).
+            # Поэтому attach делаем здесь — когда compute уже доступен.
+            # throttle внутри emit_alive_owned гарантирует period_sec.
+            if (embodied_ws is not None and embodied_org is None
+                    and ws is not None and ws.compute is not None):
+                try:
+                    from .embodied import EmbodiedOrganism
+                    embodied_org = EmbodiedOrganism(ws.compute, embodied_ws)
+                    logger.info("embodied organism attached to compute "
+                                "(n_organisms=%d)", len(ws.compute.organisms))
+                except Exception as e:
+                    logger.warning("embodied attach failed: %s", e)
             if embodied_org is not None and ws is not None:
                 try:
                     embodied_org.emit_alive_owned(
