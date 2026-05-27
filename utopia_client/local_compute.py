@@ -422,6 +422,17 @@ class LocalColonyCompute:
         self._heb_pt_samples: dict[str, int] = {
             r: 0 for r in _HEB_PT_ALL_ROLES}
 
+        # Body Migration Этап 3a Phase 2 (27.05.2026, Бендер): client-side
+        # биохимия Z7 на owned Зодчих. Per-cid `ClientCreatureBiochem` со
+        # всеми 8 эфемерными веществами + 7 baseline-генами темперамента +
+        # mental_break state. Apply* / decay_step / compute_mental_break
+        # вызываются напрямую из `environment.biochemistry` через duck-type
+        # (math equivalence с server). Заполняется в `add_creature` для
+        # `lineage="zodchiy"`, чистится в `remove_creature` / `reset_all`.
+        # Для elder/wanderer dict остаётся пустым — биохимия этих lineage
+        # остаётся на P40 (vision §2.5).
+        self.biochem: dict = {}  # cid → ClientCreatureBiochem
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -671,6 +682,16 @@ class LocalColonyCompute:
                 except Exception as e:
                     logger.debug(
                         "add_creature %s %s sfnn hooks: %s", cid, _t, e)
+            # Phase 2 (27.05.2026, Бендер): инициализация client-side
+            # биохимии Z7 для zodchiy. Идемпотентно — повторный add_creature
+            # после reseed/respawn не сбрасывает существующее состояние.
+            if cid not in self.biochem:
+                try:
+                    from .biochemistry import make_default
+                    self.biochem[cid] = make_default()
+                except Exception as e:
+                    logger.debug(
+                        "add_creature %s biochem init: %s", cid, e)
         logger.info(
             "add_creature %s lineage=%s n_tissues=%d predictor=%s S2=%s zodchiy=%s",
             cid, lineage, getattr(organism, "n_tissues", 0), pred is not None,
@@ -763,6 +784,8 @@ class LocalColonyCompute:
         self.last_cerebellum_delta.pop(cid, None)
         self.last_amygdala_valence.pop(cid, None)
         self.last_episodic_recall.pop(cid, None)
+        # Phase 2 (27.05.2026, Бендер): client-side биохимия Z7.
+        self.biochem.pop(cid, None)
 
     def reset_all(self) -> int:
         n = len(self.organisms)
@@ -785,6 +808,10 @@ class LocalColonyCompute:
         # Z7.i.e (16.05.2026): + 3 Зодчий-ткани в общем _ALL_HIGHER.
         for _t in _HIGHER_SFNN_TISSUES + _ZODCHIY_EXTRA_TISSUES:
             self.higher_tissue_sfnn_trace[_t] = {}
+        # Body Migration Phase 2 (27.05.2026, Бендер): client-side биохимия.
+        # remove_creature уже очистил per-cid записи, но clear на всякий
+        # случай (defense-in-depth от stale records при partial reset).
+        self.biochem.clear()
         # TZ B Phase 2 (26.05.2026, Бендер): сбросить per-role tracker.
         for _r in _HEB_PT_ALL_ROLES:
             self._heb_pt_n_total[_r] = 0

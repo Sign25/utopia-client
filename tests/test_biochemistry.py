@@ -283,3 +283,53 @@ def test_make_from_inheritance_returns_dataclass(envbio):
     assert child.cortisol == child.baseline_cortisol
     assert child.glucose == child.baseline_glucose
     assert child.histamine == 0.0
+
+
+# ── LocalColonyCompute integration (Phase 2 commit 2) ──────────────────────
+
+
+@pytest.fixture
+def torch_or_skip():
+    """LocalColonyCompute требует torch для импорта."""
+    return pytest.importorskip("torch")
+
+
+def test_local_compute_biochem_dict_exists(torch_or_skip):
+    """LocalColonyCompute.__init__ создаёт пустой biochem dict."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    assert hasattr(compute, "biochem")
+    assert isinstance(compute.biochem, dict)
+    assert len(compute.biochem) == 0
+
+
+def test_local_compute_remove_creature_clears_biochem(torch_or_skip):
+    """remove_creature убирает запись из biochem dict."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    # Симулируем добавление biochem напрямую (без полного add_creature flow —
+    # тот требует CompositeOrganism из seed_loader, neurocore[client]).
+    compute.biochem["c-test"] = ClientCreatureBiochem(cortisol=50.0)
+    assert "c-test" in compute.biochem
+    compute.remove_creature("c-test")
+    assert "c-test" not in compute.biochem
+
+
+def test_local_compute_reset_all_clears_biochem(torch_or_skip):
+    """reset_all() обнуляет biochem dict даже если есть stale records."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    compute.biochem["c-stale-1"] = ClientCreatureBiochem()
+    compute.biochem["c-stale-2"] = ClientCreatureBiochem(cortisol=99.0)
+    assert len(compute.biochem) == 2
+    compute.reset_all()
+    assert len(compute.biochem) == 0
+
+
+def test_local_compute_remove_creature_missing_cid_no_error(torch_or_skip):
+    """remove_creature(unknown_cid) — не падает, no-op для biochem."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    # Должно тихо отработать
+    compute.remove_creature("never-added-cid")
+    assert len(compute.biochem) == 0
