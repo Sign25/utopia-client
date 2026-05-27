@@ -685,17 +685,13 @@ class LocalColonyCompute:
             # Phase 2 (27.05.2026, Бендер): инициализация client-side
             # биохимии Z7 для zodchiy. Идемпотентно — повторный add_creature
             # после reseed/respawn не сбрасывает существующее состояние.
-            # Debug 27.05.2026: упростил error log с debug на warning + add
-            # info-log на успех — чтобы видеть в production что init фактически
-            # вызывается (Phase 2 этап 7 verify показал n_active=0 на VPS-side).
             if cid not in self.biochem:
                 try:
                     from .biochemistry import make_default
                     self.biochem[cid] = make_default()
-                    logger.info(
-                        "biochem init %s (total=%d)",
-                        cid[:12], len(self.biochem))
                 except Exception as e:
+                    # Warning (не debug) чтобы видеть в production если
+                    # neurocore[client] not available на embedded Python.
                     logger.warning(
                         "biochem init failed %s: %s", cid, e)
         logger.info(
@@ -3105,9 +3101,6 @@ class LocalColonyCompute:
     def _build_biochem_snapshot(self) -> dict:
         """Snapshot для diagnostics push: агрегаты + mental_break heatmap.
 
-        Debug 27.05.2026: добавлен info-log с size snapshot — для
-        production verify что метод реально called с непустым self.biochem.
-
         Цель — Хьюберт + frontend StatsPage увидят:
           - сколько owned Зодчих с активной биохимией (`n_active`)
           - распределение mental_break по states (`mental_break_counts`)
@@ -3119,10 +3112,6 @@ class LocalColonyCompute:
         """
         biochem = self.biochem
         n = len(biochem)
-        # Debug 27.05.2026: видеть в production что snapshot реально вызывается +
-        # с какой размерностью self.biochem. Уберём после verify Phase 2.
-        logger.info("biochem snapshot: n_active=%d organisms=%d",
-                    n, len(self.organisms))
         if n == 0:
             return {
                 "n_active": 0,
