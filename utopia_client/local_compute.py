@@ -694,6 +694,29 @@ class LocalColonyCompute:
                     # neurocore[client] not available на embedded Python.
                     logger.warning(
                         "biochem init failed %s: %s", cid, e)
+            # Phase 4 этап B (27.05.2026, Бендер): episodic memory
+            # persistence через client restart. Если для этого cid
+            # есть сохранённый state на диске — загружаем в свежесозданную
+            # episodic ткань. Idempotent: повторный add_creature тоже
+            # вызывает load, но overwrite допустимо (state файл — source
+            # of truth, in-memory копия — производное).
+            try:
+                from .memory_store import (
+                    load_memory_state, apply_memory_state_to_tissue,
+                )
+                payload = load_memory_state(cid)
+                if payload is not None:
+                    epi = self.episodic.get(cid)
+                    ok = apply_memory_state_to_tissue(payload, epi)
+                    if ok:
+                        recall = payload.get("last_episodic_recall")
+                        if recall is not None:
+                            self.last_episodic_recall[cid] = recall
+                        logger.info(
+                            "memory restore %s: episodic loaded ts_saved=%s",
+                            cid, payload.get("ts_saved"))
+            except Exception as e:
+                logger.warning("memory restore %s failed: %s", cid, e)
         logger.info(
             "add_creature %s lineage=%s n_tissues=%d predictor=%s S2=%s zodchiy=%s",
             cid, lineage, getattr(organism, "n_tissues", 0), pred is not None,
@@ -780,6 +803,10 @@ class LocalColonyCompute:
             # Z1 (Зодчий, 16.05.2026): eligibility trace тоже эфемерно.
             self.higher_tissue_sfnn_trace.get(_t, {}).pop(cid, None)
         # Z7.i.d (16.05.2026): три zodchiy-ткани (только Tissue + last-snap).
+        # Memory persistence НЕ делаем здесь — remove_creature вызывается
+        # на смерть (permanent, не вернётся), а сохранение нужно только
+        # перед shutdown (см. `persist_all_memory` в reset_all и
+        # explicit shutdown hook в main.py).
         self.cerebellum.pop(cid, None)
         self.amygdala.pop(cid, None)
         self.episodic.pop(cid, None)
@@ -789,7 +816,44 @@ class LocalColonyCompute:
         # Phase 2 (27.05.2026, Бендер): client-side биохимия Z7.
         self.biochem.pop(cid, None)
 
+    def persist_all_memory(self) -> int:
+        """Phase 4 этап B: сохранить episodic state всех живых организмов.
+
+        Вызывается перед shutdown (`reset_all`, main.py SIGTERM handler).
+        Save на death (`remove_creature`) не нужен — мёртвый cid не
+        вернётся.
+
+        Returns:
+            Число успешно сохранённых организмов.
+        """
+        try:
+            from .memory_store import save_memory_state
+        except Exception as e:
+            logger.warning("persist_all_memory: import failed: %s", e)
+            return 0
+        n_saved = 0
+        for cid, epi in list(self.episodic.items()):
+            if epi is None:
+                continue
+            try:
+                path = save_memory_state(
+                    cid, epi, self.last_episodic_recall.get(cid))
+                if path is not None:
+                    n_saved += 1
+            except Exception as e:
+                logger.debug("persist_all_memory %s failed: %s", cid, e)
+        if n_saved:
+            logger.info("persist_all_memory: %d organisms saved", n_saved)
+        return n_saved
+
     def reset_all(self) -> int:
+        # Phase 4 этап B: сохранить episodic memory ДО pop организмов.
+        # reset_all = orderly shutdown semantics (отличается от
+        # remove_creature, который вызывается на смерть).
+        try:
+            self.persist_all_memory()
+        except Exception as e:
+            logger.warning("reset_all: persist_all_memory failed: %s", e)
         n = len(self.organisms)
         for cid in list(self.organisms.keys()):
             self.remove_creature(cid)
