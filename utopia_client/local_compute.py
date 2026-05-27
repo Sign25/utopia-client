@@ -1598,7 +1598,8 @@ class LocalColonyCompute:
 
     def handle_tick(self, obs_per_cid: dict,
                     events_per_cid: Optional[dict] = None,
-                    intero_per_cid: Optional[dict] = None) -> dict:
+                    intero_per_cid: Optional[dict] = None,
+                    world_tick: int = 0) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
@@ -1810,6 +1811,13 @@ class LocalColonyCompute:
                              if events_per_cid is not None else None)
                 self._apply_biochem_events(cid, _bc_event)
                 self._apply_biochem_decay(cid)
+                # Phase 2 этап 5 (27.05.2026): hysteresis-aware mental_break
+                # update + force_STAY override action если catatonic/
+                # exhaustion/glucose<5. Порядок: decay сначала (обновил
+                # cortisol/serotonin/...), потом recompute mental_break,
+                # потом override action для P40 actions_batch.
+                self._apply_biochem_mental_break(cid, world_tick)
+                self._maybe_force_stay(cid, out)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
@@ -3087,6 +3095,75 @@ class LocalColonyCompute:
         )
 
     # ── Body Migration Phase 2 (27.05.2026, Бендер): biochem events + decay ─
+
+    def _apply_biochem_mental_break(
+        self, cid: str, world_tick: int = 0,
+    ) -> None:
+        """Hysteresis-aware update mental_break state.
+
+        Pattern (тот же что server-side в `_update_creature_mechanics`):
+          1. Декрементировать `mental_break_ticks` — пока > 0 текущий
+             state удерживается (hold через `MENTAL_BREAK_DURATIONS`).
+          2. Когда ticks <= 0 — recompute через `compute_mental_break`.
+             Если возвращает новый state — set + reset ticks на duration.
+
+        Это даёт hysteresis: cortisol-spike не «прыгает» в catatonic
+        каждый тик; новый mental_break удерживается N тиков перед
+        возможным переходом.
+        """
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return
+        try:
+            from environment.biochemistry import (  # type: ignore
+                MENTAL_BREAK_DURATIONS,
+                compute_mental_break,
+            )
+        except Exception as e:
+            logger.debug("biochem mental_break import failed cid=%s: %s",
+                         cid, e)
+            return
+        try:
+            if bc.mental_break_ticks > 0:
+                bc.mental_break_ticks -= 1
+                return
+            new_state = compute_mental_break(bc, world_tick)
+            if new_state != bc.mental_break:
+                bc.mental_break = new_state
+                # duration = 0 для "" (normal) → выйдет из hold сразу,
+                # перерасчёт каждый тик пока not normal.
+                bc.mental_break_ticks = int(
+                    MENTAL_BREAK_DURATIONS.get(new_state, 0))
+        except Exception as e:
+            logger.debug("biochem mental_break update cid=%s: %s", cid, e)
+
+    def _maybe_force_stay(self, cid: str, out: dict) -> None:
+        """Override action на STAY если биохимия требует.
+
+        Server-side equivalent: `client_actions_batch` обрабатывает
+        `should_force_stay()` и подменяет action на STAY=4. На клиенте
+        делаем то же самое перед формированием actions_batch к P40.
+
+        Triggers (см. `environment.biochemistry.should_force_stay`):
+          - `glucose < 5.0` (обморок от истощения)
+          - `mental_break == "catatonic"` (выгорание)
+          - `mental_break == "exhaustion"` (истощение)
+
+        Side-effect: out[cid] mutируется в-place. Безопасно — out это
+        локальный dict handle_tick'а.
+        """
+        bc = self.biochem.get(cid)
+        if bc is None or cid not in out:
+            return
+        try:
+            from environment.biochemistry import should_force_stay  # type: ignore
+        except Exception:
+            return
+        try:
+            if should_force_stay(bc):
+                out[cid] = {"action": STAY, "target_id": None}
+        except Exception as e:
+            logger.debug("biochem force_stay cid=%s: %s", cid, e)
 
     def _apply_biochem_events(self, cid: str, event: "Optional[dict]") -> None:
         """Apply event-driven biochem deltas из per-cid event_dict.

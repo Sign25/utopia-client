@@ -1376,7 +1376,8 @@ class ColonyWSClient:
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,
-                                                intero_per_cid=intero_per_cid)
+                                                intero_per_cid=intero_per_cid,
+                                                world_tick=world_tick)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return

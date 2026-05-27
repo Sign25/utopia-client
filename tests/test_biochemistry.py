@@ -500,3 +500,118 @@ def test_apply_biochem_events_damage_taken_string_safe(torch_or_skip, envbio):
     # Не должно raise
     compute._apply_biochem_events(cid, {"damage_taken": None})
     assert bc.cortisol == 30.0
+
+
+# ── _apply_biochem_mental_break + _maybe_force_stay (Phase 2 этап 5) ───────
+
+
+def test_mental_break_no_biochem_silent(torch_or_skip):
+    """Update mental_break для cid без biochem — no-op."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    compute._apply_biochem_mental_break("phantom", world_tick=100)
+
+
+def test_mental_break_hold_decrements_ticks(torch_or_skip, envbio):
+    """Если mental_break_ticks > 0 — decrement, без recompute."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-holding"
+    bc = make_default()
+    bc.mental_break = "catatonic"
+    bc.mental_break_ticks = 30
+    compute.biochem[cid] = bc
+    compute._apply_biochem_mental_break(cid, world_tick=100)
+    assert bc.mental_break == "catatonic"  # state не меняется в hold
+    assert bc.mental_break_ticks == 29
+
+
+def test_mental_break_recompute_when_ticks_zero(torch_or_skip, envbio):
+    """ticks=0 → recompute через compute_mental_break + set duration."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-recompute"
+    bc = make_default()
+    bc.mental_break = ""  # currently normal
+    bc.mental_break_ticks = 0
+    bc.cortisol = 90.0  # high
+    bc.serotonin = 10.0  # low → catatonic per thresholds
+    compute.biochem[cid] = bc
+    compute._apply_biochem_mental_break(cid, world_tick=100)
+    assert bc.mental_break == "catatonic"
+    # MENTAL_BREAK_DURATIONS["catatonic"] = 50
+    assert bc.mental_break_ticks == 50
+
+
+def test_mental_break_normal_state_zero_duration(torch_or_skip, envbio):
+    """Если recompute возвращает "" — duration=0, рекомпьют каждый тик."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-normal"
+    bc = make_default()
+    bc.mental_break = ""
+    bc.mental_break_ticks = 0
+    # neutral state — no triggers
+    compute.biochem[cid] = bc
+    compute._apply_biochem_mental_break(cid, world_tick=100)
+    assert bc.mental_break == ""
+    assert bc.mental_break_ticks == 0
+
+
+def test_force_stay_no_biochem_no_change(torch_or_skip):
+    """force_stay для cid без biochem — out не меняется."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    out = {"c-no-bc": {"action": 5, "target_id": "t1"}}
+    compute._maybe_force_stay("c-no-bc", out)
+    assert out["c-no-bc"] == {"action": 5, "target_id": "t1"}  # unchanged
+
+
+def test_force_stay_glucose_low_overrides(torch_or_skip, envbio):
+    """glucose<5 → action заменяется на STAY=4."""
+    from utopia_client.local_compute import LocalColonyCompute, STAY
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-low-gluc"
+    bc = make_default()
+    bc.glucose = 3.0  # < GLUCOSE_STAY_FLOOR (5.0)
+    compute.biochem[cid] = bc
+    out = {cid: {"action": 5, "target_id": "target-x"}}  # ATTACK
+    compute._maybe_force_stay(cid, out)
+    assert out[cid]["action"] == STAY
+    assert out[cid]["target_id"] is None
+
+
+def test_force_stay_catatonic_overrides(torch_or_skip, envbio):
+    """mental_break=catatonic → STAY override."""
+    from utopia_client.local_compute import LocalColonyCompute, STAY
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-cata"
+    bc = make_default()
+    bc.mental_break = "catatonic"
+    compute.biochem[cid] = bc
+    out = {cid: {"action": 0, "target_id": None}}  # NORTH
+    compute._maybe_force_stay(cid, out)
+    assert out[cid]["action"] == STAY
+
+
+def test_force_stay_normal_no_override(torch_or_skip, envbio):
+    """Здоровое состояние → action не меняется."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-healthy"
+    compute.biochem[cid] = make_default()  # glucose=50, mental_break=""
+    out = {cid: {"action": 5, "target_id": "t1"}}
+    compute._maybe_force_stay(cid, out)
+    assert out[cid] == {"action": 5, "target_id": "t1"}
+
+
+def test_force_stay_missing_cid_in_out_no_op(torch_or_skip, envbio):
+    """Если cid не в out — no-op (нет inference, нечего override)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    bc = make_default()
+    bc.mental_break = "catatonic"
+    compute.biochem["c-1"] = bc
+    out: dict = {}
+    compute._maybe_force_stay("c-1", out)
+    assert out == {}
