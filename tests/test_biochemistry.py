@@ -380,3 +380,123 @@ def test_apply_biochem_decay_low_energy_increases_cortisol(torch_or_skip,
     # Net: +0.1
     assert bc.cortisol > 50.0
     assert bc.cortisol <= 50.5
+
+
+# ── _apply_biochem_events hook (Phase 2 commit 4) ──────────────────────────
+
+
+def test_apply_biochem_events_none_event_no_op(torch_or_skip):
+    """event=None → silent (для elders / wanderers без events_per_cid)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-no-evt"
+    compute.biochem[cid] = make_default()
+    compute._apply_biochem_events(cid, None)
+    # Никакого изменения
+    assert compute.biochem[cid].dopamine == 0.0
+
+
+def test_apply_biochem_events_no_biochem_silent(torch_or_skip):
+    """Если biochem[cid] нет — no-op (не-zodchiy)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    # Не должно raise
+    compute._apply_biochem_events("phantom-cid", {"ate": True})
+
+
+def test_apply_biochem_events_empty_dict_no_op(torch_or_skip, envbio):
+    """Пустой event dict → no apply, biochem не меняется."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-empty-evt"
+    bc = make_default()
+    bc.dopamine = 30.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {})
+    assert bc.dopamine == 30.0
+
+
+def test_apply_biochem_events_ate_triggers_feed(torch_or_skip, envbio):
+    """ate=True → apply_feed: dopamine +5, glucose +10."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-eater"
+    bc = make_default()
+    bc.dopamine = 10.0
+    bc.glucose = 50.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {"ate": True})
+    assert bc.dopamine == 15.0  # +FEED_DOPAMINE (5.0)
+    assert bc.glucose == 60.0  # +FEED_GLUCOSE (10.0)
+
+
+def test_apply_biochem_events_killed_triggers_kill_prey(torch_or_skip,
+                                                         envbio):
+    """killed=True → apply_kill_prey: dopamine +8."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-hunter"
+    bc = make_default()
+    bc.dopamine = 20.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {"killed": True})
+    assert bc.dopamine == 28.0  # +KILL_PREY_DOPAMINE (8.0)
+
+
+def test_apply_biochem_events_damage_triggers_pvp_hit(torch_or_skip, envbio):
+    """damage_taken>0 → apply_pvp_hit(cross_clan_target): cortisol +2."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-victim"
+    bc = make_default()
+    bc.cortisol = 30.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {"damage_taken": 5.0})
+    # PVP_DELTA_CROSS_CLAN_TARGET_CORTISOL = 2.0
+    assert bc.cortisol == 32.0
+
+
+def test_apply_biochem_events_zero_damage_no_pvp(torch_or_skip, envbio):
+    """damage_taken=0.0 → no pvp_hit, cortisol не меняется."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-untouched"
+    bc = make_default()
+    bc.cortisol = 30.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {"damage_taken": 0.0})
+    assert bc.cortisol == 30.0
+
+
+def test_apply_biochem_events_combined_flags(torch_or_skip, envbio):
+    """Несколько flags в одном event → все apply'и срабатывают."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-mixed"
+    bc = make_default()
+    bc.dopamine = 0.0
+    bc.glucose = 50.0
+    bc.cortisol = 10.0
+    compute.biochem[cid] = bc
+    compute._apply_biochem_events(cid, {
+        "ate": True, "killed": True, "damage_taken": 3.0,
+    })
+    # ate: dopamine +5, glucose +10
+    # killed: dopamine +8 (total dopamine 0+5+8 = 13)
+    # damage: cortisol +2
+    assert bc.dopamine == 13.0
+    assert bc.glucose == 60.0
+    assert bc.cortisol == 12.0
+
+
+def test_apply_biochem_events_damage_taken_string_safe(torch_or_skip, envbio):
+    """Битый event с damage_taken=null/string → safe no-op (try/except)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-corrupt-evt"
+    bc = make_default()
+    bc.cortisol = 30.0
+    compute.biochem[cid] = bc
+    # Не должно raise
+    compute._apply_biochem_events(cid, {"damage_taken": None})
+    assert bc.cortisol == 30.0

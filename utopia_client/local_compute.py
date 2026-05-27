@@ -1800,11 +1800,15 @@ class LocalColonyCompute:
                 # PUSH_SEC из main.py). Source приоритет: SFNN → classic.
                 self._record_hebbian_per_tissue_sample(cid)
                 # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
-                # биохимия decay_step. Зависит от energy/hydration/infected
-                # синхронизированных из creatures payload в ws_client._handle_
-                # obs_batch (см. там). Math equivalence с server гарантирована
-                # — environment.biochemistry.decay_step вызывается напрямую.
-                # Safety: try/except — не ломает основной handle_tick.
+                # биохимия. Порядок: events → decay. apply_* применяет
+                # deltas из event_dict (ate/killed/damage_taken), затем
+                # decay_step обновляет 8 веществ passive growth/decay.
+                # Math equivalence с server — environment.biochemistry.*
+                # вызывается напрямую. Safety: try/except — не ломает
+                # handle_tick.
+                _bc_event = (events_per_cid.get(cid)
+                             if events_per_cid is not None else None)
+                self._apply_biochem_events(cid, _bc_event)
                 self._apply_biochem_decay(cid)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
@@ -3082,7 +3086,56 @@ class LocalColonyCompute:
             (1 - _EMA_ALPHA) * self.reward_var_ema[cid] + _EMA_ALPHA * rv
         )
 
-    # ── Body Migration Phase 2 (27.05.2026, Бендер): biochem decay ──────
+    # ── Body Migration Phase 2 (27.05.2026, Бендер): biochem events + decay ─
+
+    def _apply_biochem_events(self, cid: str, event: "Optional[dict]") -> None:
+        """Apply event-driven biochem deltas из per-cid event_dict.
+
+        Минимальный set который покрывают server-side fields из
+        `_compute_immediate_reward`:
+          - `ate=True` → `apply_feed(creature)` (dopamine +5, glucose +10)
+          - `killed=True` → `apply_kill_prey(creature)` (dopamine +8).
+            Note: client не знает lineage жертвы → assume prey (не PvP).
+            Если жертва была zodchiy, P40 не пришлёт `killed=True` без
+            доп. поля; для безопасности этот path — только prey.
+          - `damage_taken>0` → `apply_pvp_hit(creature, kind="cross_clan_target")`.
+            Conservative default — cortisol +2. Реальное разделение
+            fratricide vs cross_clan требует attacker lineage в event,
+            которого сейчас нет; добавится в Phase 2 этап 4.5 при
+            расширении event schema.
+
+        Не покрыты в этом этапе (требуют cross-cid data / новых fields):
+          - apply_mate_pair (нужен partner cid)
+          - apply_share_food (нужен donor/recipient pair)
+          - apply_signal_received (нужно channel поле)
+          - apply_predator_visible / apply_panic_low_energy (нужно flag
+            что предатор в visible зоне)
+          - apply_drink (нужно DRINK event поле)
+
+        Safety: try/except — никогда не ломает handle_tick.
+        """
+        if event is None:
+            return
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return
+        try:
+            from environment.biochemistry import (  # type: ignore
+                apply_feed, apply_kill_prey, apply_pvp_hit,
+            )
+        except Exception as e:
+            logger.debug("biochem apply import failed cid=%s: %s", cid, e)
+            return
+        try:
+            if event.get("ate"):
+                apply_feed(bc)
+            if event.get("killed"):
+                apply_kill_prey(bc)
+            damage = float(event.get("damage_taken", 0.0) or 0.0)
+            if damage > 0:
+                apply_pvp_hit(bc, kind="cross_clan_target")
+        except Exception as e:
+            logger.debug("biochem apply events cid=%s: %s", cid, e)
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.
