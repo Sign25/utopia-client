@@ -520,6 +520,24 @@ class ColonyWSClient:
                 msg.get("restored"), msg.get("requested"),
                 msg.get("failed"), msg.get("error"),
                 msg.get("fallback_path"))
+            # Body Migration Phase 1 fix (27.05.2026): когда P40 успешно
+            # восстановил cached seeds — fresh `seed_chunk` от него НЕ
+            # последует, потому что seeds уже у нас локально. Это значит
+            # `_ensure_compute()` через обычный seed-chunk path не вызовется,
+            # `self.compute` останется None всю сессию. Последствия:
+            #   - Hebbian-update/SFNN не работают (нет compute.organisms);
+            #   - diagnostics push не отдаёт hebbian_per_tissue;
+            #   - EmbodiedOrganism lazy-attach skip'ается → state_msgs=0
+            #     на VPS-брокере.
+            # Поэтому инициируем compute явно при restored>0. Если он уже
+            # создан — `_ensure_compute` идемпотентен (early return на
+            # `self.compute is not None`).
+            try:
+                if int(msg.get("restored", 0) or 0) > 0:
+                    self._ensure_compute()
+            except Exception as e:
+                logger.warning(
+                    "seed_pack_ack compute init failed: %s", e)
             return
         if msg_type == "stats":
             n = msg.get("n_alive_owned", 0)
