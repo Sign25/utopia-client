@@ -3096,6 +3096,53 @@ class LocalColonyCompute:
 
     # ── Body Migration Phase 2 (27.05.2026, Бендер): biochem events + decay ─
 
+    def _build_biochem_snapshot(self) -> dict:
+        """Snapshot для diagnostics push: агрегаты + mental_break heatmap.
+
+        Цель — Хьюберт + frontend StatsPage увидят:
+          - сколько owned Зодчих с активной биохимией (`n_active`)
+          - распределение mental_break по states (`mental_break_counts`)
+          - average levels 5 ключевых веществ (для тренда UI)
+
+        Per-cid raw данные **не пушим** в diagnostics — это шум для
+        observability. Если потребуется детальный per-cid breakdown
+        (для debug), запрашивается через отдельный admin endpoint.
+        """
+        biochem = self.biochem
+        n = len(biochem)
+        if n == 0:
+            return {
+                "n_active": 0,
+                "mental_break_counts": {},
+                "cortisol_avg": 0.0,
+                "serotonin_avg": 0.0,
+                "dopamine_avg": 0.0,
+                "glucose_avg": 0.0,
+                "histamine_avg": 0.0,
+            }
+        mb_counts: dict[str, int] = {}
+        sums = {
+            "cortisol": 0.0, "serotonin": 0.0, "dopamine": 0.0,
+            "glucose": 0.0, "histamine": 0.0,
+        }
+        for bc in biochem.values():
+            mb = str(getattr(bc, "mental_break", "") or "normal")
+            mb_counts[mb] = mb_counts.get(mb, 0) + 1
+            for chem in sums:
+                try:
+                    sums[chem] += float(getattr(bc, chem, 0.0))
+                except (TypeError, ValueError):
+                    pass
+        return {
+            "n_active": n,
+            "mental_break_counts": mb_counts,
+            "cortisol_avg": round(sums["cortisol"] / n, 2),
+            "serotonin_avg": round(sums["serotonin"] / n, 2),
+            "dopamine_avg": round(sums["dopamine"] / n, 2),
+            "glucose_avg": round(sums["glucose"] / n, 2),
+            "histamine_avg": round(sums["histamine"] / n, 2),
+        }
+
     def _apply_biochem_mental_break(
         self, cid: str, world_tick: int = 0,
     ) -> None:
@@ -3490,6 +3537,18 @@ class LocalColonyCompute:
                 "hebbian_per_tissue": {
                     r: {"n_learning": 0, "n_total": 0, "delta_mean": 0.0}
                     for r in _HEB_PT_ALL_ROLES
+                },
+                # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
+                # биохимия snapshot. Пустой stub: счётчики 0, distribution
+                # пуст.
+                "biochem": {
+                    "n_active": 0,
+                    "mental_break_counts": {},
+                    "cortisol_avg": 0.0,
+                    "serotonin_avg": 0.0,
+                    "dopamine_avg": 0.0,
+                    "glucose_avg": 0.0,
+                    "histamine_avg": 0.0,
                 },
                 "tom_steps_total": int(self.tom_steps),
                 "lang_steps_total": int(self.lang_steps),
@@ -3897,6 +3956,10 @@ class LocalColonyCompute:
             # для UI "Тренировка мозга" combined Mode E + Mode M. Build +
             # reset accumulators — следующий emit cycle с чистого листа.
             "hebbian_per_tissue": self._build_hebbian_per_tissue_snapshot(),
+            # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
+            # биохимия snapshot — для UI Brain панели (mental_break states
+            # heatmap, chem averages) + Хьюберт merge на VPS если потребуется.
+            "biochem": self._build_biochem_snapshot(),
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,

@@ -615,3 +615,155 @@ def test_force_stay_missing_cid_in_out_no_op(torch_or_skip, envbio):
     out: dict = {}
     compute._maybe_force_stay("c-1", out)
     assert out == {}
+
+
+# ── _build_biochem_snapshot (Phase 2 этап 7) ───────────────────────────────
+
+
+def test_biochem_snapshot_empty_when_no_creatures(torch_or_skip):
+    """Empty biochem dict → n_active=0, все avg=0, mental_break_counts пуст."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    snap = compute._build_biochem_snapshot()
+    assert snap["n_active"] == 0
+    assert snap["mental_break_counts"] == {}
+    assert snap["cortisol_avg"] == 0.0
+    assert snap["serotonin_avg"] == 0.0
+    assert snap["dopamine_avg"] == 0.0
+
+
+def test_biochem_snapshot_counts_creatures(torch_or_skip):
+    """n_active = len(biochem)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    for cid in ("c1", "c2", "c3"):
+        compute.biochem[cid] = make_default()
+    snap = compute._build_biochem_snapshot()
+    assert snap["n_active"] == 3
+
+
+def test_biochem_snapshot_averages_chems(torch_or_skip):
+    """cortisol_avg/serotonin_avg/dopamine_avg/glucose_avg/histamine_avg
+    усредняют по всем biochem."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    bc1 = make_default()
+    bc1.cortisol = 30.0
+    bc1.serotonin = 60.0
+    bc1.dopamine = 20.0
+    bc1.glucose = 40.0
+    bc1.histamine = 10.0
+    bc2 = make_default()
+    bc2.cortisol = 70.0
+    bc2.serotonin = 40.0
+    bc2.dopamine = 80.0
+    bc2.glucose = 60.0
+    bc2.histamine = 0.0
+    compute.biochem["c1"] = bc1
+    compute.biochem["c2"] = bc2
+    snap = compute._build_biochem_snapshot()
+    assert snap["n_active"] == 2
+    assert snap["cortisol_avg"] == 50.0  # (30+70)/2
+    assert snap["serotonin_avg"] == 50.0  # (60+40)/2
+    assert snap["dopamine_avg"] == 50.0
+    assert snap["glucose_avg"] == 50.0
+    assert snap["histamine_avg"] == 5.0
+
+
+def test_biochem_snapshot_mental_break_distribution(torch_or_skip):
+    """mental_break_counts собирает heatmap по mental_break states."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    bc_normal = make_default()
+    bc_normal.mental_break = ""
+    bc_cata1 = make_default()
+    bc_cata1.mental_break = "catatonic"
+    bc_cata2 = make_default()
+    bc_cata2.mental_break = "catatonic"
+    bc_berserk = make_default()
+    bc_berserk.mental_break = "berserk"
+    compute.biochem["c1"] = bc_normal
+    compute.biochem["c2"] = bc_cata1
+    compute.biochem["c3"] = bc_cata2
+    compute.biochem["c4"] = bc_berserk
+    snap = compute._build_biochem_snapshot()
+    # "" mapped to "normal" в snapshot
+    assert snap["mental_break_counts"] == {
+        "normal": 1, "catatonic": 2, "berserk": 1,
+    }
+
+
+def test_biochem_empty_stub_in_diagnostics(torch_or_skip):
+    """diagnostics() n=0 stub содержит biochem field со всеми keys.
+
+    Skip если neurocore[client] не установлен — `diagnostics()` импортирует
+    `core.action_selector` для N_ACTIONS.
+    """
+    pytest.importorskip("core.action_selector")
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    diag = compute.diagnostics()
+    assert "biochem" in diag
+    bc = diag["biochem"]
+    assert bc["n_active"] == 0
+    assert bc["mental_break_counts"] == {}
+    for chem_avg in ("cortisol_avg", "serotonin_avg", "dopamine_avg",
+                     "glucose_avg", "histamine_avg"):
+        assert chem_avg in bc
+        assert bc[chem_avg] == 0.0
+
+
+# ── Math equivalence smoke (Phase 2 этап 7) ────────────────────────────────
+
+
+def test_math_smoke_chems_stay_in_range(torch_or_skip, envbio):
+    """1000 ticks scenario: все 8 chems остаются в [0, 100] (clip works)."""
+    bc = make_default()
+    bc.energy = 50.0
+    bc.hydration = 50.0
+    from utopia_client.biochemistry import _FakeWorld
+    fake_world = _FakeWorld()
+    for _ in range(1000):
+        # Каждый 100й тик симулируем eat event
+        if _ % 100 == 0:
+            envbio.apply_feed(bc)
+        # Каждый 250й — урон
+        if _ % 250 == 0:
+            envbio.apply_pvp_hit(bc, kind="cross_clan_target")
+        envbio.decay_step(bc, fake_world)
+    # Все 8 веществ остались в [0, 100]
+    for chem in ("cortisol", "dopamine", "serotonin", "oxytocin",
+                 "adrenaline", "glucose", "fatigue", "histamine"):
+        val = getattr(bc, chem)
+        assert 0.0 <= val <= 100.0, f"{chem}={val} out of [0, 100]"
+
+
+def test_math_smoke_hunger_drives_cortisol_up(torch_or_skip, envbio):
+    """Hungry creature (energy<0.3) за 1000 тиков → cortisol > 50."""
+    bc = make_default()
+    bc.energy = 20.0  # ratio 0.2 < 0.3 → hunger
+    bc.hydration = 80.0  # ОК
+    bc.cortisol = 30.0  # стартовый
+    from utopia_client.biochemistry import _FakeWorld
+    fake_world = _FakeWorld()
+    for _ in range(1000):
+        envbio.decay_step(bc, fake_world)
+    # Cortisol должен накопиться от hunger (+0.1/tick - serotonin decay).
+    # Через 1000 тиков должен взлететь к verylarge value clipped at 100.
+    assert bc.cortisol > 50.0
+
+
+def test_math_smoke_healthy_low_cortisol(torch_or_skip, envbio):
+    """Healthy creature (energy/hydration > 0.5, serotonin high) →
+    cortisol снижается со временем."""
+    bc = make_default()
+    bc.energy = 90.0  # > 50
+    bc.hydration = 90.0  # > 50
+    bc.serotonin = 80.0  # > 70 → triggers CORTISOL_DECAY_HIGH_SEROTONIN
+    bc.cortisol = 50.0  # стартовый
+    from utopia_client.biochemistry import _FakeWorld
+    fake_world = _FakeWorld()
+    for _ in range(500):
+        envbio.decay_step(bc, fake_world)
+    # Cortisol должен снизиться (decay good_state + high_serotonin)
+    assert bc.cortisol < 50.0
