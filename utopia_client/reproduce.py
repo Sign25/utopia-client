@@ -118,7 +118,10 @@ def unpack_zstd_b64(b64: str):
 def build_reproduce_envelope(parent_cid: str, organism, *,
                               sigma: float = DEFAULT_SIGMA,
                               brain_state_dicts: dict | None = None,
-                              brain_emas: dict | None = None) -> dict:
+                              brain_emas: dict | None = None,
+                              mutate_topology: bool = False,
+                              topology_rng: Optional[random.Random] = None
+                              ) -> dict:
     """Собрать envelope для отправки на P40.
 
     Возвращает dict готовый к json.dumps:
@@ -127,13 +130,30 @@ def build_reproduce_envelope(parent_cid: str, organism, *,
     `child_weights_b64` — zstd-base64 от
         {"tissues_by_role": {role: state_dict},
          "brain": {predictor|dopamine|imagination|planner|insula: state_dict},
-         "brain_emas": {predictor_loss_ema|intrinsic_ema|...: float}}
+         "brain_emas": {predictor_loss_ema|intrinsic_ema|...: float},
+         "tissue_topology_genes": [gene_dict, ...]  # Phase 4 opt-in}
 
     Brain migration Etap 3.2 (11.05.2026): мозг (predictor + S2.E/G/A/F)
     мутируется на клиенте (Y50 σ=1/φ⁵) и отправляется на P40. Сервер
     `register_newborn` грузит готовые мутированные веса в ColonyMember
     без дополнительной Y50 (она уже применена здесь). Если
     `brain_state_dicts is None` — envelope шлёт только тело (legacy).
+
+    **Phase 4 этап C (27.05.2026, Бендер):** `mutate_topology` — opt-in
+    флаг (default False для backward compat). Если True и у организма
+    есть `tissue_topology_genes` field — клиент мутирует genes через
+    `mutate_topology_genes` (4 базовые NEAT мутации) и кладёт результат
+    в payload. P40 при register_newborn применяет new genes к child
+    (schema уже совместима — см. routes_world.py:5470, mate.py:179).
+
+    Args:
+        parent_cid: cid родителя
+        organism: CompositeOrganism родителя
+        sigma: σ Y50 для weight point mutations
+        brain_state_dicts: optional sidecar brain states (Etap 3.2)
+        brain_emas: optional EMA aggregates
+        mutate_topology: Phase 4 opt-in NEAT topology mutations
+        topology_rng: optional random.Random для determinism topology mutations
     """
     parent_sd = _extract_tissues_by_role(organism)
     child_sd = mutate_state_dict(parent_sd, sigma=sigma)
@@ -146,6 +166,27 @@ def build_reproduce_envelope(parent_cid: str, organism, *,
     if brain_emas:
         # EMA-агрегаты — float, не мутируются. Стартовый baseline для ребёнка.
         payload["brain_emas"] = {str(k): float(v) for k, v in brain_emas.items()}
+    if mutate_topology:
+        # Phase 4 этап C: NEAT topology мутации client-side.
+        # Genes на CompositeOrganism — `organism.tissue_topology_genes`
+        # (list[TissueConnectionGene] или []). Если field отсутствует
+        # (старая seed без Z2.b genes) — skip safely.
+        parent_genes_obj = getattr(organism, "tissue_topology_genes", None)
+        if parent_genes_obj:
+            try:
+                parent_dicts = [g.to_dict() for g in parent_genes_obj]
+            except Exception as e:
+                logger.warning(
+                    "build_reproduce_envelope topology serialize failed: %s", e)
+                parent_dicts = []
+            if parent_dicts:
+                try:
+                    mutated = mutate_topology_genes(
+                        parent_dicts, rng=topology_rng)
+                    payload["tissue_topology_genes"] = mutated
+                except Exception as e:
+                    logger.warning(
+                        "mutate_topology_genes failed (skip topology): %s", e)
     return {
         "type": "reproduce",
         "parent_cid": str(parent_cid),
