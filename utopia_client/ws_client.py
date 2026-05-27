@@ -1077,6 +1077,29 @@ class ColonyWSClient:
             except Exception as e:
                 logger.warning("inherit_brain_y50 %s ← %s: %s",
                                cid_s, parent_id, e)
+            # Body Migration Phase 2 этап 6 (27.05.2026, Бендер): gene
+            # inheritance baseline-биохимии от матери. `add_creature` выше
+            # установил `compute.biochem[cid_s] = make_default()` для
+            # zodchiy (через Phase 2 этап 2 hook). Здесь заменяем на
+            # inherited версию с σ=4.0 шумом по `inherit_baselines_*`.
+            #
+            # **Asexual fallback**: father biochem недоступен в текущей
+            # mate_request schema (P40 шлёт только organism weights, не
+            # baseline_*). Используем `inherit_baselines_asexual(child,
+            # mother)`. Это semantic regression от ТЗ §2.4 sexual mean ±
+            # noise — отдельный backlog item на schema bump (расширить
+            # mate_request полем father_baseline_*).
+            if lineage == "zodchiy":
+                mother_bc = self.compute.biochem.get(str(parent_id))
+                if mother_bc is not None:
+                    try:
+                        from .biochemistry import make_from_inheritance
+                        self.compute.biochem[cid_s] = make_from_inheritance(
+                            mother_bc, father=None)
+                    except Exception as e:
+                        logger.debug(
+                            "biochem inherit %s ← %s: %s",
+                            cid_s, parent_id, e)
             # Запись из кеша больше не нужна.
             self._pending_newborn_orgs.pop(str(parent_id), None)
 
