@@ -33,6 +33,9 @@ from .log_buffer import get_ring, setup_logging
 from .ws_client import ColonyWSClient
 from .world_cache import WorldStateCache
 from .world_feed_client import WorldFeedClient
+# Body Migration Этап 3a Phase 1 (Бендер, 27.05.2026): embodied API skeleton.
+# Импортируется лениво при включении флага cfg["embodied_enabled"] чтобы
+# не тянуть msgpack/websockets на startup при выключенном фиче-флаге.
 
 HEARTBEAT_SEC = 30.0
 COMMAND_POLL_SEC = 10.0
@@ -445,6 +448,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Поднимается вместе с ws в run, гасится в idle. Кеш переживает обрывы.
     world_cache: WorldStateCache | None = None
     world_feed: WorldFeedClient | None = None
+    # Body Migration Этап 3a Phase 1 (27.05.2026): embodied API skeleton.
+    # off-by-default через `cfg["embodied_enabled"]`. Поднимается вместе
+    # с ws в idle→run, гасится при run→idle / benchmark / restart.
+    # Phase 1 — только echo roundtrip latency, без интеграции с биохимией.
+    embodied_ws = None  # type: ignore[var-annotated]
+    embodied_org = None  # type: ignore[var-annotated]
 
     last_heartbeat = 0.0
     last_poll = 0.0
@@ -490,6 +499,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                             ws.stop()
                         if world_feed is not None:
                             world_feed.stop()
+                        if embodied_ws is not None:
+                            embodied_ws.stop()
                         return 0
                     # Принудительный self-update: ack + проверка _try_self_update
                     # и _try_neurocore_update немедленно (вне ритма 60с). При
@@ -527,6 +538,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                             world_feed = None
                             world_cache = None
                             logger.info("world feed stopped (benchmark→idle)")
+                        if embodied_ws is not None:
+                            embodied_ws.stop()
+                            embodied_ws = None
+                            embodied_org = None
+                            logger.info("embodied stopped (benchmark→idle)")
                         current_state = "idle"
                     else:
                         # F.6.B: переходы run↔idle переключают WS.
@@ -543,6 +559,25 @@ def cmd_run(args: argparse.Namespace) -> int:
                             # shadow-сборки obs (валидация vs server obs).
                             ws.world_cache = world_cache
                             logger.info("world feed started (idle→run)")
+                            # Body Migration Phase 1: optional embodied WS.
+                            # Lazy import чтобы msgpack/websockets не тянулись
+                            # на старте при выключенном флаге.
+                            if cfg.get("embodied_enabled", False):
+                                try:
+                                    from .embodied_ws import EmbodiedWSClient
+                                    from .embodied import EmbodiedOrganism
+                                    embodied_ws = EmbodiedWSClient(
+                                        cfg["server"], cfg["token"])
+                                    embodied_ws.start()
+                                    if ws.compute is not None:
+                                        embodied_org = EmbodiedOrganism(
+                                            ws.compute, embodied_ws)
+                                    logger.info("embodied started (idle→run)")
+                                except Exception as e:
+                                    logger.warning(
+                                        "embodied init failed: %s", e)
+                                    embodied_ws = None
+                                    embodied_org = None
                         elif desired == "idle" and ws is not None:
                             ws.stop()  # отправит bye → close
                             ws = None
@@ -552,6 +587,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 world_feed = None
                                 world_cache = None
                                 logger.info("world feed stopped (run→idle)")
+                            if embodied_ws is not None:
+                                embodied_ws.stop()
+                                embodied_ws = None
+                                embodied_org = None
+                                logger.info("embodied stopped (run→idle)")
                         current_state = desired
 
                     # SFNN S3.activate: применить sfnn_higher из flags.
@@ -654,6 +694,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                                     "set_lineage_upgrade_pending(False) "
                                     "failed: %s", e)
                         applied_lineage_upgrade = False
+
+            # Body Migration Phase 1: эмитим embodied/state каждый
+            # iteration (~1с), throttle внутри emit_alive_owned гарантирует
+            # period_sec. world_tick — последний известный от P40 (world_feed).
+            if embodied_org is not None and ws is not None:
+                try:
+                    embodied_org.emit_alive_owned(
+                        world_tick=ws.last_world_tick)
+                except Exception as e:
+                    logger.debug("embodied emit error: %s", e)
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
@@ -762,6 +812,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                         "respawns_sent": getattr(
                             ws, "_orphan_obs_respawns_sent", 0),
                     }
+                    # Body Migration Phase 1: stats embodied клиента
+                    # (connected, states_sent, observations_received,
+                    # latency mean/p50/p95). При выключенном флаге блока нет.
+                    if embodied_org is not None:
+                        try:
+                            diag["embodied"] = embodied_org.stats()
+                        except Exception as e:
+                            logger.debug("embodied stats error: %s", e)
                     api.push_diagnostics(name, diag)
                 except Exception as e:
                     logger.debug("diagnostics push skipped: %s", e)
@@ -789,6 +847,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             ws.stop()
         if world_feed is not None:
             world_feed.stop()
+        if embodied_ws is not None:
+            embodied_ws.stop()
     return 0
 
 
