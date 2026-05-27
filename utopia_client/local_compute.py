@@ -1799,6 +1799,13 @@ class LocalColonyCompute:
                 # snapshot emit'ится в diagnostics() каждые 30с (DIAGNOSTICS_
                 # PUSH_SEC из main.py). Source приоритет: SFNN → classic.
                 self._record_hebbian_per_tissue_sample(cid)
+                # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
+                # биохимия decay_step. Зависит от energy/hydration/infected
+                # синхронизированных из creatures payload в ws_client._handle_
+                # obs_batch (см. там). Math equivalence с server гарантирована
+                # — environment.biochemistry.decay_step вызывается напрямую.
+                # Safety: try/except — не ломает основной handle_tick.
+                self._apply_biochem_decay(cid)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
@@ -3074,6 +3081,40 @@ class LocalColonyCompute:
         self.reward_var_ema[cid] = (
             (1 - _EMA_ALPHA) * self.reward_var_ema[cid] + _EMA_ALPHA * rv
         )
+
+    # ── Body Migration Phase 2 (27.05.2026, Бендер): biochem decay ──────
+
+    def _apply_biochem_decay(self, cid: str) -> None:
+        """Тиковый passive update 8 веществ + mental_break baseline-decay.
+
+        Вызывается из handle_tick per-cid loop. Требует чтобы:
+          1. `self.biochem[cid]` существует (zodchiy, инициализирован в
+             add_creature → make_default).
+          2. Server-side зависимости (energy, hydration, infected,
+             infection_severity, pair_bond_strength, last_social_tick)
+             синхронизированы из obs_batch в ws_client._handle_obs_batch.
+             Без sync decay работает на дефолтах (energy=100, hydration=100)
+             — biochem становится biased, но не ломает.
+
+        Math equivalence с server: `environment.biochemistry.decay_step`
+        вызывается напрямую, тот же код P40 и client.
+
+        В Phase 2 commit 4 здесь же добавится apply_* для events_per_cid
+        (PvP/feed/share/mate); commit 5 — compute_mental_break override.
+        """
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return
+        try:
+            from environment.biochemistry import decay_step  # type: ignore
+            from .biochemistry import _FakeWorld
+        except Exception as e:
+            logger.debug("biochem decay import failed cid=%s: %s", cid, e)
+            return
+        try:
+            decay_step(bc, _FakeWorld())
+        except Exception as e:
+            logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
 
     # ── TZ B Phase 2 (26.05.2026, Бендер): per-role Hebbian metrics ─────
 

@@ -333,3 +333,50 @@ def test_local_compute_remove_creature_missing_cid_no_error(torch_or_skip):
     # Должно тихо отработать
     compute.remove_creature("never-added-cid")
     assert len(compute.biochem) == 0
+
+
+# ── _apply_biochem_decay hook (Phase 2 commit 3) ───────────────────────────
+
+
+def test_apply_biochem_decay_no_biochem_silent(torch_or_skip):
+    """Если для cid нет biochem (не-zodchiy) — silent no-op."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    # Не должно raise
+    compute._apply_biochem_decay("phantom-cid")
+
+
+def test_apply_biochem_decay_invokes_server_function(torch_or_skip, envbio):
+    """Вызов проходит через environment.biochemistry.decay_step → меняет dopamine.
+
+    decay_step с default values (energy=100, hydration=100, dopamine=50)
+    уменьшает dopamine на DOPAMINE_DECAY_DEFAULT=0.2/tick.
+    """
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-decay-test"
+    compute.biochem[cid] = make_default()
+    compute.biochem[cid].dopamine = 50.0
+    compute._apply_biochem_decay(cid)
+    # decay_step снижает dopamine на 0.2
+    assert compute.biochem[cid].dopamine == 49.8
+
+
+def test_apply_biochem_decay_low_energy_increases_cortisol(torch_or_skip,
+                                                            envbio):
+    """energy_ratio<0.3 → cortisol_growth_hunger (+0.1) per decay_step."""
+    from utopia_client.local_compute import LocalColonyCompute
+    compute = LocalColonyCompute(device="cpu")
+    cid = "c-hungry"
+    bc = make_default()
+    bc.energy = 20.0  # ratio = 0.2 < 0.3 → hunger
+    bc.hydration = 80.0  # > 0.5*100 = above thirst threshold
+    bc.cortisol = 50.0
+    bc.serotonin = 50.0  # не triggers HIGH/LOW corts
+    compute.biochem[cid] = bc
+    compute._apply_biochem_decay(cid)
+    # +0.1 hunger; serotonin=50 не triggers HIGH (>70) → no decay,
+    # не triggers LOW (<20) → no growth. cortisol < 70 → no SEROTONIN_DECAY.
+    # Net: +0.1
+    assert bc.cortisol > 50.0
+    assert bc.cortisol <= 50.5

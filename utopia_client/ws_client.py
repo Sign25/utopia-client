@@ -1333,6 +1333,46 @@ class ColonyWSClient:
                 self._orphan_obs_streak = 0
         except Exception:
             self._orphan_obs_streak = 0
+        # Body Migration Phase 2 (27.05.2026, Бендер): sync server-side
+        # biochem deps в client biochem state перед handle_tick. Без этого
+        # decay_step считает по stale полям (всегда energy=100, hydration=100,
+        # infected=False) и cortisol-from-hunger / cortisol-from-thirst /
+        # histamine-from-infection не работают. Использует .get(default)
+        # — legacy server без поля не ломает.
+        biochem_dict = getattr(self.compute, "biochem", None)
+        if biochem_dict:
+            for _c in creatures:
+                _cid = _c.get("cid")
+                _bc = biochem_dict.get(_cid) if _cid else None
+                if _bc is None:
+                    continue
+                if "energy" in _c:
+                    try:
+                        _bc.energy = float(_c["energy"])
+                    except (TypeError, ValueError):
+                        pass
+                if "hydration" in _c:
+                    try:
+                        _bc.hydration = float(_c["hydration"])
+                    except (TypeError, ValueError):
+                        pass
+                if "infected" in _c:
+                    _bc.infected = bool(_c["infected"])
+                if "infection_severity" in _c:
+                    try:
+                        _bc.infection_severity = float(_c["infection_severity"])
+                    except (TypeError, ValueError):
+                        pass
+                if "pair_bond_strength" in _c:
+                    try:
+                        _bc.pair_bond_strength = float(_c["pair_bond_strength"])
+                    except (TypeError, ValueError):
+                        pass
+                if "last_social_tick" in _c:
+                    try:
+                        _bc.last_social_tick = int(_c["last_social_tick"])
+                    except (TypeError, ValueError):
+                        pass
         try:
             actions = self.compute.handle_tick(obs_per_cid,
                                                 events_per_cid=events_per_cid,
