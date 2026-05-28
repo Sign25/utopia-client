@@ -34,6 +34,11 @@ EMPTY_WORLD_CHECK_SEC = 30.0
 # SFNN-правил на P40 → diskstore → возврат в seed_pack). 2 мин —
 # компромисс между свежестью при reannounce и нагрузкой на БД.
 STATE_SYNC_INTERVAL_SEC = 120.0
+# Colony Ownership Migration §5.2 (28.05.2026): projection_batch — клиент
+# шлёт публичные проекции owned Zodchiy P40 (P40 размещает в _world.creatures
+# для физики/AOI/арбитража). Schema projection_batch_draft.md §3.
+# 5 Hz (chem throttle из ТЗ Q4) = каждые 0.2с.
+PROJECTION_BATCH_INTERVAL_SEC = 0.2
 # Variant B leak fix (19.05.2026): cid считается мёртвым, если не появлялся
 # в obs_batch STALE_CID_TICKS подряд. P40 World ~25 TPS — 1500 тиков ≈ 60с
 # с запасом против транзитных гэпов obs_batch. GC запускается не чаще
@@ -267,6 +272,27 @@ class ColonyWSClient:
             # local_save в hello + сразу шлём seed_pack_start/chunk*/complete.
             local_pack = self._scan_local_seed_pack()
 
+            # Colony Ownership Migration §5.1 (28.05): n_local — сколько
+            # owned Zodchiy у клиента в local persistence. P40 при n_local>0
+            # НЕ запускает push_owned_seed, НЕ auto-respawn — ждёт
+            # projection_batch. При n_local=0 — build_seed_pack как раньше.
+            n_local = 0
+            try:
+                from .config import colonies_dir
+                states_dir = colonies_dir() / "states"
+                if states_dir.exists():
+                    n_local = len(list(states_dir.glob("*.pt")))
+            except Exception as e:
+                logger.debug("hello n_local scan failed: %s", e)
+            # Colony Ownership Migration §5: при n_local>0 client igнорирует
+            # incoming seed_start/chunk/complete (defensive client-side guard
+            # против legacy P40 push). Источник истины — local persistence.
+            self._reject_incoming_seeds = (n_local > 0)
+            if self._reject_incoming_seeds:
+                logger.info(
+                    "client-authoritative: n_local=%d → reject incoming seeds",
+                    n_local)
+
             hello_msg: dict = {
                 "type": "hello",
                 "colony_name": self.colony_name,
@@ -276,6 +302,7 @@ class ColonyWSClient:
                 "lineage": "wanderer",
                 "genesis_mode": self.genesis_mode,
                 "ts": int(time.time() * 1000),
+                "n_local": n_local,
             }
             if local_pack:
                 hello_msg["local_save"] = {
@@ -298,6 +325,8 @@ class ColonyWSClient:
             save_task = asyncio.create_task(self._save_loop())
             empty_task = asyncio.create_task(self._empty_world_loop())
             sync_task = asyncio.create_task(self._state_sync_loop(ws))
+            # Colony Ownership Migration §5.2: periodic projection_batch.
+            proj_task = asyncio.create_task(self._projection_batch_loop(ws))
             try:
                 async for raw in ws:
                     try:
@@ -401,6 +430,43 @@ class ColonyWSClient:
                 logger.debug("client_state_sync sent: n=%d", len(items))
             except Exception as e:
                 logger.warning("client_state_sync send failed: %s", e)
+                return
+
+    async def _projection_batch_loop(self, ws) -> None:
+        """Colony Ownership Migration §5.2 (28.05.2026, Бендер): periodic
+        projection_batch emit. 5 Hz (chem throttle Q4).
+
+        Schema (projection_batch_draft.md §3 финал 28.05):
+            {type: 'projection_batch', tick_client, ts_client_ms,
+             creatures: [{cid, species_id, alive, frozen, action,
+                          chem{7}, mental_break}, ...]}
+
+        P40 при non-empty client n_local — ждёт эти batches вместо
+        push_owned_seed (см. hello.n_local). Использует только для
+        физики Мира, не authoritative.
+        """
+        self._projections_sent: int = getattr(self, "_projections_sent", 0)
+        while True:
+            await asyncio.sleep(PROJECTION_BATCH_INTERVAL_SEC)
+            if self.compute is None:
+                continue
+            try:
+                projections = self.compute.build_projection_batch()
+            except Exception as e:
+                logger.debug("build_projection_batch failed: %s", e)
+                continue
+            if not projections:
+                continue
+            try:
+                await ws.send(json.dumps({
+                    "type": "projection_batch",
+                    "tick_client": int(self.last_world_tick),
+                    "ts_client_ms": int(time.time() * 1000),
+                    "creatures": projections,
+                }))
+                self._projections_sent += 1
+            except Exception as e:
+                logger.debug("projection_batch send failed: %s", e)
                 return
 
     async def _maybe_request_respawn(self, connect_ts: float) -> bool:
@@ -597,12 +663,22 @@ class ColonyWSClient:
             return
         # ── Phase F3.1.b/d: seed (chunked weights) ──────────────────────
         if msg_type == "seed_start":
+            if getattr(self, "_reject_incoming_seeds", False):
+                logger.warning(
+                    "seed_start ignored (client-authoritative, n_local>0)")
+                return
             self._handle_seed_start(msg)
             return
         if msg_type == "seed_chunk":
+            if getattr(self, "_reject_incoming_seeds", False):
+                return
             self._handle_seed_chunk(msg)
             return
         if msg_type == "seed_complete":
+            if getattr(self, "_reject_incoming_seeds", False):
+                logger.warning(
+                    "seed_complete ignored (client-authoritative)")
+                return
             await self._handle_seed_complete(msg)
             return
         # ── F4: seed.norg (центральный «днк-предок» от P40) ─────────────

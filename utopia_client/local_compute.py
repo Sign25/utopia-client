@@ -3483,6 +3483,50 @@ class LocalColonyCompute:
         return natural_selection_snapshot(
             self.biochem, capacity=capacity, top_n_to_emit=3)
 
+    # ── Colony Ownership Migration §5.2: projection_batch ────────────────
+
+    def build_projection_batch(self) -> list[dict]:
+        """Собрать lightweight projection всех owned Zodchiy для P40.
+
+        Schema (projection_batch_draft.md §3 ФИНАЛ 28.05):
+            {cid, species_id, alive, frozen, action, chem{7}, mental_break}
+
+        P40 размещает проекции в _world.creatures, использует только для
+        физики Мира (AOI, флора, видимость, арбитраж). НЕ держит
+        authoritative веса — те только у клиента.
+
+        Throttling 5 Hz делается caller'ом (main loop).
+        """
+        projections: list[dict] = []
+        for cid, org in self.organisms.items():
+            bc = self.biochem.get(cid)
+            last_action = self.last_action.get(cid, -1) if hasattr(self, "last_action") else -1
+            proj: dict = {
+                "cid": str(cid),
+                "species_id": self.species_id.get(cid) if hasattr(self, "species_id") else None,
+                "alive": True,  # client решает death; см. handle_tick + biochem
+                "frozen": False,
+                "action": int(last_action) if last_action >= 0 else -1,
+            }
+            if bc is not None:
+                # 7 ephemeral (без histamine = mirror infection_severity)
+                proj["chem"] = {
+                    "cortisol": float(getattr(bc, "cortisol", 0.0)),
+                    "dopamine": float(getattr(bc, "dopamine", 0.0)),
+                    "serotonin": float(getattr(bc, "serotonin", 0.0)),
+                    "oxytocin": float(getattr(bc, "oxytocin", 0.0)),
+                    "adrenaline": float(getattr(bc, "adrenaline", 0.0)),
+                    "glucose": float(getattr(bc, "glucose", 0.0)),
+                    "fatigue": float(getattr(bc, "fatigue", 0.0)),
+                }
+                mb = str(getattr(bc, "mental_break", "") or "")
+                proj["mental_break"] = mb if mb else None
+            else:
+                proj["chem"] = None
+                proj["mental_break"] = None
+            projections.append(proj)
+        return projections
+
     # ── Phase 4 этап E+F (28.05.2026): local-only reproduction flow ────
 
     def detect_and_emit_mate_pairs(
