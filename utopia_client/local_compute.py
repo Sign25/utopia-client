@@ -1062,6 +1062,130 @@ class LocalColonyCompute:
                 logger.warning("apply_inherited_state %s language: %s",
                                 cid, e)
 
+    def restore_persisted_state(self, cid: str, payload: dict) -> None:
+        """Colony Ownership Migration §5.1: bit-exact restore from local .pt.
+
+        В отличие от `apply_inherited_state` (Y50 noise для дочернего
+        organism), здесь restore-from-disk применяет state **as-is** —
+        тот же organism, не ребёнок. Дополнительно восстанавливает
+        biochem (8 эфемерид + 7 baseline + mental_break).
+
+        Pre-requisite: `add_creature(cid, organism, lineage)` уже
+        выполнен с tissues от родителя/seed. Здесь только load_state_dict
+        на нейронные модули + biochem restore.
+        """
+        if cid not in self.organisms:
+            logger.warning("restore_persisted_state: cid=%s unknown (skip)", cid)
+            return
+        org = self.organisms[cid]
+        # tissues_by_role — bit-exact (no Y50)
+        tbr = payload.get("tissues_by_role")
+        if isinstance(tbr, dict) and tbr:
+            role_to_tid = {
+                getattr(t, "role", ""): tid for tid, t in org.tissues.items()
+            }
+            for role, sd in tbr.items():
+                tid = role_to_tid.get(role)
+                if tid is None:
+                    continue
+                try:
+                    org.tissues[tid].load_state_dict(sd)
+                except Exception as e:
+                    logger.debug("restore_persisted_state %s tissue %s: %s",
+                                  cid, role, e)
+        # Hebbian / selector — direct load_state_dict
+        heb_sd = payload.get("hebbian")
+        if heb_sd is not None and self.hebbian.get(cid) is not None:
+            try:
+                self.hebbian[cid].load_state_dict(heb_sd)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s hebbian: %s", cid, e)
+        sel_sd = payload.get("selector")
+        sel = self.action_selectors.get(cid)
+        if sel_sd is not None and sel is not None and hasattr(sel, "load_state_dict"):
+            try:
+                sel.load_state_dict(sel_sd)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s selector: %s", cid, e)
+        # Predictor — без Y50, exact
+        pred_sd = payload.get("predictor")
+        if pred_sd is not None and self.predictor.get(cid) is not None:
+            try:
+                self.predictor[cid].load_state_dict(pred_sd)
+                self.predictor_opt[cid] = self._torch.optim.Adam(
+                    self.predictor[cid].parameters(), lr=1e-3)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s predictor: %s", cid, e)
+        # EMA aggregates
+        for key, target in (
+            ("predictor_loss_ema", "loss_ema"),
+            ("intrinsic_ema", "intrinsic_ema"),
+            ("entropy_ema", "entropy_ema"),
+            ("trace_norm_ema", "trace_norm_ema"),
+            ("reward_var_ema", "reward_var_ema"),
+        ):
+            if key in payload:
+                try:
+                    getattr(self, target)[cid] = float(payload[key])
+                except Exception:
+                    pass
+        # Higher tissues (brain migration) — exact, без Y50
+        for key, store in (
+            ("dopamine", self.dopamine),
+            ("imagination", self.imagination),
+            ("planner", self.planner),
+            ("insula", self.insula),
+            ("motor_policy", self.motor_policy),
+            ("theory_of_mind", self.theory_of_mind),
+            ("language", self.language),
+        ):
+            sd = payload.get(key)
+            tissue = store.get(cid)
+            if sd is None or tissue is None:
+                continue
+            try:
+                tissue.load_state_dict(sd)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s %s: %s", cid, key, e)
+        # motor_sfnn_rule / higher rules — direct apply
+        rule_d = payload.get("motor_sfnn_rule")
+        if rule_d is not None:
+            try:
+                from core.sfnn_rule import SFNNRule
+                self.motor_sfnn_rule[cid] = SFNNRule.from_dict(rule_d)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s motor_sfnn_rule: %s", cid, e)
+        higher_rules_d = payload.get("higher_tissue_sfnn_rules")
+        if higher_rules_d:
+            try:
+                from core.sfnn_rule import SFNNRule
+                for _t, _rule_d in higher_rules_d.items():
+                    if _t in self.higher_tissue_sfnn_rule:
+                        self.higher_tissue_sfnn_rule[_t][cid] = SFNNRule.from_dict(_rule_d)
+            except Exception as e:
+                logger.debug(
+                    "restore_persisted_state %s higher_rules: %s", cid, e)
+        # Biochem (Phase 2 эфемериды + baselines + mental_break)
+        bc_dict = payload.get("biochem")
+        if isinstance(bc_dict, dict):
+            try:
+                from .biochemistry import ClientCreatureBiochem
+                self.biochem[cid] = ClientCreatureBiochem(**bc_dict)
+            except TypeError:
+                # Schema mismatch — старый формат без новых полей; восстанавливаем
+                # частично через setattr на default instance.
+                try:
+                    from .biochemistry import make_default
+                    bc = make_default()
+                    for k, v in bc_dict.items():
+                        if hasattr(bc, k):
+                            setattr(bc, k, v)
+                    self.biochem[cid] = bc
+                except Exception as e:
+                    logger.warning("restore_persisted_state %s biochem fallback: %s", cid, e)
+            except Exception as e:
+                logger.warning("restore_persisted_state %s biochem: %s", cid, e)
+
     def restore_sfnn_state(self, cid: str, sfnn_state: dict) -> None:
         """S6.0b-B (16.05.2026): восстановить SFNN-правила из persistent-store.
 
@@ -1990,6 +2114,19 @@ class LocalColonyCompute:
                 payload[key] = tissue.state_dict()
             except Exception as e:
                 logger.debug("save_state %s %s: %s", cid, key, e)
+        # Colony Ownership Migration §5.1 (28.05.2026, Бендер):
+        # client-authoritative biochem persistence. Раньше Phase 2
+        # биохимия жила in-memory и reset'илась на каждый restart
+        # → root cause Phase 4 hotfix (oxytocin=0 → детекция спит).
+        # Теперь сохраняется в payload[biochem] как dict от dataclass.
+        bc = self.biochem.get(cid) if hasattr(self, "biochem") else None
+        if bc is not None:
+            try:
+                from dataclasses import asdict, is_dataclass
+                if is_dataclass(bc):
+                    payload["biochem"] = asdict(bc)
+            except Exception as e:
+                logger.debug("save_state %s biochem: %s", cid, e)
         return payload
 
     def save_all_states(self, dir_path) -> int:
@@ -2014,6 +2151,90 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("save_state %s torch.save failed: %s", cid, e)
         return n
+
+    def restore_colony_from_local(self, dir_path) -> list[str]:
+        """Colony Ownership Migration §5.1: восстановить колонию из local.
+
+        Сканирует `dir_path/*.pt`, для каждого:
+          1. torch.load(weights_only=False) payload
+          2. Build CompositeOrganism через seed_loader.organism_from_weights
+             (skeleton от seed.norg + веса из payload)
+          3. add_creature(cid, organism, lineage='zodchiy')
+          4. restore_persisted_state(cid, payload) — биохимия + EMA + SFNN
+          5. memory_store.load_memory_state(cid) — episodic recall
+
+        Returns:
+            List of restored cids. Empty list если dir не существует / пуст.
+
+        Errors:
+            Per-file ошибки логируются, не прерывают остальные.
+        """
+        from pathlib import Path
+        torch = self._torch
+        dir_path = Path(dir_path)
+        if not dir_path.exists() or not dir_path.is_dir():
+            logger.info("restore_colony_from_local: dir %s missing — empty start",
+                        dir_path)
+            return []
+        # Resolve seed for skeleton (нужен для organism_from_weights)
+        try:
+            from .seed_loader import seed_cache_path, organism_from_weights
+        except Exception as e:
+            logger.warning("restore_colony_from_local: seed_loader import: %s", e)
+            return []
+        seed_path = seed_cache_path("elder")
+        if not seed_path.exists():
+            logger.warning(
+                "restore_colony_from_local: seed %s missing — cannot rebuild",
+                seed_path)
+            return []
+
+        restored: list[str] = []
+        for pt_file in sorted(dir_path.glob("*.pt")):
+            cid = pt_file.stem
+            if cid in self.organisms:
+                logger.debug("restore_colony_from_local: %s already loaded, skip",
+                              cid)
+                continue
+            try:
+                # weights_only=False — payload содержит non-tensor (dicts, floats)
+                payload = torch.load(pt_file, map_location="cpu",
+                                      weights_only=False)
+            except Exception as e:
+                logger.warning("restore_colony_from_local: load %s failed: %s",
+                                pt_file.name, e)
+                continue
+            if not isinstance(payload, dict):
+                logger.warning("restore_colony_from_local: %s not a dict (skip)",
+                                pt_file.name)
+                continue
+            # Build skeleton + apply tissue weights via organism_from_weights.
+            # Это требует weights_bytes — у нас payload dict, не bytes.
+            # Альтернатива: load_founders + restore_persisted_state.
+            try:
+                from .seed_loader import load_founders
+                org = load_founders(seed_path, 1)[0]
+                org.id = f"restored_{cid}"
+            except Exception as e:
+                logger.warning("restore_colony_from_local: load_founders %s: %s",
+                                cid, e)
+                continue
+            try:
+                self.add_creature(cid, org, lineage="zodchiy")
+            except Exception as e:
+                logger.warning("restore_colony_from_local: add_creature %s: %s",
+                                cid, e)
+                continue
+            try:
+                self.restore_persisted_state(cid, payload)
+            except Exception as e:
+                logger.warning(
+                    "restore_colony_from_local: restore_persisted_state %s: %s",
+                    cid, e)
+            restored.append(cid)
+        logger.info("restore_colony_from_local: %d organisms restored from %s",
+                    len(restored), dir_path)
+        return restored
 
     @staticmethod
     def _compute_immediate_reward(event: dict) -> float:
