@@ -3682,13 +3682,19 @@ class LocalColonyCompute:
                 pass
 
             # 7. Build envelope (projection-model schema, ТЗ §2)
+            # species_id: наследуем от mother (Хьюбертов handler ожидает)
+            child_species_id = (
+                getattr(mother, "species_id", None)
+                or getattr(father, "species_id", None)
+                or 0
+            )
             envelope = {
                 "type": "newborn_announce",
                 "child_cid": child_cid,
                 "parent_cid": mother_cid,
                 "parent2_cid": father_cid,
                 "traits": child_traits,
-                "species_id": None,  # speciation wiring отдельно
+                "species_id": int(child_species_id),
                 "generation": child_generation,
                 "ts_client": _time.time(),
             }
