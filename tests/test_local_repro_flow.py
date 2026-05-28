@@ -94,13 +94,22 @@ def test_ready_pair_emits_and_registers_pending(compute_with_two_zodchiy):
     # Child добавлен в colony
     assert child_cid in c.organisms
     assert len(c.organisms) == n_before + 1
-    # Envelope отправлен
+    # Envelope отправлен (projection-model schema, ТЗ 8b8f184 §2)
     assert len(mock.sent_payloads) == 1
     env = mock.sent_payloads[0]
     assert env["type"] == "newborn_announce"
-    assert env["cid"] == child_cid
-    assert set(env["parent_cids"]) == {"parent-0", "parent-1"}
-    assert env["lineage"] == "zodchiy"
+    assert env["child_cid"] == child_cid
+    # parent_cid + parent2_cid (not array)
+    parents = {env["parent_cid"], env["parent2_cid"]}
+    assert parents == {"parent-0", "parent-1"}
+    # 9 child traits + generation
+    assert "traits" in env
+    expected_traits = {"vision_radius", "smell_radius", "attack_radius",
+                       "move_speed", "attack_power", "armor",
+                       "efficiency", "camel", "diet_gene"}
+    assert set(env["traits"].keys()) == expected_traits
+    assert "generation" in env
+    assert env["generation"] == 1  # parents default gen=0
     # Pending зарегистрирован
     assert child_cid in c._pending_newborn_envelopes
     # Cooldown started для обоих parents
@@ -158,6 +167,28 @@ def test_cooldown_lifted_after_threshold(compute_with_two_zodchiy):
 # handle_newborn_announce_ack
 # ────────────────────────────────────────────────────────────────────
 
+def test_traits_within_ranges(compute_with_two_zodchiy):
+    """ТЗ §6 R1: client clamps child traits within ranges."""
+    c = compute_with_two_zodchiy
+    mock = _MockEmbodiedClient()
+    born = c.detect_and_emit_mate_pairs(world_tick=10000, embodied_client=mock)
+    assert len(born) == 1
+    traits = mock.sent_payloads[0]["traits"]
+    for name, (lo, hi) in c._TRAIT_RANGES.items():
+        assert lo <= traits[name] <= hi, f"{name}={traits[name]} вне [{lo},{hi}]"
+
+
+def test_generation_increments(compute_with_two_zodchiy):
+    """Generation child = max(parents) + 1."""
+    c = compute_with_two_zodchiy
+    c.organisms["parent-0"].generation = 3
+    c.organisms["parent-1"].generation = 5
+    mock = _MockEmbodiedClient()
+    born = c.detect_and_emit_mate_pairs(world_tick=10000, embodied_client=mock)
+    env = mock.sent_payloads[0]
+    assert env["generation"] == 6  # max(3, 5) + 1
+
+
 def test_ack_accepted_applies_traits(compute_with_two_zodchiy):
     c = compute_with_two_zodchiy
     mock = _MockEmbodiedClient()
@@ -167,7 +198,7 @@ def test_ack_accepted_applies_traits(compute_with_two_zodchiy):
 
     ack = {
         "type": "newborn_announce_ack",
-        "cid": child_cid,
+        "child_cid": child_cid,
         "accepted": True,
         "reason": None,
         "traits": {

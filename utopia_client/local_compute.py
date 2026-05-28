@@ -3529,27 +3529,73 @@ class LocalColonyCompute:
 
     # ── Phase 4 этап E+F (28.05.2026): local-only reproduction flow ────
 
+    # 9 traits child inheritance — projection model (ТЗ 8b8f184 §4.1).
+    # Диапазоны (ТЗ §6 R1): client clamps до отправки P40.
+    _TRAIT_RANGES: dict = {
+        "vision_radius": (3, 12),
+        "smell_radius": (5, 40),
+        "attack_radius": (1, 5),
+        "move_speed": (1, 10),
+        "attack_power": (1, 10),
+        "armor": (0, 10),
+        "efficiency": (1, 10),
+        "camel": (5, 30),
+        "diet_gene": (0.0, 1.0),
+    }
+
+    def _inherit_traits_for_newborn(self, mother, father) -> dict:
+        """Compute child 9 traits via parent crossover + clamp.
+
+        Per-trait: 50/50 от родителя + малый Gaussian noise (σ=φ⁻⁵≈0.09 от range).
+        clamp в _TRAIT_RANGES (R1 R-mitigation: invalid not sent P40).
+        """
+        import random as _random
+        out: dict = {}
+        sigma_frac = 0.0902  # 1/φ⁵
+        for name, (lo, hi) in self._TRAIT_RANGES.items():
+            m_val = getattr(mother, name, None)
+            f_val = getattr(father, name, None)
+            if m_val is None and f_val is None:
+                # Default median
+                base = (lo + hi) / 2.0
+            elif m_val is None:
+                base = float(f_val)
+            elif f_val is None:
+                base = float(m_val)
+            else:
+                base = float(m_val) if _random.random() < 0.5 else float(f_val)
+            # Small Gaussian noise — scale to range
+            span = float(hi - lo)
+            noise = _random.gauss(0.0, sigma_frac * span)
+            val = base + noise
+            # Clamp
+            val = max(float(lo), min(float(hi), val))
+            # Integer fields → int
+            if isinstance(lo, int) and isinstance(hi, int):
+                val = int(round(val))
+            else:
+                val = float(val)
+            out[name] = val
+        return out
+
     def detect_and_emit_mate_pairs(
         self,
         world_tick: int,
         embodied_client=None,
     ) -> list[str]:
-        """Phase 4 E+F: scan own colony, build child, emit newborn_announce.
+        """Phase 4 reproduction под projection-модель (ТЗ 8b8f184).
 
         Flow per detected pair:
           1. Pick (mother_cid, father_cid) — only among own organisms
              (cross-owner ЗАПРЕЩЁН, vision §3.2)
-          2. Clone mother organism + crossover with father (Y50 + 50/50
-             per-tissue + topology mutations) → child organism in memory
+          2. Clone mother organism + crossover with father → child organism
           3. Allocate UUID `child_cid`
           4. `add_creature(child_cid, child_organism, lineage="zodchiy")`
-             (это автоматически load episodic, init biochem)
-          5. Build newborn_announce envelope:
-             `{type, cid, parent_cids: [mother, father], species_id,
-                lineage, ts_client, protocol_version}`
-          6. Emit через `embodied_client.send_state(envelope)`
-          7. Регистрируем pending: `_pending_newborn_envelopes[child_cid]`
-             — ждём ack через `handle_newborn_announce_ack`
+          5. Compute child traits via parent crossover (9 полей, clamped)
+          6. Compute generation = max(parents.generation) + 1
+          7. Build newborn_announce envelope (projection schema):
+             {type, child_cid, parent_cid, parent2_cid, traits, species_id, generation}
+          8. Emit + register pending → ждём ack
 
         Args:
             world_tick: текущий мировой тик (для cooldown + envelope ts)
@@ -3620,15 +3666,31 @@ class LocalColonyCompute:
                 logger.warning("add_creature %s failed: %s", child_cid, e)
                 continue
 
-            # 5. Build envelope (msgpack-encoded later by embodied_ws)
+            # 5. Compute child traits via parent crossover (ТЗ §4.1)
+            # 9 полей: vision_radius, smell_radius, attack_radius, move_speed,
+            #          attack_power, armor, efficiency, camel, diet_gene
+            # Clamping (R1): защита диапазонов до отправки P40.
+            child_traits = self._inherit_traits_for_newborn(mother, father)
+
+            # 6. Generation = max(parents) + 1
+            mother_gen = int(getattr(mother, "generation", 0))
+            father_gen = int(getattr(father, "generation", 0))
+            child_generation = max(mother_gen, father_gen) + 1
+            try:
+                child_org.generation = child_generation
+            except Exception:
+                pass
+
+            # 7. Build envelope (projection-model schema, ТЗ §2)
             envelope = {
                 "type": "newborn_announce",
-                "cid": child_cid,
-                "parent_cids": [mother_cid, father_cid],
-                "species_id": None,  # filled later when speciation wired
-                "lineage": "zodchiy",
+                "child_cid": child_cid,
+                "parent_cid": mother_cid,
+                "parent2_cid": father_cid,
+                "traits": child_traits,
+                "species_id": None,  # speciation wiring отдельно
+                "generation": child_generation,
                 "ts_client": _time.time(),
-                "protocol_version": 1,
             }
 
             # 6. Emit
@@ -3641,9 +3703,11 @@ class LocalColonyCompute:
                     sent = False
 
             if sent:
-                # 7. Register pending — ждём ack
+                # 8. Register pending — ждём ack
                 self._pending_newborn_envelopes[child_cid] = {
-                    "parent_cids": [mother_cid, father_cid],
+                    "parent_cid": mother_cid,
+                    "parent2_cid": father_cid,
+                    "generation": child_generation,
                     "ts_emit": _time.time(),
                 }
                 mark_mate_event(
@@ -3690,9 +3754,11 @@ class LocalColonyCompute:
         """
         if not isinstance(ack_payload, dict):
             return False
-        cid = str(ack_payload.get("cid", ""))
+        # Schema: новая projection-модель использует child_cid; legacy embodied
+        # путь использовал cid. Принимаем оба.
+        cid = str(ack_payload.get("child_cid") or ack_payload.get("cid") or "")
         if not cid:
-            logger.debug("ack missing cid: %s", ack_payload)
+            logger.debug("ack missing child_cid/cid: %s", ack_payload)
             return False
 
         pending = self._pending_newborn_envelopes.pop(cid, None)
