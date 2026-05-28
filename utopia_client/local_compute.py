@@ -433,6 +433,11 @@ class LocalColonyCompute:
         # остаётся на P40 (vision §2.5).
         self.biochem: dict = {}  # cid → ClientCreatureBiochem
 
+        # Phase 4 этап G (28.05.2026): cache естественный отбор capacity.
+        # estimate_population() запускает CPU benchmark (~секунды), не
+        # должна вызываться каждые push_diagnostics. Init once on demand.
+        self._natural_selection_capacity: int | None = None
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -3209,6 +3214,45 @@ class LocalColonyCompute:
             "histamine_avg": round(sums["histamine"] / n, 2),
         }
 
+    def _build_natural_selection_snapshot(self) -> dict:
+        """Phase 4 этап G (28.05.2026, Бендер): естественный отбор tracking.
+
+        Pure observability — client НЕ вмешивается в жизнь организмов
+        (vision §3.1 «вариант D»). Server-side рычаги (flora_density,
+        TelomerePhase decay, safe_grove_mult) делают давление сами.
+        Здесь только snapshot для diag и frontend.
+
+        Эмитится в diag['natural_selection']:
+            {n_organisms, capacity, weakest_cids, scores, mean_score, max_score}
+
+        Если biochem empty (нет zodchiy) — n_organisms=0, capacity сохра-
+        няется (для frontend context).
+        """
+        try:
+            from .natural_selection import natural_selection_snapshot
+        except Exception as e:
+            logger.debug("natural_selection module import failed: %s", e)
+            return {"n_organisms": 0, "capacity": None,
+                    "weakest_cids": [], "scores": {},
+                    "mean_score": 0.0, "max_score": 0.0}
+        # capacity = estimate_population() — потолок по железу.
+        # Cached on first call (бенчмарк дорогой ~секунды), не пересчи-
+        # тывается на каждый push_diagnostics.
+        if self._natural_selection_capacity is None:
+            try:
+                from .benchmark import estimate_population, run_full
+                self._natural_selection_capacity = estimate_population(run_full())
+                logger.info("natural_selection capacity = %d (cached)",
+                            self._natural_selection_capacity)
+            except Exception as e:
+                logger.debug("estimate_population failed: %s", e)
+                self._natural_selection_capacity = -1  # sentinel: tried, failed
+        capacity = (self._natural_selection_capacity
+                    if self._natural_selection_capacity and
+                       self._natural_selection_capacity > 0 else None)
+        return natural_selection_snapshot(
+            self.biochem, capacity=capacity, top_n_to_emit=3)
+
     def _apply_biochem_mental_break(
         self, cid: str, world_tick: int = 0,
     ) -> None:
@@ -4026,6 +4070,12 @@ class LocalColonyCompute:
             # биохимия snapshot — для UI Brain панели (mental_break states
             # heatmap, chem averages) + Хьюберт merge на VPS если потребуется.
             "biochem": self._build_biochem_snapshot(),
+            # Phase 4 этап G (Бендер, 28.05.2026): естественный отбор
+            # tracking — pure observability. Client не вмешивается в жизнь,
+            # только наблюдает кто weak. Server-side давление
+            # (flora_density / TelomerePhase / safe_grove_mult) делает
+            # отбор само. См. utopia_client/natural_selection.py.
+            "natural_selection": self._build_natural_selection_snapshot(),
             "s2_tom_acc_avg": s2_tom_avg,
             "tom_steps_total": int(self.tom_steps),
             "s2_lang_acc_avg": s2_lang_avg,
