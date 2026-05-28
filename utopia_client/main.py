@@ -455,6 +455,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     embodied_ws = None  # type: ignore[var-annotated]
     embodied_org = None  # type: ignore[var-annotated]
 
+    # Phase 4 этап F (28.05.2026): local-only reproduction loop state.
+    # Gate'нут через `cfg["local_repro_enabled"]` (default False).
+    # Активация — координированный rolling restart: Хьюберт ставит
+    # WorldConfig.client_owns_reproduction=True на P40 + Шеф deploys
+    # client с этим флагом True одновременно. До этого момента detect
+    # loop спит — P40 продолжает инициировать mate_request для owned
+    # Zodchiy (Phase 4 R1 mitigation — vision §3.2 cross-owner ban).
+    last_repro_check_tick = 0
+    REPRO_CHECK_INTERVAL_TICKS = 100  # ~3.3 сек @ 30 TPS
+
     last_heartbeat = 0.0
     last_poll = 0.0
     last_logpush = 0.0
@@ -566,8 +576,30 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 try:
                                     from .embodied_ws import EmbodiedWSClient
                                     from .embodied import EmbodiedOrganism
+
+                                    # Phase 4 F: dispatcher для msg.type
+                                    # routing. Phase 1 echo обработывается
+                                    # как раньше (legacy), newborn_announce_ack
+                                    # forwards в compute.
+                                    def _embodied_dispatcher(msg: dict) -> None:
+                                        if not isinstance(msg, dict):
+                                            return
+                                        mtype = msg.get("type", "")
+                                        if mtype == "newborn_announce_ack":
+                                            if ws is not None and ws.compute is not None:
+                                                try:
+                                                    ws.compute.handle_newborn_announce_ack(msg)
+                                                except Exception as e:
+                                                    logger.warning(
+                                                        "newborn_announce_ack handler error: %s", e)
+                                        # else: Phase 1 echo / legacy obs —
+                                        # latency stats уже считаются в
+                                        # _handle_msg перед callback.
+
                                     embodied_ws = EmbodiedWSClient(
-                                        cfg["server"], cfg["token"])
+                                        cfg["server"], cfg["token"],
+                                        on_observation=_embodied_dispatcher,
+                                    )
                                     embodied_ws.start()
                                     if ws.compute is not None:
                                         embodied_org = EmbodiedOrganism(
@@ -715,6 +747,36 @@ def cmd_run(args: argparse.Namespace) -> int:
                         world_tick=ws.last_world_tick)
                 except Exception as e:
                     logger.debug("embodied emit error: %s", e)
+
+            # Phase 4 этап F (28.05.2026): local-only reproduction loop.
+            # Periodic detect mate-pairs среди own colony → emit
+            # newborn_announce → ack handler в _embodied_dispatcher
+            # выше.
+            #
+            # Gate'нут через `local_repro_enabled` (default False).
+            # ВКЛЮЧАЕТСЯ только синхронно с P40-side toggle
+            # `WorldConfig.client_owns_reproduction=True` — иначе
+            # дублирование (P40 шлёт mate_request И client детектит
+            # pair → два newborn). См. R1 в design doc
+            # docs/phase4_local_reproduction_flow.md.
+            if (cfg.get("local_repro_enabled", False)
+                    and ws is not None and ws.compute is not None
+                    and embodied_ws is not None and embodied_ws.connected
+                    and ws.last_world_tick - last_repro_check_tick
+                        >= REPRO_CHECK_INTERVAL_TICKS):
+                try:
+                    born = ws.compute.detect_and_emit_mate_pairs(
+                        world_tick=int(ws.last_world_tick),
+                        embodied_client=embodied_ws,
+                    )
+                    if born:
+                        logger.info(
+                            "local repro: emitted %d newborns at tick %d",
+                            len(born), ws.last_world_tick)
+                    last_repro_check_tick = int(ws.last_world_tick)
+                except Exception as e:
+                    logger.warning("local repro detect failed: %s", e)
+                    last_repro_check_tick = int(ws.last_world_tick)
 
             # Heartbeat
             if now - last_heartbeat >= HEARTBEAT_SEC:
