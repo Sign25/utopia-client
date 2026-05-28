@@ -438,6 +438,15 @@ class LocalColonyCompute:
         # должна вызываться каждые push_diagnostics. Init once on demand.
         self._natural_selection_capacity: int | None = None
 
+        # Phase 4 этап E+F (28.05.2026): local-only reproduction state.
+        # `_last_mate_tick`: cooldown per cid (mate_detection module).
+        # `_pending_newborn_envelopes`: newborns awaiting newborn_announce_ack
+        #   {cid: {"parent_cids": [...], "ts_emit": float}}.
+        # При successful ack — traits применяются + cooldown updates.
+        # При reject — `remove_creature(cid)` cleanup.
+        self._last_mate_tick: dict[str, int] = {}
+        self._pending_newborn_envelopes: dict[str, dict] = {}
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Регистрация особей ───────────────────────────────────────────────
@@ -3252,6 +3261,215 @@ class LocalColonyCompute:
                        self._natural_selection_capacity > 0 else None)
         return natural_selection_snapshot(
             self.biochem, capacity=capacity, top_n_to_emit=3)
+
+    # ── Phase 4 этап E+F (28.05.2026): local-only reproduction flow ────
+
+    def detect_and_emit_mate_pairs(
+        self,
+        world_tick: int,
+        embodied_client=None,
+    ) -> list[str]:
+        """Phase 4 E+F: scan own colony, build child, emit newborn_announce.
+
+        Flow per detected pair:
+          1. Pick (mother_cid, father_cid) — only among own organisms
+             (cross-owner ЗАПРЕЩЁН, vision §3.2)
+          2. Clone mother organism + crossover with father (Y50 + 50/50
+             per-tissue + topology mutations) → child organism in memory
+          3. Allocate UUID `child_cid`
+          4. `add_creature(child_cid, child_organism, lineage="zodchiy")`
+             (это автоматически load episodic, init biochem)
+          5. Build newborn_announce envelope:
+             `{type, cid, parent_cids: [mother, father], species_id,
+                lineage, ts_client, protocol_version}`
+          6. Emit через `embodied_client.send_state(envelope)`
+          7. Регистрируем pending: `_pending_newborn_envelopes[child_cid]`
+             — ждём ack через `handle_newborn_announce_ack`
+
+        Args:
+            world_tick: текущий мировой тик (для cooldown + envelope ts)
+            embodied_client: EmbodiedWSClient — для send_state. Если None
+                (тестирование/disconnected), build child локально но НЕ
+                эмитим (pending не записывается → caller узнает по
+                returns list пустой).
+
+        Returns:
+            List of child cids которые были built + emitted (или пустой
+            если embodied_client недоступен).
+        """
+        import time as _time
+        import uuid as _uuid
+
+        try:
+            from .mate_detection import detect_mate_pairs, mark_mate_event
+            from .crossover import apply_crossover_inheritance
+        except Exception as e:
+            logger.warning("detect_and_emit_mate_pairs imports failed: %s", e)
+            return []
+
+        # 1. Scan биохимии — только own organisms (compute.biochem все own)
+        pairs = detect_mate_pairs(
+            self.biochem, self._last_mate_tick, world_tick)
+        if not pairs:
+            return []
+
+        born_cids: list[str] = []
+        for mother_cid, father_cid in pairs:
+            mother = self.organisms.get(mother_cid)
+            father = self.organisms.get(father_cid)
+            if mother is None or father is None:
+                logger.debug("mate pair %s+%s: organism missing", mother_cid, father_cid)
+                continue
+
+            # 2. Clone mother + apply crossover with father weights
+            # Deep clone организма матери — нужно потому что crossover
+            # пишет в child (нам нужна копия не задействующая мать).
+            try:
+                import copy as _copy
+                child_org = _copy.deepcopy(mother)
+            except Exception as e:
+                logger.warning("deepcopy mother %s failed: %s", mother_cid, e)
+                continue
+
+            try:
+                apply_crossover_inheritance(
+                    child_org=child_org,
+                    mother_org=mother,
+                    father_org=father,
+                )
+            except Exception as e:
+                logger.warning("crossover %s+%s failed: %s",
+                               mother_cid, father_cid, e)
+                continue
+
+            # 3. Allocate UUID
+            child_cid = _uuid.uuid4().hex
+
+            # 4. Register child локально — биохимия и episodic подтянутся
+            # через add_creature (auto-load episodic + biochem init).
+            # Биохимия Z7 inheritance — через make_from_inheritance в
+            # отдельном flow (Phase 2 уже работает для asexual).
+            try:
+                self.add_creature(child_cid, child_org, lineage="zodchiy")
+            except Exception as e:
+                logger.warning("add_creature %s failed: %s", child_cid, e)
+                continue
+
+            # 5. Build envelope (msgpack-encoded later by embodied_ws)
+            envelope = {
+                "type": "newborn_announce",
+                "cid": child_cid,
+                "parent_cids": [mother_cid, father_cid],
+                "species_id": None,  # filled later when speciation wired
+                "lineage": "zodchiy",
+                "ts_client": _time.time(),
+                "protocol_version": 1,
+            }
+
+            # 6. Emit
+            sent = False
+            if embodied_client is not None:
+                try:
+                    sent = bool(embodied_client.send_state(envelope))
+                except Exception as e:
+                    logger.warning("embodied send newborn_announce failed: %s", e)
+                    sent = False
+
+            if sent:
+                # 7. Register pending — ждём ack
+                self._pending_newborn_envelopes[child_cid] = {
+                    "parent_cids": [mother_cid, father_cid],
+                    "ts_emit": _time.time(),
+                }
+                mark_mate_event(
+                    self._last_mate_tick,
+                    [mother_cid, father_cid],
+                    world_tick,
+                )
+                born_cids.append(child_cid)
+                logger.info(
+                    "newborn_announce emitted cid=%s mother=%s father=%s",
+                    child_cid, mother_cid, father_cid,
+                )
+            else:
+                # Emit failed — rollback child creation
+                logger.debug(
+                    "newborn emit failed, removing local child %s", child_cid)
+                try:
+                    self.remove_creature(child_cid)
+                except Exception:
+                    pass
+
+        return born_cids
+
+    def handle_newborn_announce_ack(self, ack_payload: dict) -> bool:
+        """Phase 4 F: process incoming newborn_announce_ack from P40.
+
+        ack_payload schema (Хьюберт `server/embodied_newborn.py`):
+            {
+                "type": "newborn_announce_ack",
+                "cid": str,
+                "accepted": bool,
+                "reason": str | None,
+                "traits": {vision_radius, smell_radius, attack_radius,
+                          move_speed, attack_power, armor, efficiency,
+                          camel, diet_gene} | None,
+                "ts_server": float,
+            }
+
+        Если `accepted=True` — apply traits, удалить из pending.
+        Если `accepted=False` — `remove_creature(cid)` cleanup.
+
+        Returns:
+            True если ack обработан корректно, False иначе.
+        """
+        if not isinstance(ack_payload, dict):
+            return False
+        cid = str(ack_payload.get("cid", ""))
+        if not cid:
+            logger.debug("ack missing cid: %s", ack_payload)
+            return False
+
+        pending = self._pending_newborn_envelopes.pop(cid, None)
+        if pending is None:
+            logger.debug("ack for unknown pending cid=%s", cid)
+            # Не критично — может прийти повторно
+            return False
+
+        accepted = bool(ack_payload.get("accepted", False))
+        if not accepted:
+            reason = ack_payload.get("reason", "unknown")
+            logger.warning(
+                "newborn_announce rejected cid=%s reason=%s — cleanup",
+                cid, reason)
+            try:
+                self.remove_creature(cid)
+            except Exception as e:
+                logger.warning("cleanup remove_creature %s failed: %s", cid, e)
+            return True
+
+        # accepted=True — apply traits if provided
+        traits = ack_payload.get("traits")
+        org = self.organisms.get(cid)
+        if traits and org is not None:
+            try:
+                # Traits в client применяются как атрибуты CompositeOrganism
+                # (re-use паттерн _inherit_traits). Не все поля могут быть
+                # в organism — добавляем мягко через setattr.
+                applied = 0
+                for trait_name, trait_value in traits.items():
+                    try:
+                        setattr(org, trait_name, trait_value)
+                        applied += 1
+                    except Exception:
+                        pass
+                logger.info(
+                    "newborn accepted cid=%s traits_applied=%d", cid, applied)
+            except Exception as e:
+                logger.warning("apply traits %s failed: %s", cid, e)
+        else:
+            logger.info("newborn accepted cid=%s (no traits)", cid)
+        return True
 
     def _apply_biochem_mental_break(
         self, cid: str, world_tick: int = 0,
