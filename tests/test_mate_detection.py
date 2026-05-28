@@ -22,13 +22,14 @@ if str(_ROOT) not in sys.path:
 
 
 class _FakeBiochem:
-    """Минимальный duck-type под ClientCreatureBiochem."""
+    """Минимальный duck-type под ClientCreatureBiochem.
+
+    Default energy=600 (выше server threshold ≈500).
+    """
 
     def __init__(self, **kwargs):
         defaults = {
-            "energy": 100.0,
-            "oxytocin": 60.0,
-            "serotonin": 60.0,
+            "energy": 600.0,  # > MIN_ENERGY_FOR_REPRO ≈ 500
             "mental_break": "",
         }
         defaults.update(kwargs)
@@ -47,17 +48,25 @@ def test_healthy_organism_is_ready():
 
 def test_low_energy_not_ready():
     from utopia_client.mate_detection import is_reproduction_ready
-    assert is_reproduction_ready(_FakeBiochem(energy=15.0)) is False
+    assert is_reproduction_ready(_FakeBiochem(energy=300.0)) is False  # < 500
 
 
-def test_low_oxytocin_not_ready():
+def test_zero_oxytocin_still_ready_after_hotfix():
+    """Post-hotfix 28.05: oxytocin gate removed (server-aligned criterion).
+    biochem без oxytocin (default 0) — ready по energy."""
     from utopia_client.mate_detection import is_reproduction_ready
-    assert is_reproduction_ready(_FakeBiochem(oxytocin=10.0)) is False
+    # Default _FakeBiochem без oxytocin field → biochem.oxytocin missing
+    # → getattr returns 0 в old код → blocked. Post-hotfix только energy +
+    # mental_break — ready.
+    bc = _FakeBiochem()  # energy=600, no oxytocin
+    assert is_reproduction_ready(bc) is True
 
 
-def test_low_serotonin_not_ready():
+def test_zero_serotonin_still_ready_after_hotfix():
+    """Post-hotfix: serotonin gate removed."""
     from utopia_client.mate_detection import is_reproduction_ready
-    assert is_reproduction_ready(_FakeBiochem(serotonin=10.0)) is False
+    bc = _FakeBiochem(energy=600.0)  # serotonin absent → 0
+    assert is_reproduction_ready(bc) is True
 
 
 def test_catatonic_not_ready():
@@ -102,28 +111,30 @@ def test_two_ready_form_pair():
 
 
 def test_pair_blocked_by_cooldown():
+    """Cooldown=89 (F11): less than 89 ticks since last mate → blocked."""
     from utopia_client.mate_detection import detect_mate_pairs
     biochems = {"a": _FakeBiochem(), "b": _FakeBiochem()}
-    last_mate = {"a": 800}  # 200 < 500 cooldown
+    last_mate = {"a": 950}  # 50 < 89 cooldown
     pairs = detect_mate_pairs(biochems, last_mate, world_tick=1000)
     # a в cooldown → b остался один → нет пары
     assert pairs == []
 
 
 def test_pair_after_cooldown_elapsed():
+    """Cooldown=89: после 100 ticks → ready."""
     from utopia_client.mate_detection import detect_mate_pairs
     biochems = {"a": _FakeBiochem(), "b": _FakeBiochem()}
-    last_mate = {"a": 100, "b": 100}  # 1000 - 100 = 900 >= 500
+    last_mate = {"a": 900, "b": 900}  # 1000 - 900 = 100 >= 89
     pairs = detect_mate_pairs(biochems, last_mate, world_tick=1000)
     assert len(pairs) == 1
 
 
 def test_unready_organism_not_in_pair():
-    """Если b unready, a остался один → нет пары."""
+    """Если b unready (low energy), a остался один → нет пары."""
     from utopia_client.mate_detection import detect_mate_pairs
     biochems = {
         "a": _FakeBiochem(),
-        "b": _FakeBiochem(energy=10.0),  # unready
+        "b": _FakeBiochem(energy=100.0),  # < 500 → unready
     }
     pairs = detect_mate_pairs(biochems, {}, world_tick=1000)
     assert pairs == []
@@ -177,24 +188,25 @@ def test_deterministic_pairing_alpha_order():
 # Asexual candidates
 # ────────────────────────────────────────────────────────────────────
 
-def test_asexual_requires_more_energy():
-    """Asexual default min_energy = 50 (vs 30 для sexual)."""
+def test_asexual_requires_energy_above_threshold():
+    """Asexual использует server-aligned MIN_ENERGY_FOR_REPRO ≈ 500."""
     from utopia_client.mate_detection import detect_asexual_candidates
-    # energy=40 — достаточно для sexual, не для asexual
-    biochems = {"a": _FakeBiochem(energy=40.0)}
+    # energy=300 — недостаточно (server threshold ≈500)
+    biochems = {"a": _FakeBiochem(energy=300.0)}
     cands = detect_asexual_candidates(biochems, {}, world_tick=1000)
     assert cands == []
-    # energy=60 — OK для asexual
-    biochems_high = {"a": _FakeBiochem(energy=60.0)}
+    # energy=600 — OK
+    biochems_high = {"a": _FakeBiochem(energy=600.0)}
     cands_high = detect_asexual_candidates(biochems_high, {}, world_tick=1000)
     assert cands_high == ["a"]
 
 
 def test_asexual_respects_cooldown():
+    """Cooldown=89: 50 ticks since last mate → blocked."""
     from utopia_client.mate_detection import detect_asexual_candidates
     biochems = {"a": _FakeBiochem()}
     cands = detect_asexual_candidates(
-        biochems, last_mate_tick={"a": 999}, world_tick=1000)
+        biochems, last_mate_tick={"a": 950}, world_tick=1000)
     assert cands == []
 
 
@@ -235,7 +247,7 @@ def test_mark_empty_list_no_op():
 # ────────────────────────────────────────────────────────────────────
 
 def test_detect_mark_detect_cycle():
-    """E2E: detect → mark → detect (после cooldown) → second detect."""
+    """E2E: detect → mark → detect (после cooldown=89) → second detect."""
     from utopia_client.mate_detection import (
         detect_mate_pairs, mark_mate_event,
     )
@@ -247,12 +259,12 @@ def test_detect_mark_detect_cycle():
     assert len(pairs1) == 1
     mark_mate_event(last_mate, [pairs1[0][0], pairs1[0][1]], world_tick=1000)
 
-    # Tick 1100: cooldown не прошёл → нет пары
-    pairs2 = detect_mate_pairs(biochems, last_mate, world_tick=1100)
+    # Tick 1050: 50 ticks < 89 cooldown → blocked
+    pairs2 = detect_mate_pairs(biochems, last_mate, world_tick=1050)
     assert pairs2 == []
 
-    # Tick 1600 (>1000+500): cooldown прошёл → снова пара
-    pairs3 = detect_mate_pairs(biochems, last_mate, world_tick=1600)
+    # Tick 1100: 100 > 89 cooldown → ready
+    pairs3 = detect_mate_pairs(biochems, last_mate, world_tick=1100)
     assert len(pairs3) == 1
     assert pairs3[0] == ("a", "b")
 

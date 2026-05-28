@@ -4,24 +4,29 @@
   Размножение между собственными Зодчими ОДНОЙ колонии.
   Cross-owner mate ЗАПРЕЩЁН (vision §3.2 — Фраева ошибка #28).
 
-**MVP detection criteria** (упрощённый под client state — server имеет
-больше context: row/col, frozen, wants_reproduce, last_reproduce_tick):
+**Hotfix 28.05.2026 (после первой production activation rollback):**
+Критерий ready выровнен на server `_find_mate_pairs` —
+**energy-based gate**, не oxytocin/serotonin. Причина: oxytocin
+обнуляется при каждом restart (biochem не persist'ится в Phase 2),
+поэтому после restart колония висит без размножения. Server-side
+threshold `energy >= reproduce_threshold × φ ≈ initial_energy`
+работает потому что биохимические эфемериды не нужны для решения
+"можно ли тратить energy на ребёнка".
 
-- alive (biochem.energy > MIN_ENERGY)
+**Criteria (post-hotfix):**
+- alive (biochem.energy >= MIN_ENERGY_FOR_REPRO)
 - not catastrophic mental_break (catatonic/depression/panic — force_STAY)
-- past cooldown (cooldown_ticks с last_mate_tick)
-- sex drive proxy: oxytocin > MIN_OXYTOCIN
+- past cooldown=89 ticks (F11, matches server reproduce_cooldown)
 - one organism per pair per tick (used set)
-- **Implicit co-location:** все own organisms одной колонии — в одной
-  client-side compute, ассумирующее «рядом». Real distance check
-  делает P40 при handle_newborn_announce (reject parent_not_alive).
+- **Implicit co-location:** все own organisms одной колонии в одной
+  client-side compute → "рядом". Real distance check делает P40
+  при handle_newborn_announce (reject parent_not_alive).
 
 **Скипуем (server-side ground truth):**
 - Manhattan distance — сервер reject если parent умер / spawn fail
-- Close-kin (parent-child / siblings) — client не tracket pedigree,
-  random pairing acceptable для Phase 4 MVP
-- Cross-species — все founder Адамы species=0 (пусто), эволюции genes
-  ещё нет; gate включится когда mutate_topology=True заработает
+- Close-kin (parent-child / siblings) — client не tracket pedigree
+- Cross-species — все founder Адамы species=0; gate активен когда
+  mutate_topology=True заработает
 
 Pure function — не мутирует input. Caller хранит `last_mate_tick`
 state в LocalColonyCompute и обновляет после успешного newborn_announce_ack.
@@ -30,11 +35,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Thresholds — могут быть пере-tuned через config
-MIN_ENERGY: float = 30.0           # ниже — слабый, не готов к репродукции
-MIN_OXYTOCIN: float = 30.0         # sex drive proxy (Z7 биохимия)
-MIN_SEROTONIN: float = 30.0        # social readiness
-DEFAULT_COOLDOWN_TICKS: int = 500  # ~16 сек @ 30 TPS
+# Server-aligned thresholds (environment/world.py WorldConfig defaults):
+#   reproduce_threshold = initial_energy / φ ≈ 309 (если initial_energy=500)
+#   В _find_mate_pairs: repro_thr = reproduce_threshold × φ ≈ initial_energy
+#   reproduce_cooldown = 89 (Fibonacci F11)
+_PHI: float = (1.0 + 5.0 ** 0.5) / 2.0  # 1.6180339...
+_REPRODUCE_THRESHOLD_BASE: float = 309.0  # initial_energy / φ (server default)
+MIN_ENERGY_FOR_REPRO: float = _REPRODUCE_THRESHOLD_BASE * _PHI  # ≈ 500
+DEFAULT_COOLDOWN_TICKS: int = 89  # F(11) — matches server reproduce_cooldown
 DEFAULT_MAX_PAIRS_PER_TICK: int = 1  # natural rate-limit
 
 # Mental break states которые блокируют размножение (force_STAY territory)
@@ -44,22 +52,18 @@ BLOCKING_MENTAL_BREAK: set[str] = {"catatonic", "depression", "panic"}
 def is_reproduction_ready(
     biochem,
     *,
-    min_energy: float = MIN_ENERGY,
-    min_oxytocin: float = MIN_OXYTOCIN,
-    min_serotonin: float = MIN_SEROTONIN,
+    min_energy: float = MIN_ENERGY_FOR_REPRO,
 ) -> bool:
-    """Проверка одного organism: готов ли к репродукции по биохимии.
+    """Проверка одного organism: готов ли к репродукции (energy + mental_break).
+
+    Hotfix 28.05.2026: убраны oxytocin/serotonin gates — биохимические
+    эфемериды обнуляются при restart, ломают detection после deploy.
+    Server использует energy-only через `_find_mate_pairs`.
 
     Не учитывает cooldown — это делает caller через `_last_mate_tick`.
     """
     energy = float(getattr(biochem, "energy", 0.0))
     if energy < min_energy:
-        return False
-    oxytocin = float(getattr(biochem, "oxytocin", 0.0))
-    if oxytocin < min_oxytocin:
-        return False
-    serotonin = float(getattr(biochem, "serotonin", 0.0))
-    if serotonin < min_serotonin:
         return False
     mb_state = str(getattr(biochem, "mental_break", "") or "").lower()
     if mb_state in BLOCKING_MENTAL_BREAK:
@@ -74,9 +78,7 @@ def detect_mate_pairs(
     *,
     cooldown_ticks: int = DEFAULT_COOLDOWN_TICKS,
     max_pairs: int = DEFAULT_MAX_PAIRS_PER_TICK,
-    min_energy: float = MIN_ENERGY,
-    min_oxytocin: float = MIN_OXYTOCIN,
-    min_serotonin: float = MIN_SEROTONIN,
+    min_energy: float = MIN_ENERGY_FOR_REPRO,
 ) -> list[tuple[str, str]]:
     """Найти mate-pairs среди own colony organisms.
 
@@ -95,10 +97,7 @@ def detect_mate_pairs(
     # Step 1: фильтр готовых
     candidates: list[str] = []
     for cid, bc in biochems_dict.items():
-        if not is_reproduction_ready(
-            bc, min_energy=min_energy,
-            min_oxytocin=min_oxytocin, min_serotonin=min_serotonin,
-        ):
+        if not is_reproduction_ready(bc, min_energy=min_energy):
             continue
         # Cooldown check
         last_tick = int(last_mate_tick.get(cid, 0))
@@ -138,22 +137,17 @@ def detect_asexual_candidates(
     *,
     cooldown_ticks: int = DEFAULT_COOLDOWN_TICKS,
     max_births: int = DEFAULT_MAX_PAIRS_PER_TICK,
-    min_energy: float = MIN_ENERGY + 20.0,   # для asexual нужно больше энергии
-    min_oxytocin: float = MIN_OXYTOCIN,
-    min_serotonin: float = MIN_SEROTONIN,
+    min_energy: float = MIN_ENERGY_FOR_REPRO,
 ) -> list[str]:
     """Asexual reproduction candidates (через REPRODUCE-action).
 
     Caller вызывает только если organism сам выбрал REPRODUCE через
     motor sampling — это его волевое действие. Здесь мы лишь подтверждаем
-    что биохимия позволяет.
+    что энергия достаточная и не mental_break.
     """
     candidates: list[str] = []
     for cid, bc in biochems_dict.items():
-        if not is_reproduction_ready(
-            bc, min_energy=min_energy,
-            min_oxytocin=min_oxytocin, min_serotonin=min_serotonin,
-        ):
+        if not is_reproduction_ready(bc, min_energy=min_energy):
             continue
         last_tick = int(last_mate_tick.get(cid, 0))
         if world_tick - last_tick < cooldown_ticks:

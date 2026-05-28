@@ -58,13 +58,11 @@ def compute_with_two_zodchiy(tmp_path, monkeypatch):
     for i, o in enumerate(orgs):
         c.add_creature(f"parent-{i}", o, lineage="zodchiy")
 
-    # Manually set биохимия чтобы оба ready (default Адам serotonin=50,
-    # oxytocin=0 — недостаточно по нашим thresholds)
+    # Post-hotfix 28.05: energy-only gate. Default Адам energy=100,
+    # ниже server threshold ≈500 → надо поднять.
     for cid in c.biochem:
         bc = c.biochem[cid]
-        bc.oxytocin = 80.0  # > 30
-        bc.serotonin = 70.0  # > 30
-        bc.energy = 90.0  # > 30
+        bc.energy = 600.0  # > MIN_ENERGY_FOR_REPRO ≈ 500
 
     return c
 
@@ -76,9 +74,9 @@ def compute_with_two_zodchiy(tmp_path, monkeypatch):
 def test_no_ready_no_emit(compute_with_two_zodchiy):
     """Если none ready — empty list, нет добавления child."""
     c = compute_with_two_zodchiy
-    # Make оба unready
+    # Make оба unready (energy < 500)
     for cid in c.biochem:
-        c.biochem[cid].energy = 5.0
+        c.biochem[cid].energy = 100.0
     mock = _MockEmbodiedClient()
     born = c.detect_and_emit_mate_pairs(world_tick=10000, embodied_client=mock)
     assert born == []
@@ -133,7 +131,7 @@ def test_no_embodied_client_no_emit(compute_with_two_zodchiy):
 
 
 def test_cooldown_blocks_second_detect(compute_with_two_zodchiy):
-    """После успешного emit — повторный detect blocked cooldown."""
+    """После успешного emit — повторный detect blocked cooldown=89."""
     c = compute_with_two_zodchiy
     mock = _MockEmbodiedClient()
 
@@ -141,8 +139,8 @@ def test_cooldown_blocks_second_detect(compute_with_two_zodchiy):
     born1 = c.detect_and_emit_mate_pairs(world_tick=10000, embodied_client=mock)
     assert len(born1) == 1
 
-    # Second detect через 100 ticks (< 500 cooldown)
-    born2 = c.detect_and_emit_mate_pairs(world_tick=10100, embodied_client=mock)
+    # Second detect через 50 ticks (< 89 cooldown)
+    born2 = c.detect_and_emit_mate_pairs(world_tick=10050, embodied_client=mock)
     assert born2 == []
 
 
@@ -151,8 +149,8 @@ def test_cooldown_lifted_after_threshold(compute_with_two_zodchiy):
     c = compute_with_two_zodchiy
     mock = _MockEmbodiedClient()
     c.detect_and_emit_mate_pairs(world_tick=10000, embodied_client=mock)
-    # Через 1000 ticks (> 500 cooldown)
-    born2 = c.detect_and_emit_mate_pairs(world_tick=11000, embodied_client=mock)
+    # Через 100 ticks (> 89 cooldown)
+    born2 = c.detect_and_emit_mate_pairs(world_tick=10100, embodied_client=mock)
     assert len(born2) == 1
 
 
