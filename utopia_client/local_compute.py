@@ -87,6 +87,16 @@ _TOM_ACT_WEST = 3
 _TOM_ACT_STAY = 4
 # Phase S2.E dopamine: β_local ∈ [0, 1/φ ≈ 0.618].
 _PHI = 1.6180339887498949
+# Phase 4 fix 0.11.6: energy-порог для glucose floor. Organism с energy выше
+# этого считается "сытым" → glucose поддерживается из энергозапасов
+# (гомеостаз), не падает ниже baseline. 200 = заметно выше голодного (~0),
+# но ниже reproduce_threshold (500) — floor работает и для не-готовых к
+# размножению, но живых особей.
+_GLUCOSE_FLOOR_ENERGY_THRESHOLD = 200.0
+# Phase 4 fix 0.11.7: cortisol baseline-clearance (гомеостаз). 0.995 →
+# half-life ~144 тика (F12). Equilibrium при continuous stress ~40 (< 80
+# catatonic threshold). Старт; 0.99 (F11, eq~20) если recover медленный.
+_CORTISOL_HOMEOSTASIS_DECAY = 0.995
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
 _INSULA_DATA_DIM = 71
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
@@ -2176,18 +2186,43 @@ class LocalColonyCompute:
             logger.info("restore_colony_from_local: dir %s missing — empty start",
                         dir_path)
             return []
-        # Resolve seed for skeleton (нужен для organism_from_weights)
+        # Resolve seed skeleton. КРИТИЧНО (fix 0.11.8): genesis-зодчий —
+        # 20-tissue (brain stack + cerebellum/amygdala/episodic). Genesis
+        # записал этот 20-tissue skeleton в wanderer.norg (seed_norg
+        # lineage="wanderer"). elder/seed.norg = 10-tissue (nexus) — НЕ
+        # подходит, resume дал бы mismatch (как nexus-vs-zodchiy #33).
+        #
+        # Выбираем skeleton по факту: пробуем wanderer (20-tissue zodchiy)
+        # затем elder; берём тот что существует И даёт >=20 tissue, иначе
+        # с максимумом. .pt tissues_by_role = 20 ролей, skeleton должен
+        # совпадать для bit-exact restore_persisted_state.
         try:
-            from .seed_loader import seed_cache_path, organism_from_weights
+            from .seed_loader import seed_cache_path, load_founders
         except Exception as e:
             logger.warning("restore_colony_from_local: seed_loader import: %s", e)
             return []
-        seed_path = seed_cache_path("elder")
-        if not seed_path.exists():
+        seed_path = None
+        best_n = -1
+        for _lineage in ("wanderer", "elder"):
+            cand = seed_cache_path(_lineage)
+            if not cand.exists():
+                continue
+            try:
+                probe = load_founders(cand, 1)[0]
+                n_tis = len(getattr(probe, "tissues", {}) or {})
+            except Exception as e:
+                logger.debug("restore probe %s (%s) failed: %s", _lineage, cand, e)
+                continue
+            logger.info("restore skeleton probe: %s = %d tissues", _lineage, n_tis)
+            if n_tis > best_n:
+                best_n = n_tis
+                seed_path = cand
+        if seed_path is None:
             logger.warning(
-                "restore_colony_from_local: seed %s missing — cannot rebuild",
-                seed_path)
+                "restore_colony_from_local: no usable seed skeleton — cannot rebuild")
             return []
+        logger.info("restore_colony_from_local: skeleton=%s (%d tissues)",
+                    seed_path, best_n)
 
         restored: list[str] = []
         for pt_file in sorted(dir_path.glob("*.pt")):
@@ -3434,20 +3469,21 @@ class LocalColonyCompute:
                     sums[chem] += float(getattr(bc, chem, 0.0))
                 except (TypeError, ValueError):
                     pass
-        # DEBUG: per-cid energy log (temp diagnostic для reproduction stuck)
+        # DEBUG: per-cid biochem log (temp diagnostic). +cortisol/serotonin
+        # для verify cortisol-гомеостаза 0.11.7 (catatonic = cort>80 + ser<MAX).
         try:
             per_cid_e = sorted([
                 (cid, round(float(getattr(bc, "energy", 0.0)), 1),
-                 round(float(getattr(bc, "oxytocin", 0.0)), 1),
+                 round(float(getattr(bc, "cortisol", 0.0)), 1),
+                 round(float(getattr(bc, "serotonin", 0.0)), 1),
                  round(float(getattr(bc, "glucose", 0.0)), 1),
-                 round(float(getattr(bc, "fatigue", 0.0)), 1),
                  str(getattr(bc, "mental_break", "") or ""))
                 for cid, bc in biochem.items()
             ])
             logger.info(
-                "BIOCHEM_DEBUG cids_e_o_g_f_mb: %s",
-                "; ".join(f"{cid}:e={e},o={o},g={g},f={f},mb={mb}"
-                          for cid, e, o, g, f, mb in per_cid_e))
+                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb: %s",
+                "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb}"
+                          for cid, e, c, s, g, mb in per_cid_e))
         except Exception as _e:
             logger.debug("biochem debug log failed: %s", _e)
         return {
@@ -3932,7 +3968,15 @@ class LocalColonyCompute:
             logger.debug("biochem apply import failed cid=%s: %s", cid, e)
             return
         try:
+            delta_e = float(event.get("delta_energy", 0.0) or 0.0)
             if event.get("ate"):
+                apply_feed(bc)
+            elif delta_e > 0.5:
+                # Phase 4 fix 0.11.5 (29.05): P40 шлёт delta_energy>0 (organism
+                # ест физически) но без ate=True flag → apply_feed не вызывался
+                # → glucose decay → 0 → catatonic → reproduction блокирован.
+                # Питание = и energy И glucose: при положительном delta_energy
+                # без явного ate всё равно восполняем glucose (apply_feed).
                 apply_feed(bc)
             if event.get("killed"):
                 apply_kill_prey(bc)
@@ -3943,7 +3987,6 @@ class LocalColonyCompute:
             # events. Раньше delta_energy шёл только в reward signal, biochem.energy
             # был изолирован → особи не размножались + умирали голодом.
             # Server-side max_energy = 1000 (WorldConfig default), clamp [0, 1000].
-            delta_e = float(event.get("delta_energy", 0.0) or 0.0)
             if delta_e != 0.0:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
         except Exception as e:
@@ -3980,6 +4023,37 @@ class LocalColonyCompute:
             decay_step(bc, _FakeWorld())
         except Exception as e:
             logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
+        # Phase 4 fix 0.11.6 (29.05): glucose floor energy-coupled (вариант 1,
+        # одобрен Фраем). Физиология: глюкоза поддерживается из энергозапасов
+        # (гомеостаз). Если organism сыт (energy высокая, P40 держит ~500),
+        # glucose не падает ниже baseline → нет ложного catatonic при
+        # energy=500/glucose=0 рассогласовании.
+        #
+        # Floor = baseline (не max): glucose ВЫШЕ baseline decay'ит нормально
+        # (короткоживущая динамика сохранена), floor лишь не даёт упасть
+        # <baseline при high energy. Вытаскивает существующих catatonic
+        # (genesis g=0 → baseline → mental_break recompute снимет catatonic).
+        try:
+            energy = float(getattr(bc, "energy", 0.0))
+            if energy >= _GLUCOSE_FLOOR_ENERGY_THRESHOLD:
+                baseline_g = float(getattr(bc, "baseline_glucose", 50.0))
+                if float(getattr(bc, "glucose", 0.0)) < baseline_g:
+                    bc.glucose = baseline_g
+        except Exception as e:
+            logger.debug("glucose floor cid=%s: %s", cid, e)
+        # Phase 4 fix 0.11.7 (29.05, Шеф одобрил путь 1): cortisol-гомеостаз.
+        # cortisol — единственный гормон без baseline-clearance → монотонно
+        # копится (damage от Старших → +2, без recovery) → catatonic lock.
+        # Симметрия с dopamine_decay (unconditional). Физиология: гормон
+        # стресса очищается (печень/почки), не вечный.
+        # 0.995 = half-life ~144 тика (F12). Equilibrium при continuous stress
+        # (+0.2/tick): 0.2/0.005 = ~40 < catatonic threshold 80 → сигнал
+        # стресса держится, но ложный lock уходит. Recover existing catatonic
+        # к ~40 за ~144 тика.
+        try:
+            bc.cortisol = float(getattr(bc, "cortisol", 0.0)) * _CORTISOL_HOMEOSTASIS_DECAY
+        except Exception as e:
+            logger.debug("cortisol homeostasis cid=%s: %s", cid, e)
 
     # ── TZ B Phase 2 (26.05.2026, Бендер): per-role Hebbian metrics ─────
 
