@@ -107,7 +107,9 @@ class ClientCreatureBiochem:
 
     # ── Зависимости от мира (читаются biochemistry функциями) ─────────
     # Эти поля синхронизируются caller'ом из obs_batch перед apply'ями.
-    energy: float = 100.0
+    # energy=500: matched genesis P40 WorldConfig.initial_energy. Раньше
+    # было 100 (default) → reproduce_threshold=500 недостижим. Phase 4 fix 0.11.2.
+    energy: float = 500.0
     hydration: float = 100.0
     infected: bool = False
     infection_severity: float = 0.0

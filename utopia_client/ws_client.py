@@ -276,17 +276,14 @@ class ColonyWSClient:
             # owned Zodchiy у клиента в local persistence. P40 при n_local>0
             # НЕ запускает push_owned_seed, НЕ auto-respawn — ждёт
             # projection_batch. При n_local=0 — build_seed_pack как раньше.
-            n_local = 0
-            try:
-                from .config import colonies_dir
-                states_dir = colonies_dir() / "states"
-                if states_dir.exists():
-                    n_local = len(list(states_dir.glob("*.pt")))
-            except Exception as e:
-                logger.debug("hello n_local scan failed: %s", e)
-            # Colony Ownership Migration §5: при n_local>0 client igнорирует
-            # incoming seed_start/chunk/complete (defensive client-side guard
-            # против legacy P40 push). Источник истины — local persistence.
+            # Colony Ownership Migration §5.1: n_local = real count из
+            # того же source что legacy _scan_local_seed_pack использует
+            # (colony_state_dir, не отдельный states/ subdir — fix v0.11.1).
+            # local_pack уже scanned выше.
+            n_local = len(local_pack) if local_pack else 0
+            # При n_local>0 client igнорирует incoming seed_start/chunk/
+            # complete (defensive against legacy P40 push). Source of truth
+            # — local persistence.
             self._reject_incoming_seeds = (n_local > 0)
             if self._reject_incoming_seeds:
                 logger.info(
@@ -313,7 +310,35 @@ class ColonyWSClient:
                 }
             await ws.send(json.dumps(hello_msg))
 
-            if local_pack:
+            # Colony Ownership Migration §5.1/5.2 (29.05, fix 0.11.4):
+            # client-authoritative restore. При n_local>0 client —
+            # ЕДИНСТВЕННЫЙ хозяин: восстанавливает organisms в свой compute
+            # из local .pt (E2 restore_colony_from_local), затем шлёт
+            # projection_batch → P40 self-heal (f359f97) пересоздаёт owned.
+            #
+            # Раньше (баг): restore_colony_from_local был написан но НЕ
+            # вызывался → compute пуст → нет biochem/projection/жизни. Client
+            # пушил legacy seed_pack, но локально organisms не наполнялись.
+            #
+            # При n_local>0 — НЕ слать legacy _send_seed_pack (P40 self-heal
+            # работает через projection_batch, не через seed pack). Только
+            # restore локально.
+            if self._reject_incoming_seeds:
+                try:
+                    if self.compute is None:
+                        self._ensure_compute()
+                    if self.compute is not None:
+                        from .seed_loader import colony_state_dir
+                        restored = self.compute.restore_colony_from_local(
+                            colony_state_dir(self.colony_name))
+                        logger.info(
+                            "client-authoritative restore: %d organisms из local",
+                            len(restored))
+                except Exception as e:
+                    logger.warning("restore_colony_from_local failed: %s", e)
+            elif local_pack:
+                # n_local==0 ветка не достигается (local_pack пуст → n_local=0),
+                # но оставляем legacy push на случай edge-case формата.
                 try:
                     await self._send_seed_pack(
                         ws, local_pack,
@@ -1470,6 +1495,15 @@ class ColonyWSClient:
                 if "last_social_tick" in _c:
                     try:
                         _bc.last_social_tick = int(_c["last_social_tick"])
+                    except (TypeError, ValueError):
+                        pass
+                # Heal cosmetic backlog (memory project-roadmap-phase):
+                # freshly seeded zodchiy starts с last_social_tick=0 → loner →
+                # catatonic → frozen → не еят → death. Set к current world_tick
+                # при первом obs_batch чтобы избежать false loner от рождения.
+                if int(getattr(_bc, "last_social_tick", 0)) == 0:
+                    try:
+                        _bc.last_social_tick = int(world_tick)
                     except (TypeError, ValueError):
                         pass
         try:

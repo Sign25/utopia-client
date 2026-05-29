@@ -3434,6 +3434,22 @@ class LocalColonyCompute:
                     sums[chem] += float(getattr(bc, chem, 0.0))
                 except (TypeError, ValueError):
                     pass
+        # DEBUG: per-cid energy log (temp diagnostic для reproduction stuck)
+        try:
+            per_cid_e = sorted([
+                (cid, round(float(getattr(bc, "energy", 0.0)), 1),
+                 round(float(getattr(bc, "oxytocin", 0.0)), 1),
+                 round(float(getattr(bc, "glucose", 0.0)), 1),
+                 round(float(getattr(bc, "fatigue", 0.0)), 1),
+                 str(getattr(bc, "mental_break", "") or ""))
+                for cid, bc in biochem.items()
+            ])
+            logger.info(
+                "BIOCHEM_DEBUG cids_e_o_g_f_mb: %s",
+                "; ".join(f"{cid}:e={e},o={o},g={g},f={f},mb={mb}"
+                          for cid, e, o, g, f, mb in per_cid_e))
+        except Exception as _e:
+            logger.debug("biochem debug log failed: %s", _e)
         return {
             "n_active": n,
             "mental_break_counts": mb_counts,
@@ -3923,6 +3939,13 @@ class LocalColonyCompute:
             damage = float(event.get("damage_taken", 0.0) or 0.0)
             if damage > 0:
                 apply_pvp_hit(bc, kind="cross_clan_target")
+            # Phase 4 fix 0.11.2 (28.05.2026): apply delta_energy от P40 eat/move
+            # events. Раньше delta_energy шёл только в reward signal, biochem.energy
+            # был изолирован → особи не размножались + умирали голодом.
+            # Server-side max_energy = 1000 (WorldConfig default), clamp [0, 1000].
+            delta_e = float(event.get("delta_energy", 0.0) or 0.0)
+            if delta_e != 0.0:
+                bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
 
