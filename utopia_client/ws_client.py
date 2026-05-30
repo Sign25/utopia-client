@@ -43,6 +43,13 @@ PROJECTION_BATCH_INTERVAL_SEC = 0.2
 # traits_request. Даёт projection_batch реконсилиться у P40 и self_heal-push'у
 # (ca3e3b2) долететь, прежде чем дёргать pull. ~8с > пара циклов obs_batch.
 TRAITS_PULL_GRACE_SEC = 8.0
+# Perf (0.11.17, Бендер): min-интервал между handle_tick'ами. handle_tick
+# GIL-bound (N орг × 20 тканей Python+torch); даже offload'нутый в to_thread он
+# держит GIL. При catch-up бёрсте obs после reconnect тики идут back-to-back →
+# GIL ~100% → ws-event-loop голодает → keepalive ping timeout. Cap ~6.7 Hz
+# (>5 Hz P40-throttle, steady-state не трогает) рубит бёрсты, оставляя GIL-
+# передышку event-loop'у. Дроп лишних obs безопасен (P40 reuse last action).
+MIN_TICK_INTERVAL_SEC = 0.15
 # Variant B leak fix (19.05.2026): cid считается мёртвым, если не появлялся
 # в obs_batch STALE_CID_TICKS подряд. P40 World ~25 TPS — 1500 тиков ≈ 60с
 # с запасом против транзитных гэпов obs_batch. GC запускается не чаще
@@ -1725,6 +1732,13 @@ class ColonyWSClient:
         # последний action на пропущенных тиках. Дроп stale > pile-up.
         if getattr(self, "_tick_in_progress", False):
             return
+        # Rate-limit (0.11.17): min-интервал между тиками — GIL-передышка
+        # event-loop'у, рубит catch-up бёрсты obs после reconnect (прямая
+        # причина keepalive при 145 орг). Steady-state 5 Hz (P40 throttle)
+        # ниже cap'а → не затрагивается.
+        _now = time.monotonic()
+        if _now - getattr(self, "_last_tick_done_ts", 0.0) < MIN_TICK_INTERVAL_SEC:
+            return
         self._tick_in_progress = True
         try:
             creatures_out = await asyncio.to_thread(
@@ -1735,6 +1749,7 @@ class ColonyWSClient:
             return
         finally:
             self._tick_in_progress = False
+            self._last_tick_done_ts = time.monotonic()
         ws = self._ws
         if ws is None or not creatures_out:
             return
