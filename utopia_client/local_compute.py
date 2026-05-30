@@ -1660,7 +1660,7 @@ class LocalColonyCompute:
         on = bool(on)
         self._higher_sfnn_default = on
         n_changed = 0
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             if not hasattr(org, "genome"):
                 org.genome = types.SimpleNamespace(
                     higher_tissue_sfnn_enabled=on,
@@ -1691,7 +1691,7 @@ class LocalColonyCompute:
         on = bool(on)
         self._basic_sfnn_default = on
         n_changed = 0
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             if not hasattr(org, "genome"):
                 org.genome = types.SimpleNamespace(
                     higher_tissue_sfnn_enabled=self._higher_sfnn_default,
@@ -1732,7 +1732,7 @@ class LocalColonyCompute:
         """
         on = bool(on)
         n_changed = 0
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             if not hasattr(org, "genome"):
                 org.genome = types.SimpleNamespace(
                     higher_tissue_sfnn_enabled=self._higher_sfnn_default,
@@ -1763,7 +1763,7 @@ class LocalColonyCompute:
         on = bool(on)
         self._motor_sfnn_default = on
         n_changed = 0
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             if not hasattr(org, "genome"):
                 org.genome = types.SimpleNamespace(
                     higher_tissue_sfnn_enabled=self._higher_sfnn_default,
@@ -1937,7 +1937,11 @@ class LocalColonyCompute:
         self.tick_ts.append(time.time())
         out: dict = {}
         torch = self._torch
-        for cid, organism in self.organisms.items():
+        # Снапшот итерации: self.organisms мутируется из main-потока
+        # (detect_and_emit_mate_pairs → add_creature) и ws-потока (GC orphan,
+        # seed) параллельно с этим проходом. Без list() — "dictionary changed
+        # size during iteration" под нагрузкой (133 орг + mate/GC churn).
+        for cid, organism in list(self.organisms.items()):
             obs = obs_per_cid.get(cid)
             if obs is None:
                 out[cid] = {"action": STAY, "target_id": None}
@@ -3673,7 +3677,7 @@ class LocalColonyCompute:
         Throttling 5 Hz делается caller'ом (main loop).
         """
         projections: list[dict] = []
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             bc = self.biochem.get(cid)
             last_action = self.last_action.get(cid, -1) if hasattr(self, "last_action") else -1
             proj: dict = {
@@ -4634,7 +4638,7 @@ class LocalColonyCompute:
         n_embd_hist: dict[int, int] = {}
         n_layer_hist: dict[int, int] = {}
         n_head_hist: dict[int, int] = {}
-        for org in self.organisms.values():
+        for org in list(self.organisms.values()):
             tissues = getattr(org, "tissues", None)
             if not tissues:
                 continue
@@ -5048,7 +5052,7 @@ class LocalColonyCompute:
         bias_max = bias_max or {}
         empty_dist = [0.0] * N_ACTIONS
         out: list[dict] = []
-        for cid, org in self.organisms.items():
+        for cid, org in list(self.organisms.items()):
             tissues = getattr(org, "tissues", None) or {}
             n_embd = n_layer = n_head = 0
             n_params = 0

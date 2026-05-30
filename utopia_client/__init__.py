@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.13"  # feat: traits self_heal/pull paths (top-level owned_traits_snapshot, контракт Хьюберт ca3e3b2)
+__version__ = "0.11.14"  # fix: snapshot self.organisms iteration (handle_tick/projection race под 133-орг + mate/GC churn)
