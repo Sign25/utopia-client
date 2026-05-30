@@ -54,8 +54,8 @@ def test_dataclass_default_instantiation():
     # mental_break поля
     assert bc.mental_break == ""
     assert bc.mental_break_ticks == 0
-    # Зависимости мира
-    assert bc.energy == 100.0
+    # Зависимости мира (energy=500 matched genesis P40 WorldConfig.initial_energy, 0.11.4)
+    assert bc.energy == 500.0
     assert bc.hydration == 100.0
     assert bc.infected is False
     # Temp attrs

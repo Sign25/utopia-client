@@ -3438,7 +3438,7 @@ class LocalColonyCompute:
         Цель — Хьюберт + frontend StatsPage увидят:
           - сколько owned Зодчих с активной биохимией (`n_active`)
           - распределение mental_break по states (`mental_break_counts`)
-          - average levels 5 ключевых веществ (для тренда UI)
+          - average levels всех 8 веществ (для радара/тренда UI)
 
         Per-cid raw данные **не пушим** в diagnostics — это шум для
         observability. Если потребуется детальный per-cid breakdown
@@ -3453,13 +3453,17 @@ class LocalColonyCompute:
                 "cortisol_avg": 0.0,
                 "serotonin_avg": 0.0,
                 "dopamine_avg": 0.0,
+                "oxytocin_avg": 0.0,
+                "adrenaline_avg": 0.0,
                 "glucose_avg": 0.0,
+                "fatigue_avg": 0.0,
                 "histamine_avg": 0.0,
             }
         mb_counts: dict[str, int] = {}
         sums = {
             "cortisol": 0.0, "serotonin": 0.0, "dopamine": 0.0,
-            "glucose": 0.0, "histamine": 0.0,
+            "oxytocin": 0.0, "adrenaline": 0.0,
+            "glucose": 0.0, "fatigue": 0.0, "histamine": 0.0,
         }
         for bc in biochem.values():
             mb = str(getattr(bc, "mental_break", "") or "normal")
@@ -3492,7 +3496,10 @@ class LocalColonyCompute:
             "cortisol_avg": round(sums["cortisol"] / n, 2),
             "serotonin_avg": round(sums["serotonin"] / n, 2),
             "dopamine_avg": round(sums["dopamine"] / n, 2),
+            "oxytocin_avg": round(sums["oxytocin"] / n, 2),
+            "adrenaline_avg": round(sums["adrenaline"] / n, 2),
             "glucose_avg": round(sums["glucose"] / n, 2),
+            "fatigue_avg": round(sums["fatigue"] / n, 2),
             "histamine_avg": round(sums["histamine"] / n, 2),
         }
 
@@ -4309,7 +4316,10 @@ class LocalColonyCompute:
                     "cortisol_avg": 0.0,
                     "serotonin_avg": 0.0,
                     "dopamine_avg": 0.0,
+                    "oxytocin_avg": 0.0,
+                    "adrenaline_avg": 0.0,
                     "glucose_avg": 0.0,
+                    "fatigue_avg": 0.0,
                     "histamine_avg": 0.0,
                 },
                 "tom_steps_total": int(self.tom_steps),
