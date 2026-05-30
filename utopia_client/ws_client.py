@@ -39,6 +39,10 @@ STATE_SYNC_INTERVAL_SEC = 120.0
 # для физики/AOI/арбитража). Schema projection_batch_draft.md §3.
 # 5 Hz (chem throttle из ТЗ Q4) = каждые 0.2с.
 PROJECTION_BATCH_INTERVAL_SEC = 0.2
+# Evolved-traits recovery (30.05.2026, Бендер): grace перед pull-safety-net
+# traits_request. Даёт projection_batch реконсилиться у P40 и self_heal-push'у
+# (ca3e3b2) долететь, прежде чем дёргать pull. ~8с > пара циклов obs_batch.
+TRAITS_PULL_GRACE_SEC = 8.0
 # Variant B leak fix (19.05.2026): cid считается мёртвым, если не появлялся
 # в obs_batch STALE_CID_TICKS подряд. P40 World ~25 TPS — 1500 тиков ≈ 60с
 # с запасом против транзитных гэпов obs_batch. GC запускается не чаще
@@ -266,9 +270,10 @@ class ColonyWSClient:
             self._ws = ws
             self.connected = True
             self.last_error = ""
-            # Evolved-traits recovery: re-arm one-shot re-announce на новый
-            # коннект (welcome-handler шлёт после ingest snapshot).
+            # Evolved-traits recovery: re-arm one-shot re-announce + pull-safety
+            # net на новый коннект (welcome-handler шлёт после ingest snapshot).
             self._traits_announced_conn = False
+            self._traits_pull_sent = False
             logger.info("connected")
 
             from .seed_loader import seed_sha256
@@ -500,20 +505,89 @@ class ColonyWSClient:
                 logger.debug("projection_batch send failed: %s", e)
                 return
 
-    async def _maybe_send_traits_announce(self) -> None:
+    def _ingest_traits_snapshot(self, entries, reason: str = "snapshot") -> int:
+        """Evolved-traits recovery: применить owned_traits_snapshot creatures
+        в стор FILL-ONLY (client authoritative — baseline от P40 self-heal не
+        затирает клиентский evolved). `entries` — list[{cid, traits{9}}].
+
+        Источники: welcome.owned_traits_snapshot (inline) или top-level
+        owned_traits_snapshot.creatures (self_heal/pull, ca3e3b2).
+        Возвращает число заполненных trait-полей."""
+        if not isinstance(entries, list) or self.compute is None \
+                or not hasattr(self.compute, "ingest_owned_traits"):
+            return 0
+        filled = 0
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            ecid = str(ent.get("cid") or "")
+            etraits = ent.get("traits")
+            if ecid and isinstance(etraits, dict):
+                try:
+                    filled += self.compute.ingest_owned_traits(
+                        ecid, etraits, overwrite=False)
+                except Exception as e:
+                    logger.warning(
+                        "owned_traits_snapshot ingest %s: %s", ecid, e)
+        if filled:
+            logger.info(
+                "owned_traits_snapshot reason=%s: filled %d trait-fields",
+                reason, filled)
+        return filled
+
+    async def _maybe_pull_traits(self) -> None:
+        """Pull safety-net (ca3e3b2): один traits_request за коннект, если
+        после grace у клиента есть owned organisms, но стор traits пуст
+        (build_traits_announce_envelope is None). Grace даёт projection_batch
+        реконсилиться и self_heal-push'у прийти; pull нужен только когда
+        self_heal не сработал (P40 уже знает cid'ы). Idempotent per connect."""
+        if getattr(self, "_traits_pull_sent", False):
+            return
+        await asyncio.sleep(TRAITS_PULL_GRACE_SEC)
+        if getattr(self, "_traits_pull_sent", False):
+            return
+        compute = self.compute
+        if compute is None or not getattr(compute, "organisms", None):
+            return
+        try:
+            if compute.build_traits_announce_envelope() is not None:
+                return  # стор уже наполнен (self_heal/welcome/.pt) — pull не нужен
+        except Exception:
+            return
+        self._traits_pull_sent = True
+        await self.request_traits_resync()
+
+    async def request_traits_resync(self) -> bool:
+        """Evolved-traits recovery (ca3e3b2): pull-путь. Шлёт traits_request →
+        P40 отвечает owned_traits_snapshot reason='pull'. Резервный resync
+        если self_heal-push разъехался / стор подозрительно пуст."""
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            await ws.send(json.dumps({"type": "traits_request"}))
+            logger.info("traits_request sent (pull resync)")
+            return True
+        except Exception as e:
+            logger.warning("traits_request send failed: %s", e)
+            return False
+
+    async def _maybe_send_traits_announce(self, force: bool = False) -> None:
         """Evolved-traits recovery (30.05.2026, Бендер): re-announce evolved
         body-traits для existing owned обратно на P40 по main ws (client→P40).
 
-        One-shot per connect (guard `_traits_announced_conn`, ресет в connect-
-        блоке). Closure Body Migration: после P40 self-heal (baseline bootstrap)
-        клиент возвращает evolved тело — как мозг переживает рестарт.
+        `force=False` — one-shot per connect (guard `_traits_announced_conn`,
+        ресет в connect-блоке): для welcome. `force=True` — игнор guard: для
+        top-level owned_traits_snapshot (self_heal/pull), где стор только что
+        наполнился и нужно отправить evolved поверх baseline даже если welcome
+        уже выставил guard. P40 self_heal-push не повторяется (cid становится
+        known) → петли нет.
 
-        Канал — main ws (тот же, что welcome/owned_traits_snapshot/projection_
-        batch). Конверт batch: {type:'traits_announce', creatures:[{cid,traits}]}.
-        P40 отвечает traits_ack (см. _handle). Идемпотентно — P40 accept-over-
-        baseline принимает повторные announce.
+        Канал — main ws. Конверт batch {type:'traits_announce',
+        creatures:[{cid,traits}]}; P40 отвечает traits_ack. Идемпотентно
+        (accept-over-baseline).
         """
-        if getattr(self, "_traits_announced_conn", False):
+        if not force and getattr(self, "_traits_announced_conn", False):
             return
         ws = self._ws
         compute = self.compute
@@ -628,31 +702,12 @@ class ColonyWSClient:
                         self._cid_last_seen_tick[cid] = wt
                 except Exception:
                     pass
-            # Evolved-traits recovery (30.05.2026, Бендер): warm reconnect
-            # owned-handoff. welcome несёт owned_traits_snapshot:
-            # [{cid, traits{9}}] для owned-zodchiy (контракт Хьюберта f673741).
-            # FILL-ONLY ingest (client authoritative — после P40 self-heal
-            # snapshot = baseline, не затираем свой evolved), затем re-announce
-            # клиентского evolved-стора обратно на P40 (accept-over-baseline).
-            snap = msg.get("owned_traits_snapshot")
-            if isinstance(snap, list) and self.compute is not None \
-                    and hasattr(self.compute, "ingest_owned_traits"):
-                filled = 0
-                for ent in snap:
-                    if not isinstance(ent, dict):
-                        continue
-                    ecid = str(ent.get("cid") or "")
-                    etraits = ent.get("traits")
-                    if ecid and isinstance(etraits, dict):
-                        try:
-                            filled += self.compute.ingest_owned_traits(
-                                ecid, etraits, overwrite=False)
-                        except Exception as e:
-                            logger.warning(
-                                "owned_traits_snapshot ingest %s: %s", ecid, e)
-                if filled:
-                    logger.info(
-                        "owned_traits_snapshot: filled %d trait-fields", filled)
+            # Evolved-traits recovery (30.05.2026, Бендер): warm hello path —
+            # welcome может нести inline owned_traits_snapshot: [{cid,traits{9}}]
+            # (контракт Хьюберта f673741). FILL-ONLY ingest. Top-level
+            # owned_traits_snapshot (self_heal/pull, ca3e3b2) — отдельный handler.
+            self._ingest_traits_snapshot(
+                msg.get("owned_traits_snapshot"), reason="welcome")
             logger.info(
                 "welcome: world_tick=%s server_time=%s n_creatures=%s mode=%s",
                 wt, msg.get("server_time"), n, mode or "normal")
@@ -663,6 +718,32 @@ class ColonyWSClient:
                 await self._maybe_send_traits_announce()
             except Exception as e:
                 logger.warning("traits_announce send failed: %s", e)
+            # Pull safety-net: для client-authoritative welcome.snapshot пуст
+            # (P40 owned=0 — ещё не знает cid'ов). self_heal-push (ca3e3b2)
+            # покроет большинство, но если он не сработал (P40 уже знает cid'ы,
+            # KNOWN, push'а нет), а стор пуст — дёрнем pull через grace.
+            try:
+                asyncio.create_task(self._maybe_pull_traits())
+            except Exception as e:
+                logger.debug("schedule traits pull failed: %s", e)
+            return
+        if msg_type == "owned_traits_snapshot":
+            # Evolved-traits recovery (ca3e3b2, Хьюберт): P40 шлёт snapshot
+            # отдельным top-level сообщением {type, reason, creatures}. reason:
+            #   - "self_heal" — после projection_batch с unknown_cid>0 P40
+            #     пересоздал owned в baseline и авто-пушит. КЛЮЧЕВОЙ путь для
+            #     client-authoritative cheef (welcome.snapshot пуст, т.к. P40
+            #     ещё не знал cid'ов — теперь узнал из projection_batch).
+            #   - "pull" — ответ на наш traits_request (resync).
+            # FILL-ONLY ingest (baseline не затирает evolved в сторе) → force
+            # re-announce: guard _traits_announced_conn уже True после welcome,
+            # но именно здесь стор наполнился → шлём evolved поверх baseline.
+            reason = str(msg.get("reason", "") or "snapshot")
+            self._ingest_traits_snapshot(msg.get("creatures"), reason=reason)
+            try:
+                await self._maybe_send_traits_announce(force=True)
+            except Exception as e:
+                logger.warning("traits_announce (snapshot) send failed: %s", e)
             return
         if msg_type == "traits_ack":
             # Evolved-traits recovery: P40 применил evolved поверх baseline
