@@ -266,6 +266,9 @@ class ColonyWSClient:
             self._ws = ws
             self.connected = True
             self.last_error = ""
+            # Evolved-traits recovery: re-arm one-shot re-announce на новый
+            # коннект (welcome-handler шлёт после ingest snapshot).
+            self._traits_announced_conn = False
             logger.info("connected")
 
             from .seed_loader import seed_sha256
@@ -497,6 +500,48 @@ class ColonyWSClient:
                 logger.debug("projection_batch send failed: %s", e)
                 return
 
+    async def _maybe_send_traits_announce(self) -> None:
+        """Evolved-traits recovery (30.05.2026, Бендер): re-announce evolved
+        body-traits для existing owned обратно на P40 по main ws (client→P40).
+
+        One-shot per connect (guard `_traits_announced_conn`, ресет в connect-
+        блоке). Closure Body Migration: после P40 self-heal (baseline bootstrap)
+        клиент возвращает evolved тело — как мозг переживает рестарт.
+
+        Канал — main ws (тот же, что welcome/owned_traits_snapshot/projection_
+        batch). Конверт batch: {type:'traits_announce', creatures:[{cid,traits}]}.
+        P40 отвечает traits_ack (см. _handle). Идемпотентно — P40 accept-over-
+        baseline принимает повторные announce.
+        """
+        if getattr(self, "_traits_announced_conn", False):
+            return
+        ws = self._ws
+        compute = self.compute
+        if ws is None or compute is None \
+                or not hasattr(compute, "build_traits_announce_envelope"):
+            return
+        try:
+            envelope = compute.build_traits_announce_envelope()
+        except Exception as e:
+            logger.warning("build_traits_announce_envelope failed: %s", e)
+            return
+        # Помечаем коннект обработанным даже при пустом сторе (нечего слать —
+        # fresh colony), чтобы не пересобирать каждый welcome.
+        self._traits_announced_conn = True
+        if not envelope:
+            return
+        creatures = envelope.get("creatures", [])
+        try:
+            await ws.send(json.dumps(envelope))
+        except Exception as e:
+            logger.warning("traits_announce send failed: %s", e)
+            return
+        try:
+            compute.mark_traits_announce_sent([c["cid"] for c in creatures])
+        except Exception:
+            pass
+        logger.info("traits_announce sent: %d owned", len(creatures))
+
     async def _maybe_request_respawn(self, connect_ts: float) -> bool:
         """Phase G.3: одна проверка watchdog'а.
 
@@ -583,9 +628,51 @@ class ColonyWSClient:
                         self._cid_last_seen_tick[cid] = wt
                 except Exception:
                     pass
+            # Evolved-traits recovery (30.05.2026, Бендер): warm reconnect
+            # owned-handoff. welcome несёт owned_traits_snapshot:
+            # [{cid, traits{9}}] для owned-zodchiy (контракт Хьюберта f673741).
+            # FILL-ONLY ingest (client authoritative — после P40 self-heal
+            # snapshot = baseline, не затираем свой evolved), затем re-announce
+            # клиентского evolved-стора обратно на P40 (accept-over-baseline).
+            snap = msg.get("owned_traits_snapshot")
+            if isinstance(snap, list) and self.compute is not None \
+                    and hasattr(self.compute, "ingest_owned_traits"):
+                filled = 0
+                for ent in snap:
+                    if not isinstance(ent, dict):
+                        continue
+                    ecid = str(ent.get("cid") or "")
+                    etraits = ent.get("traits")
+                    if ecid and isinstance(etraits, dict):
+                        try:
+                            filled += self.compute.ingest_owned_traits(
+                                ecid, etraits, overwrite=False)
+                        except Exception as e:
+                            logger.warning(
+                                "owned_traits_snapshot ingest %s: %s", ecid, e)
+                if filled:
+                    logger.info(
+                        "owned_traits_snapshot: filled %d trait-fields", filled)
             logger.info(
                 "welcome: world_tick=%s server_time=%s n_creatures=%s mode=%s",
                 wt, msg.get("server_time"), n, mode or "normal")
+            # Re-announce evolved traits обратно на P40 (one-shot per connect).
+            # На warm reconnect organisms уже в compute (in-memory / restore_
+            # colony_from_local в connect-блоке) → стор содержит evolved.
+            try:
+                await self._maybe_send_traits_announce()
+            except Exception as e:
+                logger.warning("traits_announce send failed: %s", e)
+            return
+        if msg_type == "traits_ack":
+            # Evolved-traits recovery: P40 применил evolved поверх baseline
+            # для applied_cids (accept-over-baseline). Снимаем pending.
+            if self.compute is not None \
+                    and hasattr(self.compute, "handle_traits_ack"):
+                try:
+                    self.compute.handle_traits_ack(msg)
+                except Exception as e:
+                    logger.warning("traits_ack handler error: %s", e)
             return
         if msg_type == "pong":
             self.last_pong_ts = time.time()
@@ -898,6 +985,30 @@ class ColonyWSClient:
                     except Exception as e:
                         logger.warning(
                             "restore_sfnn_state cid=%s failed: %s", cid, e)
+                # Evolved-traits recovery (30.05.2026, Бендер): owned-handoff
+                # body-traits от P40 (контракт Хьюберта f673741). _creature_meta
+                # кладёт 8 evolved int в meta["traits"] + diet_gene ОТДЕЛЬНО на
+                # верхнем уровне meta. Мёржим в один 9-полевой dict → стор.
+                # Без этого crossover для не-client-born особей читал бы median-
+                # defaults. Local-cache (.pt) свои traits уже восстановил в
+                # restore_persisted_state — здесь P40 закрывает остаток
+                # (founders/elder/wanderer).
+                if isinstance(meta, dict) and hasattr(self.compute, "ingest_owned_traits"):
+                    handoff_traits = dict(meta.get("traits") or {})
+                    if "diet_gene" in meta and "diet_gene" not in handoff_traits:
+                        handoff_traits["diet_gene"] = meta["diet_gene"]
+                    if handoff_traits:
+                        try:
+                            # FILL-ONLY: client authoritative — не затираем свой
+                            # evolved (local-cache .pt мог восстановить раньше).
+                            n_tr = self.compute.ingest_owned_traits(
+                                cid, handoff_traits, overwrite=False)
+                            if n_tr:
+                                logger.info(
+                                    "owned-handoff traits cid=%s n=%d", cid, n_tr)
+                        except Exception as e:
+                            logger.warning(
+                                "ingest_owned_traits cid=%s failed: %s", cid, e)
                 self._seed_accepted += 1
                 logger.info("seed accepted cid=%s seed_id=%d bytes=%d source=%s",
                             cid, seed_id, len(weights), src)

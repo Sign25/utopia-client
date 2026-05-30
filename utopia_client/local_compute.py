@@ -464,6 +464,25 @@ class LocalColonyCompute:
         self._last_mate_tick: dict[str, int] = {}
         self._pending_newborn_envelopes: dict[str, dict] = {}
 
+        # Evolved-traits recovery (30.05.2026, Бендер; согласовано Фрай/Хьюберт).
+        # Authoritative per-cid стор 9 body-traits (vision_radius, smell_radius,
+        # attack_radius, move_speed, attack_power, armor, efficiency, camel,
+        # diet_gene). Источники наполнения:
+        #   - newborn-ack (handle_newborn_announce_ack) — для client-born;
+        #   - owned-handoff от P40 (ingest_owned_traits) — для founders/не-своих,
+        #     traits приходят в seed_pack.meta / hello.
+        # Переживает client-restart через save_state/restore_persisted_state.
+        # Принцип миграции: client держит ТЕЛО как мозг → при P40 self-heal
+        # (baseline bootstrap) client re-announce'ит evolved через
+        # `emit_traits_announce`; P40 принимает поверх baseline. До этого
+        # traits жили как loose-атрибуты на CompositeOrganism (только
+        # client-born, без persist) → терялись при рестарте.
+        self.traits: dict[str, dict] = {}        # cid → {9 trait полей}
+        # Pending re-announce: cid'ы, для которых traits_announce отправлен и
+        # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
+        # handle_traits_announce_ack.
+        self._pending_traits_announce: dict[str, float] = {}
+
         logger.info("LocalColonyCompute device=%s", self.device)
 
     # ── Client-local speciation (ТЗ §3.7) ───────────────────────────────
@@ -899,6 +918,9 @@ class LocalColonyCompute:
         # Phase 2 (27.05.2026, Бендер): client-side биохимия Z7.
         self.biochem.pop(cid, None)
         self.species_id.pop(cid, None)
+        # Evolved-traits recovery (30.05.2026): drop стор + pending re-announce.
+        self.traits.pop(cid, None)
+        self._pending_traits_announce.pop(cid, None)
 
     def persist_all_memory(self) -> int:
         """Phase 4 этап B: сохранить episodic state всех живых организмов.
@@ -963,6 +985,10 @@ class LocalColonyCompute:
         # случай (defense-in-depth от stale records при partial reset).
         self.biochem.clear()
         self.species_id.clear()  # реестр видов на диске сохраняется
+        # Evolved-traits recovery (30.05.2026): remove_creature уже очистил
+        # per-cid, clear на всякий случай (defense-in-depth от stale records).
+        self.traits.clear()
+        self._pending_traits_announce.clear()
         # TZ B Phase 2 (26.05.2026, Бендер): сбросить per-role tracker.
         for _r in _HEB_PT_ALL_ROLES:
             self._heb_pt_n_total[_r] = 0
@@ -1256,6 +1282,22 @@ class LocalColonyCompute:
                     logger.warning("restore_persisted_state %s biochem fallback: %s", cid, e)
             except Exception as e:
                 logger.warning("restore_persisted_state %s biochem: %s", cid, e)
+        # Evolved-traits recovery (30.05.2026): restore 9 body-traits +
+        # generation из .pt. Закрывает client-restart дыру — тело переживает
+        # рестарт как мозг. ingest_owned_traits санитизирует/клампит и
+        # дублирует на атрибуты организма (back-compat для getattr-чтения).
+        traits_d = payload.get("traits")
+        if isinstance(traits_d, dict) and traits_d:
+            try:
+                self.ingest_owned_traits(cid, traits_d)
+            except Exception as e:
+                logger.warning("restore_persisted_state %s traits: %s", cid, e)
+        gen = payload.get("generation")
+        if gen is not None:
+            try:
+                setattr(org, "generation", int(gen))
+            except Exception:
+                pass
 
     def restore_sfnn_state(self, cid: str, sfnn_state: dict) -> None:
         """S6.0b-B (16.05.2026): восстановить SFNN-правила из persistent-store.
@@ -2198,6 +2240,19 @@ class LocalColonyCompute:
                     payload["biochem"] = asdict(bc)
             except Exception as e:
                 logger.debug("save_state %s biochem: %s", cid, e)
+        # Evolved-traits recovery (30.05.2026, Бендер): 9 body-traits +
+        # generation в .pt. Раньше тело (traits) жило только loose-атрибутами
+        # и НЕ персистилось → client-restart сбрасывал к baseline. Теперь —
+        # bit-exact как мозг. Источник: authoritative стор self.traits.
+        traits_d = self.traits.get(cid)
+        if isinstance(traits_d, dict) and traits_d:
+            payload["traits"] = dict(traits_d)
+        try:
+            gen = getattr(org, "generation", None)
+            if gen is not None:
+                payload["generation"] = int(gen)
+        except Exception:
+            pass
         return payload
 
     def save_all_states(self, dir_path) -> int:
@@ -3663,18 +3718,39 @@ class LocalColonyCompute:
         "diet_gene": (0.0, 1.0),
     }
 
-    def _inherit_traits_for_newborn(self, mother, father) -> dict:
+    def _parent_trait(self, organism, cid, name):
+        """Resolve один trait родителя: authoritative стор по cid → fallback
+        loose-атрибут организма → None.
+
+        Evolved-traits recovery (30.05.2026): стор — источник истины (он
+        переживает рестарт и наполняется owned-handoff'ом). getattr оставлен
+        как back-compat для путей, где traits ещё не попали в стор (старые
+        client-born до миграции, тесты с атрибутами на организме)."""
+        if cid is not None:
+            stored = self.traits.get(cid)
+            if isinstance(stored, dict) and name in stored \
+                    and stored[name] is not None:
+                return stored[name]
+        return getattr(organism, name, None)
+
+    def _inherit_traits_for_newborn(self, mother, father,
+                                    mother_cid=None, father_cid=None) -> dict:
         """Compute child 9 traits via parent crossover + clamp.
 
         Per-trait: 50/50 от родителя + малый Gaussian noise (σ=φ⁻⁵≈0.09 от range).
         clamp в _TRAIT_RANGES (R1 R-mitigation: invalid not sent P40).
+
+        Evolved-traits recovery: значения родителя берутся из authoritative
+        стора `self.traits` по cid (с fallback на loose-атрибут) — иначе
+        crossover терял эволюцию, читая baseline-атрибуты пересозданного
+        self-heal'ом организма.
         """
         import random as _random
         out: dict = {}
         sigma_frac = 0.0902  # 1/φ⁵
         for name, (lo, hi) in self._TRAIT_RANGES.items():
-            m_val = getattr(mother, name, None)
-            f_val = getattr(father, name, None)
+            m_val = self._parent_trait(mother, mother_cid, name)
+            f_val = self._parent_trait(father, father_cid, name)
             if m_val is None and f_val is None:
                 # Default median
                 base = (lo + hi) / 2.0
@@ -3790,7 +3866,8 @@ class LocalColonyCompute:
             # 9 полей: vision_radius, smell_radius, attack_radius, move_speed,
             #          attack_power, armor, efficiency, camel, diet_gene
             # Clamping (R1): защита диапазонов до отправки P40.
-            child_traits = self._inherit_traits_for_newborn(mother, father)
+            child_traits = self._inherit_traits_for_newborn(
+                mother, father, mother_cid=mother_cid, father_cid=father_cid)
 
             # 6. Generation = max(parents) + 1
             mother_gen = int(getattr(mother, "generation", 0))
@@ -3905,21 +3982,16 @@ class LocalColonyCompute:
                 logger.warning("cleanup remove_creature %s failed: %s", cid, e)
             return True
 
-        # accepted=True — apply traits if provided
+        # accepted=True — apply traits if provided.
+        # Evolved-traits recovery (30.05.2026): P40 ack несёт authoritative
+        # (clamped) traits → пишем в стор `self.traits` + дублируем на
+        # атрибуты организма (ingest_owned_traits делает оба). Стор теперь
+        # переживает рестарт (save_state) и используется в crossover.
         traits = ack_payload.get("traits")
         org = self.organisms.get(cid)
         if traits and org is not None:
             try:
-                # Traits в client применяются как атрибуты CompositeOrganism
-                # (re-use паттерн _inherit_traits). Не все поля могут быть
-                # в organism — добавляем мягко через setattr.
-                applied = 0
-                for trait_name, trait_value in traits.items():
-                    try:
-                        setattr(org, trait_name, trait_value)
-                        applied += 1
-                    except Exception:
-                        pass
+                applied = self.ingest_owned_traits(cid, traits)
                 logger.info(
                     "newborn accepted cid=%s traits_applied=%d", cid, applied)
             except Exception as e:
@@ -3927,6 +3999,157 @@ class LocalColonyCompute:
         else:
             logger.info("newborn accepted cid=%s (no traits)", cid)
         return True
+
+    # ── Evolved-traits recovery (30.05.2026, Бендер) ─────────────────────
+    # Closure Body Migration: тело (9 traits) переживает рестарт как мозг.
+    # Согласовано Фрай (client authoritative по traits) + Хьюберт (owned-
+    # handoff в seed/hello + accept-поверх-baseline на P40 self-heal).
+
+    def _sanitize_traits(self, traits: dict) -> dict:
+        """Привести входящие traits к 9 валидным полям в диапазонах _TRAIT_RANGES.
+
+        Игнорирует лишние ключи, клампит значения, int-поля → int. Возвращает
+        только валидные поля (частичный dict допустим — owned-handoff может
+        нести подмножество)."""
+        out: dict = {}
+        if not isinstance(traits, dict):
+            return out
+        for name, (lo, hi) in self._TRAIT_RANGES.items():
+            if name not in traits or traits[name] is None:
+                continue
+            try:
+                val = float(traits[name])
+            except (TypeError, ValueError):
+                continue
+            val = max(float(lo), min(float(hi), val))
+            if isinstance(lo, int) and isinstance(hi, int):
+                val = int(round(val))
+            else:
+                val = float(val)
+            out[name] = val
+        return out
+
+    def ingest_owned_traits(self, cid: str, traits: dict,
+                            overwrite: bool = True) -> int:
+        """Записать traits в стор + дублировать на организм. Возвращает число
+        фактически применённых полей.
+
+        Источники и режим:
+          - newborn-ack (handle_newborn_announce_ack) — overwrite=True
+            (P40 authoritative для только что рождённого);
+          - restore_persisted_state (.pt) — overwrite=True (свой evolved,
+            стор пуст → режим без разницы);
+          - owned-handoff P40 (seed_pack.meta / welcome.owned_traits_snapshot)
+            — overwrite=False (FILL-ONLY): client authoritative по traits
+            (принцип миграции). После P40 self-heal snapshot = baseline — НЕЛЬЗЯ
+            затирать клиентский evolved. Заполняем только НЕизвестные поля
+            (founders/never-persisted), известные — оставляем своими.
+
+        Дублирование на loose-атрибуты сохранено для back-compat (тесты/
+        проекция читают getattr).
+        """
+        clean = self._sanitize_traits(traits)
+        if not clean:
+            return 0
+        cur = self.traits.get(cid)
+        if not isinstance(cur, dict):
+            cur = {}
+            self.traits[cid] = cur
+        applied: dict = {}
+        for name, val in clean.items():
+            if not overwrite and name in cur:
+                continue  # client-authoritative: своё значение не трогаем
+            cur[name] = val
+            applied[name] = val
+        org = self.organisms.get(cid)
+        if org is not None:
+            for name, val in applied.items():
+                try:
+                    setattr(org, name, val)
+                except Exception:
+                    pass
+        return len(applied)
+
+    def get_traits(self, cid: str) -> Optional[dict]:
+        """Снимок traits особи из стора (copy), либо None если неизвестна."""
+        t = self.traits.get(cid)
+        return dict(t) if isinstance(t, dict) else None
+
+    def build_traits_announce(self, cids=None) -> list[dict]:
+        """Собрать `creatures`-список для batch traits_announce (existing owned).
+
+        P40 после self-heal держит baseline → клиент возвращает evolved.
+        Включаем только особей с известными traits в сторе (founders без
+        handoff'а — пропуск, у P40 для них baseline корректный bootstrap).
+
+        Schema items (контракт Хьюберта f673741): `{cid, traits{9}}` — БЕЗ
+        generation/species_id (P40 держит их в CreatureState authoritative).
+        Конверт собирает `build_traits_announce_envelope`.
+        """
+        if cids is None:
+            cids = list(self.organisms.keys())
+        out: list[dict] = []
+        for cid in cids:
+            traits = self.traits.get(cid)
+            if not isinstance(traits, dict) or not traits:
+                continue
+            out.append({"cid": cid, "traits": dict(traits)})
+        return out
+
+    def build_traits_announce_envelope(self, cids=None) -> Optional[dict]:
+        """Batch-конверт traits_announce для отправки по main ws (client→P40).
+
+        Контракт Хьюберта f673741:
+            {type: 'traits_announce', creatures: [{cid, traits{9}}, ...]}
+
+        Возвращает None если нет ни одной особи с известными traits (нечего
+        слать). Pending-учёт — отдельно через `mark_traits_announce_sent`
+        (после фактической отправки), т.к. ws-send асинхронный."""
+        creatures = self.build_traits_announce(cids=cids)
+        if not creatures:
+            return None
+        return {"type": "traits_announce", "creatures": creatures}
+
+    def mark_traits_announce_sent(self, cids) -> None:
+        """Зарегистрировать pending для отправленных announce (ждём traits_ack).
+        Эфемерное — снимается в `handle_traits_ack` по applied_cids."""
+        import time as _time
+        ts = _time.time()
+        for cid in cids:
+            self._pending_traits_announce[cid] = ts
+
+    def handle_traits_ack(self, ack_payload: dict) -> int:
+        """Process traits_ack от P40 (batch, контракт Хьюберта f673741).
+
+        ack schema:
+            {type: 'traits_ack', applied_cids: [cid,...],
+             invalid: int, unknown: int}
+
+        P40 применил evolved поверх baseline для `applied_cids` (authoritative
+        теперь совпадает с тем, что клиент отправил — стор уже верный, доп.
+        мёрж не нужен). Снимаем pending по applied_cids; invalid/unknown —
+        warn для observability (несовпадение стора и server-side owner/range).
+
+        Returns:
+            Число cid'ов, снятых с pending.
+        """
+        if not isinstance(ack_payload, dict):
+            return False  # type: ignore[return-value]
+        applied = ack_payload.get("applied_cids") or []
+        cleared = 0
+        for cid in applied:
+            if self._pending_traits_announce.pop(str(cid), None) is not None:
+                cleared += 1
+        invalid = int(ack_payload.get("invalid", 0) or 0)
+        unknown = int(ack_payload.get("unknown", 0) or 0)
+        if invalid or unknown:
+            logger.warning(
+                "traits_ack: applied=%d invalid=%d unknown=%d "
+                "(invalid=range-reject, unknown=not-owned/absent)",
+                cleared, invalid, unknown)
+        else:
+            logger.info("traits_ack: applied=%d", cleared)
+        return cleared
 
     def _apply_biochem_mental_break(
         self, cid: str, world_tick: int = 0,

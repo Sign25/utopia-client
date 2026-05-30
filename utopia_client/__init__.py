@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.11"  # feat: подключение client-local speciation (species_id в projection, ТЗ §3.7)
+__version__ = "0.11.12"  # feat: evolved-traits recovery (тело persistent через restart, контракт Хьюберт f673741)
