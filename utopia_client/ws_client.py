@@ -1652,6 +1652,18 @@ class ColonyWSClient:
                         self._request_orphan_respawn(world_tick))
             else:
                 self._orphan_obs_streak = 0
+                # Liveness fix (30.05.2026, Бендер): obs_batch с known owned
+                # creatures = особи живы и наблюдаются P40. Раньше n_alive_owned/
+                # last_owned_alive_ts обновлялись ТОЛЬКО из welcome/stats —
+                # у client-authoritative cheef они часто =0 (welcome
+                # n_creatures=0 до projection-реконсиляции; stats редкие/0). В
+                # итоге empty-world watchdog ложно слал respawn_owned_request
+                # каждые ~grace сек → P40 _async_respawn → reconnect → broker
+                # supersede старой сессии (1001) → "no close frame" → петля,
+                # n_alive не устаканивается. obs для owned — авторитетный
+                # signal "колония НЕ пуста"; stats/welcome поправят при приходе.
+                self.n_alive_owned = known
+                self.last_owned_alive_ts = time.time()
         except Exception:
             self._orphan_obs_streak = 0
         # Body Migration Phase 2 (27.05.2026, Бендер): sync server-side
