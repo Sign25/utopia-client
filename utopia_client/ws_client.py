@@ -388,7 +388,9 @@ class ColonyWSClient:
                 save_task.cancel()
                 empty_task.cancel()
                 sync_task.cancel()
-                for t in (ping_task, save_task, empty_task, sync_task):
+                proj_task.cancel()
+                for t in (ping_task, save_task, empty_task, sync_task,
+                          proj_task):
                     try:
                         await t
                     except (asyncio.CancelledError, Exception):

@@ -48,25 +48,56 @@ DEFAULT_MAX_PAIRS_PER_TICK: int = 1  # natural rate-limit
 # Mental break states которые блокируют размножение (force_STAY territory)
 BLOCKING_MENTAL_BREAK: set[str] = {"catatonic", "depression", "panic"}
 
+# Multifactorial fitness gate (30.05.2026, Шеф + vision body_migration.md §:
+# «размножение = совокупность факторов: энергия + болезни + mental_break +
+# cortisol + ...», не безконтрольное). Пороги выровнены на natural_selection.py
+# (HIGH_CORTISOL=70, HIGH_FATIGUE=70, LOW_GLUCOSE=25, INFECTION_FLOOR=0.1).
+# Биохимия теперь persist'ится (Colony Ownership Migration §5.1) → факторы не
+# обнуляются при restart (исходная причина energy-only hotfix снята).
+REPRO_HIGH_CORTISOL: float = 70.0    # хронический стресс → не плодим
+REPRO_HIGH_FATIGUE: float = 70.0     # переутомление → не плодим
+REPRO_LOW_GLUCOSE: float = 25.0      # голод → не плодим
+REPRO_INFECTION_FLOOR: float = 0.1   # болезнь → не плодим
+
 
 def is_reproduction_ready(
     biochem,
     *,
     min_energy: float = MIN_ENERGY_FOR_REPRO,
 ) -> bool:
-    """Проверка одного organism: готов ли к репродукции (energy + mental_break).
+    """Готов ли organism к репродукции — МНОГОФАКТОРНО (30.05.2026, Шеф).
 
-    Hotfix 28.05.2026: убраны oxytocin/serotonin gates — биохимические
-    эфемериды обнуляются при restart, ломают detection после deploy.
-    Server использует energy-only через `_find_mate_pairs`.
+    Vision (body_migration.md §): размножение — совокупность факторов, не
+    безконтрольное (одна энергия). Без этого колония плодилась 9× сверх
+    ёмкости железа → perf-коллапс. Теперь плодятся только реально fit особи →
+    естественная регуляция у carrying capacity (server-side смерть слабых
+    освобождает место — vision «client не убивает явно»).
 
-    Не учитывает cooldown — это делает caller через `_last_mate_tick`.
+    Факторы (биохимия persist'ится с §5.1 → restart-safe):
+      - energy >= min_energy (может позволить ребёнка)
+      - НЕ катастрофический mental_break (catatonic/depression/panic)
+      - cortisol НЕ хронически высокий (стресс)
+      - fatigue НЕ высокая (переутомление)
+      - glucose НЕ низкая (голод)
+      - НЕ болен (infected / infection_severity)
+    Возраст/adaptability/repertoire/fitness — P40-side (skipped, как в
+    natural_selection.py MVP). Cooldown — caller через `_last_mate_tick`.
     """
     energy = float(getattr(biochem, "energy", 0.0))
     if energy < min_energy:
         return False
     mb_state = str(getattr(biochem, "mental_break", "") or "").lower()
     if mb_state in BLOCKING_MENTAL_BREAK:
+        return False
+    # Многофакторная fitness-проверка
+    if float(getattr(biochem, "cortisol", 0.0)) > REPRO_HIGH_CORTISOL:
+        return False
+    if float(getattr(biochem, "fatigue", 0.0)) > REPRO_HIGH_FATIGUE:
+        return False
+    if float(getattr(biochem, "glucose", 100.0)) < REPRO_LOW_GLUCOSE:
+        return False
+    if bool(getattr(biochem, "infected", False)) or \
+            float(getattr(biochem, "infection_severity", 0.0)) > REPRO_INFECTION_FLOOR:
         return False
     return True
 
