@@ -171,6 +171,9 @@ class ColonyWSClient:
         self._cid_last_seen_tick: dict[str, int] = {}
         self._cid_gc_total: int = 0
         self._cid_gc_last_run_tick: int = 0
+        # Issue #2 (30.05.2026): счётчик отправленных owned_bye cid (явный
+        # despawn на P40 при локальном удалении — GC/смерть).
+        self._owned_bye_sent: int = 0
         # 0.10.9 (21.05.2026): счётчик последовательных obs_batch'ей, у которых
         # ни один cid не зарегистрирован в compute.organisms. Триггерит
         # respawn_owned_request при достижении ORPHAN_OBS_RESPAWN_THRESHOLD.
@@ -1435,7 +1438,9 @@ class ColonyWSClient:
             self.last_world_tick = world_tick
             for cid in obs_per_cid:
                 self._cid_last_seen_tick[cid] = world_tick
-            self._gc_orphan_cids(world_tick)
+            gced = self._gc_orphan_cids(world_tick)
+            if gced:
+                await self._send_owned_bye(gced)
         # 0.10.9 (21.05.2026): orphan-obs backstop. Если ни один cid из
         # obs_per_cid не зарегистрирован в compute.organisms — handle_tick
         # вернёт {} → ws.send actions_batch не сработает → P40 пометит
@@ -1586,7 +1591,7 @@ class ColonyWSClient:
 
     # ── Variant B (19.05.2026): GC ghost'ов в LocalColonyCompute ─────────
 
-    def _gc_orphan_cids(self, world_tick: int) -> None:
+    def _gc_orphan_cids(self, world_tick: int) -> list[str]:
         """Чистим LocalColonyCompute от cid'ов, которых давно нет в obs_batch.
 
         P40 удаляет умерших из World молча (Phase F3.6 шлёт death только
@@ -1598,25 +1603,28 @@ class ColonyWSClient:
         Запускается не чаще CID_GC_INTERVAL_TICKS, чистит cid с
         last_seen < world_tick - STALE_CID_TICKS либо отсутствующий
         в _cid_last_seen_tick совсем (значит не появлялся ни разу).
+
+        Возвращает список удалённых cid — вызывающий шлёт по ним `owned_bye`
+        (issue #2: явный despawn на P40 вместо ожидания 24ч freeze-sticky cap).
         """
         compute = self.compute
         if compute is None:
-            return
+            return []
         if world_tick - self._cid_gc_last_run_tick < CID_GC_INTERVAL_TICKS:
-            return
+            return []
         self._cid_gc_last_run_tick = world_tick
         threshold = world_tick - STALE_CID_TICKS
         if threshold <= 0:
             # World моложе grace-периода — рано GC, новорождённые могли
             # ещё не попасть в obs_batch.
-            return
+            return []
         orphans: list[str] = []
         for cid in list(compute.organisms.keys()):
             last = self._cid_last_seen_tick.get(cid)
             if last is None or last < threshold:
                 orphans.append(cid)
         if not orphans:
-            return
+            return []
         for cid in orphans:
             try:
                 compute.remove_creature(cid)
@@ -1628,6 +1636,29 @@ class ColonyWSClient:
             "cid GC: removed %d orphan(s), live=%d, total_gc=%d, threshold=%d",
             len(orphans), len(compute.organisms),
             self._cid_gc_total, threshold)
+        return orphans
+
+    async def _send_owned_bye(self, cids: list[str]) -> None:
+        """Issue #2 (30.05.2026, Бендер): явный despawn owned cid на P40.
+
+        Когда client локально выкинул cid (GC orphan, смерть battle/mate-fail,
+        regen) — шлём `owned_bye {cids}`, чтобы P40 despawn'нул проекцию сразу,
+        а не держал её frozen-sticky до 24ч safety cap. Counterpart к handler
+        `_handle_owned_bye` в colony_pusher (neurocore 5512521).
+        """
+        ws = self._ws
+        if ws is None or not cids:
+            return
+        try:
+            await ws.send(json.dumps({
+                "type": "owned_bye",
+                "cids": list(cids),
+                "ts": int(time.time() * 1000),
+            }))
+            self._owned_bye_sent += len(cids)
+            logger.info("owned_bye sent: %d cid(s)", len(cids))
+        except Exception as e:
+            logger.warning("owned_bye send failed: %s", e)
 
     # ── Phase F3.3.a: weights_request → weights_dump ─────────────────────
 
