@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.15"  # fix: liveness из obs_batch (known owned) — стоп ложному empty-world respawn → reconnect-петле
+__version__ = "0.11.16"  # perf: offload handle_tick на asyncio.to_thread — ws-loop не блокируется (142 орг → keepalive)

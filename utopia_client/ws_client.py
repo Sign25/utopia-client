@@ -1715,34 +1715,29 @@ class ColonyWSClient:
                         _bc.last_social_tick = int(world_tick)
                     except (TypeError, ValueError):
                         pass
+        # Offload handle_tick + actions-build на thread-executor (0.11.16,
+        # Бендер): N орг × 20 тканей forward синхронно блокировали ws-event-loop
+        # → ws-read голодал → keepalive ping timeout (broker→client queue MAX
+        # при 142 орг). torch forward releases GIL → event-loop успевает на
+        # ping/read во время тика. Guard _tick_in_progress: если предыдущий тик
+        # ещё идёт (handle_tick медленнее obs-rate), пропускаем heavy-обработку
+        # этого batch — liveness/GC/last_seen уже обновлены выше, P40 reuse'ит
+        # последний action на пропущенных тиках. Дроп stale > pile-up.
+        if getattr(self, "_tick_in_progress", False):
+            return
+        self._tick_in_progress = True
         try:
-            actions = self.compute.handle_tick(obs_per_cid,
-                                                events_per_cid=events_per_cid,
-                                                intero_per_cid=intero_per_cid,
-                                                world_tick=world_tick)
+            creatures_out = await asyncio.to_thread(
+                self._run_tick_and_build,
+                obs_per_cid, events_per_cid, intero_per_cid, world_tick)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return
+        finally:
+            self._tick_in_progress = False
         ws = self._ws
-        if ws is None or not actions:
+        if ws is None or not creatures_out:
             return
-        # Phase emas pushback (03.05.2026): подмешиваем phase_emas per-creature,
-        # чтобы сервер видел Phase 1/2/6 метрики для owned. Поле опциональное —
-        # старые серверы игнорируют, новые применяют через _apply_phase_emas.
-        creatures_out: list = []
-        for cid, a in actions.items():
-            entry: dict = {
-                "cid": cid,
-                "action": int(a["action"]),
-                "target_id": a.get("target_id"),
-            }
-            try:
-                emas = self.compute.get_phase_emas(cid) if self.compute else None
-            except Exception:
-                emas = None
-            if emas:
-                entry["phase_emas"] = emas
-            creatures_out.append(entry)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -1754,6 +1749,37 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+
+    def _run_tick_and_build(self, obs_per_cid, events_per_cid,
+                            intero_per_cid, world_tick):
+        """Offload-worker (0.11.16): handle_tick + сборка creatures_out с
+        phase_emas. Запускается в asyncio.to_thread — torch-forward'ы N орг не
+        блокируют ws-event-loop. Весь compute-доступ изолирован здесь; на
+        event-loop одновременно может идти build_projection_batch (read-mostly,
+        list-снапшоты в 0.11.14 защищают от dict-race; stale-read безвреден).
+        Phase emas (03.05.2026): per-creature Phase 1/2/6 метрики для owned."""
+        if self.compute is None:
+            return None
+        actions = self.compute.handle_tick(
+            obs_per_cid, events_per_cid=events_per_cid,
+            intero_per_cid=intero_per_cid, world_tick=world_tick)
+        if not actions:
+            return None
+        creatures_out: list = []
+        for cid, a in actions.items():
+            entry: dict = {
+                "cid": cid,
+                "action": int(a["action"]),
+                "target_id": a.get("target_id"),
+            }
+            try:
+                emas = self.compute.get_phase_emas(cid)
+            except Exception:
+                emas = None
+            if emas:
+                entry["phase_emas"] = emas
+            creatures_out.append(entry)
+        return creatures_out
 
     async def _request_orphan_respawn(self, world_tick: int) -> None:
         """0.10.9 (21.05.2026): запросить у P40 повторную рассылку seed_pack.
