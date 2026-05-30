@@ -443,6 +443,13 @@ class LocalColonyCompute:
         # остаётся на P40 (vision §2.5).
         self.biochem: dict = {}  # cid → ClientCreatureBiochem
 
+        # Phase 4 этап D (30.05.2026, Бендер): client-local speciation (ТЗ §3.7).
+        # cid → species_id; реестр client-local (core.tissue_speciation), lazy
+        # из colonies_dir/species_registry.json. До этого speciation.py был
+        # написан, но НЕ подключён → species_id всегда None в projection.
+        self.species_id: dict = {}      # cid → int
+        self._species_registry = None   # SpeciesRegistry, lazy
+
         # Phase 4 этап G (28.05.2026): cache естественный отбор capacity.
         # estimate_population() запускает CPU benchmark (~секунды), не
         # должна вызываться каждые push_diagnostics. Init once on demand.
@@ -458,6 +465,55 @@ class LocalColonyCompute:
         self._pending_newborn_envelopes: dict[str, dict] = {}
 
         logger.info("LocalColonyCompute device=%s", self.device)
+
+    # ── Client-local speciation (ТЗ §3.7) ───────────────────────────────
+
+    def _ensure_species_registry(self):
+        """Lazy SpeciesRegistry из colonies_dir/species_registry.json.
+        False-sentinel если core.tissue_speciation недоступен."""
+        if self._species_registry is None:
+            try:
+                from .speciation import load_or_create_registry
+                self._species_registry = load_or_create_registry()
+            except Exception as e:
+                logger.debug("species registry load failed: %s", e)
+                self._species_registry = False
+        return self._species_registry or None
+
+    @staticmethod
+    def _organism_topology_genes(organism) -> list:
+        """Межтканевые NEAT-гены организма как list[dict] для assign_species.
+        Z2.b apply_topology_overlay пока не подключён → обычно [] (все особи
+        попадают в founder-вид; реальная дивергенция придёт с Z2.b)."""
+        try:
+            genes = getattr(organism, "tissue_topology_genes", None)
+            if genes:
+                return [g.to_dict() if hasattr(g, "to_dict") else dict(g)
+                        for g in genes]
+        except Exception:
+            pass
+        return []
+
+    def _assign_species(self, cid: str, organism, tick: int = 0) -> None:
+        """Назначить species_id особи через client-local registry (идемпотентно)."""
+        if cid in self.species_id:
+            return
+        reg = self._ensure_species_registry()
+        if reg is None:
+            return
+        try:
+            from .speciation import assign_species, save_registry
+            topo = self._organism_topology_genes(organism)
+            sid, is_new = assign_species(
+                reg, topo, tick=int(tick), founder_cid=str(cid))
+            self.species_id[cid] = int(sid)
+            if is_new:
+                try:
+                    save_registry(reg)
+                except Exception as e:
+                    logger.debug("save_registry failed: %s", e)
+        except Exception as e:
+            logger.debug("assign_species cid=%s: %s", cid, e)
 
     # ── Регистрация особей ───────────────────────────────────────────────
 
@@ -480,6 +536,9 @@ class LocalColonyCompute:
         if hasattr(organism, "eval"):
             organism.eval()
         self.organisms[cid] = organism
+        # Phase 4 этап D: client-local species_id (идемпотентно; topology []
+        # пока Z2.b не подключён → founder-вид). build_projection_batch шлёт его.
+        self._assign_species(cid, organism)
         # SFNN S3.activate: CompositeOrganism не несёт genome — приклеиваем
         # SimpleNamespace с текущим дефолтом флага. set_higher_sfnn() позже
         # переписывает атрибут у всех существующих особей.
@@ -839,6 +898,7 @@ class LocalColonyCompute:
         self.last_episodic_recall.pop(cid, None)
         # Phase 2 (27.05.2026, Бендер): client-side биохимия Z7.
         self.biochem.pop(cid, None)
+        self.species_id.pop(cid, None)
 
     def persist_all_memory(self) -> int:
         """Phase 4 этап B: сохранить episodic state всех живых организмов.
@@ -902,6 +962,7 @@ class LocalColonyCompute:
         # remove_creature уже очистил per-cid записи, но clear на всякий
         # случай (defense-in-depth от stale records при partial reset).
         self.biochem.clear()
+        self.species_id.clear()  # реестр видов на диске сохраняется
         # TZ B Phase 2 (26.05.2026, Бендер): сбросить per-role tracker.
         for _r in _HEB_PT_ALL_ROLES:
             self._heb_pt_n_total[_r] = 0
@@ -3741,10 +3802,10 @@ class LocalColonyCompute:
                 pass
 
             # 7. Build envelope (projection-model schema, ТЗ §2)
-            # species_id: наследуем от mother (Хьюбертов handler ожидает)
+            # species_id: наследуем от mother (client-local registry, §3.7)
             child_species_id = (
-                getattr(mother, "species_id", None)
-                or getattr(father, "species_id", None)
+                self.species_id.get(mother_cid)
+                or self.species_id.get(father_cid)
                 or 0
             )
             envelope = {
