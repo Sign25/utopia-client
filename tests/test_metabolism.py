@@ -74,10 +74,12 @@ def test_no_dehydration_death_while_damage_disabled():
     assert bc.energy == 342.0       # энергия не тронута жаждой
 
 
-def test_dehydration_damage_enabled_by_default():
-    """0.11.34: death-урон ВКЛ по умолчанию (доход подтверждён на проде)."""
+def test_dehydration_damage_disabled_by_default():
+    """0.11.35: death-урон ОТКЛ по умолчанию (0.11.34 выкосил колонию —
+    дрейп φ²/тик при 5Гц выжигает энергию; re-enable после рабочего water-seek
+    или рекалибровки дрейна)."""
     c, org, bc = _compute_with_org()
-    assert c._dehydration_damage_enabled is True
+    assert c._dehydration_damage_enabled is False
 
 
 def test_dehydration_stage_thresholds():

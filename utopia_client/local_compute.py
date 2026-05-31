@@ -522,10 +522,14 @@ class LocalColonyCompute:
         self._hyd_calib_ticks: int = 0
         # Death-урон от обезвоживания (01.06.2026, Шеф: «вода влияет на общее
         # состояние и гибель»). dh_stage>=2 → energy_drain → смерть через
-        # energy<=0. ВКЛЮЧЕНО 0.11.34: доход подтверждён на проде (drink_sum
-        # 261→667, ratio 2-7, hydration mean ~85) — баланс здоровый, урок
-        # 0.11.24 соблюдён (не включали без проверенного дохода).
-        self._dehydration_damage_enabled: bool = True
+        # energy<=0. ОТКАЧЕНО 0.11.35: 0.11.34 выкосил всю колонию (17→0 за 3
+        # мин). Дрейн φ²≈2.6/тик при 5Гц = ~13 энергии/сек → стадия 2 за
+        # полминуты выжигает весь запас энергии → starvation при здоровой воде.
+        # На сервере не наказуемо (обученное поведение избегает обезвоживания),
+        # на клиенте поведения нет + water-seek рефлекс не срабатывает →
+        # гарантированный вайп. RE-ENABLE только после: (1) рабочий water-seek
+        # ИЛИ (2) рекалибровка дрейна под client-tick-rate (мельче/только st.3).
+        self._dehydration_damage_enabled: bool = False
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
