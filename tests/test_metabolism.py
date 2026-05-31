@@ -63,14 +63,21 @@ def test_thirst_unconditional_now():
 
 
 def test_no_dehydration_death_while_damage_disabled():
-    """Death-урон ОТКЛ (дефолт-флаг): hydration=0, energy=342, telomere=0.999
-    → НЕ умирает, энергия не тронута. (Урок 0.11.24 — без дохода не убиваем.)"""
+    """Death-урон ОТКЛ (флаг False): hydration=0, energy=342, telomere=0.999
+    → НЕ умирает, энергия не тронута. (Защитный путь — урок 0.11.24.)"""
     c, org, bc = _compute_with_org(energy=342.0, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
+    c._dehydration_damage_enabled = False  # явно (дефолт 0.11.34 = True)
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 30.0})
     assert "c1" not in c._dead_cids  # ЖИВ (energy_drain выключен)
     assert bc.energy == 342.0       # энергия не тронута жаждой
+
+
+def test_dehydration_damage_enabled_by_default():
+    """0.11.34: death-урон ВКЛ по умолчанию (доход подтверждён на проде)."""
+    c, org, bc = _compute_with_org()
+    assert c._dehydration_damage_enabled is True
 
 
 def test_dehydration_stage_thresholds():

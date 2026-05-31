@@ -522,9 +522,10 @@ class LocalColonyCompute:
         self._hyd_calib_ticks: int = 0
         # Death-урон от обезвоживания (01.06.2026, Шеф: «вода влияет на общее
         # состояние и гибель»). dh_stage>=2 → energy_drain → смерть через
-        # energy<=0. Включаем ТОЛЬКО после подтверждения дохода (drink_sum>0):
-        # урок 0.11.24 — энергодрейн-смерть без дохода выкашивает колонию.
-        self._dehydration_damage_enabled: bool = False
+        # energy<=0. ВКЛЮЧЕНО 0.11.34: доход подтверждён на проде (drink_sum
+        # 261→667, ratio 2-7, hydration mean ~85) — баланс здоровый, урок
+        # 0.11.24 соблюдён (не включали без проверенного дохода).
+        self._dehydration_damage_enabled: bool = True
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.

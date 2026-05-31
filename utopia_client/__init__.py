@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.33"  # fix: client-income больше не гейтится P40-ключом delta_hydration=0 (был мёртв с 0.11.30) — приоритет террейна над нулём P40 + INC_DIAG вне гейта
+__version__ = "0.11.34"  # feat: водный контур ЗАВЕРШЁН — dehydration energy_drain death ВКЛ (доход подтверждён drink_sum 261→667, ratio 2-7); INC_DIAG убран
