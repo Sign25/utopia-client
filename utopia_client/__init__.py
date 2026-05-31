@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.40"  # tune Phase 4: ATTACK-boost только при достижимой добыче (prox>0.3, не видимость 0.1) + магнитуда 2.0→1.5 — срезать over-aggression (ATTACK доминировал 36%, Хьюберт)
+__version__ = "0.11.41"  # feat Phase 4 #1: REINFORCE-baseline для motor_policy (advantage=reward−EMA) — политика учится отличать yield-действия (eat/kill) от пустых (move), а не только reinforce

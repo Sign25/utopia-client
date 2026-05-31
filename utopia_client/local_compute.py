@@ -380,6 +380,11 @@ class LocalColonyCompute:
         self.last_imag_mult: dict = {}     # cid → float ∈ [1, 2]
         self.last_planner_delta: dict = {} # cid → torch.Tensor [16]
         self.last_motor_delta: dict = {}   # cid → torch.Tensor [16] (Phase 7)
+        # REINFORCE baseline (Phase 4 #1, 01.06.2026): бегущее среднее reward
+        # на cid → advantage = r − baseline. Без него gain=1+r всегда >0 →
+        # политика только reinforce, не дискриминирует. Server intent:
+        # "REINFORCE по log_prob[a]·(r_imm_total − baseline)".
+        self._motor_reward_baseline: dict = {}  # cid → float (EMA reward)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -926,6 +931,7 @@ class LocalColonyCompute:
         # SFNN S1.2c: forget baseline row-norms.
         self.motor_sfnn_row_norms.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
+        self._motor_reward_baseline.pop(cid, None)
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
         self.theory_of_mind_opt.pop(cid, None)
@@ -3308,7 +3314,19 @@ class LocalColonyCompute:
         try:
             r_imm = self._compute_immediate_reward(event)
             r_imm_total = float(r_imm + intrinsic_now)
-            reward_gain = 1.0 + r_imm_total
+            # REINFORCE baseline (Phase 4 #1, 01.06.2026): advantage =
+            # reward − бегущее среднее. Выше среднего (eat/kill) → gain>1
+            # reinforce; ниже (пустой move/damage) → gain<1 ослабить →
+            # политика УЧИТСЯ отличать yield-действия. Без baseline (было)
+            # gain=1+r всегда>0 → только reinforce, нет дискриминации.
+            b = self._motor_reward_baseline.get(cid, 0.0)
+            b = 0.99 * b + 0.01 * r_imm_total      # EMA (τ≈100 тиков)
+            self._motor_reward_baseline[cid] = b
+            advantage = r_imm_total - b
+            # clamp [-2,2] → gain ∈ [-1,3] (ΔW-clip ±0.01 + row-renorm
+            # ниже бортуют величину; знак-флип = анти-Hebbian «отучивание»).
+            advantage = max(-2.0, min(2.0, advantage))
+            reward_gain = 1.0 + advantage
             clip_val = self._MOTOR_SFNN_DW_CLIP
             eps = self._MOTOR_SFNN_RENORM_EPS
             with torch.no_grad():

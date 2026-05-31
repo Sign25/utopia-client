@@ -132,6 +132,15 @@ def test_shape_logits_flee_near_predator():
     assert float(logits[10]) > 0   # FLEE буст у хищника
 
 
+def test_motor_reward_baseline_cleanup():
+    """Phase 4 #1: REINFORCE-baseline dict существует и чистится в remove."""
+    c = LocalColonyCompute(device="cpu")
+    assert isinstance(c._motor_reward_baseline, dict)
+    c._motor_reward_baseline["x"] = 1.5
+    c.remove_creature("x")
+    assert "x" not in c._motor_reward_baseline
+
+
 def test_reproduction_population_cap():
     """0.11.38: размножение НЕ идёт при alive >= ёмкости (bounded self-
     sustaining цикл, без перенаселения)."""
