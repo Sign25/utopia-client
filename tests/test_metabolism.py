@@ -132,6 +132,38 @@ def test_shape_logits_flee_near_predator():
     assert float(logits[10]) > 0   # FLEE буст у хищника
 
 
+def test_infection_ticks_and_drains_energy():
+    """Фрай: owned-инфекцию тикает клиент. severity +0.005/тик, energy -=
+    severity*2.0 (болезнь)."""
+    c, org, bc = _compute_with_org(energy=100.0)
+    bc.infection_severity = 0.5
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    assert abs(bc.infection_severity - 0.505) < 1e-6
+    assert abs(bc.energy - (100.0 - 0.505 * 2.0)) < 1e-6
+
+
+def test_infection_death_at_severity_1():
+    """severity>=1.0 → death (cause=infection) через единый death-envelope."""
+    c, org, bc = _compute_with_org(energy=500.0)
+    c.organisms["c1"].telomere = 0.999
+    bc.infection_severity = 0.999
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    assert bc.infection_severity >= 1.0
+    assert "c1" in c._dead_cids
+
+
+def test_infection_contact_event():
+    """P40 шлёт infected/infection_contact → начальная severity 0.05."""
+    pytest.importorskip("environment.biochemistry")
+    c, org, bc = _compute_with_org()
+    bc.infection_severity = 0.0
+    c._apply_biochem_events("c1", {"infected": True})
+    assert abs(bc.infection_severity - 0.05) < 1e-9
+    assert bc.infected is True
+
+
 def test_speciation_empty_topology_collapses_to_founder():
     """Phase 4 fix (Фрай): пустая топология → founder-вид (1), НЕ новый каждый
     раз (баг 17/17). find_best_match симулируем как не-матчащий (баг ядра)."""

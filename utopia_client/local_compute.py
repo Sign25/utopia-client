@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import random
 import time
 import types
 from collections import deque
@@ -4567,6 +4568,21 @@ class LocalColonyCompute:
                     max_h = float(getattr(bc, "max_hydration", 100.0))
                     bc.hydration = max(
                         0.0, min(max_h, float(getattr(bc, "hydration", max_h)) + delta_h))
+                # Вода лечит инфекцию (01.06.2026, Фрай; mirror world.py:3552):
+                # питьё + severity<0.5 → 30% шанс полного выздоровления.
+                if delta_h > 0.0:
+                    _sev = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+                    if 0.0 < _sev < 0.5 and random.random() < 0.3:
+                        bc.infection_severity = 0.0
+                        bc.infected = False
+            # Infection contact (01.06.2026, Фрай): owned-инфекцию ВЕДЁТ КЛИЕНТ
+            # (P40 phase-out). Заражение от соседа — P40 шлёт infected/
+            # infection_contact → начальная severity 0.05 (mirror world.py).
+            # Прогресс severity + death тикает _apply_metabolism.
+            if event.get("infected") or event.get("infection_contact"):
+                _s = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+                bc.infection_severity = max(_s, 0.05)
+                bc.infected = True
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
 
@@ -4627,12 +4643,27 @@ class LocalColonyCompute:
                     1.0, float(getattr(org, "telomere", 1.0)) - tel_decay))
             except Exception:
                 pass
-        # Death-check: голод (energy<=0) + старость (telomere AGONY). Смерть от
-        # жажды НЕ отдельная ось — обезвоживание грызёт energy (energy_drain
-        # выше) → energy<=0 → starvation. Единая ось смерти через энергию
-        # (как на сервере, world.py:3569).
+        # Infection (01.06.2026, Фрай): owned-инфекцию ТИКАЕТ КЛИЕНТ (P40
+        # phase-out перестаёт убивать owned от infection). Mirror world.py:
+        # 4574-4588: severity +0.005/тик (cap 1.0), energy -= severity*2.0
+        # (болезнь). Затрагивает ТОЛЬКО заражённых; вода лечит (income-путь);
+        # contact от соседа — P40 шлёт infected event (_apply_biochem_events).
+        if bc is not None:
+            _sev = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+            if _sev > 0.0:
+                _sev = min(1.0, _sev + 0.005)
+                bc.infection_severity = _sev
+                bc.energy = max(
+                    0.0, float(getattr(bc, "energy", 0.0)) - _sev * 2.0)
+        # Death-check: голод (energy<=0) + старость (telomere AGONY) + инфекция
+        # (severity>=1.0). Жажда/инфекция грызут energy → starvation; критическая
+        # инфекция — отдельная причина. Единый death-envelope (Фрай: градиентно).
         dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
         cause = "starvation" if dead else ""
+        if not dead and bc is not None and float(
+                getattr(bc, "infection_severity", 0.0) or 0.0) >= 1.0:
+            dead = True
+            cause = "infection"
         if not dead and org is not None:
             try:
                 from core.telomere_phase import get_phase, TelomerePhase
@@ -4644,10 +4675,12 @@ class LocalColonyCompute:
         if dead and cid not in self._dead_cids:
             self._dead_cids.add(cid)
             logger.info(
-                "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f telomere=%.3f",
+                "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f "
+                "telomere=%.3f infection=%.2f",
                 cid, cause, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
                 float(getattr(bc, "hydration", -1.0)) if bc else -1.0,
-                float(getattr(org, "telomere", -1.0)) if org else -1.0)
+                float(getattr(org, "telomere", -1.0)) if org else -1.0,
+                float(getattr(bc, "infection_severity", 0.0)) if bc else -1.0)
         # Water calibration лог (31.05.2026): раз в ~300 тиков сводка баланса
         # income(drink)/cost(thirst) + распределение hydration. Из тренда
         # (drink≈thirst → баланс; drink<<thirst → income мал) калибруем.
