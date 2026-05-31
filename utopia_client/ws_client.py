@@ -1804,6 +1804,15 @@ class ColonyWSClient:
         ws = self._ws
         if ws is None or not creatures_out:
             return
+        # Water-seek рефлекс (31.05.2026, Хьюберт+Бендер): zodchiy НЕ навигируют
+        # к воде (obs несёт food-градиент, не water) → drink_sum=0 → дегидратация
+        # выкашивала колонию. При low-hydration (<30% max) override action к
+        # ближайшей воде (terrain из world_cache). После → ambient water_restore
+        # на P40 → delta_hydration>0 → ось воды заработает (тогда вернём смерть).
+        try:
+            self._apply_water_seek(creatures, creatures_out)
+        except Exception as e:
+            logger.debug("water-seek override failed: %s", e)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -1815,6 +1824,79 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+
+    # Water-seek рефлекс (31.05.2026). Tile.WATER=1 (environment/world.py).
+    _WATER_TILE = 1
+    _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду
+    _WATER_SEEK_RADIUS = 8         # тайлов вокруг — дальше random walk
+
+    def _water_seek_action(self, row: int, col: int):
+        """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
+        или None если воды рядом нет / нет terrain. terrain из world_cache
+        (bytes size×size, row-major). Greedy: ближайший по Manhattan."""
+        wc = getattr(self, "world_cache", None)
+        if wc is None:
+            return None
+        cfg = getattr(wc, "config", None)
+        terrain = getattr(wc, "terrain", b"")
+        if cfg is None or not terrain:
+            return None
+        size = int(getattr(cfg, "size", 0) or 0)
+        if size <= 0 or len(terrain) < size * size:
+            return None
+        r0, c0 = int(row), int(col)
+        best = None
+        best_d = 10**9
+        R = self._WATER_SEEK_RADIUS
+        for r in range(max(0, r0 - R), min(size, r0 + R + 1)):
+            base = r * size
+            for c in range(max(0, c0 - R), min(size, c0 + R + 1)):
+                if terrain[base + c] == self._WATER_TILE:
+                    d = abs(r - r0) + abs(c - c0)
+                    if 0 < d < best_d:
+                        best_d = d
+                        best = (r, c)
+        if best is None:
+            return None
+        dr = best[0] - r0
+        dc = best[1] - c0
+        if abs(dr) >= abs(dc):
+            return 0 if dr < 0 else 1   # N / S
+        return 2 if dc > 0 else 3       # E / W
+
+    def _apply_water_seek(self, creatures, creatures_out) -> None:
+        """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
+        не учатся искать воду (obs без water-градиента) → дегидратация. Рефлекс:
+        thirsty → шаг к ближайшей воде → ambient water_restore на P40."""
+        compute = self.compute
+        if compute is None:
+            return
+        biochem = getattr(compute, "biochem", None)
+        if not biochem:
+            return
+        pos = {}
+        for c in creatures:
+            cid = c.get("cid")
+            if cid is not None and "row" in c and "col" in c:
+                pos[str(cid)] = (c.get("row"), c.get("col"))
+        n_seek = 0
+        for entry in creatures_out:
+            cid = entry.get("cid")
+            bc = biochem.get(cid) if cid else None
+            if bc is None:
+                continue
+            if float(getattr(bc, "hydration", 100.0)) >= self._WATER_SEEK_HYDRATION:
+                continue
+            rc = pos.get(cid)
+            if rc is None or rc[0] is None:
+                continue
+            wd = self._water_seek_action(rc[0], rc[1])
+            if wd is not None:
+                entry["action"] = int(wd)
+                n_seek += 1
+        if n_seek:
+            self._water_seek_overrides = getattr(
+                self, "_water_seek_overrides", 0) + n_seek
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
                             intero_per_cid, world_tick, rates_per_cid=None):
