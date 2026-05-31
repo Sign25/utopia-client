@@ -111,11 +111,16 @@ def test_shape_logits_attack_context():
     l1 = torch.zeros(16)
     c._shape_action_logits(l1, [0.0] * 64, diet=0.5, energy_ratio=1.0)
     assert float(l1[5]) < 0
-    # есть prey (prox>0.1) → ATTACK буст
+    # добыча достижима (prox>0.3) → ATTACK буст
     l2 = torch.zeros(16)
     obs = [0.0] * 64; obs[58] = 0.5
     c._shape_action_logits(l2, obs, diet=0.5, energy_ratio=1.0)
     assert float(l2[5]) > 0
+    # добыча видна но далеко (prox 0.1..0.3) → нейтрально (ни штраф, ни буст)
+    l3 = torch.zeros(16)
+    obs = [0.0] * 64; obs[58] = 0.2
+    c._shape_action_logits(l3, obs, diet=0.5, energy_ratio=1.0)
+    assert float(l3[5]) == 0.0  # prey-градиент подведёт, ATTACK не форсим
 
 
 def test_shape_logits_flee_near_predator():

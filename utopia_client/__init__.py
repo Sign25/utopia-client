@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.39"  # feat Phase 4: контекстный шейпинг логитов (_shape_action_logits, порт _decide_action) — флора/prey/predator градиенты + штрафы/boost'ы → зодчие идут к еде/охотятся/бегут вместо move-only коллапса
+__version__ = "0.11.40"  # tune Phase 4: ATTACK-boost только при достижимой добыче (prox>0.3, не видимость 0.1) + магнитуда 2.0→1.5 — срезать over-aggression (ATTACK доминировал 36%, Хьюберт)

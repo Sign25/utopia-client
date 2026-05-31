@@ -3129,13 +3129,15 @@ class LocalColonyCompute:
             logits[9] -= 1.0                 # REPRODUCE (через mate_pairs, не action)
             logits[11] -= 1.0                # DIG
             logits[12] -= 1.0 / (PHI * PHI)  # BUILD
-            # Контекстные.
-            has_prey = p_prox > 0.1
-            if not has_prey:
-                logits[5] -= 1.0 * BS        # ATTACK без целей — нет смысла
-            else:
-                logits[5] += 2.0 * BS        # ATTACK при цели
-                if diet > 0.7 and p_prox > 0.3:
+            # Контекстные. ATTACK: boost ТОЛЬКО когда добыча ДОСТИЖИМА (prox>0.3),
+            # не просто видна (prox>0.1) — иначе фуражёры впустую лезут в драку
+            # (Хьюберт: ATTACK доминировал 36%). prox 0.1..0.3: prey виден но
+            # далеко → нейтрально, prey-градиент сам подведёт. Магнитуда 2.0→1.5.
+            if p_prox <= 0.1:
+                logits[5] -= 1.0 * BS        # добычи нет — ATTACK бессмысленна
+            elif p_prox > 0.3:
+                logits[5] += 1.5 * BS        # добыча достижима
+                if diet > 0.7:
                     logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
