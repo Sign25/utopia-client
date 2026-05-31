@@ -493,6 +493,14 @@ class LocalColonyCompute:
         # (persist bloat сверх ёмкости). ws_client читает → owned_bye на P40
         # (despawn осиротевших проекций) → чистит после отправки.
         self._cull_bye_cids: list = []
+        # Water calibration (31.05.2026, Шеф: «раньше на сервере работала»).
+        # Инструментация баланса income(drink)/cost(thirst): декей жажды ВКЛ
+        # для наблюдения, смерть от жажды ОТКЛ (без риска падежа). Сравниваем
+        # thirst_sum (P40 thirst_now) vs drink_sum (P40 delta_hydration) +
+        # тренд hydration → находим перекос, калибруем с серверной моделью.
+        self._hyd_thirst_sum: float = 0.0
+        self._hyd_drink_sum: float = 0.0
+        self._hyd_calib_ticks: int = 0
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -4386,6 +4394,8 @@ class LocalColonyCompute:
             if "delta_hydration" in event:
                 self._hydration_active.add(cid)
                 delta_h = float(event.get("delta_hydration", 0.0) or 0.0)
+                if delta_h > 0.0:
+                    self._hyd_drink_sum += delta_h  # calib: income питья
                 if delta_h != 0.0:
                     max_h = float(getattr(bc, "max_hydration", 100.0))
                     bc.hydration = max(
@@ -4421,14 +4431,15 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-            # HYDRATION-ОСЬ ОТКЛЮЧЕНА (31.05.2026 INCIDENT): thirst-декей выкосил
-            # ВСЮ колонию (327→0) — income питья НЕДОСТАТОЧЕН (drink не покрывает
-            # thirst_now), hydration→0 у всех → массовая жажда-смерть при ЗДОРОВЫХ
-            # energy(183-357)+telomere(0.999). Self-gating (0.11.21) активировался
-            # при delta_hydration, но баланс income/cost сломан. Декей+смерть
-            # выключены до тех пор, пока drink-income не покроет thirst (нужна
-            # калибровка с Хьюбертом). Income (delta_hydration) безвреден —
-            # hydration только растёт/стоит. thirst_now приходит, НЕ применяется.
+            # Water CALIBRATION (31.05.2026, Шеф): thirst-декей ВКЛ для
+            # наблюдения баланса (смерть от жажды по-прежнему ОТКЛ — см.
+            # death-check ниже, без риска падежа). Аккумулируем применённый
+            # thirst → сравним с drink-income (delta_hydration) в calib-логе.
+            if thirst > 0.0 and cid in self._hydration_active:
+                max_h = float(getattr(bc, "max_hydration", 100.0))
+                bc.hydration = max(
+                    0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
+                self._hyd_thirst_sum += thirst
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(
@@ -4454,6 +4465,33 @@ class LocalColonyCompute:
                 cid, cause, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
                 float(getattr(bc, "hydration", -1.0)) if bc else -1.0,
                 float(getattr(org, "telomere", -1.0)) if org else -1.0)
+        # Water calibration лог (31.05.2026): раз в ~300 тиков сводка баланса
+        # income(drink)/cost(thirst) + распределение hydration. Из тренда
+        # (drink≈thirst → баланс; drink<<thirst → income мал) калибруем.
+        self._hyd_calib_ticks += 1
+        if self._hyd_calib_ticks >= 300:
+            try:
+                hyds = [float(getattr(b, "hydration", 0.0))
+                        for b in self.biochem.values()]
+                n = len(hyds)
+                hmin = min(hyds) if hyds else 0.0
+                hmax = max(hyds) if hyds else 0.0
+                hmean = (sum(hyds) / n) if n else 0.0
+                nlow = sum(1 for h in hyds if h < 10.0)
+                logger.info(
+                    "WATER_CALIB ticks=300 active=%d thirst_sum=%.1f "
+                    "drink_sum=%.1f ratio=%.2f | hydration n=%d min=%.1f "
+                    "mean=%.1f max=%.1f low(<10)=%d",
+                    len(self._hydration_active), self._hyd_thirst_sum,
+                    self._hyd_drink_sum,
+                    (self._hyd_drink_sum / self._hyd_thirst_sum
+                     if self._hyd_thirst_sum > 0 else -1.0),
+                    n, hmin, hmean, hmax, nlow)
+            except Exception as e:
+                logger.debug("WATER_CALIB log failed: %s", e)
+            self._hyd_thirst_sum = 0.0
+            self._hyd_drink_sum = 0.0
+            self._hyd_calib_ticks = 0
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.

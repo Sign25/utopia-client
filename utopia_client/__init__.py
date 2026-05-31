@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.24"  # INCIDENT-fix: отключить hydration death+decay (income недостаточен → выкосил колонию)
+__version__ = "0.11.25"  # calib: thirst-декей ВКЛ для наблюдения баланса воды, смерть ОТКЛ + WATER_CALIB лог

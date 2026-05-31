@@ -42,27 +42,34 @@ def test_energy_decay():
     assert "c1" not in c._dead_cids
 
 
-def test_thirst_DISABLED_no_decay():
-    """INCIDENT 31.05: hydration-ось ОТКЛЮЧЕНА. income питья недостаточен
-    (drink < thirst_now) → жажда выкосила ВСЮ колонию при здоровых
-    energy(183-357)+telomere(0.999). thirst_now НЕ применяется (даже если cid
-    активен). Включить только когда drink-income покроет thirst (калибровка)."""
+def test_thirst_decays_calibration_mode():
+    """Калибровка 31.05: thirst-декей ВКЛ для наблюдения баланса (для активных
+    cid). Смерть от жажды ОТКЛ (см. ниже). Аккумулятор thirst_sum растёт."""
     c, org, bc = _compute_with_org(hydration=80.0)
-    c._hydration_active.add("c1")  # даже активный
+    c._hydration_active.add("c1")
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 15.0})
-    assert bc.hydration == 80.0  # НЕ тронут (ось отключена)
+    assert bc.hydration == 65.0  # декей применён (калибровка)
+    assert c._hyd_thirst_sum == 15.0  # аккумулятор для calib-лога
+
+
+def test_thirst_inactive_still_no_decay():
+    """Неактивный cid (P40 не шлёт delta_hydration) — thirst НЕ применяется."""
+    c, org, bc = _compute_with_org(hydration=80.0)
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 15.0})
+    assert bc.hydration == 80.0
 
 
 def test_no_dehydration_death_even_active_at_zero():
-    """РОВНО баг, выкосивший колонию: hydration=0 + активна, но energy=342 +
-    telomere=0.999 (здоров) → НЕ умирает (жажда-смерть отключена)."""
+    """СМЕРТЬ от жажды ОТКЛ (калибровка): hydration=0 + активна, energy=342 +
+    telomere=0.999 → НЕ умирает. (Был баг, выкосивший колонию.)"""
     c, org, bc = _compute_with_org(energy=342.0, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
     c._hydration_active.add("c1")
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 30.0})
-    assert "c1" not in c._dead_cids  # ЖИВ
+    assert "c1" not in c._dead_cids  # ЖИВ (жажда-смерть отключена)
 
 
 def test_delta_hydration_income_still_works():
