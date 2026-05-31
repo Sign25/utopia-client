@@ -1623,33 +1623,41 @@ class ColonyWSClient:
             # если P40 прислал delta_hydration — берём его; иначе начисляем сами
             # при нахождении на/рядом с водой (_near_water). Переиспользует
             # готовый путь _apply_biochem_events (clamp до max_hydration).
-            if "delta_hydration" in c:
-                events_per_cid[cid_s]["delta_hydration"] = float(
-                    c.get("delta_hydration", 0.0) or 0.0)
-            else:
-                _rc = self._resolve_pos(cid_s, c)
-                if _rc is not None and self._near_water(_rc[0], _rc[1]):
-                    events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
-                # DIAG 0.11.32: раз в ~1500 — почему income не течёт.
-                self._inc_diag = getattr(self, "_inc_diag", 0) + 1
-                if self._inc_diag >= 1500:
-                    self._inc_diag = 0
-                    wc = getattr(self, "world_cache", None)
-                    cp = getattr(wc, "creature_pos", {}) if wc else {}
-                    tile = None
-                    if _rc is not None:
-                        wr, wc2 = _rc
-                        terr = getattr(wc, "terrain", b"") if wc else b""
-                        sz = int(getattr(getattr(wc, "config", None), "size", 0) or 0) if wc else 0
-                        if terr and sz and 0 <= wr < sz and 0 <= wc2 < sz:
-                            tile = terr[wr * sz + wc2]
-                    logger.info(
-                        "INC_DIAG cid=%s c_has_rowcol=%s c_keys=%s cp_len=%d "
-                        "cp_has=%s resolved=%s tile=%s near=%s",
-                        cid_s, ("row" in c and "col" in c),
-                        sorted(c.keys())[:12], len(cp),
-                        (cid_s in cp), _rc, tile,
-                        (None if _rc is None else self._near_water(_rc[0], _rc[1])))
+            # Client владеет водным доходом (01.06.2026, Шеф). P40 ШЛЁТ
+            # delta_hydration=0 для owned (их метаболизм не симулируется
+            # server-side) → нельзя гейтить income на отсутствие ключа (был
+            # баг: client-income в else к `if delta_hydration in c` → мёртв с
+            # 0.11.30, P40-ключ всегда перебивал). Теперь приоритет: ненулевой
+            # P40 > client-террейн > нулевой P40 (последний сохраняем для
+            # активации hydration-оси в _apply_biochem_events).
+            _p40_dh = (float(c.get("delta_hydration", 0.0) or 0.0)
+                       if "delta_hydration" in c else None)
+            _rc = self._resolve_pos(cid_s, c)
+            _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
+            if _p40_dh is not None and _p40_dh != 0.0:
+                events_per_cid[cid_s]["delta_hydration"] = _p40_dh
+            elif _near:
+                events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
+            elif _p40_dh is not None:
+                events_per_cid[cid_s]["delta_hydration"] = _p40_dh  # 0 → ось вкл
+            # DIAG 0.11.32: раз в ~1500 — позиция/террейн/вода.
+            self._inc_diag = getattr(self, "_inc_diag", 0) + 1
+            if self._inc_diag >= 1500:
+                self._inc_diag = 0
+                wc = getattr(self, "world_cache", None)
+                cp = getattr(wc, "creature_pos", {}) if wc else {}
+                tile = None
+                if _rc is not None and wc is not None:
+                    wr, wc2 = _rc
+                    terr = getattr(wc, "terrain", b"")
+                    sz = int(getattr(getattr(wc, "config", None), "size", 0) or 0)
+                    if terr and sz and 0 <= wr < sz and 0 <= wc2 < sz:
+                        tile = terr[wr * sz + wc2]
+                logger.info(
+                    "INC_DIAG cid=%s p40_dh=%s c_rowcol=%s cp_len=%d cp_has=%s "
+                    "resolved=%s tile=%s near=%s", cid_s, _p40_dh,
+                    ("row" in c and "col" in c), len(cp), (cid_s in cp),
+                    _rc, tile, _near)
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
