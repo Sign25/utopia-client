@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.30"  # feat: водный контур client-authoritative — доход из террейна (_near_water) + безусловная жажда + dehydration energy_drain (за флагом, ждёт drink_sum>0)
+__version__ = "0.11.31"  # fix: позиция организма из world_cache.creature_pos (obs-словарь row/col не содержит) — чинит water-seek + income (drink_sum был 0) + WATER_SEEK_DIAG

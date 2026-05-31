@@ -26,12 +26,14 @@ class _Cfg:
 
 
 class _FakeWC:
-    def __init__(self, size, water_cells):
+    def __init__(self, size, water_cells, creature_pos=None):
         self.config = _Cfg(size)
         t = bytearray(size * size)  # 0 = PLAIN
         for (r, c) in water_cells:
             t[r * size + c] = 1  # WATER
         self.terrain = bytes(t)
+        # creature_pos: dict[cid → (x, y) = (col, row)] (world_cache.py:384)
+        self.creature_pos = dict(creature_pos or {})
 
 
 def _client(wc=None):
@@ -113,6 +115,43 @@ def test_near_water_far_false():
 def test_near_water_no_cache():
     cli = _client(None)
     assert cli._near_water(5, 5) is False
+
+
+def test_resolve_pos_prefers_creature_pos():
+    # creature_pos[c1] = (x=16, y=10) = (col, row) → должно вернуть (row=10, col=16)
+    cli = _client(_FakeWC(20, [], creature_pos={"c1": (16, 10)}))
+    assert cli._resolve_pos("c1", None) == (10, 16)
+
+
+def test_resolve_pos_fallback_to_obs_dict():
+    # cid нет в creature_pos → fallback на obs-словарь
+    cli = _client(_FakeWC(20, [], creature_pos={}))
+    assert cli._resolve_pos("cX", {"row": 5, "col": 7}) == (5, 7)
+
+
+def test_resolve_pos_none_when_no_data():
+    cli = _client(_FakeWC(20, [], creature_pos={}))
+    assert cli._resolve_pos("cX", {}) is None
+
+
+def test_water_seek_uses_creature_pos_when_obs_lacks_rowcol():
+    """Главный фикс: obs-словарь БЕЗ row/col, но creature_pos знает позицию →
+    water-seek всё равно срабатывает (раньше брал из obs → (0,0) → no-op)."""
+    pytest.importorskip("torch")
+    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.biochemistry import make_default
+    import types
+    c = LocalColonyCompute(device="cpu")
+    bc = make_default(); bc.hydration = 10.0  # жаждущий
+    c.biochem["c1"] = bc
+    c.organisms["c1"] = types.SimpleNamespace(generation=0)
+    # вода восточнее (10,16); позиция через creature_pos, obs-словарь пуст
+    cli = _client(_FakeWC(20, [(10, 16)], creature_pos={"c1": (10, 10)}))
+    cli.compute = c
+    creatures = [{"cid": "c1"}]  # НЕТ row/col
+    creatures_out = [{"cid": "c1", "action": 1, "target_id": None}]
+    cli._apply_water_seek(creatures, creatures_out)
+    assert creatures_out[0]["action"] == 2  # EAST — фикс работает
 
 
 def test_apply_water_seek_skips_hydrated():

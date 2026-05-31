@@ -1626,8 +1626,10 @@ class ColonyWSClient:
             if "delta_hydration" in c:
                 events_per_cid[cid_s]["delta_hydration"] = float(
                     c.get("delta_hydration", 0.0) or 0.0)
-            elif self._near_water(int(c.get("row", 0)), int(c.get("col", 0))):
-                events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
+            else:
+                _rc = self._resolve_pos(cid_s, c)
+                if _rc is not None and self._near_water(_rc[0], _rc[1]):
+                    events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
@@ -1895,10 +1897,32 @@ class ColonyWSClient:
                     return True
         return False
 
+    def _resolve_pos(self, cid, c=None):
+        """(row, col) организма. Источник истины — world_cache.creature_pos
+        (dict[cid → (x,y)=(col,row)], world_cache.py:384, заполняется из
+        snap.creatures). obs-словари obs_batch row/col НЕ содержат — это и была
+        причина drink_sum=0: позиция читалась оттуда → дефолт (0,0)=PLAIN, ни
+        water-seek, ни income не срабатывали. Fallback на c — если задан и есть."""
+        wc = getattr(self, "world_cache", None)
+        if wc is not None:
+            try:
+                p = wc.creature_pos.get(str(cid))
+                if p is not None:
+                    return int(p[1]), int(p[0])  # (row=y, col=x)
+            except Exception:
+                pass
+        if c is not None and "row" in c and "col" in c:
+            try:
+                return int(c["row"]), int(c["col"])
+            except (TypeError, ValueError):
+                pass
+        return None
+
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
         не учатся искать воду (obs без water-градиента) → дегидратация. Рефлекс:
-        thirsty → шаг к ближайшей воде → ambient water_restore на P40."""
+        thirsty → шаг к ближайшей воде → доход (_near_water в _collect_obs_batch).
+        Позиция из creature_pos (world_cache), НЕ из obs-словаря."""
         compute = self.compute
         if compute is None:
             return
@@ -1908,9 +1932,14 @@ class ColonyWSClient:
         pos = {}
         for c in creatures:
             cid = c.get("cid")
-            if cid is not None and "row" in c and "col" in c:
-                pos[str(cid)] = (c.get("row"), c.get("col"))
+            if cid is None:
+                continue
+            rc = self._resolve_pos(cid, c)
+            if rc is not None:
+                pos[str(cid)] = rc  # (row, col)
         n_seek = 0
+        n_thirsty = 0
+        n_near = 0
         for entry in creatures_out:
             cid = entry.get("cid")
             bc = biochem.get(cid) if cid else None
@@ -1918,9 +1947,12 @@ class ColonyWSClient:
                 continue
             if float(getattr(bc, "hydration", 100.0)) >= self._WATER_SEEK_HYDRATION:
                 continue
+            n_thirsty += 1
             rc = pos.get(cid)
             if rc is None or rc[0] is None:
                 continue
+            if self._near_water(rc[0], rc[1]):
+                n_near += 1
             wd = self._water_seek_action(rc[0], rc[1])
             if wd is not None:
                 entry["action"] = int(wd)
@@ -1928,6 +1960,16 @@ class ColonyWSClient:
         if n_seek:
             self._water_seek_overrides = getattr(
                 self, "_water_seek_overrides", 0) + n_seek
+        # Диагностика (01.06.2026): раз в ~600 вызовов — видимость работы
+        # water-seek/income (поз/жаждущие/у воды/override). Подтверждает фикс
+        # позиции на проде (creature_pos vs пустой obs-словарь).
+        self._ws_diag_ticks = getattr(self, "_ws_diag_ticks", 0) + 1
+        if self._ws_diag_ticks >= 600:
+            self._ws_diag_ticks = 0
+            logger.info(
+                "WATER_SEEK_DIAG creatures=%d with_pos=%d thirsty=%d "
+                "near_water=%d seek_override=%d", len(creatures_out), len(pos),
+                n_thirsty, n_near, n_seek)
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
                             intero_per_cid, world_tick, rates_per_cid=None):
