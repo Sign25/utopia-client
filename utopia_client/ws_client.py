@@ -1626,6 +1626,13 @@ class ColonyWSClient:
                 "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
                 "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
             }
+            # Infection contact (01.06.2026, Фрай): P40 детектит контакт
+            # больной↔здоровый (физика пространства) → events.infection_contact.
+            # Прокидываем в event → _apply_biochem_events бутстрапит infection
+            # (infected=True, severity=0.05); прогресс/death ведёт клиент.
+            # Формат согласуется с Хьюбертом (top-level bool по конвенции ate).
+            if c.get("infection_contact"):
+                events_per_cid[cid_s]["infection_contact"] = True
             # Hydration income (31.05→01.06.2026, Шеф): питьё — из бесконечного
             # террейна (WATER-тайл ничего не расходует, арбитраж P40 не нужен, в
             # отличие от еды-сущности). Клиент владеет всем водным контуром:
