@@ -385,6 +385,13 @@ class LocalColonyCompute:
         # политика только reinforce, не дискриминирует. Server intent:
         # "REINFORCE по log_prob[a]·(r_imm_total − baseline)".
         self._motor_reward_baseline: dict = {}  # cid → float (EMA reward)
+        # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
+        # активность тканей per snapshot для осциллографа /stats
+        # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
+        # на клиенте) → клиент шлёт свой. Нормировка per-role runmax (Δ-нормы
+        # разномасштабны: motor 0.17 vs amygdala 172k).
+        self._tissue_activation_ring = deque(maxlen=60)  # [[v per role], ...]
+        self._tissue_act_runmax: dict = {}               # role → running max
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -4837,12 +4844,34 @@ class LocalColonyCompute:
                 "n_total": int(self._heb_pt_n_total[role]),
                 "delta_mean": delta_mean,
             }
+        # EEG-ring sample (#2, 01.06.2026): нормированная активность per role
+        # → ring (один срез на snapshot). runmax с медленным декеем (0.97) →
+        # вариативность волны (не флэтлайн на максимуме).
+        try:
+            sample = []
+            for role in _HEB_PT_ALL_ROLES:
+                dm = float(snap[role]["delta_mean"])
+                rm = max(dm, self._tissue_act_runmax.get(role, 0.0) * 0.97)
+                self._tissue_act_runmax[role] = rm
+                sample.append(round(min(1.0, dm / rm), 4) if rm > 1e-9 else 0.0)
+            self._tissue_activation_ring.append(sample)
+        except Exception as e:
+            logger.debug("tissue_activation_ring sample failed: %s", e)
         for role in _HEB_PT_ALL_ROLES:
             self._heb_pt_n_total[role] = 0
             self._heb_pt_n_learning[role] = 0
             self._heb_pt_delta_sum[role] = 0.0
             self._heb_pt_samples[role] = 0
         return snap
+
+    def _build_tissue_activation_ring_payload(self) -> dict:
+        """EEG-осциллограф payload для /stats (#2). {tissues, data,
+        window_size} — нормированные [0,1] срезы активности тканей во времени."""
+        return {
+            "tissues": list(_HEB_PT_ALL_ROLES),
+            "data": list(self._tissue_activation_ring),
+            "window_size": self._tissue_activation_ring.maxlen,
+        }
 
     # ── Diagnostics aggregation ──────────────────────────────────────────
 
@@ -4977,6 +5006,7 @@ class LocalColonyCompute:
                     r: {"n_learning": 0, "n_total": 0, "delta_mean": 0.0}
                     for r in _HEB_PT_ALL_ROLES
                 },
+                "tissue_activation_ring": self._build_tissue_activation_ring_payload(),
                 # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
                 # биохимия snapshot. Пустой stub: счётчики 0, distribution
                 # пуст.
@@ -5398,6 +5428,7 @@ class LocalColonyCompute:
             # для UI "Тренировка мозга" combined Mode E + Mode M. Build +
             # reset accumulators — следующий emit cycle с чистого листа.
             "hebbian_per_tissue": self._build_hebbian_per_tissue_snapshot(),
+            "tissue_activation_ring": self._build_tissue_activation_ring_payload(),
             # Body Migration Phase 2 (Бендер, 27.05.2026): client-side
             # биохимия snapshot — для UI Brain панели (mental_break states
             # heatmap, chem averages) + Хьюберт merge на VPS если потребуется.

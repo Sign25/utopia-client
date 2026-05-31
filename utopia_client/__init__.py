@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.41"  # feat Phase 4 #1: REINFORCE-baseline для motor_policy (advantage=reward−EMA) — политика учится отличать yield-действия (eat/kill) от пустых (move), а не только reinforce
+__version__ = "0.11.42"  # feat(stats #2): client EEG tissue-activation ring — owned тикаются на клиенте, P40 world_meta.ring пуст → EEG 0%. Клиент шлёт свой нормированный ring
