@@ -352,6 +352,13 @@ class ColonyWSClient:
                         logger.info(
                             "client-authoritative restore: %d organisms из local",
                             len(restored))
+                        # Carrying-capacity cap (31.05.2026): restore сбросил
+                        # .pt сверх ёмкости → owned_bye на P40, чтобы despawn'нул
+                        # их проекции (иначе осиротеют → фантомное /stats).
+                        cull = list(getattr(self.compute, "_cull_bye_cids", []) or [])
+                        if cull:
+                            await self._send_owned_bye(cull)
+                            self.compute._cull_bye_cids = []
                 except Exception as e:
                     logger.warning("restore_colony_from_local failed: %s", e)
             elif local_pack:

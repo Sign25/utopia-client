@@ -489,6 +489,10 @@ class LocalColonyCompute:
         # для активных cid (deploy-order-safe: пока P40 не шлёт delta_hydration,
         # жажда не действует → нет коллапса от монотонного декея без income).
         self._hydration_active: set = set()
+        # Carrying-capacity cap (31.05.2026): cid'ы, сброшенные restore-cap'ом
+        # (persist bloat сверх ёмкости). ws_client читает → owned_bye на P40
+        # (despawn осиротевших проекций) → чистит после отправки.
+        self._cull_bye_cids: list = []
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -2329,13 +2333,15 @@ class LocalColonyCompute:
                 and self._natural_selection_capacity > 0 else None)
 
     @staticmethod
-    def _cap_and_clean_pt(dir_path, cap: int) -> list:
-        """Carrying-capacity cap для restore (31.05.2026, Шеф). Возвращает N
-        свежайших .pt (по mtime, новые первыми), УДАЛЯЕТ остальные (persist
-        bloat — Шеф: «толку никакого»). cap = estimate_population (ёмкость
-        железа). Защита от перенаселения → заморозки Мира.
+    def _cap_and_clean_pt(dir_path, cap: int) -> tuple:
+        """Carrying-capacity cap для restore (31.05.2026, Шеф). Возвращает
+        (keep_paths, culled_cids): N свежайших .pt (по mtime) + cid'ы удалённых.
+        УДАЛЯЕТ остальные (persist bloat). cap = estimate_population.
 
-        Удаляет только сверх cap (самые старые); свежайшие cap-штук сохраняет.
+        culled_cids возвращаются ДО удаления → caller шлёт owned_bye, чтобы
+        P40 despawn'нул сброшенные проекции (иначе осиротеют на сервере,
+        /stats показывает фантомное число — frozen-sticky до 24ч safety cap).
+        Удаляет только сверх cap (старейшие); свежайшие cap сохраняет.
         """
         from pathlib import Path
         dir_path = Path(dir_path)
@@ -2345,6 +2351,7 @@ class LocalColonyCompute:
             cap = 0
         keep = all_pt[:cap]
         cull = all_pt[cap:]
+        culled_cids = [p.stem for p in cull]  # собираем ДО unlink
         for old in cull:
             try:
                 old.unlink()
@@ -2353,9 +2360,9 @@ class LocalColonyCompute:
         if cull:
             logger.info(
                 "_cap_and_clean_pt: cap=%d — оставлено %d свежих .pt, "
-                "почищено %d устаревших (persist bloat)",
+                "почищено %d устаревших (persist bloat) → owned_bye",
                 cap, len(keep), len(cull))
-        return keep
+        return keep, culled_cids
 
     def restore_colony_from_local(self, dir_path) -> list[str]:
         """Colony Ownership Migration §5.1: восстановить колонию из local.
@@ -2425,7 +2432,10 @@ class LocalColonyCompute:
         # замерзал → отбор не сходился (дедлок). Грузим только N свежайших,
         # где N = estimate_population (расчётная ёмкость). Лишние чистим.
         cap = self._get_hw_capacity() or 16  # fallback 16 если бенчмарк недоступен
-        keep_pt = self._cap_and_clean_pt(dir_path, cap)
+        keep_pt, culled_cids = self._cap_and_clean_pt(dir_path, cap)
+        # Сброшенные cid'ы → ws шлёт owned_bye (P40 despawn проекций), иначе
+        # осиротеют на сервере (фантомное /stats). Читается в ws_client.
+        self._cull_bye_cids = list(culled_cids)
 
         restored: list[str] = []
         for pt_file in keep_pt:

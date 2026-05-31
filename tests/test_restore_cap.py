@@ -35,34 +35,39 @@ def _make_pt_files(d: Path, n: int) -> list[Path]:
 
 def test_cap_keeps_newest_deletes_rest(tmp_path):
     _make_pt_files(tmp_path, 50)
-    keep = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
-    # оставлено ровно 16
+    keep, culled = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
     assert len(keep) == 16
-    # на диске осталось ровно 16
+    assert len(culled) == 34  # culled cid'ы возвращены (для owned_bye)
     remaining = sorted(tmp_path.glob("*.pt"))
     assert len(remaining) == 16
-    # оставлены САМЫЕ НОВЫЕ (cid_049..cid_034), старые удалены
     kept_names = {p.stem for p in remaining}
     assert "cid_049" in kept_names  # новейший
     assert "cid_034" in kept_names  # граница (50-16=34)
     assert "cid_033" not in kept_names  # за границей — удалён
     assert "cid_000" not in kept_names  # старейший — удалён
+    # culled cid'ы = удалённые старейшие (для despawn на P40)
+    assert "cid_000" in culled
+    assert "cid_033" in culled
+    assert "cid_034" not in culled  # сохранён, не в culled
 
 
 def test_cap_under_count_keeps_all(tmp_path):
     _make_pt_files(tmp_path, 10)
-    keep = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
+    keep, culled = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
     assert len(keep) == 10  # меньше cap → всё сохранено
+    assert culled == []
     assert len(list(tmp_path.glob("*.pt"))) == 10
 
 
 def test_cap_zero_deletes_all(tmp_path):
     _make_pt_files(tmp_path, 5)
-    keep = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=0)
+    keep, culled = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=0)
     assert keep == []
+    assert len(culled) == 5
     assert list(tmp_path.glob("*.pt")) == []
 
 
 def test_empty_dir_noop(tmp_path):
-    keep = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
+    keep, culled = LocalColonyCompute._cap_and_clean_pt(tmp_path, cap=16)
     assert keep == []
+    assert culled == []
