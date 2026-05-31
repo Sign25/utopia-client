@@ -1630,6 +1630,26 @@ class ColonyWSClient:
                 _rc = self._resolve_pos(cid_s, c)
                 if _rc is not None and self._near_water(_rc[0], _rc[1]):
                     events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
+                # DIAG 0.11.32: раз в ~1500 — почему income не течёт.
+                self._inc_diag = getattr(self, "_inc_diag", 0) + 1
+                if self._inc_diag >= 1500:
+                    self._inc_diag = 0
+                    wc = getattr(self, "world_cache", None)
+                    cp = getattr(wc, "creature_pos", {}) if wc else {}
+                    tile = None
+                    if _rc is not None:
+                        wr, wc2 = _rc
+                        terr = getattr(wc, "terrain", b"") if wc else b""
+                        sz = int(getattr(getattr(wc, "config", None), "size", 0) or 0) if wc else 0
+                        if terr and sz and 0 <= wr < sz and 0 <= wc2 < sz:
+                            tile = terr[wr * sz + wc2]
+                    logger.info(
+                        "INC_DIAG cid=%s c_has_rowcol=%s c_keys=%s cp_len=%d "
+                        "cp_has=%s resolved=%s tile=%s near=%s",
+                        cid_s, ("row" in c and "col" in c),
+                        sorted(c.keys())[:12], len(cp),
+                        (cid_s in cp), _rc, tile,
+                        (None if _rc is None else self._near_water(_rc[0], _rc[1])))
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
@@ -1819,7 +1839,7 @@ class ColonyWSClient:
         try:
             self._apply_water_seek(creatures, creatures_out)
         except Exception as e:
-            logger.debug("water-seek override failed: %s", e)
+            logger.warning("water-seek override failed: %r", e)  # DIAG 0.11.32
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -1964,7 +1984,7 @@ class ColonyWSClient:
         # water-seek/income (поз/жаждущие/у воды/override). Подтверждает фикс
         # позиции на проде (creature_pos vs пустой obs-словарь).
         self._ws_diag_ticks = getattr(self, "_ws_diag_ticks", 0) + 1
-        if self._ws_diag_ticks >= 600:
+        if self._ws_diag_ticks >= 200:
             self._ws_diag_ticks = 0
             logger.info(
                 "WATER_SEEK_DIAG creatures=%d with_pos=%d thirsty=%d "
