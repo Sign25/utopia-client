@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.42"  # feat(stats #2): client EEG tissue-activation ring — owned тикаются на клиенте, P40 world_meta.ring пуст → EEG 0%. Клиент шлёт свой нормированный ring
+__version__ = "0.11.43"  # fix(speciation #1, Фрай): пустая топология → 1 founder-вид (Z2.b не подключён, дивергенции нет) — чинит баг 17/17 (каждый организм = свой вид)

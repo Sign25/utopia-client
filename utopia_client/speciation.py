@@ -104,6 +104,18 @@ def assign_species(
                     s.species_id, founder_cid)
         return (s.species_id, True)
 
+    # Phase 4 fix (01.06.2026, Фрай): пустая топология (Z2.b apply_topology_
+    # overlay не подключён → у всех owned топология ПУСТАЯ) = нулевая
+    # дивергенция → ВСЕ особи в ОДИН founder-вид. Без этого find_best_match на
+    # пустой топологии не матчит → каждый организм = новый вид (баг 17/17 в
+    # /stats). Критерий вида = топология межтканевого графа (НЕ traits — то
+    # отдельная ось adaptability). Оживёт по замыслу с Z2.b.
+    if not topology:
+        founder = min(registry.all(), key=lambda sp: sp.species_id)
+        if getattr(founder, "extinct", False):
+            registry.revive(founder.species_id)
+        return (founder.species_id, False)
+
     # Best match search
     best = registry.find_best_match(
         topology,

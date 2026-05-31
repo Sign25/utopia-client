@@ -132,6 +132,45 @@ def test_shape_logits_flee_near_predator():
     assert float(logits[10]) > 0   # FLEE буст у хищника
 
 
+def test_speciation_empty_topology_collapses_to_founder():
+    """Phase 4 fix (Фрай): пустая топология → founder-вид (1), НЕ новый каждый
+    раз (баг 17/17). find_best_match симулируем как не-матчащий (баг ядра)."""
+    pytest.importorskip("core.tissue_speciation")
+    from utopia_client.speciation import assign_species
+
+    class _Sp:
+        def __init__(self, sid):
+            self.species_id = sid
+            self.extinct = False
+
+    class _Reg:
+        def __init__(self):
+            self.sp = [_Sp(1), _Sp(5), _Sp(3)]
+            self.created = 0
+
+        def is_empty(self):
+            return not self.sp
+
+        def all(self):
+            return self.sp
+
+        def find_best_match(self, *a, **k):
+            return None  # симуляция бага: пустая топология не матчится
+
+        def create(self, **k):
+            self.created += 1
+            return _Sp(99)
+
+        def revive(self, sid):
+            pass
+
+    reg = _Reg()
+    sid, is_new = assign_species(reg, [], tick=1, founder_cid="x")
+    assert sid == 1            # founder (min species_id)
+    assert is_new is False     # НЕ новый вид
+    assert reg.created == 0    # новый вид НЕ создан
+
+
 def test_motor_reward_baseline_cleanup():
     """Phase 4 #1: REINFORCE-baseline dict существует и чистится в remove."""
     c = LocalColonyCompute(device="cpu")
