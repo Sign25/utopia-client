@@ -210,6 +210,28 @@ def test_infection_contact_event():
     assert bc.infected is True
 
 
+def test_infection_contact_list_format():
+    """Формат Хьюберта: infection_contact=[{from_cid, severity_hint}] →
+    infected=True, severity=max(severity_hint)."""
+    pytest.importorskip("environment.biochemistry")
+    c, org, bc = _compute_with_org()
+    bc.infection_severity = 0.0
+    c._apply_biochem_events("c1", {"infection_contact": [
+        {"from_cid": "z9", "severity_hint": 0.05}]})
+    assert abs(bc.infection_severity - 0.05) < 1e-9
+    assert bc.infected is True
+
+
+def test_projection_includes_infection():
+    """projection_batch несёт infected + infection_severity (P40 зеркалит)."""
+    c, org, bc = _compute_with_org()
+    bc.infected = True
+    bc.infection_severity = 0.3
+    p = c.build_projection_batch()[0]
+    assert p["infected"] is True
+    assert abs(p["infection_severity"] - 0.3) < 1e-9
+
+
 def test_speciation_empty_topology_collapses_to_founder():
     """Phase 4 fix (Фрай): пустая топология → founder-вид (1), НЕ новый каждый
     раз (баг 17/17). find_best_match симулируем как не-матчащий (баг ядра)."""

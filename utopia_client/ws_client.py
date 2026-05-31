@@ -1630,9 +1630,11 @@ class ColonyWSClient:
             # больной↔здоровый (физика пространства) → events.infection_contact.
             # Прокидываем в event → _apply_biochem_events бутстрапит infection
             # (infected=True, severity=0.05); прогресс/death ведёт клиент.
-            # Формат согласуется с Хьюбертом (top-level bool по конвенции ate).
-            if c.get("infection_contact"):
-                events_per_cid[cid_s]["infection_contact"] = True
+            # Формат (Хьюберт): список [{from_cid, severity_hint}]. Прокидываем
+            # как есть → _apply_biochem_events берёт max severity_hint.
+            _ic = c.get("infection_contact")
+            if _ic:
+                events_per_cid[cid_s]["infection_contact"] = _ic
             # Hydration income (31.05→01.06.2026, Шеф): питьё — из бесконечного
             # террейна (WATER-тайл ничего не расходует, арбитраж P40 не нужен, в
             # отличие от еды-сущности). Клиент владеет всем водным контуром:

@@ -3967,6 +3967,11 @@ class LocalColonyCompute:
                 if bc is not None:
                     proj["energy"] = float(getattr(bc, "energy", 0.0))
                     proj["hydration"] = float(getattr(bc, "hydration", 0.0))
+                    # Infection (01.06.2026, Фрай): client-authoritative →
+                    # P40 зеркалит (как energy/hydration). Тик/death — клиент.
+                    proj["infected"] = bool(getattr(bc, "infected", False))
+                    proj["infection_severity"] = float(
+                        getattr(bc, "infection_severity", 0.0) or 0.0)
                 proj["telomere_scale"] = float(getattr(org, "telomere", 1.0))
             except Exception:
                 pass
@@ -4607,9 +4612,20 @@ class LocalColonyCompute:
             # (P40 phase-out). Заражение от соседа — P40 шлёт infected/
             # infection_contact → начальная severity 0.05 (mirror world.py).
             # Прогресс severity + death тикает _apply_metabolism.
-            if event.get("infected") or event.get("infection_contact"):
+            _ic = event.get("infection_contact")
+            if _ic or event.get("infected"):
+                # _ic: список [{from_cid, severity_hint}] (Хьюберт). Берём max
+                # severity_hint (несколько контактов за тик), дефолт 0.05.
+                sev_hint = 0.05
+                if isinstance(_ic, list) and _ic:
+                    try:
+                        sev_hint = max(
+                            float(d.get("severity_hint", 0.05) or 0.05)
+                            for d in _ic if isinstance(d, dict))
+                    except Exception:
+                        sev_hint = 0.05
                 _s = float(getattr(bc, "infection_severity", 0.0) or 0.0)
-                bc.infection_severity = max(_s, 0.05)
+                bc.infection_severity = max(_s, sev_hint)
                 bc.infected = True
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
