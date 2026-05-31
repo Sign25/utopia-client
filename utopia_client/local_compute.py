@@ -33,10 +33,16 @@ N_ACTIONS = 16
 
 # Dehydration-модель (mirror environment/world.py:909/926 — источник истины).
 # Стадии по hydration ratio → energy_drain грызёт ЭНЕРГИЮ (не отдельная
-# hydration-смерть): φ²≈2.618 (stage 2) / φ³≈4.236 (stage 3). Смерть наступает
-# органически через energy<=0 (starvation). Единая ось смерти — энергия.
+# hydration-смерть): смерть через energy<=0 (starvation), единая ось.
+# РЕКАЛИБРОВКА под client-tick (0.11.37, Шеф «давление смерти, мягче»): сервер
+# φ²≈2.618/φ³≈4.236 ПЕР-СЕРВЕР-ТИК; клиент применяет ~5Гц → полный φ² = ~13
+# энергии/сек → выжигал запас за <1мин (0.11.34 вайп). ×0.1 → ≈0.26/0.42 за
+# тик: мягкое давление отбора (застрявший без воды гибнет за ~4мин, сытый у
+# воды не страдает), не вайп. Тюнить scale если 50→16 не идёт.
 _PHI_CONST = 1.618033988749895
-_DEHYDRATION_DRAIN = {2: _PHI_CONST ** 2, 3: _PHI_CONST ** 3}
+_DEHYDRATION_DRAIN_SCALE = 0.1
+_DEHYDRATION_DRAIN = {2: _PHI_CONST ** 2 * _DEHYDRATION_DRAIN_SCALE,
+                      3: _PHI_CONST ** 3 * _DEHYDRATION_DRAIN_SCALE}
 
 
 def _dehydration_stage(hydration: float, max_hydration: float) -> int:
@@ -522,14 +528,12 @@ class LocalColonyCompute:
         self._hyd_calib_ticks: int = 0
         # Death-урон от обезвоживания (01.06.2026, Шеф: «вода влияет на общее
         # состояние и гибель»). dh_stage>=2 → energy_drain → смерть через
-        # energy<=0. ОТКАЧЕНО 0.11.35: 0.11.34 выкосил всю колонию (17→0 за 3
-        # мин). Дрейн φ²≈2.6/тик при 5Гц = ~13 энергии/сек → стадия 2 за
-        # полминуты выжигает весь запас энергии → starvation при здоровой воде.
-        # На сервере не наказуемо (обученное поведение избегает обезвоживания),
-        # на клиенте поведения нет + water-seek рефлекс не срабатывает →
-        # гарантированный вайп. RE-ENABLE только после: (1) рабочий water-seek
-        # ИЛИ (2) рекалибровка дрейна под client-tick-rate (мельче/только st.3).
-        self._dehydration_damage_enabled: bool = False
+        # energy<=0. RE-ENABLE 0.11.37 (Шеф «давление смерти» против
+        # перенаселения 50): дрейн рекалиброван ×0.1 (_DEHYDRATION_DRAIN_SCALE)
+        # под client-tick → ~0.26/0.42 за тик вместо φ²/φ³. Безопасно: eat-income
+        # работает (0.11.36) → сытые переживают, гибнут только застрявшие без
+        # воды → отбор. 0.11.34 вайпнул full-φ² БЕЗ eat-income; оба условия сняты.
+        self._dehydration_damage_enabled: bool = True
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.

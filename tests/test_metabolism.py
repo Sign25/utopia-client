@@ -74,12 +74,11 @@ def test_no_dehydration_death_while_damage_disabled():
     assert bc.energy == 342.0       # энергия не тронута жаждой
 
 
-def test_dehydration_damage_disabled_by_default():
-    """0.11.35: death-урон ОТКЛ по умолчанию (0.11.34 выкосил колонию —
-    дрейп φ²/тик при 5Гц выжигает энергию; re-enable после рабочего water-seek
-    или рекалибровки дрейна)."""
+def test_dehydration_damage_enabled_by_default():
+    """0.11.37: death-урон ВКЛ (давление отбора против перенаселения), но
+    рекалиброван ×0.1 под client-tick (eat-income 0.11.36 делает безопасным)."""
     c, org, bc = _compute_with_org()
-    assert c._dehydration_damage_enabled is False
+    assert c._dehydration_damage_enabled is True
 
 
 def test_dehydration_stage_thresholds():
@@ -91,23 +90,26 @@ def test_dehydration_stage_thresholds():
 
 
 def test_dehydration_energy_drain_when_enabled():
-    """Флаг ВКЛ: hydration stage 2 (10/100) → energy -= φ²≈2.618."""
+    """Флаг ВКЛ: hydration stage 2 (10/100) → energy -= φ²×0.1≈0.262 (мягкий
+    рекалиброванный дрейн под client-tick, не полный φ²)."""
     c, org, bc = _compute_with_org(energy=100.0, hydration=10.0)
     c._dehydration_damage_enabled = True
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 0.0})
-    assert abs(bc.energy - (100.0 - 1.618033988749895 ** 2)) < 1e-6
+    assert abs(bc.energy - (100.0 - 1.618033988749895 ** 2 * 0.1)) < 1e-6
 
 
 def test_dehydration_death_via_energy():
-    """Флаг ВКЛ + низкая энергия + крит-обезвоживание → energy<=0 → смерть
-    через starvation (единая ось), не отдельной hydration-смертью."""
-    c, org, bc = _compute_with_org(energy=3.0, hydration=0.0)
+    """Флаг ВКЛ + почти нулевая энергия + крит-обезвоживание → energy<=0 →
+    смерть через starvation (единая ось), не отдельной hydration-смертью.
+    (Дрейн мягкий φ³×0.1≈0.424 → нужна низкая стартовая энергия для смерти
+    за тик; в проде смерть наступает за минуты, не мгновенно.)"""
+    c, org, bc = _compute_with_org(energy=0.3, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
     c._dehydration_damage_enabled = True
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 0.0})
-    assert bc.energy == 0.0          # 3.0 − φ³≈4.236 → clamp 0
+    assert bc.energy == 0.0          # 0.3 − φ³×0.1≈0.424 → clamp 0
     assert "c1" in c._dead_cids      # смерть через энергию
 
 
