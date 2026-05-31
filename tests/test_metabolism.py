@@ -82,6 +82,51 @@ def test_dehydration_damage_disabled_by_default():
     assert c._dehydration_damage_enabled is False
 
 
+def test_shape_logits_flora_gradient_pulls_movement():
+    """Phase 4: флора-градиент NS>0 → bias к SOUTH (logits[1]) над NORTH[0]."""
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    logits = torch.zeros(16)
+    obs = [0.0] * 64
+    obs[33] = 1.0  # флора-градиент NS
+    c._shape_action_logits(logits, obs, diet=0.5, energy_ratio=1.0)
+    assert float(logits[1]) > float(logits[0])  # S притянут, N оттолкнут
+
+
+def test_shape_logits_penalizes_stay_reproduce_dig():
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    logits = torch.zeros(16)
+    c._shape_action_logits(logits, [0.0] * 64, diet=0.5, energy_ratio=1.0)
+    assert float(logits[4]) < 0    # STAY
+    assert float(logits[9]) < 0    # REPRODUCE
+    assert float(logits[11]) < 0   # DIG
+    assert float(logits[0]) == 0.0  # move без градиента не тронут
+
+
+def test_shape_logits_attack_context():
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    # нет prey → ATTACK штраф
+    l1 = torch.zeros(16)
+    c._shape_action_logits(l1, [0.0] * 64, diet=0.5, energy_ratio=1.0)
+    assert float(l1[5]) < 0
+    # есть prey (prox>0.1) → ATTACK буст
+    l2 = torch.zeros(16)
+    obs = [0.0] * 64; obs[58] = 0.5
+    c._shape_action_logits(l2, obs, diet=0.5, energy_ratio=1.0)
+    assert float(l2[5]) > 0
+
+
+def test_shape_logits_flee_near_predator():
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    logits = torch.zeros(16)
+    obs = [0.0] * 64; obs[61] = 0.5  # pred_prox > 0.15
+    c._shape_action_logits(logits, obs, diet=0.5, energy_ratio=1.0)
+    assert float(logits[10]) > 0   # FLEE буст у хищника
+
+
 def test_reproduction_population_cap():
     """0.11.38: размножение НЕ идёт при alive >= ёмкости (bounded self-
     sustaining цикл, без перенаселения)."""

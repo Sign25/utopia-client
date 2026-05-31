@@ -2064,6 +2064,19 @@ class LocalColonyCompute:
                 # SFNN-стиля захватывают pre/post активации для следующего
                 # update_step. Применяется к первым 16 элементам logits
                 # (action-space). Если ткани нет — fallback к raw_logits.
+                # Phase 4 (01.06.2026): контекстный шейпинг логитов до motor_delta
+                # (порт _decide_action) — даёт сигнал «иди к еде/беги/атакуй»,
+                # без которого ActionSelector коллапсирует в move-only → голод.
+                try:
+                    _diet = float((self.traits.get(cid) or {}).get(
+                        "diet_gene", 0.5) or 0.5)
+                    _bc2 = self.biochem.get(cid)
+                    _er = (float(getattr(_bc2, "energy", 500.0)) / 1000.0
+                           if _bc2 is not None else 0.5)
+                    self._shape_action_logits(logits[0], obs_arr, _diet, _er)
+                except Exception as e:
+                    logger.debug("action shaping %s: %s", cid, e)
+
                 motor_delta = self._motor_forward(cid, obs_tensor)
                 selector = self.action_selectors[cid]
                 if motor_delta is not None:
@@ -3065,6 +3078,72 @@ class LocalColonyCompute:
             logger.debug("lang build features %s: %s", cid, e)
 
     # ── motor_policy forward (SFNN S4) ───────────────────────────────────
+
+    def _shape_action_logits(self, logits, obs_arr, diet: float,
+                             energy_ratio: float) -> None:
+        """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
+        действия — порт server `_decide_action` (phase_a.py:668-765). Без него
+        логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
+        зодчие не едят/не охотятся/не бегут → голод + мёртвое поведение.
+
+        Градиентные bias'ы (флора/prey/predator из obs-слотов) направляют
+        движение; структурные φ-штрафы + контекстные boost'ы формируют action.
+        motor_policy (SFNN) доучивается ПОВЕРХ. EAT/GATHER не трогаем —
+        passive_eating кормит ambient на флоре.
+
+        Конвенция Action (world.py): N=0,S=1,E=2,W=3,STAY=4,ATTACK=5,SIGNAL_FOOD
+        =6,SIGNAL_DANGER=7,SHARE=8,REPRODUCE=9,FLEE=10,DIG=11,BUILD=12,GATHER=13,
+        EAT=14,SHARE_FOOD=15. obs: [33/34]=флора-град NS/EW, [56-58]=prey NS/EW/
+        prox, [59-61]=predator. logits: torch[16]-вью, мутируется in-place.
+        """
+        try:
+            n = len(obs_arr)
+            BS = 1.0  # _bias_scale (server default 1.0; на клиенте фикс)
+            PHI = 1.6180339887
+            # Флора-градиент (иди к еде). Травоядный (diet→0) сильнее.
+            g_ns = float(obs_arr[33]) if n > 34 else 0.0
+            g_ew = float(obs_arr[34]) if n > 34 else 0.0
+            fw = (4.0 - 2.0 * diet) * BS
+            logits[0] -= fw * g_ns; logits[1] += fw * g_ns
+            logits[2] += fw * g_ew; logits[3] -= fw * g_ew
+            # Prey-градиент (охота). Карнивор (diet→1) сильнее.
+            p_ns = float(obs_arr[56]) if n > 58 else 0.0
+            p_ew = float(obs_arr[57]) if n > 58 else 0.0
+            p_prox = float(obs_arr[58]) if n > 58 else 0.0
+            pw = (2.0 + 4.0 * diet) * BS * min(p_prox + 0.1, 1.0)
+            logits[0] -= pw * p_ns; logits[1] += pw * p_ns
+            logits[2] += pw * p_ew; logits[3] -= pw * p_ew
+            # Predator-градиент (беги ПРОТИВ градиента).
+            d_ns = float(obs_arr[59]) if n > 61 else 0.0
+            d_ew = float(obs_arr[60]) if n > 61 else 0.0
+            d_prox = float(obs_arr[61]) if n > 61 else 0.0
+            if d_prox > 0.05:
+                pf = 4.0 * BS * min(d_prox, 1.0)
+                logits[0] += pf * d_ns; logits[1] -= pf * d_ns
+                logits[2] -= pf * d_ew; logits[3] += pf * d_ew
+            # Структурные φ-штрафы (постоянные).
+            logits[4] -= 1.0                 # STAY
+            logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
+            logits[7] -= 1.0 / (PHI * PHI)   # SIGNAL_DANGER
+            logits[8] -= 1.0 / PHI           # SHARE
+            logits[9] -= 1.0                 # REPRODUCE (через mate_pairs, не action)
+            logits[11] -= 1.0                # DIG
+            logits[12] -= 1.0 / (PHI * PHI)  # BUILD
+            # Контекстные.
+            has_prey = p_prox > 0.1
+            if not has_prey:
+                logits[5] -= 1.0 * BS        # ATTACK без целей — нет смысла
+            else:
+                logits[5] += 2.0 * BS        # ATTACK при цели
+                if diet > 0.7 and p_prox > 0.3:
+                    logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
+            logits[10] -= 0.3 * BS           # FLEE базовый штраф
+            if d_prox > 0.15:
+                logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
+            if energy_ratio < 0.3:
+                logits[12] += 1.0 * BS       # BUILD при низкой энергии (оборона)
+        except Exception as e:
+            logger.debug("shape_action_logits failed: %s", e)
 
     def _motor_forward(self, cid: str, obs_tensor):
         """Forward motor_policy → tanh-delta [-1, 1]^16. Hooks захватывают
