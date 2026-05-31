@@ -42,14 +42,52 @@ def test_energy_decay():
     assert "c1" not in c._dead_cids
 
 
-def test_hydration_decay_DISABLED_no_income():
-    """SAFETY (31.05): hydration-декей отключён — нет income питья на клиенте
-    (монотонный thirst → массовый падёж от жажды). thirst_now игнорируется,
-    hydration не меняется. Включить, когда P40 будет слать delta_hydration."""
+def test_thirst_inactive_no_decay():
+    """Hydration-ось гейтится: пока cid НЕ активен (P40 не шлёт
+    delta_hydration), thirst не применяется — deploy-order-safe, нет коллапса."""
     c, org, bc = _compute_with_org(hydration=80.0)
+    # cid НЕ в _hydration_active
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 15.0})
-    assert bc.hydration == 80.0  # не тронут (декей отключён)
+    assert bc.hydration == 80.0  # не тронут (ось не активна)
+    assert "c1" not in c._dead_cids
+
+
+def test_thirst_active_decays():
+    """Когда питьё активно (P40 шлёт delta_hydration) — thirst применяется."""
+    c, org, bc = _compute_with_org(hydration=80.0)
+    c._hydration_active.add("c1")  # эмулируем активацию (P40 шлёт income)
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 15.0})
+    assert bc.hydration == 65.0
+
+
+def test_dehydration_death_when_active():
+    c, org, bc = _compute_with_org(hydration=10.0)
+    c._hydration_active.add("c1")
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 30.0})
+    assert bc.hydration == 0.0
+    assert "c1" in c._dead_cids  # жажда
+
+
+def test_delta_hydration_activates_and_incomes():
+    """delta_hydration в event → активирует hydration-ось + добавляет income.
+    (Нужен environment.biochemistry для apply_feed-импорта в _apply_biochem_events.)"""
+    pytest.importorskip("environment.biochemistry")
+    c, org, bc = _compute_with_org(hydration=50.0)
+    c._apply_biochem_events("c1", {"delta_hydration": 20.0})
+    assert "c1" in c._hydration_active
+    assert bc.hydration == 70.0  # income применён
+
+
+def test_no_dehydration_death_when_inactive():
+    """hydration=0 у НЕактивного cid НЕ убивает (ложная смерть без income)."""
+    c, org, bc = _compute_with_org(hydration=0.0)
+    # cid НЕ активен
+    c._apply_metabolism("c1", {"step_cost_now": 5.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 30.0})
+    assert "c1" not in c._dead_cids  # энергии хватает, жажда не считается
 
 
 def test_telomere_decay():

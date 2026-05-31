@@ -479,10 +479,16 @@ class LocalColonyCompute:
         # client-born, без persist) → терялись при рестарте.
         self.traits: dict[str, dict] = {}        # cid → {9 trait полей}
         # Body Migration метаболизм (31.05.2026): cid'ы с метаболической смертью
-        # (energy<=0 голод / telomere AGONY старость). build_projection_batch
-        # шлёт для них alive=False → P40 убирает. Чистится в remove_creature
-        # (после P40-removal client GC по orphan-obs снимет cid).
+        # (energy<=0 голод / telomere AGONY старость / hydration<=0 жажда).
+        # build_projection_batch шлёт для них alive=False → P40 убирает.
+        # Чистится в remove_creature (после P40-removal client GC снимет cid).
         self._dead_cids: set = set()
+        # Hydration-ось отбора (31.05.2026): cid'ы, для которых P40 шлёт
+        # delta_hydration (income от питья) — присутствие ключа = «система
+        # питья активна». thirst-декей + hydration<=0 death применяются ТОЛЬКО
+        # для активных cid (deploy-order-safe: пока P40 не шлёт delta_hydration,
+        # жажда не действует → нет коллапса от монотонного декея без income).
+        self._hydration_active: set = set()
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -926,8 +932,9 @@ class LocalColonyCompute:
         # Evolved-traits recovery (30.05.2026): drop стор + pending re-announce.
         self.traits.pop(cid, None)
         self._pending_traits_announce.pop(cid, None)
-        # Body Migration метаболизм (31.05.2026): drop death-mark.
+        # Body Migration метаболизм (31.05.2026): drop death-mark + hydration.
         self._dead_cids.discard(cid)
+        self._hydration_active.discard(cid)
 
     def persist_all_memory(self) -> int:
         """Phase 4 этап B: сохранить episodic state всех живых организмов.
@@ -4319,6 +4326,17 @@ class LocalColonyCompute:
             # Server-side max_energy = 1000 (WorldConfig default), clamp [0, 1000].
             if delta_e != 0.0:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
+            # Hydration income (31.05.2026): присутствие ключа delta_hydration
+            # в event = P40 шлёт питьё → активируем hydration-ось отбора для
+            # этого cid (thirst-декей + жажда-смерть включатся в
+            # _apply_metabolism). delta_hydration>0 = попил (income).
+            if "delta_hydration" in event:
+                self._hydration_active.add(cid)
+                delta_h = float(event.get("delta_hydration", 0.0) or 0.0)
+                if delta_h != 0.0:
+                    max_h = float(getattr(bc, "max_hydration", 100.0))
+                    bc.hydration = max(
+                        0.0, min(max_h, float(getattr(bc, "hydration", max_h)) + delta_h))
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
 
@@ -4350,22 +4368,27 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-            # SAFETY (31.05.2026, Бендер): hydration-декей ОТКЛЮЧЁН. У клиента
-            # нет income гидрации — питьё не моделируется (_apply_biochem_events
-            # не обрабатывает drink/delta_hydration). Монотонный thirst-декей →
-            # hydration→0 у ВСЕХ → массовый падёж от жажды (не отбор). Включим,
-            # когда P40 будет слать delta_hydration (как delta_energy) →
-            # реальный баланс питьё/жажда. До тех пор hydration не трогаем
-            # (energy/telomere — полноценный отбор: у energy есть income от еды).
-            # thirst_now приходит, но не применяется (см. сигнал Хьюберту).
+            # Hydration thirst-декей (31.05.2026): ТОЛЬКО для активных cid (P40
+            # шлёт delta_hydration income → _hydration_active). Deploy-order-safe:
+            # пока P40 не включил питьё, жажда не действует (нет коллапса от
+            # декея без income). Когда income живёт — баланс питьё/жажда =
+            # полноценная ось отбора (обезвоживание слабых).
+            if thirst > 0.0 and cid in self._hydration_active:
+                max_h = float(getattr(bc, "max_hydration", 100.0))
+                bc.hydration = max(
+                    0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(
                     1.0, float(getattr(org, "telomere", 1.0)) - tel_decay))
             except Exception:
                 pass
-        # Death-check: голод (energy<=0) или старость (telomere AGONY).
+        # Death-check: голод (energy<=0), жажда (hydration<=0, только если
+        # питьё активно — иначе ложная смерть без income), старость (AGONY).
         dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
+        if (not dead and bc is not None and cid in self._hydration_active
+                and float(getattr(bc, "hydration", 1.0)) <= 0.0):
+            dead = True  # дегидратация
         if not dead and org is not None:
             try:
                 from core.telomere_phase import get_phase, TelomerePhase

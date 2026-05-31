@@ -1600,6 +1600,12 @@ class ColonyWSClient:
                 "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
                 "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
             }
+            # Hydration income (31.05.2026): ключ delta_hydration прокидываем
+            # ТОЛЬКО если P40 его шлёт — присутствие = сигнал «питьё активно»
+            # (_apply_biochem_events активирует hydration-ось отбора для cid).
+            if "delta_hydration" in c:
+                events_per_cid[cid_s]["delta_hydration"] = float(
+                    c.get("delta_hydration", 0.0) or 0.0)
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
