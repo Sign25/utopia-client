@@ -640,6 +640,16 @@ class ColonyWSClient:
         """
         if not self.connected:
             return False
+        # Client-authoritative НЕ шлёт legacy respawn_owned_request (31.05.2026,
+        # Бендер): источник десинка — legacy _async_respawn создавал клоны с
+        # НОВЫМИ cid'ами, не совпадающими с client-набором → P40/client desync,
+        # rates не шли. В client-authoritative организмы приходят из local .pt
+        # + projection-model self-heal + reproduction, НЕ из legacy respawn.
+        # Пустая client-authoritative колония восстанавливается genesis'ом
+        # (n_local=0 ветка) или репродукцией, не legacy. Для остальных user'ов
+        # (n_local=0 на старте) respawn остаётся штатным.
+        if getattr(self, "_reject_incoming_seeds", False):
+            return False
         if self.n_alive_owned > 0:
             return False
         # awaiting_seed_pack — сервер сам обещает прислать seed_pack
@@ -1838,6 +1848,11 @@ class ColonyWSClient:
         """
         ws = self._ws
         if ws is None:
+            return
+        # Client-authoritative НЕ шлёт legacy respawn (31.05.2026): orphan-obs
+        # для client-authoritative = stale P40-проекции (десинк), не повод
+        # legacy-respawn'ить (создаёт клоны с новыми cid → углубляет десинк).
+        if getattr(self, "_reject_incoming_seeds", False):
             return
         now = time.time()
         if (self._last_respawn_request_ts > 0

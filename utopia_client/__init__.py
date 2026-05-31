@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.25"  # calib: thirst-декей ВКЛ для наблюдения баланса воды, смерть ОТКЛ + WATER_CALIB лог
+__version__ = "0.11.26"  # fix: отключить legacy respawn_owned_request для client-authoritative (источник clone-десинка)
