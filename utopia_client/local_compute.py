@@ -4350,10 +4350,14 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-            if thirst > 0.0:
-                max_h = float(getattr(bc, "max_hydration", 100.0))
-                bc.hydration = max(
-                    0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
+            # SAFETY (31.05.2026, Бендер): hydration-декей ОТКЛЮЧЁН. У клиента
+            # нет income гидрации — питьё не моделируется (_apply_biochem_events
+            # не обрабатывает drink/delta_hydration). Монотонный thirst-декей →
+            # hydration→0 у ВСЕХ → массовый падёж от жажды (не отбор). Включим,
+            # когда P40 будет слать delta_hydration (как delta_energy) →
+            # реальный баланс питьё/жажда. До тех пор hydration не трогаем
+            # (energy/telomere — полноценный отбор: у energy есть income от еды).
+            # thirst_now приходит, но не применяется (см. сигнал Хьюберту).
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(

@@ -42,11 +42,14 @@ def test_energy_decay():
     assert "c1" not in c._dead_cids
 
 
-def test_hydration_decay():
+def test_hydration_decay_DISABLED_no_income():
+    """SAFETY (31.05): hydration-декей отключён — нет income питья на клиенте
+    (монотонный thirst → массовый падёж от жажды). thirst_now игнорируется,
+    hydration не меняется. Включить, когда P40 будет слать delta_hydration."""
     c, org, bc = _compute_with_org(hydration=80.0)
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 15.0})
-    assert bc.hydration == 65.0
+    assert bc.hydration == 80.0  # не тронут (декей отключён)
 
 
 def test_telomere_decay():
