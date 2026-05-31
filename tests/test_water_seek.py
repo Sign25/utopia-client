@@ -95,6 +95,26 @@ def test_apply_water_seek_overrides_thirsty():
     assert creatures_out[0]["action"] == 2  # override → EAST (к воде)
 
 
+def test_near_water_on_tile():
+    cli = _client(_FakeWC(20, [(10, 10)]))  # организм прямо на воде
+    assert cli._near_water(10, 10) is True
+
+
+def test_near_water_adjacent():
+    cli = _client(_FakeWC(20, [(10, 11)]))  # вода — сосед справа (радиус 1)
+    assert cli._near_water(10, 10) is True
+
+
+def test_near_water_far_false():
+    cli = _client(_FakeWC(20, [(10, 13)]))  # 3 клетки — вне радиуса-1
+    assert cli._near_water(10, 10) is False
+
+
+def test_near_water_no_cache():
+    cli = _client(None)
+    assert cli._near_water(5, 5) is False
+
+
 def test_apply_water_seek_skips_hydrated():
     pytest.importorskip("torch")
     from utopia_client.local_compute import LocalColonyCompute

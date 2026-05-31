@@ -53,23 +53,53 @@ def test_thirst_decays_calibration_mode():
     assert c._hyd_thirst_sum == 15.0  # аккумулятор для calib-лога
 
 
-def test_thirst_inactive_still_no_decay():
-    """Неактивный cid (P40 не шлёт delta_hydration) — thirst НЕ применяется."""
+def test_thirst_unconditional_now():
+    """01.06: водный контур client-authoritative — жажда БЕЗУСЛОВНА (доход
+    теперь client-side из террейна, gate _hydration_active убран)."""
     c, org, bc = _compute_with_org(hydration=80.0)
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 15.0})
-    assert bc.hydration == 80.0
+    assert bc.hydration == 65.0  # декей применён даже без _hydration_active
 
 
-def test_no_dehydration_death_even_active_at_zero():
-    """СМЕРТЬ от жажды ОТКЛ (калибровка): hydration=0 + активна, energy=342 +
-    telomere=0.999 → НЕ умирает. (Был баг, выкосивший колонию.)"""
+def test_no_dehydration_death_while_damage_disabled():
+    """Death-урон ОТКЛ (дефолт-флаг): hydration=0, energy=342, telomere=0.999
+    → НЕ умирает, энергия не тронута. (Урок 0.11.24 — без дохода не убиваем.)"""
     c, org, bc = _compute_with_org(energy=342.0, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
-    c._hydration_active.add("c1")
     c._apply_metabolism("c1", {"step_cost_now": 0.0,
                                "telomere_decay_now": 0.0, "thirst_now": 30.0})
-    assert "c1" not in c._dead_cids  # ЖИВ (жажда-смерть отключена)
+    assert "c1" not in c._dead_cids  # ЖИВ (energy_drain выключен)
+    assert bc.energy == 342.0       # энергия не тронута жаждой
+
+
+def test_dehydration_stage_thresholds():
+    from utopia_client.local_compute import _dehydration_stage
+    assert _dehydration_stage(80.0, 100.0) == 0   # >0.5 норма
+    assert _dehydration_stage(40.0, 100.0) == 1   # 0.25–0.5 жажда
+    assert _dehydration_stage(10.0, 100.0) == 2   # 0–0.25 обезвоживание
+    assert _dehydration_stage(0.0, 100.0) == 3    # =0 критическое
+
+
+def test_dehydration_energy_drain_when_enabled():
+    """Флаг ВКЛ: hydration stage 2 (10/100) → energy -= φ²≈2.618."""
+    c, org, bc = _compute_with_org(energy=100.0, hydration=10.0)
+    c._dehydration_damage_enabled = True
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    assert abs(bc.energy - (100.0 - 1.618033988749895 ** 2)) < 1e-6
+
+
+def test_dehydration_death_via_energy():
+    """Флаг ВКЛ + низкая энергия + крит-обезвоживание → energy<=0 → смерть
+    через starvation (единая ось), не отдельной hydration-смертью."""
+    c, org, bc = _compute_with_org(energy=3.0, hydration=0.0)
+    c.organisms["c1"].telomere = 0.999
+    c._dehydration_damage_enabled = True
+    c._apply_metabolism("c1", {"step_cost_now": 0.0,
+                               "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    assert bc.energy == 0.0          # 3.0 − φ³≈4.236 → clamp 0
+    assert "c1" in c._dead_cids      # смерть через энергию
 
 
 def test_delta_hydration_income_still_works():

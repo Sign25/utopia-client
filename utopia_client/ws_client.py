@@ -1617,12 +1617,17 @@ class ColonyWSClient:
                 "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
                 "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
             }
-            # Hydration income (31.05.2026): ключ delta_hydration прокидываем
-            # ТОЛЬКО если P40 его шлёт — присутствие = сигнал «питьё активно»
-            # (_apply_biochem_events активирует hydration-ось отбора для cid).
+            # Hydration income (31.05→01.06.2026, Шеф): питьё — из бесконечного
+            # террейна (WATER-тайл ничего не расходует, арбитраж P40 не нужен, в
+            # отличие от еды-сущности). Клиент владеет всем водным контуром:
+            # если P40 прислал delta_hydration — берём его; иначе начисляем сами
+            # при нахождении на/рядом с водой (_near_water). Переиспользует
+            # готовый путь _apply_biochem_events (clamp до max_hydration).
             if "delta_hydration" in c:
                 events_per_cid[cid_s]["delta_hydration"] = float(
                     c.get("delta_hydration", 0.0) or 0.0)
+            elif self._near_water(int(c.get("row", 0)), int(c.get("col", 0))):
+                events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
@@ -1829,6 +1834,9 @@ class ColonyWSClient:
     _WATER_TILE = 1
     _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду
     _WATER_SEEK_RADIUS = 8         # тайлов вокруг — дальше random walk
+    # Water income client-side (01.06.2026, Шеф): на/рядом с WATER → доход
+    # hydration. φ⁷≈29.03 = prey_kill_energy (mirror world.py:551).
+    _WATER_RESTORE = 1.618033988749895 ** 7
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -1863,6 +1871,29 @@ class ColonyWSClient:
         if abs(dr) >= abs(dc):
             return 0 if dr < 0 else 1   # N / S
         return 2 if dc > 0 else 3       # E / W
+
+    def _near_water(self, row: int, col: int) -> bool:
+        """Организм на ИЛИ рядом (5 клеток, радиус 1: self + 4 соседа) с
+        WATER-тайлом → может пить (mirror world.py:3551). terrain из
+        world_cache (bytes size×size). Границы клампим (без torus — на проде
+        вода в центре, edge-эффект пренебрежим)."""
+        wc = getattr(self, "world_cache", None)
+        if wc is None:
+            return False
+        cfg = getattr(wc, "config", None)
+        terrain = getattr(wc, "terrain", b"")
+        if cfg is None or not terrain:
+            return False
+        size = int(getattr(cfg, "size", 0) or 0)
+        if size <= 0 or len(terrain) < size * size:
+            return False
+        r0, c0 = int(row), int(col)
+        for dr, dc in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
+            r, c = r0 + dr, c0 + dc
+            if 0 <= r < size and 0 <= c < size:
+                if terrain[r * size + c] == self._WATER_TILE:
+                    return True
+        return False
 
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy

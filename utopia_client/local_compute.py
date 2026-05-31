@@ -31,6 +31,25 @@ logger = logging.getLogger("utopia_client.compute")
 STAY = 4
 N_ACTIONS = 16
 
+# Dehydration-модель (mirror environment/world.py:909/926 — источник истины).
+# Стадии по hydration ratio → energy_drain грызёт ЭНЕРГИЮ (не отдельная
+# hydration-смерть): φ²≈2.618 (stage 2) / φ³≈4.236 (stage 3). Смерть наступает
+# органически через energy<=0 (starvation). Единая ось смерти — энергия.
+_PHI_CONST = 1.618033988749895
+_DEHYDRATION_DRAIN = {2: _PHI_CONST ** 2, 3: _PHI_CONST ** 3}
+
+
+def _dehydration_stage(hydration: float, max_hydration: float) -> int:
+    """0=норма, 1=жажда, 2=обезвоживание, 3=критическое (world.py:909)."""
+    ratio = hydration / max(1.0, max_hydration)
+    if ratio > 0.5:
+        return 0
+    if ratio > 0.25:
+        return 1
+    if ratio > 0.0:
+        return 2
+    return 3
+
 # Phase 2 — intrinsic reward coefficient (1/φ²). Идентично P40.
 _BETA_INTRINSIC = 0.3819660112501051
 # Y50 noise scale для predictor наследования (1/φ⁵ ≈ 0.0902). Идентично P40.
@@ -501,6 +520,11 @@ class LocalColonyCompute:
         self._hyd_thirst_sum: float = 0.0
         self._hyd_drink_sum: float = 0.0
         self._hyd_calib_ticks: int = 0
+        # Death-урон от обезвоживания (01.06.2026, Шеф: «вода влияет на общее
+        # состояние и гибель»). dh_stage>=2 → energy_drain → смерть через
+        # energy<=0. Включаем ТОЛЬКО после подтверждения дохода (drink_sum>0):
+        # урок 0.11.24 — энергодрейн-смерть без дохода выкашивает колонию.
+        self._dehydration_damage_enabled: bool = False
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -4446,23 +4470,39 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-            # Water CALIBRATION (31.05.2026, Шеф): thirst-декей ВКЛ для
-            # наблюдения баланса (смерть от жажды по-прежнему ОТКЛ — см.
-            # death-check ниже, без риска падежа). Аккумулируем применённый
-            # thirst → сравним с drink-income (delta_hydration) в calib-логе.
-            if thirst > 0.0 and cid in self._hydration_active:
+            # Водный контур client-authoritative (01.06.2026, Шеф). Расход
+            # жажды теперь БЕЗУСЛОВНЫЙ для всех owned-zodchiy (как на сервере):
+            # доход (delta_hydration) теперь client-side из террейна
+            # (ws_client._near_water), не зависит от P40 → gate _hydration_active
+            # больше не нужен. Аккумулируем для calib-лога баланса.
+            if thirst > 0.0:
                 max_h = float(getattr(bc, "max_hydration", 100.0))
                 bc.hydration = max(
                     0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
                 self._hyd_thirst_sum += thirst
+            # Обезвоживание → стадийный урон ЭНЕРГИИ (mirror world.py:3569):
+            # dh_stage>=2 → energy -= energy_drain (φ²/φ³). Смерть наступает
+            # органически через energy<=0 (starvation, см. death-check ниже),
+            # не отдельной hydration-смертью. Gate: включаем урон только после
+            # подтверждения дохода (drink_sum>0) — урок 0.11.24.
+            if self._dehydration_damage_enabled:
+                max_h = float(getattr(bc, "max_hydration", 100.0))
+                stage = _dehydration_stage(
+                    float(getattr(bc, "hydration", max_h)), max_h)
+                drain = _DEHYDRATION_DRAIN.get(stage, 0.0)
+                if drain > 0.0:
+                    bc.energy = max(
+                        0.0, float(getattr(bc, "energy", 0.0)) - drain)
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(
                     1.0, float(getattr(org, "telomere", 1.0)) - tel_decay))
             except Exception:
                 pass
-        # Death-check: ТОЛЬКО голод (energy<=0) + старость (telomere AGONY).
-        # Жажда ОТКЛЮЧЕНА (см. выше — income недостаточен, выкашивала колонию).
+        # Death-check: голод (energy<=0) + старость (telomere AGONY). Смерть от
+        # жажды НЕ отдельная ось — обезвоживание грызёт energy (energy_drain
+        # выше) → energy<=0 → starvation. Единая ось смерти через энергию
+        # (как на сервере, world.py:3569).
         dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
         cause = "starvation" if dead else ""
         if not dead and org is not None:
