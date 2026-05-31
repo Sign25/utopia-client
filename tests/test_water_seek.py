@@ -154,6 +154,36 @@ def test_water_seek_uses_creature_pos_when_obs_lacks_rowcol():
     assert creatures_out[0]["action"] == 2  # EAST — фикс работает
 
 
+_GRASS = 1.618033988749895 ** -2
+_BERRY = (1.618033988749895 ** -2) * (1.618033988749895 ** 3)
+
+
+def test_flora_income_grass_on_tile():
+    cli = _client(_FakeWC(20, []))
+    assert abs(cli._flora_income(10, 10, {(10, 10): 1}) - _GRASS) < 1e-6
+
+
+def test_flora_income_berry_adjacent():
+    cli = _client(_FakeWC(20, []))
+    assert abs(cli._flora_income(10, 10, {(10, 11): 2}) - _BERRY) < 1e-6
+
+
+def test_flora_income_best_nearby_wins():
+    # grass на тайле + berry рядом → berry (лучшая еда в радиусе)
+    cli = _client(_FakeWC(20, []))
+    assert abs(cli._flora_income(10, 10, {(10, 10): 1, (11, 10): 2}) - _BERRY) < 1e-6
+
+
+def test_flora_income_none_beyond_radius():
+    cli = _client(_FakeWC(20, []))
+    assert cli._flora_income(10, 10, {(10, 13): 1}) == 0.0  # d=3 > радиус 1
+
+
+def test_flora_income_empty():
+    cli = _client(_FakeWC(20, []))
+    assert cli._flora_income(10, 10, {}) == 0.0
+
+
 def test_apply_water_seek_skips_hydrated():
     pytest.importorskip("torch")
     from utopia_client.local_compute import LocalColonyCompute

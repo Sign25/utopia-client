@@ -1574,6 +1574,15 @@ class ColonyWSClient:
             except Exception as e:
                 logger.debug("obs builder import failed: %s", e)
                 local_builder_ready = False
+        # Eat income (01.06.2026): flora-позиции для _flora_income — РАЗ на батч
+        # (не на cid). cache.flora = set[(row,col,kind)] → dict[(r,c)→kind].
+        flora_pos: dict = {}
+        if cache is not None:
+            try:
+                flora_pos = {(int(r), int(cc)): int(k)
+                             for (r, cc, k) in cache.flora}
+            except Exception:
+                flora_pos = {}
         for c in creatures:
             cid = c.get("cid")
             if not cid:
@@ -1640,24 +1649,15 @@ class ColonyWSClient:
                 events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
             elif _p40_dh is not None:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh  # 0 → ось вкл
-            # DIAG 0.11.32: раз в ~1500 — позиция/террейн/вода.
-            self._inc_diag = getattr(self, "_inc_diag", 0) + 1
-            if self._inc_diag >= 1500:
-                self._inc_diag = 0
-                wc = getattr(self, "world_cache", None)
-                cp = getattr(wc, "creature_pos", {}) if wc else {}
-                tile = None
-                if _rc is not None and wc is not None:
-                    wr, wc2 = _rc
-                    terr = getattr(wc, "terrain", b"")
-                    sz = int(getattr(getattr(wc, "config", None), "size", 0) or 0)
-                    if terr and sz and 0 <= wr < sz and 0 <= wc2 < sz:
-                        tile = terr[wr * sz + wc2]
-                logger.info(
-                    "INC_DIAG cid=%s p40_dh=%s c_rowcol=%s cp_len=%d cp_has=%s "
-                    "resolved=%s tile=%s near=%s", cid_s, _p40_dh,
-                    ("row" in c and "col" in c), len(cp), (cid_s in cp),
-                    _rc, tile, _near)
+            # Eat income client-side (01.06.2026, Шеф/Хьюберт): симметрия с водой.
+            # P40 шлёт delta_energy>0 только когда owned ТОЧНО на flora-тайле
+            # (passive_eating), но зодчие ходят случайно → редко попадают → голод
+            # за 13мин. Кредитуем близость к flora (радиус 1), если P40 прислал 0
+            # (приоритет ненулевого P40 — без двойного начисления on-flora).
+            if events_per_cid[cid_s]["delta_energy"] == 0.0 and _rc is not None:
+                _fe = self._flora_income(_rc[0], _rc[1], flora_pos)
+                if _fe > 0.0:
+                    events_per_cid[cid_s]["delta_energy"] = _fe
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
             intero = c.get("intero")
@@ -1867,6 +1867,15 @@ class ColonyWSClient:
     # Water income client-side (01.06.2026, Шеф): на/рядом с WATER → доход
     # hydration. φ⁷≈29.03 = prey_kill_energy (mirror world.py:551).
     _WATER_RESTORE = 1.618033988749895 ** 7
+    # Eat income client-side (01.06.2026, Шеф/Хьюберт): на/рядом с flora →
+    # доход energy. grass=φ⁻²≈0.382, berry=grass·φ³≈1.618 (mirror world.py:311/
+    # 516). FloraType: GRASS=1, BERRY=2. P40 шлёт delta_energy только когда
+    # owned ТОЧНО на flora (passive_eating), но зодчие ходят случайно (только
+    # move-действия, Хьюберт) → почти не попадают → голод за 13мин. Клиент
+    # кредитует близость (как воду), приоритет ненулевого P40.
+    _GRASS_ENERGY = 1.618033988749895 ** -2
+    _BERRY_ENERGY = (1.618033988749895 ** -2) * (1.618033988749895 ** 3)
+    _FLORA_KIND_ENERGY = {1: _GRASS_ENERGY, 2: _BERRY_ENERGY}
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -1945,6 +1954,21 @@ class ColonyWSClient:
             except (TypeError, ValueError):
                 pass
         return None
+
+    def _flora_income(self, row, col, flora_pos) -> float:
+        """Энергия лучшей flora в радиусе 1 (5 клеток) от (row,col), иначе 0.0.
+        flora_pos: dict[(r,c) → kind]. GRASS→grass_energy, BERRY→berry_energy.
+        Симметрия с _near_water: близость к ресурсу = доход (P40 кредитует
+        owned только on-tile, а зодчие туда почти не доходят)."""
+        if not flora_pos:
+            return 0.0
+        r0, c0 = int(row), int(col)
+        best = 0.0
+        for dr, dc in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
+            k = flora_pos.get((r0 + dr, c0 + dc))
+            if k is not None:
+                best = max(best, self._FLORA_KIND_ENERGY.get(k, self._GRASS_ENERGY))
+        return best
 
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
