@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.44"  # feat(infection, Фрай): owned-инфекцию ведёт клиент — severity-тик +0.005 + energy-drain severity*2 + death при >=1.0 + contact-event от P40 + вода лечит (P40 phase-out owned-infection)
+__version__ = "0.11.45"  # feat(skill-growth F5, Фрай): owned Lamarckian skill-growth на клиенте — eat/kill/move counts → efficiency/attack_power/move_speed каждые 200т (mirror world.py) + re-announce P40 (P40 phase-out owned skill-growth)

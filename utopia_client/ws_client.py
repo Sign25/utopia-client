@@ -1859,6 +1859,15 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
+        # F5 skill-growth (01.06.2026, Фрай): traits изменились within-life →
+        # re-announce P40 (рейты/бой считаются от traits). _skill_changed_cids
+        # разрежен (только реальные изменения раз в 200 тиков) → не спамит.
+        try:
+            if getattr(self.compute, "_skill_changed_cids", None):
+                self.compute._skill_changed_cids.clear()
+                await self._maybe_send_traits_announce(force=True)
+        except Exception as e:
+            logger.debug("skill traits re-announce failed: %s", e)
 
     # Water-seek рефлекс (31.05.2026). Tile.WATER=1 (environment/world.py).
     _WATER_TILE = 1

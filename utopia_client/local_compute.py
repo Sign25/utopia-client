@@ -393,6 +393,15 @@ class LocalColonyCompute:
         # разномасштабны: motor 0.17 vs amygdala 172k).
         self._tissue_activation_ring = deque(maxlen=60)  # [[v per role], ...]
         self._tissue_act_runmax: dict = {}               # role → running max
+        # Lamarckian skill-growth (F5, 01.06.2026, Фрай): owned skill-growth
+        # ведёт КЛИЕНТ (P40 phase-out). Окно 200 тиков: eat/kill/move counts →
+        # efficiency/attack_power/move_speed растут/падают (mirror world.py:4595).
+        # Внутрижизненная эволюция тела → наследуется через crossover.
+        self._skill_eat: dict = {}          # cid → eat count (окно 200т)
+        self._skill_kill: dict = {}         # cid → kill count
+        self._skill_move: dict = {}         # cid → move count
+        self._skill_window_tick: dict = {}  # cid → world_tick последнего окна
+        self._skill_changed_cids: set = set()  # cid с изменёнными traits → re-announce
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -940,6 +949,11 @@ class LocalColonyCompute:
         self.motor_sfnn_row_norms.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
         self._motor_reward_baseline.pop(cid, None)
+        self._skill_eat.pop(cid, None)
+        self._skill_kill.pop(cid, None)
+        self._skill_move.pop(cid, None)
+        self._skill_window_tick.pop(cid, None)
+        self._skill_changed_cids.discard(cid)
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
         self.theory_of_mind_opt.pop(cid, None)
@@ -2100,6 +2114,15 @@ class LocalColonyCompute:
                 else:
                     action = int(selector.select(logits, n_actions=N_ACTIONS))
                 out[cid] = {"action": action, "target_id": None}
+
+                # F5 skill-growth (01.06.2026, Фрай): счётчик move (действия
+                # 0-3) + окно 200 тиков → _skill_growth_step (mirror world.py).
+                if 0 <= action <= 3:
+                    self._skill_move[cid] = self._skill_move.get(cid, 0) + 1
+                _sw = self._skill_window_tick.setdefault(cid, world_tick)
+                if world_tick - _sw >= 200:
+                    self._skill_growth_step(cid)
+                    self._skill_window_tick[cid] = world_tick
 
                 # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
                 intero_tensor = None
@@ -4546,6 +4569,11 @@ class LocalColonyCompute:
                 apply_feed(bc)
             if event.get("killed"):
                 apply_kill_prey(bc)
+                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1  # F5
+            # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
+            # опыт фуражёра → efficiency растёт каждые 200 тиков.
+            if event.get("ate") or delta_e > 0.0:
+                self._skill_eat[cid] = self._skill_eat.get(cid, 0) + 1
             damage = float(event.get("damage_taken", 0.0) or 0.0)
             if damage > 0:
                 apply_pvp_hit(bc, kind="cross_clan_target")
@@ -4585,6 +4613,44 @@ class LocalColonyCompute:
                 bc.infected = True
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
+
+    def _skill_growth_step(self, cid: str) -> None:
+        """Lamarckian skill-growth (F5, 01.06.2026, Фрай; mirror world.py:4595).
+        Каждые 200 тиков из опыта (eat/kill/move counts): efficiency/attack_power/
+        move_speed растут/падают. P40 phase-out owned skill-growth → клиент ведёт.
+        Внутрижизненная эволюция тела → наследуется crossover'ом. Изменённые
+        traits → _skill_changed_cids (re-announce P40)."""
+        tr = self.traits.get(cid)
+        eat = self._skill_eat.get(cid, 0)
+        kill = self._skill_kill.get(cid, 0)
+        move = self._skill_move.get(cid, 0)
+        if tr is not None:
+            try:
+                eff0 = int(tr.get("efficiency", 5))
+                atk0 = int(tr.get("attack_power", 3))
+                spd0 = int(tr.get("move_speed", 3))
+                eff, atk, spd = eff0, atk0, spd0
+                # Growth
+                if eat > 10:
+                    eff = min(15, eff + 1)
+                if kill >= max(2, round(atk / 1.6180339887)):  # φ-порог
+                    atk = min(10, atk + 1)
+                if move > 100:
+                    spd = min(10, spd + 1)
+                # Decay (attack_power НЕ деградирует — cold-start trap)
+                if eat <= 2:
+                    eff = max(5, eff - 1)
+                if move < 30:
+                    spd = max(2, spd - 1)
+                if (eff, atk, spd) != (eff0, atk0, spd0):
+                    tr["efficiency"], tr["attack_power"], tr["move_speed"] = (
+                        eff, atk, spd)
+                    self._skill_changed_cids.add(cid)
+            except Exception as e:
+                logger.debug("skill_growth %s: %s", cid, e)
+        self._skill_eat[cid] = 0
+        self._skill_kill[cid] = 0
+        self._skill_move[cid] = 0
 
     def _apply_metabolism(self, cid: str, rates: "Optional[dict]") -> None:
         """Body Migration метаболизм (31.05.2026, Бендер; контракт Хьюберт).

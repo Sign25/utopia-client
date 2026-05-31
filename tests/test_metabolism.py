@@ -132,6 +132,52 @@ def test_shape_logits_flee_near_predator():
     assert float(logits[10]) > 0   # FLEE буст у хищника
 
 
+def test_skill_growth_efficiency_movespeed():
+    """F5 (Фрай): eat>10 → efficiency+1, move>100 → move_speed+1, reset+changed."""
+    c, org, bc = _compute_with_org()
+    c.traits["c1"] = {"efficiency": 6, "attack_power": 3, "move_speed": 4}
+    c._skill_eat["c1"] = 15
+    c._skill_move["c1"] = 120
+    c._skill_growth_step("c1")
+    assert c.traits["c1"]["efficiency"] == 7
+    assert c.traits["c1"]["move_speed"] == 5
+    assert "c1" in c._skill_changed_cids
+    assert c._skill_eat["c1"] == 0  # окно сброшено
+
+
+def test_skill_decay_on_disuse():
+    """eat<=2 → efficiency-1 (min5), move<30 → move_speed-1 (min2)."""
+    c, org, bc = _compute_with_org()
+    c.traits["c1"] = {"efficiency": 8, "attack_power": 3, "move_speed": 6}
+    c._skill_eat["c1"] = 1
+    c._skill_move["c1"] = 10
+    c._skill_growth_step("c1")
+    assert c.traits["c1"]["efficiency"] == 7
+    assert c.traits["c1"]["move_speed"] == 5
+
+
+def test_skill_efficiency_floor_no_spurious_change():
+    """efficiency на полу 5 + disuse → не падает ниже 5, changed НЕ ставится."""
+    c, org, bc = _compute_with_org()
+    c.traits["c1"] = {"efficiency": 5, "attack_power": 3, "move_speed": 5}
+    c._skill_eat["c1"] = 0
+    c._skill_move["c1"] = 50  # 30..100 → move без изменений
+    c._skill_growth_step("c1")
+    assert c.traits["c1"]["efficiency"] == 5
+    assert "c1" not in c._skill_changed_cids
+
+
+def test_skill_attack_power_phi_threshold():
+    """kill>=max(2,round(atk/φ)) → attack_power+1 (φ-порог)."""
+    c, org, bc = _compute_with_org()
+    c.traits["c1"] = {"efficiency": 6, "attack_power": 3, "move_speed": 5}
+    c._skill_kill["c1"] = 2   # порог для atk=3: max(2,round(1.85))=2
+    c._skill_eat["c1"] = 5    # без изменения efficiency
+    c._skill_move["c1"] = 50  # без изменения move_speed
+    c._skill_growth_step("c1")
+    assert c.traits["c1"]["attack_power"] == 4
+
+
 def test_infection_ticks_and_drains_energy():
     """Фрай: owned-инфекцию тикает клиент. severity +0.005/тик, energy -=
     severity*2.0 (болезнь)."""
