@@ -1674,6 +1674,19 @@ class ColonyWSClient:
             self.last_world_tick = world_tick
             for cid in obs_per_cid:
                 self._cid_last_seen_tick[cid] = world_tick
+            # Grace для свежевосстановленных (restore) cid'ов (31.05.2026,
+            # Бендер): их НЕТ в obs (P40 после purge/restart их не знает), но
+            # они в compute.organisms. Без grace GC видит last_seen=None →
+            # сносит НЕМЕДЛЕННО, ДО того как projection_batch установит их на
+            # P40 (self-heal) → дедлок (это и выкосило 16 restored). setdefault
+            # = только новым (уже отслеживаемые сохраняют своё last_seen) →
+            # переживут STALE-окно, пока projection self-heal'нет → obs пойдут.
+            if self.compute is not None:
+                try:
+                    for cid in list(self.compute.organisms.keys()):
+                        self._cid_last_seen_tick.setdefault(cid, world_tick)
+                except Exception:
+                    pass
             gced = self._gc_orphan_cids(world_tick)
             if gced:
                 await self._send_owned_bye(gced)
