@@ -4421,39 +4421,38 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-            # Hydration thirst-декей (31.05.2026): ТОЛЬКО для активных cid (P40
-            # шлёт delta_hydration income → _hydration_active). Deploy-order-safe:
-            # пока P40 не включил питьё, жажда не действует (нет коллапса от
-            # декея без income). Когда income живёт — баланс питьё/жажда =
-            # полноценная ось отбора (обезвоживание слабых).
-            if thirst > 0.0 and cid in self._hydration_active:
-                max_h = float(getattr(bc, "max_hydration", 100.0))
-                bc.hydration = max(
-                    0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
+            # HYDRATION-ОСЬ ОТКЛЮЧЕНА (31.05.2026 INCIDENT): thirst-декей выкосил
+            # ВСЮ колонию (327→0) — income питья НЕДОСТАТОЧЕН (drink не покрывает
+            # thirst_now), hydration→0 у всех → массовая жажда-смерть при ЗДОРОВЫХ
+            # energy(183-357)+telomere(0.999). Self-gating (0.11.21) активировался
+            # при delta_hydration, но баланс income/cost сломан. Декей+смерть
+            # выключены до тех пор, пока drink-income не покроет thirst (нужна
+            # калибровка с Хьюбертом). Income (delta_hydration) безвреден —
+            # hydration только растёт/стоит. thirst_now приходит, НЕ применяется.
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(
                     1.0, float(getattr(org, "telomere", 1.0)) - tel_decay))
             except Exception:
                 pass
-        # Death-check: голод (energy<=0), жажда (hydration<=0, только если
-        # питьё активно — иначе ложная смерть без income), старость (AGONY).
+        # Death-check: ТОЛЬКО голод (energy<=0) + старость (telomere AGONY).
+        # Жажда ОТКЛЮЧЕНА (см. выше — income недостаточен, выкашивала колонию).
         dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
-        if (not dead and bc is not None and cid in self._hydration_active
-                and float(getattr(bc, "hydration", 1.0)) <= 0.0):
-            dead = True  # дегидратация
+        cause = "starvation" if dead else ""
         if not dead and org is not None:
             try:
                 from core.telomere_phase import get_phase, TelomerePhase
                 if get_phase(float(getattr(org, "telomere", 1.0))) == TelomerePhase.AGONY:
                     dead = True
+                    cause = "agony"
             except Exception:
                 pass
         if dead and cid not in self._dead_cids:
             self._dead_cids.add(cid)
             logger.info(
-                "metabolic death cid=%s energy=%.1f telomere=%.3f",
-                cid, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
+                "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f telomere=%.3f",
+                cid, cause, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
+                float(getattr(bc, "hydration", -1.0)) if bc else -1.0,
                 float(getattr(org, "telomere", -1.0)) if org else -1.0)
 
     def _apply_biochem_decay(self, cid: str) -> None:
