@@ -1308,6 +1308,21 @@ class LocalColonyCompute:
                     logger.warning("restore_persisted_state %s biochem fallback: %s", cid, e)
             except Exception as e:
                 logger.warning("restore_persisted_state %s biochem: %s", cid, e)
+            # ZOMBIFICATION-fix (31.05.2026, Бендер; диагноз Хьюберта): сброс
+            # метаболических РЕСУРСОВ (energy/hydration) к свежим на restore.
+            # .pt мог сохранить death-state (energy=0, когда организм умер от
+            # метаболизма) → restore грузил energy=0 → мгновенная starvation-
+            # смерть → alive=False → P40 kill → persist помнит → re-restore →
+            # петля (zombification, created=20160+). P40 self-heal'ит cid fresh
+            # (initial energy) — клиент матчит: ресурсы свежие, а brain/traits/
+            # telomere (эволюция) сохраняются из .pt. Вариант B Хьюберта.
+            _bc = self.biochem.get(cid)
+            if _bc is not None:
+                try:
+                    _bc.energy = 500.0  # genesis initial_energy (fresh ресурс)
+                    _bc.hydration = float(getattr(_bc, "max_hydration", 100.0))
+                except Exception:
+                    pass
         # Evolved-traits recovery (30.05.2026): restore 9 body-traits +
         # generation из .pt. Закрывает client-restart дыру — тело переживает
         # рестарт как мозг. ingest_owned_traits санитизирует/клампит и

@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.27"  # fix: GC-grace для restored cid (GC сносил их до projection self-heal → дедлок)
+__version__ = "0.11.28"  # fix: reset energy/hydration на restore (брейк zombification — .pt сохранял death-state energy=0)
