@@ -2311,6 +2311,52 @@ class LocalColonyCompute:
                 logger.warning("save_state %s torch.save failed: %s", cid, e)
         return n
 
+    def _get_hw_capacity(self) -> Optional[int]:
+        """Расчётная ёмкость колонии по железу (vision body_migration.md §40/
+        §145: `benchmark.py:estimate_population`). Кэш — бенчмарк дорогой
+        (~секунды). Возвращает int>0 или None (если бенчмарк недоступен/упал)."""
+        if self._natural_selection_capacity is None:
+            try:
+                from .benchmark import estimate_population, run_full
+                self._natural_selection_capacity = estimate_population(run_full())
+                logger.info("hw capacity = %d (estimate_population, cached)",
+                            self._natural_selection_capacity)
+            except Exception as e:
+                logger.debug("estimate_population failed: %s", e)
+                self._natural_selection_capacity = -1  # sentinel: tried, failed
+        return (self._natural_selection_capacity
+                if self._natural_selection_capacity
+                and self._natural_selection_capacity > 0 else None)
+
+    @staticmethod
+    def _cap_and_clean_pt(dir_path, cap: int) -> list:
+        """Carrying-capacity cap для restore (31.05.2026, Шеф). Возвращает N
+        свежайших .pt (по mtime, новые первыми), УДАЛЯЕТ остальные (persist
+        bloat — Шеф: «толку никакого»). cap = estimate_population (ёмкость
+        железа). Защита от перенаселения → заморозки Мира.
+
+        Удаляет только сверх cap (самые старые); свежайшие cap-штук сохраняет.
+        """
+        from pathlib import Path
+        dir_path = Path(dir_path)
+        all_pt = sorted(dir_path.glob("*.pt"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+        if cap < 0:
+            cap = 0
+        keep = all_pt[:cap]
+        cull = all_pt[cap:]
+        for old in cull:
+            try:
+                old.unlink()
+            except Exception as e:
+                logger.debug("_cap_and_clean_pt unlink %s: %s", old.name, e)
+        if cull:
+            logger.info(
+                "_cap_and_clean_pt: cap=%d — оставлено %d свежих .pt, "
+                "почищено %d устаревших (persist bloat)",
+                cap, len(keep), len(cull))
+        return keep
+
     def restore_colony_from_local(self, dir_path) -> list[str]:
         """Colony Ownership Migration §5.1: восстановить колонию из local.
 
@@ -2373,8 +2419,16 @@ class LocalColonyCompute:
         logger.info("restore_colony_from_local: skeleton=%s (%d tissues)",
                     seed_path, best_n)
 
+        # Carrying-capacity cap (31.05.2026, Шеф; vision §40/§145). Persist
+        # накопил сотни .pt без чистки → restore всех → колония 20× сверх
+        # ёмкости железа → cheef-PC не тикает handle_tick → ws-churn → Мир
+        # замерзал → отбор не сходился (дедлок). Грузим только N свежайших,
+        # где N = estimate_population (расчётная ёмкость). Лишние чистим.
+        cap = self._get_hw_capacity() or 16  # fallback 16 если бенчмарк недоступен
+        keep_pt = self._cap_and_clean_pt(dir_path, cap)
+
         restored: list[str] = []
-        for pt_file in sorted(dir_path.glob("*.pt")):
+        for pt_file in keep_pt:
             cid = pt_file.stem
             if cid in self.organisms:
                 logger.debug("restore_colony_from_local: %s already loaded, skip",
@@ -3673,21 +3727,10 @@ class LocalColonyCompute:
             return {"n_organisms": 0, "capacity": None,
                     "weakest_cids": [], "scores": {},
                     "mean_score": 0.0, "max_score": 0.0}
-        # capacity = estimate_population() — потолок по железу.
-        # Cached on first call (бенчмарк дорогой ~секунды), не пересчи-
-        # тывается на каждый push_diagnostics.
-        if self._natural_selection_capacity is None:
-            try:
-                from .benchmark import estimate_population, run_full
-                self._natural_selection_capacity = estimate_population(run_full())
-                logger.info("natural_selection capacity = %d (cached)",
-                            self._natural_selection_capacity)
-            except Exception as e:
-                logger.debug("estimate_population failed: %s", e)
-                self._natural_selection_capacity = -1  # sentinel: tried, failed
-        capacity = (self._natural_selection_capacity
-                    if self._natural_selection_capacity and
-                       self._natural_selection_capacity > 0 else None)
+        # capacity = estimate_population() — потолок по железу (vision
+        # body_migration.md §40/§145: размер колонии определяется
+        # benchmark.py:estimate_population).
+        capacity = self._get_hw_capacity()
         return natural_selection_snapshot(
             self.biochem, capacity=capacity, top_n_to_emit=3)
 
