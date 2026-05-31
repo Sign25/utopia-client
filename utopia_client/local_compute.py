@@ -478,6 +478,11 @@ class LocalColonyCompute:
         # traits жили как loose-атрибуты на CompositeOrganism (только
         # client-born, без persist) → терялись при рестарте.
         self.traits: dict[str, dict] = {}        # cid → {9 trait полей}
+        # Body Migration метаболизм (31.05.2026): cid'ы с метаболической смертью
+        # (energy<=0 голод / telomere AGONY старость). build_projection_batch
+        # шлёт для них alive=False → P40 убирает. Чистится в remove_creature
+        # (после P40-removal client GC по orphan-obs снимет cid).
+        self._dead_cids: set = set()
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -921,6 +926,8 @@ class LocalColonyCompute:
         # Evolved-traits recovery (30.05.2026): drop стор + pending re-announce.
         self.traits.pop(cid, None)
         self._pending_traits_announce.pop(cid, None)
+        # Body Migration метаболизм (31.05.2026): drop death-mark.
+        self._dead_cids.discard(cid)
 
     def persist_all_memory(self) -> int:
         """Phase 4 этап B: сохранить episodic state всех живых организмов.
@@ -1916,7 +1923,8 @@ class LocalColonyCompute:
     def handle_tick(self, obs_per_cid: dict,
                     events_per_cid: Optional[dict] = None,
                     intero_per_cid: Optional[dict] = None,
-                    world_tick: int = 0) -> dict:
+                    world_tick: int = 0,
+                    rates_per_cid: Optional[dict] = None) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
@@ -1942,6 +1950,11 @@ class LocalColonyCompute:
         # seed) параллельно с этим проходом. Без list() — "dictionary changed
         # size during iteration" под нагрузкой (133 орг + mate/GC churn).
         for cid, organism in list(self.organisms.items()):
+            # Body Migration метаболизм (31.05.2026): мёртвый (energy<=0 /
+            # telomere AGONY) не действует — ждёт removal P40 по alive=False.
+            if cid in self._dead_cids:
+                out[cid] = {"action": STAY, "target_id": None}
+                continue
             obs = obs_per_cid.get(cid)
             if obs is None:
                 out[cid] = {"action": STAY, "target_id": None}
@@ -2132,6 +2145,15 @@ class LocalColonyCompute:
                              if events_per_cid is not None else None)
                 self._apply_biochem_events(cid, _bc_event)
                 self._apply_biochem_decay(cid)
+                # Body Migration метаболизм (31.05.2026, Бендер; контракт
+                # Хьюберт): client-authoritative энергозатрата/гидрация/теломеры.
+                # P40 шлёт effective rates (step_cost_now/thirst_now/
+                # telomere_decay_now), client интегрирует. income (delta_energy)
+                # уже добавлен в _apply_biochem_events выше → здесь только cost
+                # + death-check (energy<=0 голод / telomere AGONY старость).
+                _rates = (rates_per_cid.get(cid)
+                          if rates_per_cid is not None else None)
+                self._apply_metabolism(cid, _rates)
                 # Phase 2 этап 5 (27.05.2026): hysteresis-aware mental_break
                 # update + force_STAY override action если catatonic/
                 # exhaustion/glucose<5. Порядок: decay сначала (обновил
@@ -3683,10 +3705,23 @@ class LocalColonyCompute:
             proj: dict = {
                 "cid": str(cid),
                 "species_id": self.species_id.get(cid) if hasattr(self, "species_id") else None,
-                "alive": True,  # client решает death; см. handle_tick + biochem
+                # Body Migration метаболизм (31.05.2026): client-authoritative
+                # death. _dead_cids заполняется в _apply_metabolism (energy<=0 /
+                # telomere AGONY). P40 на alive=False убирает + decrement.
+                "alive": cid not in self._dead_cids,
                 "frozen": False,
                 "action": int(last_action) if last_action >= 0 else -1,
             }
+            # Body Migration метаболизм: client-authoritative energy/hydration/
+            # telomere → P40 accept'ит как chem на CreatureState (для death-
+            # триггеров + физики). Контракт Хьюберт 31.05.
+            try:
+                if bc is not None:
+                    proj["energy"] = float(getattr(bc, "energy", 0.0))
+                    proj["hydration"] = float(getattr(bc, "hydration", 0.0))
+                proj["telomere_scale"] = float(getattr(org, "telomere", 1.0))
+            except Exception:
+                pass
             if bc is not None:
                 # 7 ephemeral (без histamine = mirror infection_severity)
                 proj["chem"] = {
@@ -4286,6 +4321,60 @@ class LocalColonyCompute:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
         except Exception as e:
             logger.debug("biochem apply events cid=%s: %s", cid, e)
+
+    def _apply_metabolism(self, cid: str, rates: "Optional[dict]") -> None:
+        """Body Migration метаболизм (31.05.2026, Бендер; контракт Хьюберт).
+
+        Client-authoritative энергозатрата/гидрация/теломеры. P40 phase-out
+        перестал тикать owned-zodchiy (energy=500/age=0 forever → death-триггеры
+        молчали, колония росла 9× сверх ёмкости). Теперь тело целиком на client:
+        P40 шлёт effective per-tick rates (формулы single-source, зависят от
+        night/season/biome — client их не знает), client интегрирует state.
+
+        rates = {step_cost_now, telomere_decay_now, thirst_now}. income
+        (delta_energy от еды) уже добавлен в _apply_biochem_events. Здесь cost +
+        death-check: energy<=0 (голод) / telomere в фазе AGONY (старость) →
+        cid в _dead_cids → build_projection_batch шлёт alive=False → P40 убирает
+        (естественный отбор; client сообщает объективную смерть, не «убивает»).
+        """
+        if not rates:
+            return
+        bc = self.biochem.get(cid)
+        org = self.organisms.get(cid)
+        try:
+            step_cost = float(rates.get("step_cost_now", 0.0) or 0.0)
+            thirst = float(rates.get("thirst_now", 0.0) or 0.0)
+            tel_decay = float(rates.get("telomere_decay_now", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if bc is not None:
+            if step_cost > 0.0:
+                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
+            if thirst > 0.0:
+                max_h = float(getattr(bc, "max_hydration", 100.0))
+                bc.hydration = max(
+                    0.0, min(max_h, float(getattr(bc, "hydration", max_h)) - thirst))
+        if org is not None and tel_decay > 0.0:
+            try:
+                org.telomere = max(0.0, min(
+                    1.0, float(getattr(org, "telomere", 1.0)) - tel_decay))
+            except Exception:
+                pass
+        # Death-check: голод (energy<=0) или старость (telomere AGONY).
+        dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
+        if not dead and org is not None:
+            try:
+                from core.telomere_phase import get_phase, TelomerePhase
+                if get_phase(float(getattr(org, "telomere", 1.0))) == TelomerePhase.AGONY:
+                    dead = True
+            except Exception:
+                pass
+        if dead and cid not in self._dead_cids:
+            self._dead_cids.add(cid)
+            logger.info(
+                "metabolic death cid=%s energy=%.1f telomere=%.3f",
+                cid, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
+                float(getattr(org, "telomere", -1.0)) if org else -1.0)
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.

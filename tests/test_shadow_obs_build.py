@@ -272,7 +272,7 @@ class TestCollectObsBatchPhase33B:
         ws.world_cache = cache
 
         creatures, _ = _make_creatures_payload(w)
-        obs, events, intero = ws._collect_obs_batch(creatures)
+        obs, events, intero, _rates = ws._collect_obs_batch(creatures)
 
         assert len(obs) == 3
         assert ws._client_obs_local_built == 0
@@ -294,7 +294,7 @@ class TestCollectObsBatchPhase33B:
 
         creatures, server_obs = _make_creatures_payload(w)
         creatures_no_obs = _strip_obs_from_payload(creatures)
-        obs, events, intero = ws._collect_obs_batch(creatures_no_obs)
+        obs, events, intero, _rates = ws._collect_obs_batch(creatures_no_obs)
 
         assert len(obs) == 3
         assert ws._client_obs_local_built == 3
@@ -310,7 +310,7 @@ class TestCollectObsBatchPhase33B:
         w = _make_world(size=64, n_creatures=3, seed=41)
         creatures, _ = _make_creatures_payload(w)
         creatures_no_obs = _strip_obs_from_payload(creatures)
-        obs, events, intero = ws._collect_obs_batch(creatures_no_obs)
+        obs, events, intero, _rates = ws._collect_obs_batch(creatures_no_obs)
 
         assert obs == {}
         assert events == {}
