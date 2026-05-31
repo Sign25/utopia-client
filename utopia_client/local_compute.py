@@ -528,12 +528,14 @@ class LocalColonyCompute:
         self._hyd_calib_ticks: int = 0
         # Death-урон от обезвоживания (01.06.2026, Шеф: «вода влияет на общее
         # состояние и гибель»). dh_stage>=2 → energy_drain → смерть через
-        # energy<=0. RE-ENABLE 0.11.37 (Шеф «давление смерти» против
-        # перенаселения 50): дрейн рекалиброван ×0.1 (_DEHYDRATION_DRAIN_SCALE)
-        # под client-tick → ~0.26/0.42 за тик вместо φ²/φ³. Безопасно: eat-income
-        # работает (0.11.36) → сытые переживают, гибнут только застрявшие без
-        # воды → отбор. 0.11.34 вайпнул full-φ² БЕЗ eat-income; оба условия сняты.
-        self._dehydration_damage_enabled: bool = True
+        # energy<=0. ОТКАЧЕНО 0.11.38: дрейн (даже ×0.1) опрокидывал маргинальный
+        # eat-income в минус → энергия падала НИЖЕ порога размножения (~309) →
+        # рождения вставали, смерти шли → death-спираль → вымирание (3-й раз
+        # после 0.11.24/0.11.34). Death-налог на ВСЕХ ≠ отбор слабых. Контроль
+        # населения теперь через ПОПУЛЯЦИОННЫЙ КЭП в detect_and_emit_mate_pairs
+        # (рождения до ёмкости, без энерго-налога) → bounded self-sustaining
+        # цикл как на сервере (рождения заменяют смерти, не вымирает).
+        self._dehydration_damage_enabled: bool = False
         # Pending re-announce: cid'ы, для которых traits_announce отправлен и
         # ждёт ack (зеркало _pending_newborn_envelopes). Очищается в
         # handle_traits_announce_ack.
@@ -3967,6 +3969,17 @@ class LocalColonyCompute:
             from .crossover import apply_crossover_inheritance
         except Exception as e:
             logger.warning("detect_and_emit_mate_pairs imports failed: %s", e)
+            return []
+
+        # Популяционный КЭП (0.11.38, Шеф): размножение до ёмкости железа, не
+        # выше (vision §40/§145). Без кэпа eat-income разгонял колонию до 50 →
+        # perf-шторм (message-too-big/keepalive). Кэп = bounded self-sustaining
+        # цикл: рождения заменяют естественные смерти ДО потолка, без death-
+        # налога (тот опрокидывал energy<порог-репро → вымирание). cap=None
+        # (бенчмарк упал) → fallback 20 (не runaway).
+        _cap = self._get_hw_capacity() or 20
+        _alive = sum(1 for cid in self.organisms if cid not in self._dead_cids)
+        if _alive >= _cap:
             return []
 
         # 1. Scan биохимии — только own organisms (compute.biochem все own)

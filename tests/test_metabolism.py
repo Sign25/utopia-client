@@ -74,11 +74,25 @@ def test_no_dehydration_death_while_damage_disabled():
     assert bc.energy == 342.0       # энергия не тронута жаждой
 
 
-def test_dehydration_damage_enabled_by_default():
-    """0.11.37: death-урон ВКЛ (давление отбора против перенаселения), но
-    рекалиброван ×0.1 под client-tick (eat-income 0.11.36 делает безопасным)."""
+def test_dehydration_damage_disabled_by_default():
+    """0.11.38: death-урон ОТКЛ — дрейн (даже ×0.1) опрокидывал маргинальный
+    eat-income → energy<порог-репро → вымирание (3×). Контроль населения теперь
+    через популяционный кэп в размножении, не death-налог."""
     c, org, bc = _compute_with_org()
-    assert c._dehydration_damage_enabled is True
+    assert c._dehydration_damage_enabled is False
+
+
+def test_reproduction_population_cap():
+    """0.11.38: размножение НЕ идёт при alive >= ёмкости (bounded self-
+    sustaining цикл, без перенаселения)."""
+    import types
+    c = LocalColonyCompute(device="cpu")
+    c._natural_selection_capacity = 2  # маленькая ёмкость для теста
+    for cid in ("a", "b", "c"):  # 3 alive > cap 2
+        c.organisms[cid] = types.SimpleNamespace(generation=0, telomere=1.0)
+        c.biochem[cid] = make_default()
+    born = c.detect_and_emit_mate_pairs(world_tick=1000, embodied_client=None)
+    assert born == []  # кэп сработал — рождений нет
 
 
 def test_dehydration_stage_thresholds():
