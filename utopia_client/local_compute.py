@@ -37,6 +37,23 @@ N_ACTIONS = 16
 # а паралич: осознаёт, но не движется (motor=STAY), обучающий сигнал «плохо».
 # N ≈ 3с (= 89 P40-тиков @30TPS; wall-clock → client-TPS-агностик, НЕ копируем
 # «89» вслепую). После N — recovery-грант энергии (НЕ времени).
+# ── Self-observable obs contract (Track 2 / этап 4, Фрай 01.06.2026) ──────
+# Phase 6 self-observable = интероцепция ВЫСШЕГО порядка: организм ощущает не
+# тело, а свой УМ. Дом — STATE_DIM[64:80] (P40 шлёт zeros, designated internal
+# регион; client [64:80] свободен), путь через insula (ткань самоощущения) +
+# predictor, позже DMN (S2.D). НЕ компромисс — концептуально верный дом.
+# ПОСТОЯННЫЙ КОНТРАКТ obs (порядок зафиксирован, не менять — Фрай):
+#   obs[64] = entropy_ema     — энтропия выбора действия («не уверен»)
+#   obs[65] = trace_norm_ema  — норма Hebbian-следов («учусь»)
+#   obs[66] = reward_var_ema  — разброс награды («среда изменилась»)
+#   obs[67] = paralyzed       — §3 паралич 0/1 («осознаёт паралич», §3 learning-half)
+# Мозг расширяет read-окно 64→68 (predictor+insula): новые input-веса init ≈0,
+# чтобы обученный founding-мозг c103927 не сломался (Hebbian подхватит). env[:64]
+# НЕ трогаем. Реализация read-expansion + weight-init — отдельным шагом.
+_SELF_OBS_OFFSET = 64
+_SELF_OBS_DIM = 4
+_BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM  # 68 — окно чтения мозга
+
 _PARALYSIS_SEC = 3.0
 # Tier 1 (Хьюберт 01.06.2026): φ⁷≈45 (2.8с окно) → φ⁶≈73 (4.6с, ~9 тайлов
 # навигации @ move_speed=2 → шанс найти flora ~25%→~80%). Окно НАВИГАЦИИ до
