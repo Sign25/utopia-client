@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.69"  # FLORA_KINDS порог 200→25 (handle_tick медленный ~2.4с, 200 вызовов=8мин). Быстрее данные: есть ли berry рядом
+__version__ = "0.11.70"  # single-organism pivot этап 1+2: флаг single_organism (гейт колониальных механик), bias_scale=0 автоном, snapshot_elite min_alive=1, tag-adam CLI + api.tag_adam, ранжировка кандидатов
