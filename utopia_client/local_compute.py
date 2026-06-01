@@ -2492,12 +2492,16 @@ class LocalColonyCompute:
                             _reason = str((_ds[0] or {}).get("reason", "suppressed"))
                         except Exception:
                             pass
-                        # starvation/energy — домен триггера 1 (energy≤0), НЕ
-                        # дублируем: P40 не должен слать death_suppressed по
-                        # energy-оси (контракт Фрая «P40 не пишет owned energy»);
-                        # если шлёт — игнорим, иначе ре-арм глушит recovery.
-                        # Триггер 2 — только non-energy векторы (pvp/age/...).
-                        if "starv" not in _reason.lower():
+                        # Триггер 2 — ТОЛЬКО транзиентные внешние death-вектора
+                        # (pvp/attack): паралич как обучающий сигнал «избегай».
+                        # ПЕРМАНЕНТНЫЕ состояния Адама игнорим — для персистентного
+                        # одиночки они always-true → паралич каждый тик (как loner):
+                        #   starv — энерго-ось, домен триггера 1 (energy≤0);
+                        #   age   — старения-смерти у Адама нет (§1), telomere
+                        #           AGONY давится immortality, но P40 спамит
+                        #           death_suppressed(aged) каждый тик.
+                        _rl = _reason.lower()
+                        if not any(k in _rl for k in ("starv", "age")):
                             self._enter_paralysis(cid, _reason)
                 # Body Migration метаболизм (31.05.2026, Бендер; контракт
                 # Хьюберт): client-authoritative энергозатрата/гидрация/теломеры.
