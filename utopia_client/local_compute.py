@@ -4237,6 +4237,11 @@ class LocalColonyCompute:
             # (p_add=0.02/поколение) → speciation расходится постепенно, не
             # скачком. Делаем ДО add_creature, чтобы _assign_species увидел
             # финальные genes.
+            # p_add=0.05/p_remove=0.01 — config-замысел WorldConfig (world.py:378,
+            # zodchiy_topology_p_add/p_remove), НЕ функц.дефолт 0.02 (это getattr-
+            # fallback в server loop/mate). Z6.c на 0.05+threshold0.9: 5 speciation
+            # events за 2ч39м. p_change_type=0.005/p_weight=0.05 совпадают с
+            # серверными дефолтами mate_tissue_topology.
             try:
                 from core.tissue_topology import (
                     crossover_org_topology_for_zodchiy)
@@ -4244,6 +4249,7 @@ class LocalColonyCompute:
                 crossover_org_topology_for_zodchiy(
                     child_org, mother, father, lineage="zodchiy",
                     available_roles=_default_zodchiy_available_roles(),
+                    p_add=0.05, p_remove=0.01,
                 )
             except Exception as e:
                 logger.debug("Z2.b topology crossover %s+%s: %s",
