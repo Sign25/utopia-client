@@ -2140,7 +2140,7 @@ class ColonyWSClient:
         # Диагностика распределения типов флоры (даже если berry нет) — чтобы
         # отличить «нет berry рядом (тундра)» от «kind в кэше битый».
         self._food_seek_diag = getattr(self, "_food_seek_diag", 0) + 1
-        if self._food_seek_diag >= 200:
+        if self._food_seek_diag >= 25:   # ~раз в 1-2 мин при медленном тике
             self._food_seek_diag = 0
             _grass = sum(1 for (_r, _c, k) in _flora if int(k) == 1)
             _berry = sum(1 for (_r, _c, k) in _flora if int(k) == 2)
