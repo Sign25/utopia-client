@@ -191,8 +191,10 @@ _BASIC_SFNN_TISSUES: tuple[str, ...] = (
 # CreatureState с lineage, тканей нет — все ткани клиентские). Аналог
 # `_build_zodchiy_connections` (workbench), но без полного rebuild графа:
 # Tissue 21/3/1 на cid → forward в _compute_higher_tissues + SFNN-rule
-# storage. NEAT межтканевой топологии (Z2.b apply_topology_overlay) пока не
-# подключён — z-ткани живут как hookable sidecar-форма для будущего Z3/Z5.
+# storage. Z2.b overlay подключён (01.06.2026) для ролей в org.tissues; эти
+# z-ткани — sidecar (не в org.tissues), потому genes на их роли overlay
+# игнорирует (apply_topology_overlay_by_role: unknown role → skip) — divergence
+# по genes идёт, но рёбра на sidecar не материализуются (как на сервере).
 _ZODCHIY_EXTRA_TISSUES: tuple[str, ...] = (
     "cerebellum",
     "amygdala",
@@ -586,8 +588,9 @@ class LocalColonyCompute:
     @staticmethod
     def _organism_topology_genes(organism) -> list:
         """Межтканевые NEAT-гены организма как list[dict] для assign_species.
-        Z2.b apply_topology_overlay пока не подключён → обычно [] (все особи
-        попадают в founder-вид; реальная дивергенция придёт с Z2.b)."""
+        Z2.b подключён (01.06.2026): mate-flow наполняет genes через
+        crossover_org_topology_for_zodchiy → дивергенция графа по поколениям.
+        Founders/первое поколение ещё []; расходятся органично (p_add=0.02)."""
         try:
             genes = getattr(organism, "tissue_topology_genes", None)
             if genes:
@@ -1283,6 +1286,22 @@ class LocalColonyCompute:
                 except Exception as e:
                     logger.debug("restore_persisted_state %s tissue %s: %s",
                                   cid, role, e)
+        # Z2.b (01.06.2026, Фрай): восстановить межтканевые topology genes и
+        # пере-наложить overlay на org.connections (иначе resume/elite даёт
+        # дефолтный граф, divergence теряется). add_creature уже назначил
+        # species по ПУСТЫМ генам (founder) — после restore графа переназначаем.
+        genes_dicts = payload.get("tissue_topology_genes")
+        if genes_dicts:
+            try:
+                from core.tissue_topology import (
+                    TissueConnectionGene, apply_topology_overlay_to_org)
+                org.tissue_topology_genes = [
+                    TissueConnectionGene.from_dict(d) for d in genes_dicts]
+                apply_topology_overlay_to_org(org)
+                self.species_id.pop(cid, None)
+                self._assign_species(cid, org)
+            except Exception as e:
+                logger.debug("restore_persisted_state %s topology: %s", cid, e)
         # Hebbian / selector — direct load_state_dict
         heb_sd = payload.get("hebbian")
         if heb_sd is not None and self.hebbian.get(cid) is not None:
@@ -2310,6 +2329,19 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("save_state %s tissues: %s", cid, e)
                 return None
+        # Z2.b (01.06.2026, Фрай): межтканевые topology genes (NEAT-overlay
+        # Зодчего). Без них граф особи теряется на restart/resume/elite →
+        # speciation схлопывается в founder. Сериализуем как list[dict]
+        # (TissueConnectionGene.to_dict), пустые не пишем.
+        genes = getattr(org, "tissue_topology_genes", None)
+        if genes:
+            try:
+                payload["tissue_topology_genes"] = [
+                    g.to_dict() if hasattr(g, "to_dict") else dict(g)
+                    for g in genes
+                ]
+            except Exception as e:
+                logger.debug("save_state %s topology genes: %s", cid, e)
         heb = self.hebbian.get(cid)
         if heb is not None and hasattr(heb, "state_dict"):
             try:
@@ -4196,6 +4228,27 @@ class LocalColonyCompute:
                                mother_cid, father_cid, e)
                 continue
 
+            # 2b. Z2.b (01.06.2026, Фрай): межтканевой NEAT-overlay — суть
+            # Зодчего: перестраивает граф тканей, не только веса. crossover
+            # рёбер родителей (по innovation_id) + σ-мутация add/remove/
+            # change_type/weight → apply_topology_overlay_to_org переписывает
+            # child.connections. motor_policy исключён (sidecar-policy, учится
+            # весами REINFORCE, не топологией). Гены наполняются органично
+            # (p_add=0.02/поколение) → speciation расходится постепенно, не
+            # скачком. Делаем ДО add_creature, чтобы _assign_species увидел
+            # финальные genes.
+            try:
+                from core.tissue_topology import (
+                    crossover_org_topology_for_zodchiy)
+                from .reproduce import _default_zodchiy_available_roles
+                crossover_org_topology_for_zodchiy(
+                    child_org, mother, father, lineage="zodchiy",
+                    available_roles=_default_zodchiy_available_roles(),
+                )
+            except Exception as e:
+                logger.debug("Z2.b topology crossover %s+%s: %s",
+                             mother_cid, father_cid, e)
+
             # 3. Allocate UUID
             child_cid = _uuid.uuid4().hex
 
@@ -4226,9 +4279,12 @@ class LocalColonyCompute:
                 pass
 
             # 7. Build envelope (projection-model schema, ТЗ §2)
-            # species_id: наследуем от mother (client-local registry, §3.7)
+            # species_id: Z2.b — add_creature уже назначил ребёнку species по
+            # его genes (мог разойтись с родителями через topology overlay).
+            # Шлём собственный вид ребёнка, fallback на родительский.
             child_species_id = (
-                self.species_id.get(mother_cid)
+                self.species_id.get(child_cid)
+                or self.species_id.get(mother_cid)
                 or self.species_id.get(father_cid)
                 or 0
             )
