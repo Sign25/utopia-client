@@ -32,6 +32,14 @@ logger = logging.getLogger("utopia_client.compute")
 STAY = 4
 N_ACTIONS = 16
 
+# §3 paralysis (ТЗ e3cc81b, single-organism, контракт Фрая 01.06.2026):
+# owned-смерть client-authoritative. Под single_organism energy≤0 — НЕ смерть,
+# а паралич: осознаёт, но не движется (motor=STAY), обучающий сигнал «плохо».
+# N ≈ 3с (= 89 P40-тиков @30TPS; wall-clock → client-TPS-агностик, НЕ копируем
+# «89» вслепую). После N — recovery-грант энергии (НЕ времени).
+_PARALYSIS_SEC = 3.0
+_RECOVERY_ENERGY_DEFAULT = 45.0  # max_energy/φ⁷ (max_energy=1309)
+
 # Dehydration-модель (mirror environment/world.py:909/926 — источник истины).
 # Стадии по hydration ratio → energy_drain грызёт ЭНЕРГИЮ (не отдельная
 # hydration-смерть): смерть через energy<=0 (starvation), единая ось.
@@ -486,6 +494,11 @@ class LocalColonyCompute:
         # пригодится для Зоопарка Эпохи 2. Дефолт False (колониальный режим);
         # включается через cmd["flags"]["single_organism"] → set_single_organism.
         self._single_organism: bool = False
+        # §3 paralysis: cid → monotonic-дедлайн снятия паралича (energy≤0).
+        self._paralysis_until: dict[str, float] = {}
+        # Recovery-грант энергии после паралича. Тюнится мной (Фрай): если
+        # grass-only зацикливает — поднимаю (max/φ⁶≈73 / max/φ⁵≈118).
+        self._recovery_energy: float = _RECOVERY_ENERGY_DEFAULT
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -992,6 +1005,7 @@ class LocalColonyCompute:
         self.trace_norm_ema.pop(cid, None)
         self.reward_var_ema.pop(cid, None)
         self.reward_history.pop(cid, None)
+        self._paralysis_until.pop(cid, None)  # §3 paralysis cleanup
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
         self.dopamine.pop(cid, None)
         self.imagination.pop(cid, None)
@@ -4954,6 +4968,13 @@ class LocalColonyCompute:
         bc = self.biochem.get(cid)
         if bc is None or cid not in out:
             return
+        # §3 paralysis (single-organism): пока паралич не снят — не движется.
+        # «Осознаёт, но не движется» — обучающий сигнал. Проверяем ПЕРВЫМ:
+        # paralysis независим от биохимического force_stay.
+        if cid in self._paralysis_until:
+            if time.monotonic() < self._paralysis_until[cid]:
+                out[cid] = {"action": STAY, "target_id": None}
+                return
         try:
             from environment.biochemistry import should_force_stay  # type: ignore
         except Exception:
@@ -5207,36 +5228,60 @@ class LocalColonyCompute:
                 bc.energy = max(
                     0.0, float(getattr(bc, "energy", 0.0)) - _idrain)
                 self._e_infdrain_sum += _idrain  # ENERGY_CALIB
-        # Death-check: голод (energy<=0) + старость (telomere AGONY) + инфекция
-        # (severity>=1.0). Жажда/инфекция грызут energy → starvation; критическая
-        # инфекция — отдельная причина. Единый death-envelope (Фрай: градиентно).
-        dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
-        cause = "starvation" if dead else ""
-        if not dead and bc is not None and float(
-                getattr(bc, "infection_severity", 0.0) or 0.0) >= 1.0:
-            dead = True
-            cause = "infection"
-        if not dead and org is not None:
-            try:
-                from core.telomere_phase import get_phase, TelomerePhase
-                if get_phase(float(getattr(org, "telomere", 1.0))) == TelomerePhase.AGONY:
-                    dead = True
-                    cause = "agony"
-            except Exception:
-                pass
-        if dead and cid not in self._dead_cids:
-            self._dead_cids.add(cid)
-            # deaths-by-cause для colony_summary (agony=telomere-фаза).
-            _bucket = "telomere" if cause == "agony" else cause
-            if _bucket in self._deaths_by_cause:
-                self._deaths_by_cause[_bucket] += 1
-            logger.info(
-                "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f "
-                "telomere=%.3f infection=%.2f",
-                cid, cause, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
-                float(getattr(bc, "hydration", -1.0)) if bc else -1.0,
-                float(getattr(org, "telomere", -1.0)) if org else -1.0,
-                float(getattr(bc, "infection_severity", 0.0)) if bc else -1.0)
+        # §3 paralysis (single-organism, контракт Фрая): owned energy+смерть
+        # client-authoritative. Под флагом energy≤0 — НЕ смерть, а паралич ~3с
+        # (осознаёт, motor=STAY в _maybe_force_stay), через N клиент сам даёт
+        # recovery (+45 energy). Agony/infection Адама НЕ убивают (персистентный;
+        # P40 immortality бэкстопит свои death-вектора). Цикл паралич→recovery→
+        # (нет еды)→паралич держит мозг живым (stuck, не dead); если зацикливает
+        # — поднимаю self._recovery_energy.
+        if self._single_organism:
+            if bc is not None:
+                now_m = time.monotonic()
+                until = self._paralysis_until.get(cid)
+                if until is not None:
+                    if now_m >= until:
+                        self._paralysis_until.pop(cid, None)
+                        bc.energy = float(self._recovery_energy)
+                        logger.info(
+                            "paralysis recovery cid=%s -> energy=%.1f",
+                            cid, self._recovery_energy)
+                elif float(getattr(bc, "energy", 1.0)) <= 0.0:
+                    self._paralysis_until[cid] = now_m + _PARALYSIS_SEC
+                    logger.info(
+                        "paralysis start cid=%s energy<=0 -> STAY %.1fs "
+                        "(NOT death)", cid, _PARALYSIS_SEC)
+        else:
+            # Death-check (колониальный режим): голод (energy<=0) + старость
+            # (telomere AGONY) + инфекция (severity>=1.0). Жажда/инфекция грызут
+            # energy → starvation. Единый death-envelope (Фрай: градиентно).
+            dead = bool(bc is not None and float(getattr(bc, "energy", 1.0)) <= 0.0)
+            cause = "starvation" if dead else ""
+            if not dead and bc is not None and float(
+                    getattr(bc, "infection_severity", 0.0) or 0.0) >= 1.0:
+                dead = True
+                cause = "infection"
+            if not dead and org is not None:
+                try:
+                    from core.telomere_phase import get_phase, TelomerePhase
+                    if get_phase(float(getattr(org, "telomere", 1.0))) == TelomerePhase.AGONY:
+                        dead = True
+                        cause = "agony"
+                except Exception:
+                    pass
+            if dead and cid not in self._dead_cids:
+                self._dead_cids.add(cid)
+                # deaths-by-cause для colony_summary (agony=telomere-фаза).
+                _bucket = "telomere" if cause == "agony" else cause
+                if _bucket in self._deaths_by_cause:
+                    self._deaths_by_cause[_bucket] += 1
+                logger.info(
+                    "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f "
+                    "telomere=%.3f infection=%.2f",
+                    cid, cause, float(getattr(bc, "energy", 0.0)) if bc else -1.0,
+                    float(getattr(bc, "hydration", -1.0)) if bc else -1.0,
+                    float(getattr(org, "telomere", -1.0)) if org else -1.0,
+                    float(getattr(bc, "infection_severity", 0.0)) if bc else -1.0)
         # Water calibration лог (31.05.2026): раз в ~300 тиков сводка баланса
         # income(drink)/cost(thirst) + распределение hydration. Из тренда
         # (drink≈thirst → баланс; drink<<thirst → income мал) калибруем.

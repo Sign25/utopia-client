@@ -190,3 +190,55 @@ def test_snapshot_elite_min_alive_threshold(compute_with_two_zodchiy, tmp_path):
     # порог 1 (single-режим) → снимает → durability восстановлена
     n = c.snapshot_elite(elite_dir, min_alive=1)
     assert n >= 1
+
+
+# ── §3 paralysis вместо death-spiral (этап 3) ────────────────────────
+
+def test_paralysis_instead_of_death(compute_with_two_zodchiy):
+    """single_organism + energy≤0 → паралич, НЕ смерть."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c.biochem[cid].energy = 0.0
+    c._apply_metabolism(cid, {"step_cost_per_sec": 0.0})
+    assert cid in c._paralysis_until          # парализован
+    assert cid not in c._dead_cids            # НЕ мёртв
+    assert c._deaths_by_cause.get("starvation", 0) == 0
+
+
+def test_colony_mode_still_dies(compute_with_two_zodchiy):
+    """Контроль: без флага energy≤0 → смерть (механика цела)."""
+    c = compute_with_two_zodchiy
+    assert c._single_organism is False
+    cid = next(iter(c.biochem))
+    c.biochem[cid].energy = 0.0
+    c._apply_metabolism(cid, {"step_cost_per_sec": 0.0})
+    assert cid in c._dead_cids                # умер
+    assert cid not in c._paralysis_until
+
+
+def test_paralysis_forces_stay(compute_with_two_zodchiy):
+    """Пока паралич не снят — motor=STAY (не движется)."""
+    import time
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c._paralysis_until[cid] = time.monotonic() + 10.0   # активный паралич
+    out = {cid: {"action": 13, "target_id": None}}      # хотел GATHER
+    c._maybe_force_stay(cid, out)
+    from utopia_client.local_compute import STAY
+    assert out[cid]["action"] == STAY
+
+
+def test_paralysis_recovery_grants_energy(compute_with_two_zodchiy):
+    """После N паралич снимается + recovery-грант энергии."""
+    import time
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c.biochem[cid].energy = 0.0
+    c._paralysis_until[cid] = time.monotonic() - 1.0    # срок истёк
+    c._apply_metabolism(cid, {"step_cost_per_sec": 0.0})
+    assert cid not in c._paralysis_until                # снят
+    assert c.biochem[cid].energy == c._recovery_energy  # +45 (max/φ⁷)
+    assert cid not in c._dead_cids
