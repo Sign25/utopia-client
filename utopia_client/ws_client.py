@@ -452,10 +452,17 @@ class ColonyWSClient:
                 logger.debug("periodic local-save: %d creatures", n)
                 # Elite snapshot (02.06.2026, Фрай): снимок здоровых обученных
                 # мозгов в elite-слот (переживает вымирание) → recovery поднимает
-                # оттуда. snapshot_elite сам гейтит на здоровье (>=4 живых).
+                # оттуда. snapshot_elite гейтит на здоровье (>=min_alive живых).
+                # Single-organism pivot (ТЗ e3cc81b, Фрай ОК#1): порог 4 — это
+                # колониальное допущение; для n=1 Адама len(alive)=1<4 → elite
+                # молча не снимался → страховка-на-вымирание мертва. Под флагом
+                # min_alive=1 (адаптация порога, НЕ гейт — durability-positive).
+                _min_alive = 1 if getattr(
+                    self.compute, "_single_organism", False) else 4
                 await asyncio.to_thread(
                     self.compute.snapshot_elite,
-                    colony_state_dir(self.colony_name) / "elite")
+                    colony_state_dir(self.colony_name) / "elite",
+                    _min_alive)
             except Exception as e:
                 logger.warning("periodic save_all_states failed: %s", e)
 

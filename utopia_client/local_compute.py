@@ -1923,6 +1923,15 @@ class LocalColonyCompute:
             logger.info("set_single_organism: %s → %s (n_organisms=%d)",
                         self._single_organism, on, len(self.organisms))
         self._single_organism = on
+        if on:
+            # bias_scale=0 → own_contribution=1 → мотор автономен, без
+            # motor-scaffold (прямого подруливания в обход мозга). Адам стоит
+            # на своём мозге; легитимная помощь — от среды (Storyteller §6), не
+            # puppeting. СЕКВЕНС (Фрай): целевое состояние, но снимает выживальный
+            # scaffold — автономного Адама в live только в связке с паралич-сеткой
+            # (§3) + починкой income, не раньше. Сейчас живого Адама нет, код
+            # стейджится; не tag'ать+гонять автономного Адама в зазоре до §3.
+            self._bias_scale = 0.0
         return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -3352,6 +3361,11 @@ class LocalColonyCompute:
         on_flora + carried_food — P40 authoritative (9f8d99d), убирает desync;
         carried_food=None → fallback на client-зеркало (переходный период).
         Только client-рождённые (есть birth_tick); остальные → no-op."""
+        # Single-organism pivot (ТЗ e3cc81b §1): newborn-scaffold — колониальная
+        # механика (Адам не новорождённый, scaffold GATHER/EAT не нужен). Под
+        # флагом no-op. Код сохранён для Зоопарка Эпохи 2.
+        if self._single_organism:
+            return
         bt = self._birth_tick.get(cid)
         if bt is None:
             return
@@ -3382,6 +3396,13 @@ class LocalColonyCompute:
                                           доминирует, motor подавлен;
           health >= 1.0 (self-sustaining) → bias -= 0.05 → отпускаем motor.
         Механизм (own_contribution=max(0,1-bias)×motor_delta) — серверный."""
+        # Single-organism pivot (ТЗ e3cc81b §1): популяционный annealing
+        # (по ratio населения/энергобалансу колонии) — колониальный. Под флагом
+        # не ведём: bias_scale заморожен на 0 (автономный мотор) в
+        # set_single_organism. Curriculum-усложнение переезжает на адаптивный
+        # Storyteller (§6, зона Хьюберта).
+        if self._single_organism:
+            return
         if int(world_tick) - self._bias_last_update_tick < 1000:
             return
         self._bias_last_update_tick = int(world_tick)

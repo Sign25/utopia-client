@@ -116,3 +116,77 @@ def test_single_organism_skips_speciation(tmp_path, monkeypatch):
     org = load_founders(_PROD_SEED, 1)[0]
     c.add_creature("adam", org, lineage="zodchiy")
     assert "adam" not in c.species_id
+
+
+# ── bias_scale (срез 2) ──────────────────────────────────────────────
+
+def test_single_organism_freezes_bias_scale():
+    """set_single_organism(True) → bias_scale=0 (автономный мотор)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    c._bias_scale = 0.8  # как будто untrained-колония
+    c.set_single_organism(True)
+    assert c._bias_scale == 0.0
+
+
+def test_single_organism_skips_bias_curriculum():
+    """Под флагом популяционный annealing не двигает bias_scale."""
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    c.set_single_organism(True)
+    c._bias_scale = 0.7                     # вручную, после флага
+    c._last_window = {"ratio": 0.0}         # health<1 → обычно bias += 0.1
+    c._bias_last_update_tick = 0
+    c._update_bias_curriculum(world_tick=5000)
+    assert c._bias_scale == 0.7             # annealing заглушён, не дрейфует
+
+
+def test_colony_mode_bias_curriculum_runs():
+    """Контроль: без флага annealing двигает bias_scale (механика цела)."""
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    assert c._single_organism is False
+    c._bias_scale = 0.5
+    c._last_window = {"ratio": 0.0}         # health<1 → bias += 0.1
+    c._bias_last_update_tick = 0
+    c._update_bias_curriculum(world_tick=5000)
+    assert c._bias_scale > 0.5              # сдвинулся вверх
+
+
+# ── newborn-instinct (срез 2) ────────────────────────────────────────
+
+def test_single_organism_instinct_noop():
+    """Под флагом _apply_newborn_instinct не трогает logits."""
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    c.set_single_organism(True)
+    c._birth_tick["adam"] = 1000            # был бы свежим (instinct=1)
+    logits = [0.0] * 16
+    c._apply_newborn_instinct("adam", logits, world_tick=1000,
+                              on_flora=True, carried_food=3)
+    assert logits == [0.0] * 16             # ноль изменений
+
+
+def test_colony_mode_instinct_boosts():
+    """Контроль: без флага свежий newborn получает GATHER-boost."""
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    assert c._single_organism is False
+    c._birth_tick["baby"] = 1000            # age=0 → instinct=1
+    logits = [0.0] * 16
+    c._apply_newborn_instinct("baby", logits, world_tick=1000,
+                              on_flora=True, carried_food=3)
+    assert logits[13] > 0.0                 # GATHER подкручен
+
+
+# ── snapshot_elite durability порог (срез 2, Фрай ОК#1) ───────────────
+
+def test_snapshot_elite_min_alive_threshold(compute_with_two_zodchiy, tmp_path):
+    """min_alive=1 снимает elite при одном живом; min_alive=4 — нет (n=2<4)."""
+    c = compute_with_two_zodchiy
+    elite_dir = tmp_path / "elite"
+    # n=2 живых: порог 4 → не снимает (колониальное допущение)
+    assert c.snapshot_elite(elite_dir, min_alive=4) == 0
+    # порог 1 (single-режим) → снимает → durability восстановлена
+    n = c.snapshot_elite(elite_dir, min_alive=1)
+    assert n >= 1
