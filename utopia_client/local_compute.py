@@ -54,6 +54,16 @@ _SELF_OBS_OFFSET = 64
 _SELF_OBS_DIM = 4
 _BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM  # 68 — окно чтения мозга
 
+# Колониально-специфичные mental_break (Фрай 01.06.2026): требуют колонию,
+# под single_organism для одиночки always-true/бессодержательны → гейтятся.
+#   loner    = oxytocin<10 + social_gap>500 — у одиночки oxytocin всегда→0
+#              (растёт только от clan-proximity/mating) → loner всегда (sabotage).
+#   pair-bond = oxytocin>75 — mate-связь (только от спаривания).
+# Стресс-состояния (catatonic/exhaustion/wander/berserk/hunt-mode/inflammation)
+# НЕ гейтим — валидны для solo, маскировать нельзя (это не колониальные артефакты,
+# а реальные сигналы; foraging Адам учит сам, давление не снимаем).
+_COLONIAL_MENTAL_BREAKS = frozenset({"loner", "pair-bond"})
+
 _PARALYSIS_SEC = 3.0
 # Tier 1 (Хьюберт 01.06.2026): φ⁷≈45 (2.8с окно) → φ⁶≈73 (4.6с, ~9 тайлов
 # навигации @ move_speed=2 → шанс найти flora ~25%→~80%). Окно НАВИГАЦИИ до
@@ -5005,6 +5015,11 @@ class LocalColonyCompute:
                 bc.mental_break_ticks -= 1
                 return
             new_state = compute_mental_break(bc, world_tick)
+            # §1 (Фрай): под single_organism гейтим колониально-специфичные
+            # mental_break (loner/pair-bond) — для одиночки always-true/
+            # бессодержательны, сбивают solo-поведение. Не маскируем стресс.
+            if self._single_organism and new_state in _COLONIAL_MENTAL_BREAKS:
+                new_state = ""
             if new_state != bc.mental_break:
                 bc.mental_break = new_state
                 # duration = 0 для "" (normal) → выйдет из hold сразу,

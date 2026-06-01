@@ -283,3 +283,46 @@ def test_enter_paralysis_idempotent(compute_with_two_zodchiy):
     d1 = c._paralysis_until[cid]
     c._enter_paralysis(cid, "pvp_kill")    # поток событий не должен «вечнить»
     assert c._paralysis_until[cid] == d1
+
+
+# ── Гейт колониального mental_break (Фрай watch-item, §1) ─────────────
+
+def _set_loner_biochem(bc):
+    bc.oxytocin = 0.0; bc.cortisol = 5.0; bc.serotonin = 60.0
+    bc.dopamine = 0.0; bc.adrenaline = 0.0; bc.fatigue = 0.0
+    bc.histamine = 0.0; bc.last_social_tick = 0
+    bc.mental_break = ""; bc.mental_break_ticks = 0
+
+
+def test_single_organism_gates_loner(compute_with_two_zodchiy):
+    """Колониальный loner гейтится под флагом (для одиночки always-true)."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    _set_loner_biochem(c.biochem[cid])
+    c._apply_biochem_mental_break(cid, world_tick=2000)   # gap 2000>500
+    assert c.biochem[cid].mental_break != "loner"          # загейчен
+
+
+def test_colony_mode_allows_loner(compute_with_two_zodchiy):
+    """Без флага loner ставится (механика цела для Зоопарка)."""
+    c = compute_with_two_zodchiy
+    assert c._single_organism is False
+    cid = next(iter(c.biochem))
+    _set_loner_biochem(c.biochem[cid])
+    c._apply_biochem_mental_break(cid, world_tick=2000)
+    assert c.biochem[cid].mental_break == "loner"
+
+
+def test_single_organism_keeps_stress_mental_break(compute_with_two_zodchiy):
+    """Стресс-состояния (catatonic) НЕ гейтятся — не колониальный артефакт."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    bc = c.biochem[cid]
+    bc.cortisol = 90.0; bc.serotonin = 10.0                # >80 / <20 → catatonic
+    bc.dopamine = 0.0; bc.adrenaline = 0.0; bc.fatigue = 0.0
+    bc.histamine = 0.0; bc.oxytocin = 0.0
+    bc.mental_break = ""; bc.mental_break_ticks = 0
+    c._apply_biochem_mental_break(cid, world_tick=2000)
+    assert bc.mental_break == "catatonic"                  # стресс не маскируем
