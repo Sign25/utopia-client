@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.55"  # Z2.b: p_add выровнен 0.02→0.05 (config WorldConfig world.py:378 zodchiy_topology_p_add; 0.02 был getattr-fallback). Z6.c на 0.05+threshold0.9 дал 5 speciation events/2ч39м — темп видообразования как на сервере, не вдвое медленнее (Фрай)
+__version__ = "0.11.56"  # Newborn-инстинкт (Фрай, порт server phase_a.py:748-755): client-рождённые тянутся к GATHER(на флоре)/EAT(с едой) первые 500т, затухает → motor_policy учится есть на eat-reward → Lamarckian (eat→eff↑→income↑). carried_food — клиентское зеркало (P40 не шлёт), on_flora из cache.flora. passive_eating — бэкстоп

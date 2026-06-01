@@ -404,6 +404,13 @@ class LocalColonyCompute:
         self._skill_move: dict = {}         # cid → move count
         self._skill_window_tick: dict = {}  # cid → world_tick последнего окна
         self._skill_changed_cids: set = set()  # cid с изменёнными traits → re-announce
+        # Newborn-инстинкт (01.06.2026, Фрай): client-рождённые особи тянутся к
+        # GATHER/EAT первые 500 тиков (scaffold, затухает) → motor_policy
+        # учится есть на eat-reward, прежде чем голод. birth_tick — только для
+        # mate-рождённых (старые/restored не трекаются → инстинкт=0). carried_
+        # food — клиентское зеркало серверного инвентаря (P40 его не шлёт).
+        self._birth_tick: dict = {}         # cid → world_tick рождения (newborn)
+        self._carried_food: dict = {}       # cid → int 0..5 (зеркало world.py)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -961,6 +968,9 @@ class LocalColonyCompute:
         self._skill_move.pop(cid, None)
         self._skill_window_tick.pop(cid, None)
         self._skill_changed_cids.discard(cid)
+        # Newborn-инстинкт (Фрай): снять трекинг рождения + зеркало carried_food.
+        self._birth_tick.pop(cid, None)
+        self._carried_food.pop(cid, None)
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
         self.theory_of_mind_opt.pop(cid, None)
@@ -2044,7 +2054,8 @@ class LocalColonyCompute:
                     events_per_cid: Optional[dict] = None,
                     intero_per_cid: Optional[dict] = None,
                     world_tick: int = 0,
-                    rates_per_cid: Optional[dict] = None) -> dict:
+                    rates_per_cid: Optional[dict] = None,
+                    on_flora_per_cid: Optional[dict] = None) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
@@ -2118,6 +2129,8 @@ class LocalColonyCompute:
                 # Phase 4 (01.06.2026): контекстный шейпинг логитов до motor_delta
                 # (порт _decide_action) — даёт сигнал «иди к еде/беги/атакуй»,
                 # без которого ActionSelector коллапсирует в move-only → голод.
+                # Флора-под-ногами (до try — нужно и зеркалу carried_food ниже).
+                _onf = bool((on_flora_per_cid or {}).get(cid, False))
                 try:
                     _diet = float((self.traits.get(cid) or {}).get(
                         "diet_gene", 0.5) or 0.5)
@@ -2125,6 +2138,13 @@ class LocalColonyCompute:
                     _er = (float(getattr(_bc2, "energy", 500.0)) / 1000.0
                            if _bc2 is not None else 0.5)
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er)
+                    # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
+                    # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
+                    # (birth_tick трекается в mate-flow). Даёт eat-reward →
+                    # motor_policy доучивается есть до затухания инстинкта →
+                    # Lamarckian (eat→eff↑→income↑). passive_eating — бэкстоп.
+                    self._apply_newborn_instinct(
+                        cid, logits[0], world_tick, _onf)
                 except Exception as e:
                     logger.debug("action shaping %s: %s", cid, e)
 
@@ -2137,6 +2157,13 @@ class LocalColonyCompute:
                 else:
                     action = int(selector.select(logits, n_actions=N_ACTIONS))
                 out[cid] = {"action": action, "target_id": None}
+
+                # carried_food зеркало (mirror server world.py:3048-3141) для
+                # newborn EAT-инстинкта: GATHER на флоре +1 (cap5), EAT/
+                # SHARE_FOOD -1. Только для трекаемых newborn (экономия + без
+                # утечки на старых особях).
+                if cid in self._birth_tick:
+                    self._update_carried_food_mirror(cid, action, _onf)
 
                 # F5 skill-growth (01.06.2026, Фрай): счётчик move (действия
                 # 0-3) + окно 200 тиков → _skill_growth_step (mirror world.py).
@@ -3191,6 +3218,49 @@ class LocalColonyCompute:
             logger.debug("lang build features %s: %s", cid, e)
 
     # ── motor_policy forward (SFNN S4) ───────────────────────────────────
+
+    _NEWBORN_INSTINCT_DECAY = 500.0  # тиков до затухания (server phase_a.py:749)
+    _CARRIED_FOOD_CAP = 5            # F(5) (world.py:735, carried_food cap)
+
+    def _apply_newborn_instinct(self, cid: str, logits, world_tick: int,
+                                on_flora: bool) -> None:
+        """Newborn-инстинкт GATHER/EAT (порт server phase_a.py:748-755).
+
+        age = world_tick - birth_tick; instinct = max(0, 1 - age/500) — линейно
+        затухает за 500 тиков. Пока instinct>0:
+          GATHER(13) += 2*instinct — если на флоре и carried_food<5;
+          EAT(14)    += 2*instinct — если carried_food>0.
+        Только client-рождённые (есть birth_tick); остальные → no-op. logits —
+        torch[16]-вью, мутируется in-place. Когда инстинкт затух — снимаем
+        трекинг (особь «выросла», motor_policy ест сама на выученном reward)."""
+        bt = self._birth_tick.get(cid)
+        if bt is None:
+            return
+        age = max(0, int(world_tick) - int(bt))
+        instinct = 1.0 - age / self._NEWBORN_INSTINCT_DECAY
+        if instinct <= 0.0:
+            self._birth_tick.pop(cid, None)
+            self._carried_food.pop(cid, None)
+            return
+        carried = int(self._carried_food.get(cid, 0))
+        if on_flora and carried < self._CARRIED_FOOD_CAP:
+            logits[13] += 2.0 * instinct   # GATHER когда есть что собрать
+        if carried > 0:
+            logits[14] += 2.0 * instinct   # EAT когда есть что есть
+
+    def _update_carried_food_mirror(self, cid: str, action: int,
+                                    on_flora: bool) -> None:
+        """Клиентское зеркало carried_food (mirror server world.py:3048-3141).
+
+        P40 carried_food клиенту не шлёт → реплицируем серверные правила резолва
+        action: GATHER на флоре +1 (cap F(5)=5), EAT/SHARE_FOOD -1. Оценочно
+        (редкий рассинхрон при гонке за флору), но bounded 0..5 и self-
+        correcting — для затухающего scaffold достаточно. Нужно только инстинкту."""
+        cur = int(self._carried_food.get(cid, 0))
+        if action == 13 and on_flora and cur < self._CARRIED_FOOD_CAP:  # GATHER
+            self._carried_food[cid] = cur + 1
+        elif action in (14, 15) and cur > 0:                            # EAT/SHARE_FOOD
+            self._carried_food[cid] = cur - 1
 
     def _shape_action_logits(self, logits, obs_arr, diet: float,
                              energy_ratio: float) -> None:
@@ -4267,6 +4337,12 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("add_creature %s failed: %s", child_cid, e)
                 continue
+
+            # Newborn-инстинкт (Фрай): отметить рождение → тяга к GATHER/EAT
+            # первые 500 тиков (см. _apply_newborn_instinct). Только mate-
+            # рождённые трекаются — restored/seed (age>500) инстинкта не имеют.
+            self._birth_tick[child_cid] = int(world_tick)
+            self._carried_food[child_cid] = 0
 
             # 5. Compute child traits via parent crossover (ТЗ §4.1)
             # 9 полей: vision_radius, smell_radius, attack_radius, move_speed,

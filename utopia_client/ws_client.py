@@ -1616,6 +1616,9 @@ class ColonyWSClient:
         events_per_cid: dict = {}
         intero_per_cid: dict = {}
         rates_per_cid: dict = {}
+        # Newborn-инстинкт (01.06.2026, Фрай/Хьюберт): флора-под-ногами per cid
+        # для GATHER-bias. cache.flora даёт карту, _resolve_pos — позицию.
+        on_flora_per_cid: dict = {}
         cache = getattr(self, "world_cache", None)
         local_builder_ready = bool(
             cache is not None and getattr(cache, "is_bootstrapped", False))
@@ -1709,6 +1712,10 @@ class ColonyWSClient:
             _p40_dh = (float(c.get("delta_hydration", 0.0) or 0.0)
                        if "delta_hydration" in c else None)
             _rc = self._resolve_pos(cid_s, c)
+            # Флора-под-ногами (newborn GATHER-инстинкт). Та же flora_pos, что
+            # passive-income — особь ТОЧНО на flora-тайле.
+            on_flora_per_cid[cid_s] = bool(
+                _rc is not None and (_rc[0], _rc[1]) in flora_pos)
             _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
             if _p40_dh is not None and _p40_dh != 0.0:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh
@@ -1755,7 +1762,8 @@ class ColonyWSClient:
                         c.get("telomere_decay_now", 0.0) or 0.0),
                     "thirst_now": float(c.get("thirst_now", 0.0) or 0.0),
                 }
-        return obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid
+        return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
+                on_flora_per_cid)
 
     async def _handle_obs_batch(self, msg: dict) -> None:
         creatures = msg.get("creatures") or []
@@ -1768,10 +1776,11 @@ class ColonyWSClient:
         # P40 шлёт parent_id для каждой особи. Если cid новый, и мы кешировали
         # child_org после mate-pair кроссинговера, регистрируем + Y50.
         self._attach_pending_newborns(creatures)
-        obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid = \
-            self._collect_obs_batch(creatures)
+        (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
+         on_flora_per_cid) = self._collect_obs_batch(creatures)
         if not obs_per_cid:
             return
+        self._on_flora_per_cid = on_flora_per_cid
         # Фаза 3.3A obs migration (11.05.2026): shadow-сборка obs из локального
         # кеша. Поведение не меняется — forward по-прежнему по серверному obs.
         # Сравниваем slot-by-slot, метрики идут в diagnostics(). После
@@ -1906,7 +1915,7 @@ class ColonyWSClient:
             creatures_out = await asyncio.to_thread(
                 self._run_tick_and_build,
                 obs_per_cid, events_per_cid, intero_per_cid, world_tick,
-                rates_per_cid)
+                rates_per_cid, on_flora_per_cid)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return
@@ -2135,7 +2144,8 @@ class ColonyWSClient:
                 n_thirsty, n_near, n_seek)
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
-                            intero_per_cid, world_tick, rates_per_cid=None):
+                            intero_per_cid, world_tick, rates_per_cid=None,
+                            on_flora_per_cid=None):
         """Offload-worker (0.11.16): handle_tick + сборка creatures_out с
         phase_emas. Запускается в asyncio.to_thread — torch-forward'ы N орг не
         блокируют ws-event-loop. Весь compute-доступ изолирован здесь; на
@@ -2147,7 +2157,7 @@ class ColonyWSClient:
         actions = self.compute.handle_tick(
             obs_per_cid, events_per_cid=events_per_cid,
             intero_per_cid=intero_per_cid, world_tick=world_tick,
-            rates_per_cid=rates_per_cid)
+            rates_per_cid=rates_per_cid, on_flora_per_cid=on_flora_per_cid)
         if not actions:
             return None
         creatures_out: list = []
