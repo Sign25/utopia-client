@@ -42,6 +42,20 @@ def test_energy_decay():
     assert "c1" not in c._dead_cids
 
 
+def test_metab_guard_one_drain_per_server_tick():
+    # Contract ×2 fix (Хьюберт): дубль handle_tick того же world_tick не дренит.
+    c, org, bc = _compute_with_org(energy=500.0)
+    rates = {"step_cost_now": 10.0, "telomere_decay_now": 0.0, "thirst_now": 0.0}
+    c._last_world_tick = 100
+    c._apply_metabolism("c1", rates)
+    assert bc.energy == 490.0 and c._metab_applies == 1
+    c._apply_metabolism("c1", rates)          # тот же server-тик → skip
+    assert bc.energy == 490.0 and c._metab_skips == 1
+    c._last_world_tick = 101                  # новый server-тик → дренит
+    c._apply_metabolism("c1", rates)
+    assert bc.energy == 480.0 and c._metab_applies == 2
+
+
 def test_thirst_decays_calibration_mode():
     """Калибровка 31.05: thirst-декей ВКЛ для наблюдения баланса (для активных
     cid). Смерть от жажды ОТКЛ (см. ниже). Аккумулятор thirst_sum растёт."""

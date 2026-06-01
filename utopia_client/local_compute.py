@@ -431,7 +431,13 @@ class LocalColonyCompute:
         # gather/gather_onf — GATHER issued + на флоре (успех), flip — shaping-
         # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
-                           "eat": 0, "flip": 0, "mnorm": 0.0}
+                           "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0}
+        # Contract ×2 fix (01.06.2026, Хьюберт audit): server применяет step_cost
+        # раз/server-тик; handle_tick зовётся ЧАЩЕ (дубли world_tick) → client
+        # дренил ×2. Метаболизм — раз на РАЗЛИЧНЫЙ server-тик (per-cid last tick).
+        self._last_metab_tick: dict = {}     # cid → world_tick последнего метаб.
+        self._metab_applies: int = 0          # применено (различные тики)
+        self._metab_skips: int = 0            # скипнуто (дубли тика) — verify ×2
         # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
         # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
         # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
@@ -1000,6 +1006,7 @@ class LocalColonyCompute:
         # Newborn-инстинкт (Фрай): снять трекинг рождения + зеркало carried_food.
         self._birth_tick.pop(cid, None)
         self._carried_food.pop(cid, None)
+        self._last_metab_tick.pop(cid, None)  # contract ×2 guard
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
         self.theory_of_mind_opt.pop(cid, None)
@@ -2206,6 +2213,11 @@ class LocalColonyCompute:
                 self._nav["ticks"] += 1
                 if _onf:
                     self._nav["onf"] += 1
+                # P40 ground-truth: реально ли P40 зарегистрировал eat (ate
+                # событие прошлого тика). Сравнение с gather_onf (клиентское
+                # зеркало) вскрывает рассинхрон client-выбор vs P40-резолв (#2).
+                if events_per_cid and events_per_cid.get(cid, {}).get("ate"):
+                    self._nav["p40_ate"] += 1
                 if action == 13:        # GATHER
                     self._nav["gather"] += 1
                     if _onf:
@@ -5041,6 +5053,15 @@ class LocalColonyCompute:
         """
         if not rates:
             return
+        # Contract ×2 fix (Хьюберт audit): server применяет rate РАЗ на server-
+        # тик. handle_tick зовётся чаще (дубли world_tick) → дренили ×2. Дреним
+        # раз на РАЗЛИЧНЫЙ server-тик; повторный handle_tick того же тика — skip.
+        _wt = int(self._last_world_tick)
+        if self._last_metab_tick.get(cid) == _wt:
+            self._metab_skips += 1
+            return
+        self._last_metab_tick[cid] = _wt
+        self._metab_applies += 1
         bc = self.biochem.get(cid)
         org = self.organisms.get(cid)
         try:
@@ -5189,11 +5210,20 @@ class LocalColonyCompute:
                 _nt = max(1, self._nav["ticks"])
                 logger.info(
                     "NAV_DIAG ticks=%d onf_rate=%.3f gather=%d gather_onf=%d "
-                    "eat=%d flip_rate=%.3f motor_norm=%.3f",
+                    "eat=%d p40_ate=%d flip_rate=%.3f motor_norm=%.3f",
                     self._nav["ticks"], self._nav["onf"] / _nt,
                     self._nav["gather"], self._nav["gather_onf"],
-                    self._nav["eat"], self._nav["flip"] / _nt,
-                    self._nav["mnorm"] / _nt)
+                    self._nav["eat"], self._nav["p40_ate"],
+                    self._nav["flip"] / _nt, self._nav["mnorm"] / _nt)
+                # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
+                # server-тика (handle_tick ×2). applies = реальные server-тики.
+                _mt = max(1, self._metab_applies + self._metab_skips)
+                logger.info(
+                    "METAB_DIAG applies=%d skips=%d skip_rate=%.3f",
+                    self._metab_applies, self._metab_skips,
+                    self._metab_skips / _mt)
+                self._metab_applies = 0
+                self._metab_skips = 0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
@@ -5203,7 +5233,7 @@ class LocalColonyCompute:
             self._e_cost_sum = 0.0
             self._e_infdrain_sum = 0.0
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
-                         "eat": 0, "flip": 0, "mnorm": 0.0}
+                         "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.
