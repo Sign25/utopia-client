@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.56"  # Newborn-инстинкт (Фрай, порт server phase_a.py:748-755): client-рождённые тянутся к GATHER(на флоре)/EAT(с едой) первые 500т, затухает → motor_policy учится есть на eat-reward → Lamarckian (eat→eff↑→income↑). carried_food — клиентское зеркало (P40 не шлёт), on_flora из cache.flora. passive_eating — бэкстоп
+__version__ = "0.11.57"  # Bootstrap (Фрай): restored-особи омолаживаются (birth_tick=now) → инстинкт активен → учатся есть как newborn (учит, не дарит энергию). Self-decay: пойдут natural-роды → restore редок → bootstrap сойдёт сам. INSTINCT_DIAG в ENERGY_CALIB (natural/bootstrap/instinct_active). Критерий: natural>0 + eff_mean 5→10

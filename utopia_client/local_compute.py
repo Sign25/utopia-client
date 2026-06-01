@@ -411,6 +411,13 @@ class LocalColonyCompute:
         # food — клиентское зеркало серверного инвентаря (P40 его не шлёт).
         self._birth_tick: dict = {}         # cid → world_tick рождения (newborn)
         self._carried_food: dict = {}       # cid → int 0..5 (зеркало world.py)
+        # Bootstrap (Фрай): restored-особи омолаживаются (birth_tick=now) →
+        # инстинкт активен → учатся есть тем же механизмом, что newborn (учит,
+        # не дарит энергию). Self-decay: как пойдут natural-роды и колония
+        # станет self-sustaining, restore станет редким → bootstrap сойдёт сам.
+        self._bootstrap_pending: set = set()  # cid restored → омолодить в handle_tick
+        self._n_bootstrap_rejuv: int = 0      # счётчик омоложённых (verify ratio)
+        self._n_natural_newborn: int = 0      # счётчик natural-родов (verify ratio)
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -2074,6 +2081,7 @@ class LocalColonyCompute:
         получают STAY (защита от рассинхронизации).
         """
         self.tick_ts.append(time.time())
+        self._apply_bootstrap_pending(world_tick)
         out: dict = {}
         torch = self._torch
         # Снапшот итерации: self.organisms мутируется из main-потока
@@ -2690,6 +2698,11 @@ class LocalColonyCompute:
                 logger.warning(
                     "restore_colony_from_local: restore_persisted_state %s: %s",
                     cid, e)
+            # Bootstrap (Фрай): пометить на омоложение — birth_tick выставится
+            # в handle_tick (там известен текущий world_tick) → инстинкт
+            # активен → особь учится есть, как newborn. На реконнекте/elite-
+            # recovery каждый раз заново (ОК, пока колония не self-sustaining).
+            self._bootstrap_pending.add(cid)
             restored.append(cid)
         logger.info("restore_colony_from_local: %d organisms restored from %s",
                     len(restored), dir_path)
@@ -3247,6 +3260,23 @@ class LocalColonyCompute:
             logits[13] += 2.0 * instinct   # GATHER когда есть что собрать
         if carried > 0:
             logits[14] += 2.0 * instinct   # EAT когда есть что есть
+
+    def _apply_bootstrap_pending(self, world_tick: int) -> None:
+        """Bootstrap (Фрай): омолодить restored-особей — birth_tick=now →
+        инстинкт активен 500т → учатся есть тем же механизмом, что newborn.
+
+        Делается в handle_tick (а не в restore), т.к. restore не знает текущий
+        world_tick. Применяется только к ещё живым зарегистрированным; на
+        каждом restore/elite-recovery заново (self-decay: пока колония не
+        self-sustaining). Счётчик _n_bootstrap_rejuv — для verify ratio."""
+        if not self._bootstrap_pending:
+            return
+        for cid in list(self._bootstrap_pending):
+            if cid in self.organisms and cid not in self._dead_cids:
+                self._birth_tick[cid] = int(world_tick)
+                self._carried_food.setdefault(cid, 0)
+                self._n_bootstrap_rejuv += 1
+        self._bootstrap_pending.clear()
 
     def _update_carried_food_mirror(self, cid: str, action: int,
                                     on_flora: bool) -> None:
@@ -4343,6 +4373,7 @@ class LocalColonyCompute:
             # рождённые трекаются — restored/seed (age>500) инстинкта не имеют.
             self._birth_tick[child_cid] = int(world_tick)
             self._carried_food[child_cid] = 0
+            self._n_natural_newborn += 1  # verify: natural vs bootstrap ratio
 
             # 5. Compute child traits via parent crossover (ТЗ §4.1)
             # 9 полей: vision_radius, smell_radius, attack_radius, move_speed,
@@ -4977,13 +5008,21 @@ class LocalColonyCompute:
                         for c in self.organisms]
                 eff_mean = (sum(effs) / len(effs)) if effs else 0.0
                 _net = self._e_income_sum - self._e_cost_sum - self._e_infdrain_sum
+                # INSTINCT_DIAG (Фрай): natural-роды vs bootstrap-омоложение +
+                # сколько особей сейчас в активном инстинкте. Критерий успеха:
+                # natural>0 (пошли роды) + eff_mean ползёт 5→10. Если держится
+                # ТОЛЬКО на bootstrap (natural=0) — scaffold лечит симптом.
+                _instinct_active = sum(1 for c in self._birth_tick
+                                       if c in self.organisms)
                 logger.info(
                     "ENERGY_CALIB ticks=300 income=%.1f cost=%.1f infdrain=%.1f "
-                    "net=%.1f ratio=%.2f eff_mean=%.1f",
+                    "net=%.1f ratio=%.2f eff_mean=%.1f natural=%d bootstrap=%d "
+                    "instinct_active=%d",
                     self._e_income_sum, self._e_cost_sum, self._e_infdrain_sum,
                     _net, (self._e_income_sum /
                            max(self._e_cost_sum + self._e_infdrain_sum, 1e-6)),
-                    eff_mean)
+                    eff_mean, self._n_natural_newborn, self._n_bootstrap_rejuv,
+                    _instinct_active)
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0

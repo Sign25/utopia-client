@@ -146,3 +146,37 @@ def test_remove_creature_clears_instinct_state():
     c.remove_creature("n")
     assert "n" not in c._birth_tick
     assert "n" not in c._carried_food
+
+
+# ── bootstrap: омоложение restored-особей ─────────────────────────────
+
+def test_bootstrap_rejuvenates_registered_alive():
+    import types
+    c = _c()
+    c.organisms["r1"] = types.SimpleNamespace()
+    c._bootstrap_pending.add("r1")
+    c._apply_bootstrap_pending(world_tick=1000)
+    assert c._birth_tick.get("r1") == 1000   # омоложён → инстинкт активен
+    assert c._carried_food.get("r1") == 0
+    assert c._n_bootstrap_rejuv == 1
+    assert "r1" not in c._bootstrap_pending   # pending очищен
+
+
+def test_bootstrap_skips_dead_or_unregistered():
+    import types
+    c = _c()
+    c.organisms["alive"] = types.SimpleNamespace()
+    c._dead_cids.add("dead")
+    c.organisms["dead"] = types.SimpleNamespace()
+    c._bootstrap_pending.update({"alive", "dead", "ghost"})
+    c._apply_bootstrap_pending(world_tick=500)
+    assert "alive" in c._birth_tick
+    assert "dead" not in c._birth_tick      # мёртвого не омолаживаем
+    assert "ghost" not in c._birth_tick     # незарегистрированного нет
+    assert c._n_bootstrap_rejuv == 1
+
+
+def test_bootstrap_noop_when_empty():
+    c = _c()
+    c._apply_bootstrap_pending(world_tick=10)
+    assert c._n_bootstrap_rejuv == 0
