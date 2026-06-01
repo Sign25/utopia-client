@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.66"  # #1 per-sec transition-safe: *_per_sec→wall-clock dt-интеграция, *_now (legacy)→dt=1 (per-apply, БЕЗ over-drain) — авто-апгрейд когда P40 завершит rename, нет окна rate=0. #2 EAT desync fix: instinct GATHER/EAT по P40 authoritative on_flora+carried_food (9f8d99d) вместо stale cache.flora+зеркало → убирает p40_ate=0
+__version__ = "0.11.67"  # #2 berry/fruit-навигация (Хьюберт audit: grass net −7.85/сек НЕ кормит, berry +18/сек). Голодные Зодчие (energy<450, не жаждущие) → override move к ближайшему berry/fruit (kind 2-6) из cache.flora; на нём → инстинкт GATHER/EAT. Зеркало water-seek, вода в приоритете. FOOD_SEEK_DIAG. #1 per-sec подтверждён (mean_rate_per_sec=10.7, окно закрыто)

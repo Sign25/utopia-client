@@ -223,6 +223,38 @@ def test_flora_in_radius_on_tile():
     assert cli._flora_in_radius(5, 5, {(5, 5): 2}, 7) is True
 
 
+def test_food_seek_east():
+    cli = _client()
+    assert cli._food_seek_action(10, 10, {(10, 12)}) == 2   # berry восточнее
+
+
+def test_food_seek_north():
+    cli = _client()
+    assert cli._food_seek_action(10, 10, {(8, 10)}) == 0    # berry севернее
+
+
+def test_food_seek_none_when_on_tile():
+    cli = _client()
+    # УЖЕ на berry → None (инстинкт GATHER/EAT, не оверрайдим движением)
+    assert cli._food_seek_action(10, 10, {(10, 10)}) is None
+
+
+def test_food_seek_nearest_chosen():
+    cli = _client()
+    # близко (восток d=2) и далеко (север d=7) → ближний (восток)
+    assert cli._food_seek_action(10, 10, {(3, 10), (10, 12)}) == 2
+
+
+def test_food_seek_none_out_of_radius():
+    cli = _client()
+    assert cli._food_seek_action(10, 10, {(40, 40)}) is None   # > radius 12
+
+
+def test_food_seek_empty():
+    cli = _client()
+    assert cli._food_seek_action(10, 10, set()) is None
+
+
 def test_apply_water_seek_skips_hydrated():
     pytest.importorskip("torch")
     from utopia_client.local_compute import LocalColonyCompute

@@ -2001,6 +2001,12 @@ class ColonyWSClient:
             self._apply_water_seek(creatures, creatures_out)
         except Exception as e:
             logger.warning("water-seek override failed: %r", e)  # DIAG 0.11.32
+        # Berry/fruit-seek (01.06.2026, Хьюберт): ПОСЛЕ water (вода приоритет) —
+        # голодных ведём к высокоценной флоре (grass не кормит, net −7.85/сек).
+        try:
+            self._apply_food_seek(creatures, creatures_out)
+        except Exception as e:
+            logger.warning("food-seek override failed: %r", e)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -2031,6 +2037,12 @@ class ColonyWSClient:
     _WATER_TILE = 1
     _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду
     _WATER_SEEK_RADIUS = 8         # тайлов вокруг — дальше random walk
+    # Berry/fruit-seek (01.06.2026, Хьюберт audit): grass net −7.85/сек (НЕ
+    # кормит), berry +18/сек. Голодные Зодчие должны идти к высокоценной флоре,
+    # не пастись на траве. flora_kind: 1=GRASS,2=BERRY,3-6=FRUIT (φ× сытнее).
+    _BERRY_FRUIT_KINDS = frozenset({2, 3, 4, 5, 6})
+    _FOOD_SEEK_ENERGY = 450.0      # energy < порог → искать berry/fruit
+    _FOOD_SEEK_RADIUS = 12         # тайлов вокруг (vision-ish)
     # Water income client-side (01.06.2026, Шеф): на/рядом с WATER → доход
     # hydration. φ⁷≈29.03 = prey_kill_energy (mirror world.py:551).
     _WATER_RESTORE = 1.618033988749895 ** 7
@@ -2078,6 +2090,88 @@ class ColonyWSClient:
         if abs(dr) >= abs(dc):
             return 0 if dr < 0 else 1   # N / S
         return 2 if dc > 0 else 3       # E / W
+
+    def _food_seek_action(self, row: int, col: int, berry_pos):
+        """Направление (0=N,1=S,2=E,3=W) к ближайшему berry/fruit-тайлу в радиусе.
+        None если УЖЕ на нём (→ не оверрайдим, инстинкт GATHER/EAT) или нет рядом.
+        berry_pos — set[(row,col)] высокоценной флоры (kind 2-6)."""
+        if not berry_pos:
+            return None
+        r0, c0 = int(row), int(col)
+        if (r0, c0) in berry_pos:
+            return None  # на берри/фрукте → инстинкт ест, не перебиваем
+        best = None
+        best_d = 10 ** 9
+        R = self._FOOD_SEEK_RADIUS
+        for dr in range(-R, R + 1):
+            rem = R - abs(dr)
+            for dc in range(-rem, rem + 1):
+                if (r0 + dr, c0 + dc) in berry_pos:
+                    d = abs(dr) + abs(dc)
+                    if 0 < d < best_d:
+                        best_d = d
+                        best = (r0 + dr, c0 + dc)
+        if best is None:
+            return None
+        dr = best[0] - r0
+        dc = best[1] - c0
+        if abs(dr) >= abs(dc):
+            return 0 if dr < 0 else 1   # N / S
+        return 2 if dc > 0 else 3       # E / W
+
+    def _apply_food_seek(self, creatures, creatures_out) -> None:
+        """Override move к ближайшему berry/fruit для голодных (energy<порог),
+        кто НЕ на берри/фрукте. Хьюберт audit: grass не кормит (net −7.85/сек),
+        berry +18/сек → вести к высокоценной флоре. Зеркалит water-seek; вода
+        (жажда) применяется РАНЬШЕ → приоритет, food-seek жаждущих не трогает."""
+        compute = self.compute
+        if compute is None:
+            return
+        biochem = getattr(compute, "biochem", None)
+        cache = getattr(self, "world_cache", None)
+        if not biochem or cache is None:
+            return
+        try:
+            berry_pos = {(int(r), int(c)) for (r, c, k) in cache.flora
+                         if int(k) in self._BERRY_FRUIT_KINDS}
+        except Exception:
+            return
+        if not berry_pos:
+            return
+        pos = {}
+        for c in creatures:
+            cid = c.get("cid")
+            if cid is None:
+                continue
+            rc = self._resolve_pos(cid, c)
+            if rc is not None:
+                pos[str(cid)] = rc
+        n_seek = 0
+        n_hungry = 0
+        for entry in creatures_out:
+            cid = entry.get("cid")
+            bc = biochem.get(cid) if cid else None
+            if bc is None:
+                continue
+            if float(getattr(bc, "energy", 1e9)) >= self._FOOD_SEEK_ENERGY:
+                continue
+            # жаждущий → water-seek в приоритете (уже оверрайднул), не трогаем
+            if float(getattr(bc, "hydration", 100.0)) < self._WATER_SEEK_HYDRATION:
+                continue
+            n_hungry += 1
+            rc = pos.get(cid)
+            if rc is None or rc[0] is None:
+                continue
+            fd = self._food_seek_action(rc[0], rc[1], berry_pos)
+            if fd is not None:
+                entry["action"] = int(fd)
+                n_seek += 1
+        self._food_seek_diag = getattr(self, "_food_seek_diag", 0) + 1
+        if self._food_seek_diag >= 200:
+            self._food_seek_diag = 0
+            logger.info(
+                "FOOD_SEEK_DIAG berry_fruit_tiles=%d hungry=%d seek_override=%d",
+                len(berry_pos), n_hungry, n_seek)
 
     def _near_water(self, row: int, col: int) -> bool:
         """Организм на ИЛИ рядом (5 клеток, радиус 1: self + 4 соседа) с
