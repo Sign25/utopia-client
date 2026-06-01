@@ -264,7 +264,8 @@ def _make_ws(cfg: dict, name: str) -> ColonyWSClient:
 
 def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
                bench: dict, n_alive: int = 0,
-               colony_summary: Optional[dict] = None) -> bool:
+               colony_summary: Optional[dict] = None,
+               creature_stats: Optional[dict] = None) -> bool:
     extra = {
         "client_version": __version__,
         "estimated_population": bench.get("estimated_population", 0),
@@ -276,6 +277,10 @@ def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
     # обучения → public_meta.extra.colony_summary → useStatsData.
     if colony_summary:
         extra["colony_summary"] = colony_summary
+    # creature_stats (01.06.2026, UI): per-creature client-only поля (species_id/
+    # topo/inst) keyed by cid — тем же надёжным каналом (diag-push ловит 502).
+    if creature_stats:
+        extra["creature_stats"] = creature_stats
     return api.push_stats(
         name=name,
         n_alive=n_alive,
@@ -789,13 +794,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 world_tick = ws.last_world_tick if ws is not None else 0
                 ws_connected = ws.connected if ws is not None else False
                 _summary = None
+                _cstats = None
                 if ws is not None and ws.compute is not None:
                     try:
                         _summary = ws.compute.build_colony_summary()
+                        _cstats = ws.compute.build_creature_stats()
                     except Exception as e:
-                        logger.debug("build_colony_summary failed: %s", e)
+                        logger.debug("build colony/creature stats failed: %s", e)
                 ok = _heartbeat(api, name, current_state, world_tick, bench,
-                                n_alive, _summary)
+                                n_alive, _summary, _cstats)
                 feed_snaps = world_feed.snapshots_received if world_feed else 0
                 feed_conn = world_feed.connected if world_feed else False
                 logger.info(

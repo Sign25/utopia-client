@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.61"  # bias_scale energy-health guard: декей bias только когда колония self-sustaining (income≥cost), не «по населению». Баг 0.11.60: колония закреплена на cap (elite-restore) но голодает → population-ratio=1.0 → bias декеил 1.0→0.30 → untrained motor возвращался → самоподрыв. Кроссфейд работает (gather_onf 1→21 при bias≈1.0), но income≪cost ×8 — энергобаланс отдельный блокер
+__version__ = "0.11.62"  # bias_scale ведём по энергобалансу (health=income/cost), не населению: health<1 (голод)→bias+0.1 (shaping↑), >=1 (self-sustaining)→-0.05 (motor↑). Фикс 0.11.61: bias застрял на 0 (декейнул багом, guard не поднимал). + UI: build_creature_stats (species_id/topo/inst keyed by cid) на heartbeat-канале (diag-push ловит 502)

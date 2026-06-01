@@ -111,3 +111,31 @@ def test_per_creature_null_age_for_untracked():
     p = next(r for r in rows if r["cid"] == "y")
     assert p["gen"] == 1 and p["topo"] == 0
     assert p["age"] is None and p["inst"] is None   # не newborn → None
+
+
+# ── build_creature_stats (heartbeat-канал для UI) ─────────────────────
+
+def test_creature_stats_compact_keyed_by_cid():
+    from core.tissue_topology import TissueConnectionGene  # noqa
+    g = TissueConnectionGene(innovation=1, source_role="sensory",
+                             target_role="brain")
+    c = _c()
+    c.organisms["x"] = _org(genes=[g])
+    c.species_id["x"] = 5
+    c._last_world_tick = 100
+    c._birth_tick["x"] = 0                # age=100 → inst=0.8
+    cs = c.build_creature_stats()
+    assert set(cs.keys()) == {"x"}
+    assert cs["x"]["species_id"] == 5
+    assert cs["x"]["topo"] == 1
+    assert abs(cs["x"]["inst"] - 0.8) < 1e-6
+
+
+def test_creature_stats_skips_dead_and_null_inst():
+    c = _c()
+    c.organisms["a"] = _org()             # не newborn → inst None
+    c.organisms["d"] = _org()
+    c._dead_cids.add("d")
+    cs = c.build_creature_stats()
+    assert "d" not in cs                  # мёртвого нет
+    assert cs["a"]["inst"] is None        # не newborn

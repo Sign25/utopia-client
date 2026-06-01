@@ -439,7 +439,6 @@ class LocalColonyCompute:
         # motor автономен. NAV-данные подтвердили: motor перебивал shaping
         # (flip_rate 0.6, motor_norm≈shaping) → голод. Каждые 1000 world-тиков.
         self._bias_scale: float = 1.0
-        self._alive_ema: float = 0.0
         self._bias_last_update_tick: int = 0
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
@@ -3311,48 +3310,36 @@ class LocalColonyCompute:
         if carried > 0:
             logits[14] += 2.0 * instinct   # EAT когда есть что есть
 
-    _BIAS_ALIVE_EMA_ALPHA: float = 0.05   # server routes_world.py:543
-
     def _update_bias_curriculum(self, world_tick: int) -> None:
-        """Порт server curriculum bias_scale (loop.py:607-636). Каждые 1000
-        world-тиков: ratio = n_alive / effective_target (адаптивный EMA-таргет).
-        ratio>=0.95 → bias_scale -= 0.05 (колония устойчива, отпускаем motor);
-        ratio<0.7 → += 0.1 (крах, shaping снова доминирует); между — держим.
+        """Curriculum bias_scale — кроссфейд shaping↔motor (порт server
+        механизма loop.py:603 own_contribution; СИГНАЛ адаптирован под наш
+        контекст). Каждые 1000 world-тиков.
 
-        own_contribution = max(0, 1-bias_scale) масштабирует motor_delta при
-        выборе action (handle_tick). target = ёмкость колонии (как mate-cap)."""
+        Сервер ведёт bias по населению (n_alive/target) — там население⟹здоровье
+        (обученные мозги кормят). У НАС колония закреплена elite-restore на cap
+        ПРИ net<0 → population-ratio=1.0 всегда → bias декеил до 0 → untrained
+        motor на полную → голод (подтверждено монитором). Поэтому ведём bias по
+        ПРЯМОМУ признаку self-sustaining — энергобалансу (income/cost):
+          health < 1.0 (не кормит себя) → bias += 0.1 → shaping (флора-навигация)
+                                          доминирует, motor подавлен;
+          health >= 1.0 (self-sustaining) → bias -= 0.05 → отпускаем motor.
+        Механизм (own_contribution=max(0,1-bias)×motor_delta) — серверный."""
         if int(world_tick) - self._bias_last_update_tick < 1000:
             return
         self._bias_last_update_tick = int(world_tick)
-        n_alive = sum(1 for c in self.organisms if c not in self._dead_cids)
-        target = float(self._get_hw_capacity() or 20)
-        if self._alive_ema <= 0.0:
-            self._alive_ema = float(max(n_alive, target))
-        floor = max(1.0, target * 0.5)
-        effective_target = max(self._alive_ema, floor)
-        ratio = n_alive / effective_target if effective_target > 0 else 1.0
-        # Energy-health guard (01.06.2026): декей bias (отпустить motor) ТОЛЬКО
-        # когда колония энергетически self-sustaining (income≥cost). На сервере
-        # население-at-target ⟹ здорова (обученные мозги кормят); у нас колония
-        # закреплена на cap через elite-restore, но ГОЛОДАЕТ (net<0) → чистый
-        # population-ratio давал ratio=1.0 → bias декеил 1.0→0.30 → untrained
-        # motor возвращался → фуражировка деградировала (самоподрыв). Смысл
-        # curriculum — отпускать motor когда выучилась, а признак — баланс, не cap.
-        _healthy = (self._last_window is not None
-                    and float(self._last_window.get("ratio", 0.0)) >= 1.0)
+        health = (float(self._last_window.get("ratio", 0.0))
+                  if self._last_window else 0.0)
         old = self._bias_scale
-        if ratio >= 0.95 and _healthy:
-            self._bias_scale = max(0.0, self._bias_scale - 0.05)
-        elif ratio < 0.7:
+        if health < 1.0:
             self._bias_scale = min(1.0, self._bias_scale + 0.1)
-        self._alive_ema = (self._BIAS_ALIVE_EMA_ALPHA * n_alive
-                           + (1.0 - self._BIAS_ALIVE_EMA_ALPHA) * self._alive_ema)
+        else:
+            self._bias_scale = max(0.0, self._bias_scale - 0.05)
         if abs(self._bias_scale - old) > 0.001:
+            n_alive = sum(1 for c in self.organisms if c not in self._dead_cids)
             logger.info(
-                "bias_scale curriculum %.2f → %.2f (alive=%d ema=%.1f "
-                "ratio=%.2f own_contrib=%.2f tick=%d)",
-                old, self._bias_scale, n_alive, self._alive_ema, ratio,
-                max(0.0, 1.0 - self._bias_scale), int(world_tick))
+                "bias_scale curriculum %.2f → %.2f (health_ratio=%.2f alive=%d "
+                "own_contrib=%.2f tick=%d)", old, self._bias_scale, health,
+                n_alive, max(0.0, 1.0 - self._bias_scale), int(world_tick))
 
     def _apply_bootstrap_pending(self, world_tick: int) -> None:
         """Bootstrap (Фрай): омолодить restored-особей — birth_tick=now →
@@ -4262,6 +4249,31 @@ class LocalColonyCompute:
                 proj["mental_break"] = None
             projections.append(proj)
         return projections
+
+    def build_creature_stats(self) -> dict:
+        """Компактный per-creature CLIENT-only для UI /stats — keyed by cid.
+
+        Только поля, которых НЕТ в P40 owner_creatures (world_save.py:518):
+          species_id — client-local speciation (по графу Z2.b);
+          topo       — число межтканевых рёбер-генов (сложность графа мозга);
+          inst       — newborn_instinct 0..1 (None для не-newborn).
+        Идёт heartbeat-каналом (push_stats → public_meta.extra.creature_stats),
+        тем же, что colony_summary — проверенно доходит (diag-push ловит 502).
+        Фронт мёржит по cid на свой ряд особи."""
+        out: dict = {}
+        for cid, org in list(self.organisms.items()):
+            if cid in self._dead_cids:
+                continue
+            bt = self._birth_tick.get(cid)
+            inst = (round(max(0.0, 1.0 - max(
+                0, int(self._last_world_tick) - int(bt)) / 500.0), 3)
+                if bt is not None else None)
+            out[str(cid)] = {
+                "species_id": self.species_id.get(cid),
+                "topo": len(getattr(org, "tissue_topology_genes", []) or []),
+                "inst": inst,
+            }
+        return out
 
     def build_colony_summary(self) -> dict:
         """Агрегат для UI /stats (extra.colony_summary): выживание (energy/
