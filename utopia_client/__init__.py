@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.50"  # fix(энергобаланс, Фрай): eat-income ∝ kleiber_efficiency (потерял множитель при миграции → сломан Lamarckian loop) + eff дефолт 5→10 + ENERGY_CALIB замер income/cost
+__version__ = "0.11.51"  # fix: kleiber floor 1.0 (eff застряла на 5 → 0.65 срезал income); ENERGY_CALIB вскрыл net-negative + step_cost ×3.6 base
