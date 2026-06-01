@@ -38,7 +38,11 @@ N_ACTIONS = 16
 # N ≈ 3с (= 89 P40-тиков @30TPS; wall-clock → client-TPS-агностик, НЕ копируем
 # «89» вслепую). После N — recovery-грант энергии (НЕ времени).
 _PARALYSIS_SEC = 3.0
-_RECOVERY_ENERGY_DEFAULT = 45.0  # max_energy/φ⁷ (max_energy=1309)
+# Tier 1 (Хьюберт 01.06.2026): φ⁷≈45 (2.8с окно) → φ⁶≈73 (4.6с, ~9 тайлов
+# навигации @ move_speed=2 → шанс найти flora ~25%→~80%). Окно НАВИГАЦИИ до
+# первого укуса, не отмена голода. Если on_flora_ticks=0 при 73 → policy gap
+# (моя зона); если растёт но не доедает → Tier 2 φ⁵≈118. max_energy=1309.
+_RECOVERY_ENERGY_DEFAULT = 73.0  # max_energy/φ⁶
 
 # Dehydration-модель (mirror environment/world.py:909/926 — источник истины).
 # Стадии по hydration ratio → energy_drain грызёт ЭНЕРГИЮ (не отдельная
