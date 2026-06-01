@@ -545,6 +545,10 @@ class LocalColonyCompute:
         # для наблюдения, смерть от жажды ОТКЛ (без риска падежа). Сравниваем
         # thirst_sum (P40 thirst_now) vs drink_sum (P40 delta_hydration) +
         # тренд hydration → находим перекос, калибруем с серверной моделью.
+        # ENERGY_CALIB (02.06.2026, Фрай): замер income vs cost per-тик.
+        self._e_income_sum: float = 0.0   # delta_energy (eat)
+        self._e_cost_sum: float = 0.0     # step_cost
+        self._e_infdrain_sum: float = 0.0  # infection-drain
         self._hyd_thirst_sum: float = 0.0
         self._hyd_drink_sum: float = 0.0
         self._hyd_calib_ticks: int = 0
@@ -4628,6 +4632,8 @@ class LocalColonyCompute:
             # Server-side max_energy = 1000 (WorldConfig default), clamp [0, 1000].
             if delta_e != 0.0:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
+                if delta_e > 0.0:
+                    self._e_income_sum += delta_e  # ENERGY_CALIB
             # Hydration income (31.05.2026): присутствие ключа delta_hydration
             # в event = P40 шлёт питьё → активируем hydration-ось отбора для
             # этого cid (thirst-декей + жажда-смерть включатся в
@@ -4682,7 +4688,7 @@ class LocalColonyCompute:
         move = self._skill_move.get(cid, 0)
         if tr is not None:
             try:
-                eff0 = int(tr.get("efficiency", 5))
+                eff0 = int(tr.get("efficiency", 10))  # server default 10 (не 5)
                 atk0 = int(tr.get("attack_power", 3))
                 spd0 = int(tr.get("move_speed", 3))
                 eff, atk, spd = eff0, atk0, spd0
@@ -4736,6 +4742,7 @@ class LocalColonyCompute:
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
+                self._e_cost_sum += step_cost  # ENERGY_CALIB
             # Водный контур client-authoritative (01.06.2026, Шеф). Расход
             # жажды теперь БЕЗУСЛОВНЫЙ для всех owned-zodchiy (как на сервере):
             # доход (delta_hydration) теперь client-side из террейна
@@ -4777,6 +4784,7 @@ class LocalColonyCompute:
                 bc.infection_severity = _sev
                 bc.energy = max(
                     0.0, float(getattr(bc, "energy", 0.0)) - _sev * 2.0)
+                self._e_infdrain_sum += _sev * 2.0  # ENERGY_CALIB
         # Death-check: голод (energy<=0) + старость (telomere AGONY) + инфекция
         # (severity>=1.0). Жажда/инфекция грызут energy → starvation; критическая
         # инфекция — отдельная причина. Единый death-envelope (Фрай: градиентно).
@@ -4825,11 +4833,27 @@ class LocalColonyCompute:
                     (self._hyd_drink_sum / self._hyd_thirst_sum
                      if self._hyd_thirst_sum > 0 else -1.0),
                     n, hmin, hmean, hmax, nlow)
+                # ENERGY_CALIB (Фрай): income(eat) vs cost(step+infection) +
+                # efficiency. net>0 → колония растёт; net<0 → вымирание.
+                effs = [int((self.traits.get(c) or {}).get("efficiency", 10))
+                        for c in self.organisms]
+                eff_mean = (sum(effs) / len(effs)) if effs else 0.0
+                _net = self._e_income_sum - self._e_cost_sum - self._e_infdrain_sum
+                logger.info(
+                    "ENERGY_CALIB ticks=300 income=%.1f cost=%.1f infdrain=%.1f "
+                    "net=%.1f ratio=%.2f eff_mean=%.1f",
+                    self._e_income_sum, self._e_cost_sum, self._e_infdrain_sum,
+                    _net, (self._e_income_sum /
+                           max(self._e_cost_sum + self._e_infdrain_sum, 1e-6)),
+                    eff_mean)
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
             self._hyd_drink_sum = 0.0
             self._hyd_calib_ticks = 0
+            self._e_income_sum = 0.0
+            self._e_cost_sum = 0.0
+            self._e_infdrain_sum = 0.0
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.

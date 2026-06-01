@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.49"  # feat(recovery, Фрай): elite-preservation — снимок здоровых обученных мозгов в elite-слот + re-genesis при вымирании online (watchdog→restore_from_elite). Обучение не теряется при extinction
+__version__ = "0.11.50"  # fix(энергобаланс, Фрай): eat-income ∝ kleiber_efficiency (потерял множитель при миграции → сломан Lamarckian loop) + eff дефолт 5→10 + ENERGY_CALIB замер income/cost
