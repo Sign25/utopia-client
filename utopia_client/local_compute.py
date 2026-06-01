@@ -438,6 +438,8 @@ class LocalColonyCompute:
         self._last_metab_tick: dict = {}     # cid → world_tick последнего метаб.
         self._metab_applies: int = 0          # применено (различные тики)
         self._metab_skips: int = 0            # скипнуто (дубли тика) — verify ×2
+        self._metab_dworld_sum: int = 0       # Σ Δworld_tick — гранулярность тика
+        self._metab_sc_sum: float = 0.0       # Σ step_cost_now — реальный rate
         # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
         # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
         # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
@@ -5057,15 +5059,19 @@ class LocalColonyCompute:
         # тик. handle_tick зовётся чаще (дубли world_tick) → дренили ×2. Дреним
         # раз на РАЗЛИЧНЫЙ server-тик; повторный handle_tick того же тика — skip.
         _wt = int(self._last_world_tick)
-        if self._last_metab_tick.get(cid) == _wt:
+        _prev = self._last_metab_tick.get(cid)
+        if _prev == _wt:
             self._metab_skips += 1
             return
+        if _prev is not None:
+            self._metab_dworld_sum += max(0, _wt - _prev)  # Δworld_tick/apply
         self._last_metab_tick[cid] = _wt
         self._metab_applies += 1
         bc = self.biochem.get(cid)
         org = self.organisms.get(cid)
         try:
             step_cost = float(rates.get("step_cost_now", 0.0) or 0.0)
+            self._metab_sc_sum += step_cost  # реальный rate от P40 (verify ×2)
             thirst = float(rates.get("thirst_now", 0.0) or 0.0)
             tel_decay = float(rates.get("telomere_decay_now", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -5218,12 +5224,17 @@ class LocalColonyCompute:
                 # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
                 # server-тика (handle_tick ×2). applies = реальные server-тики.
                 _mt = max(1, self._metab_applies + self._metab_skips)
+                _ma = max(1, self._metab_applies)
                 logger.info(
-                    "METAB_DIAG applies=%d skips=%d skip_rate=%.3f",
+                    "METAB_DIAG applies=%d skips=%d skip_rate=%.3f "
+                    "mean_step_cost=%.3f mean_dworld=%.2f",
                     self._metab_applies, self._metab_skips,
-                    self._metab_skips / _mt)
+                    self._metab_skips / _mt, self._metab_sc_sum / _ma,
+                    self._metab_dworld_sum / _ma)
                 self._metab_applies = 0
                 self._metab_skips = 0
+                self._metab_dworld_sum = 0
+                self._metab_sc_sum = 0.0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
