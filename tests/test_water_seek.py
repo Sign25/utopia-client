@@ -201,6 +201,28 @@ def test_passive_flora_empty():
     assert cli._passive_flora_income(10, 10, {}, 7, 0.0, 10.0) == 0.0
 
 
+def test_flora_in_radius_true():
+    cli = _client()
+    fp = {(10, 12): 1}                       # dist 2
+    assert cli._flora_in_radius(10, 10, fp, 7) is True
+
+
+def test_flora_in_radius_false_out_of_range():
+    cli = _client()
+    fp = {(10, 20): 1}                       # dist 10 > vr 7
+    assert cli._flora_in_radius(10, 10, fp, 7) is False
+
+
+def test_flora_in_radius_empty():
+    cli = _client()
+    assert cli._flora_in_radius(10, 10, {}, 7) is False
+
+
+def test_flora_in_radius_on_tile():
+    cli = _client()
+    assert cli._flora_in_radius(5, 5, {(5, 5): 2}, 7) is True
+
+
 def test_apply_water_seek_skips_hydrated():
     pytest.importorskip("torch")
     from utopia_client.local_compute import LocalColonyCompute

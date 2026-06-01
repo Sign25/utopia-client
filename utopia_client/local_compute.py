@@ -426,6 +426,12 @@ class LocalColonyCompute:
                                        "infection": 0}
         self._summary_history: deque = deque(maxlen=120)
         self._last_window: Optional[dict] = None  # последняя 300-тик энерго-точка
+        # NAV_DIAG (01.06.2026, Фрай): диагностика навигации к еде ПЕРЕД портом
+        # bias_scale. Корень голода — доходят ли до флоры. onf=on_flora-rate,
+        # gather/gather_onf — GATHER issued + на флоре (успех), flip — shaping-
+        # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
+        self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
+                           "eat": 0, "flip": 0, "mnorm": 0.0}
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -2181,6 +2187,26 @@ class LocalColonyCompute:
                 # утечки на старых особях).
                 if cid in self._birth_tick:
                     self._update_carried_food_mirror(cid, action, _onf)
+
+                # NAV_DIAG (Фрай): измеряем навигацию к еде + кто доминирует.
+                self._nav["ticks"] += 1
+                if _onf:
+                    self._nav["onf"] += 1
+                if action == 13:        # GATHER
+                    self._nav["gather"] += 1
+                    if _onf:
+                        self._nav["gather_onf"] += 1
+                elif action == 14:      # EAT
+                    self._nav["eat"] += 1
+                if motor_delta is not None:
+                    try:
+                        _sh_arg = int(torch.argmax(
+                            logits[0, :N_ACTIONS]).item())  # shaping-выбор
+                        if _sh_arg != action:               # motor перебил
+                            self._nav["flip"] += 1
+                        self._nav["mnorm"] += float(motor_delta.norm().item())
+                    except Exception:
+                        pass
 
                 # F5 skill-growth (01.06.2026, Фрай): счётчик move (действия
                 # 0-3) + окно 200 тиков → _skill_growth_step (mirror world.py).
@@ -5087,6 +5113,17 @@ class LocalColonyCompute:
                        "eff": round(eff_mean, 2), "sp": _n_sp}
                 self._summary_history.append(_pt)
                 self._last_window = _pt
+                # NAV_DIAG (Фрай): навигация к еде. onf_rate низкий → не доходят
+                # до флоры; flip_rate высокий → motor_policy перебивает shaping
+                # (→ нужен bias_scale curriculum); gather_onf≈0 → нечего собрать.
+                _nt = max(1, self._nav["ticks"])
+                logger.info(
+                    "NAV_DIAG ticks=%d onf_rate=%.3f gather=%d gather_onf=%d "
+                    "eat=%d flip_rate=%.3f motor_norm=%.3f",
+                    self._nav["ticks"], self._nav["onf"] / _nt,
+                    self._nav["gather"], self._nav["gather_onf"],
+                    self._nav["eat"], self._nav["flip"] / _nt,
+                    self._nav["mnorm"] / _nt)
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
@@ -5095,6 +5132,8 @@ class LocalColonyCompute:
             self._e_income_sum = 0.0
             self._e_cost_sum = 0.0
             self._e_infdrain_sum = 0.0
+            self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
+                         "eat": 0, "flip": 0, "mnorm": 0.0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.

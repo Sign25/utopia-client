@@ -1716,6 +1716,20 @@ class ColonyWSClient:
             # passive-income — особь ТОЧНО на flora-тайле.
             on_flora_per_cid[cid_s] = bool(
                 _rc is not None and (_rc[0], _rc[1]) in flora_pos)
+            # NAV_VIS (01.06.2026, Фрай): видят ли флору в радиусе зрения (vr) +
+            # on_flora-rate. Низкий sees_rate → «пустыни»/мало флоры; высокий
+            # sees, низкий onf → видят, но не доходят (навигация). Аккумулируем.
+            if not hasattr(self, "_nav_vis"):
+                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
+            _nv = self._nav_vis
+            _nv["cids"] += 1
+            if on_flora_per_cid[cid_s]:
+                _nv["onf"] += 1
+            if _rc is not None:
+                _vr = int(float((self.compute.traits.get(cid_s) or {}).get(
+                    "vision_radius", 7) or 7)) if self.compute else 7
+                if self._flora_in_radius(_rc[0], _rc[1], flora_pos, _vr):
+                    _nv["sees"] += 1
             _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
             if _p40_dh is not None and _p40_dh != 0.0:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh
@@ -1762,8 +1776,33 @@ class ColonyWSClient:
                         c.get("telomere_decay_now", 0.0) or 0.0),
                     "thirst_now": float(c.get("thirst_now", 0.0) or 0.0),
                 }
+        # NAV_VIS периодический лог (раз в ~300 батчей ≈ 60с при 5Гц).
+        if hasattr(self, "_nav_vis"):
+            self._nav_vis["batches"] += 1
+            if self._nav_vis["batches"] >= 300:
+                _nv = self._nav_vis
+                _cc = max(1, _nv["cids"])
+                logger.info(
+                    "NAV_VIS batches=300 sees_flora_rate=%.3f onf_rate=%.3f "
+                    "flora_total=%d cid_samples=%d",
+                    _nv["sees"] / _cc, _nv["onf"] / _cc, len(flora_pos),
+                    _nv["cids"])
+                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
         return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
                 on_flora_per_cid)
+
+    @staticmethod
+    def _flora_in_radius(row: int, col: int, flora_pos: dict, vr: int) -> bool:
+        """Есть ли флора в манхэттен-радиусе vr от (row,col). Ранний выход на
+        первой найденной. Без torus-wrap (диагностика, край-эффект мал)."""
+        if not flora_pos or vr <= 0:
+            return False
+        for dr in range(-vr, vr + 1):
+            rem = vr - abs(dr)
+            for dc in range(-rem, rem + 1):
+                if (row + dr, col + dc) in flora_pos:
+                    return True
+        return False
 
     async def _handle_obs_batch(self, msg: dict) -> None:
         creatures = msg.get("creatures") or []
