@@ -1977,6 +1977,26 @@ class LocalColonyCompute:
             # (§3) + починкой income, не раньше. Сейчас живого Адама нет, код
             # стейджится; не tag'ать+гонять автономного Адама в зазоре до §3.
             self._bias_scale = 0.0
+            # Bootstrap-race fix (баг live 01.06): на рестарте флаг применяется
+            # на ~8с ПОЗЖЕ restore (нужен command-poll). В этом окне активен
+            # КОЛОНИАЛЬНЫЙ death-check — если persisted energy=0 (голодавший
+            # прогон), Адам умирает → _dead_cids → handle_tick его скипает →
+            # ЗАМОРОЗКА навсегда (метаболизм/mental_break не тикают). Под
+            # single_organism смерти нет → оживляем dead-marked: un-mark + снять
+            # paralysis + дать стартовую энергию (recovery), чтобы не зависнуть
+            # в параличе сразу. Идемпотентно.
+            _revived = 0
+            for _cid in list(self._dead_cids):
+                self._dead_cids.discard(_cid)
+                self._paralysis_until.pop(_cid, None)
+                _bc = self.biochem.get(_cid)
+                if _bc is not None and float(getattr(_bc, "energy", 0.0)) <= 0.0:
+                    _bc.energy = float(self._recovery_energy)
+                _revived += 1
+            if _revived:
+                logger.info(
+                    "single_organism: revived %d dead-marked особей "
+                    "(bootstrap race fix)", _revived)
         return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
