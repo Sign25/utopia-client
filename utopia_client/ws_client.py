@@ -1724,19 +1724,11 @@ class ColonyWSClient:
             if events_per_cid[cid_s]["delta_energy"] == 0.0 and _rc is not None:
                 _fe = self._flora_income(_rc[0], _rc[1], flora_pos)
                 if _fe > 0.0:
-                    # kleiber-efficiency (02.06.2026, Фрай): income ∝ (eff/10)^
-                    # (1/φ) как сервер (world.py:3105). Мой fixed income терял
-                    # множитель → сломан Lamarckian loop (ешь→eff↑→income↑) →
-                    # маргинальность. eff дефолт 10 (server), eff=15→×1.29.
-                    _eff = 10.0
-                    if self.compute is not None:
-                        _eff = float((self.compute.traits.get(cid_s) or {}).get(
-                            "efficiency", 10) or 10)
-                    # FLOOR 1.0 (02.06.2026): eff застряла на 5 (ПОЛ) при
-                    # маргинальном питании → kleiber(5)=0.65 срезал income →
-                    # спираль. Floor убирает штраф (eff<10 → ×1.0), сохраняя
-                    # upside (eff>10 → >1×). Не штрафуем голодных ещё сильнее.
-                    _fe *= max(1.0, (_eff / 10.0) ** (1.0 / 1.618033988749895))
+                    # ОТКАТ kleiber-coupling (02.06.2026, Шеф «перемудрил»):
+                    # добавил серверный множитель (0.11.50), не проверив что eff
+                    # здоров → eff застряла на 5 → kleiber(5)=0.65 срезал income
+                    # → backfire → залатал floor'ом → no-op. Упрощаю до fixed
+                    # income; вернём корректную модель после описания Хьюберта.
                     events_per_cid[cid_s]["delta_energy"] = _fe
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
