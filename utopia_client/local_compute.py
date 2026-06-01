@@ -432,6 +432,15 @@ class LocalColonyCompute:
         # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                            "eat": 0, "flip": 0, "mnorm": 0.0}
+        # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
+        # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
+        # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
+        # shaping ведёт, motor подавлен) → decay по ratio n_alive/target →
+        # motor автономен. NAV-данные подтвердили: motor перебивал shaping
+        # (flip_rate 0.6, motor_norm≈shaping) → голод. Каждые 1000 world-тиков.
+        self._bias_scale: float = 1.0
+        self._alive_ema: float = 0.0
+        self._bias_last_update_tick: int = 0
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -2097,6 +2106,7 @@ class LocalColonyCompute:
         self.tick_ts.append(time.time())
         self._last_world_tick = int(world_tick)  # для age/ts в colony_summary
         self._apply_bootstrap_pending(world_tick)
+        self._update_bias_curriculum(world_tick)
         out: dict = {}
         torch = self._torch
         # Снапшот итерации: self.organisms мутируется из main-потока
@@ -2173,8 +2183,13 @@ class LocalColonyCompute:
 
                 motor_delta = self._motor_forward(cid, obs_tensor)
                 selector = self.action_selectors[cid]
-                if motor_delta is not None:
-                    action_slice = logits[0, :N_ACTIONS] + motor_delta
+                # Кроссфейд (порт server loop.py:603): own_contribution =
+                # max(0, 1-bias_scale) масштабирует motor_delta. bias_scale=1.0
+                # (untrained) → motor×0 → shaping (флора-градиент) ведёт чисто
+                # → доходят до еды; bias_scale→0 (обучена) → motor автономен.
+                _own = max(0.0, 1.0 - float(self._bias_scale))
+                if motor_delta is not None and _own > 0.0:
+                    action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
@@ -3296,6 +3311,40 @@ class LocalColonyCompute:
         if carried > 0:
             logits[14] += 2.0 * instinct   # EAT когда есть что есть
 
+    _BIAS_ALIVE_EMA_ALPHA: float = 0.05   # server routes_world.py:543
+
+    def _update_bias_curriculum(self, world_tick: int) -> None:
+        """Порт server curriculum bias_scale (loop.py:607-636). Каждые 1000
+        world-тиков: ratio = n_alive / effective_target (адаптивный EMA-таргет).
+        ratio>=0.95 → bias_scale -= 0.05 (колония устойчива, отпускаем motor);
+        ratio<0.7 → += 0.1 (крах, shaping снова доминирует); между — держим.
+
+        own_contribution = max(0, 1-bias_scale) масштабирует motor_delta при
+        выборе action (handle_tick). target = ёмкость колонии (как mate-cap)."""
+        if int(world_tick) - self._bias_last_update_tick < 1000:
+            return
+        self._bias_last_update_tick = int(world_tick)
+        n_alive = sum(1 for c in self.organisms if c not in self._dead_cids)
+        target = float(self._get_hw_capacity() or 20)
+        if self._alive_ema <= 0.0:
+            self._alive_ema = float(max(n_alive, target))
+        floor = max(1.0, target * 0.5)
+        effective_target = max(self._alive_ema, floor)
+        ratio = n_alive / effective_target if effective_target > 0 else 1.0
+        old = self._bias_scale
+        if ratio >= 0.95:
+            self._bias_scale = max(0.0, self._bias_scale - 0.05)
+        elif ratio < 0.7:
+            self._bias_scale = min(1.0, self._bias_scale + 0.1)
+        self._alive_ema = (self._BIAS_ALIVE_EMA_ALPHA * n_alive
+                           + (1.0 - self._BIAS_ALIVE_EMA_ALPHA) * self._alive_ema)
+        if abs(self._bias_scale - old) > 0.001:
+            logger.info(
+                "bias_scale curriculum %.2f → %.2f (alive=%d ema=%.1f "
+                "ratio=%.2f own_contrib=%.2f tick=%d)",
+                old, self._bias_scale, n_alive, self._alive_ema, ratio,
+                max(0.0, 1.0 - self._bias_scale), int(world_tick))
+
     def _apply_bootstrap_pending(self, world_tick: int) -> None:
         """Bootstrap (Фрай): омолодить restored-особей — birth_tick=now →
         инстинкт активен 500т → учатся есть тем же механизмом, что newborn.
@@ -3346,7 +3395,7 @@ class LocalColonyCompute:
         """
         try:
             n = len(obs_arr)
-            BS = 1.0  # _bias_scale (server default 1.0; на клиенте фикс)
+            BS = float(self._bias_scale)  # curriculum (порт server _bias_scale)
             PHI = 1.6180339887
             # Флора-градиент (иди к еде). Травоядный (diet→0) сильнее.
             g_ns = float(obs_arr[33]) if n > 34 else 0.0
