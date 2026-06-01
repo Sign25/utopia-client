@@ -45,6 +45,15 @@ _DEHYDRATION_DRAIN_SCALE = 0.1
 _DEHYDRATION_DRAIN = {2: _PHI_CONST ** 2 * _DEHYDRATION_DRAIN_SCALE,
                       3: _PHI_CONST ** 3 * _DEHYDRATION_DRAIN_SCALE}
 
+# Метаболизм per-sec (01.06.2026, Хьюберт): rate × wall-clock dt. Клемп dt —
+# чтобы reconnect-разрыв (организм отсутствовал минуты) не списал разом.
+_MAX_METAB_DT = 3.0          # сек; типичный интервал handle_tick ~2.4с
+# Infection client-side per-sec: server world.py 0.005/sim-тик при sim 30 Гц
+# (Хьюберт) → 0.15/сек прогресс; energy-drain 2.0/sim-тик → 60/сек × severity.
+_SIM_TPS = 30.0
+_INFECTION_SEVERITY_PER_SEC = 0.005 * _SIM_TPS   # 0.15/сек
+_INFECTION_DRAIN_PER_SEC = 2.0 * _SIM_TPS        # 60/сек × severity
+
 
 def _dehydration_stage(hydration: float, max_hydration: float) -> int:
     """0=норма, 1=жажда, 2=обезвоживание, 3=критическое (world.py:909)."""
@@ -432,14 +441,15 @@ class LocalColonyCompute:
         # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                            "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0}
-        # Contract ×2 fix (01.06.2026, Хьюберт audit): server применяет step_cost
-        # раз/server-тик; handle_tick зовётся ЧАЩЕ (дубли world_tick) → client
-        # дренил ×2. Метаболизм — раз на РАЗЛИЧНЫЙ server-тик (per-cid last tick).
-        self._last_metab_tick: dict = {}     # cid → world_tick последнего метаб.
-        self._metab_applies: int = 0          # применено (различные тики)
-        self._metab_skips: int = 0            # скипнуто (дубли тика) — verify ×2
-        self._metab_dworld_sum: int = 0       # Σ Δworld_tick — гранулярность тика
-        self._metab_sc_sum: float = 0.0       # Σ step_cost_now — реальный rate
+        # Contract per-sec (01.06.2026, Хьюберт): server чист (0.272), двоение
+        # у нас — obs 6Hz vs sim 30Hz, применяли rate лишний раз. Решение: P40
+        # шлёт rate в energy/СЕК, client интегрирует energy -= rate × dt_wallclock
+        # между applies. Убирает tick-mismatch НАВСЕГДА, независимо от client TPS
+        # (dworld был ~36 — handle_tick тяжёлый). Все 4 оси в _apply_metabolism.
+        self._last_metab_wall: dict = {}     # cid → wall-clock последнего apply
+        self._metab_applies: int = 0          # для METAB_DIAG
+        self._metab_dt_sum: float = 0.0       # Σ dt_seconds — средний интервал
+        self._metab_sc_sum: float = 0.0       # Σ step_cost_now (per-sec rate)
         # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
         # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
         # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
@@ -1008,7 +1018,7 @@ class LocalColonyCompute:
         # Newborn-инстинкт (Фрай): снять трекинг рождения + зеркало carried_food.
         self._birth_tick.pop(cid, None)
         self._carried_food.pop(cid, None)
-        self._last_metab_tick.pop(cid, None)  # contract ×2 guard
+        self._last_metab_wall.pop(cid, None)  # contract per-sec dt-интеграция
         # S2.B — theory_of_mind.
         self.theory_of_mind.pop(cid, None)
         self.theory_of_mind_opt.pop(cid, None)
@@ -5055,25 +5065,28 @@ class LocalColonyCompute:
         """
         if not rates:
             return
-        # Contract ×2 fix (Хьюберт audit): server применяет rate РАЗ на server-
-        # тик. handle_tick зовётся чаще (дубли world_tick) → дренили ×2. Дреним
-        # раз на РАЗЛИЧНЫЙ server-тик; повторный handle_tick того же тика — skip.
-        _wt = int(self._last_world_tick)
-        _prev = self._last_metab_tick.get(cid)
-        if _prev == _wt:
-            self._metab_skips += 1
+        # Contract per-sec (Хьюберт): rate в energy/СЕК; интегрируем по wall-clock
+        # dt между applies → energy -= rate × dt. Tick-mismatch уходит независимо
+        # от client TPS (handle_tick ~раз в 2.4с при dworld~36). dt клемпуется,
+        # чтобы reconnect-разрыв не убил разом; первый apply — только засечь время.
+        _now = time.time()
+        _last_wall = self._last_metab_wall.get(cid)
+        self._last_metab_wall[cid] = _now
+        if _last_wall is None:
             return
-        if _prev is not None:
-            self._metab_dworld_sum += max(0, _wt - _prev)  # Δworld_tick/apply
-        self._last_metab_tick[cid] = _wt
+        dt = min(_MAX_METAB_DT, max(0.0, _now - _last_wall))
+        if dt <= 0.0:
+            return
         self._metab_applies += 1
+        self._metab_dt_sum += dt
         bc = self.biochem.get(cid)
         org = self.organisms.get(cid)
         try:
-            step_cost = float(rates.get("step_cost_now", 0.0) or 0.0)
-            self._metab_sc_sum += step_cost  # реальный rate от P40 (verify ×2)
-            thirst = float(rates.get("thirst_now", 0.0) or 0.0)
-            tel_decay = float(rates.get("telomere_decay_now", 0.0) or 0.0)
+            _sc_rate = float(rates.get("step_cost_now", 0.0) or 0.0)
+            self._metab_sc_sum += _sc_rate          # per-sec rate (METAB_DIAG)
+            step_cost = _sc_rate * dt                # energy/сек × сек
+            thirst = float(rates.get("thirst_now", 0.0) or 0.0) * dt
+            tel_decay = float(rates.get("telomere_decay_now", 0.0) or 0.0) * dt
         except (TypeError, ValueError):
             return
         if bc is not None:
@@ -5099,7 +5112,7 @@ class LocalColonyCompute:
                 max_h = float(getattr(bc, "max_hydration", 100.0))
                 stage = _dehydration_stage(
                     float(getattr(bc, "hydration", max_h)), max_h)
-                drain = _DEHYDRATION_DRAIN.get(stage, 0.0)
+                drain = _DEHYDRATION_DRAIN.get(stage, 0.0) * dt  # per-sec × dt
                 if drain > 0.0:
                     bc.energy = max(
                         0.0, float(getattr(bc, "energy", 0.0)) - drain)
@@ -5111,17 +5124,18 @@ class LocalColonyCompute:
                 pass
         # Infection (01.06.2026, Фрай): owned-инфекцию ТИКАЕТ КЛИЕНТ (P40
         # phase-out перестаёт убивать owned от infection). Mirror world.py:
-        # 4574-4588: severity +0.005/тик (cap 1.0), energy -= severity*2.0
-        # (болезнь). Затрагивает ТОЛЬКО заражённых; вода лечит (income-путь);
-        # contact от соседа — P40 шлёт infected event (_apply_biochem_events).
+        # 4574-4588 (per-sec × dt, как остальные оси — Хьюберт): severity
+        # +0.15/сек (cap 1.0), energy -= 60/сек × severity. Затрагивает ТОЛЬКО
+        # заражённых; вода лечит; contact от соседа — P40 шлёт infected event.
         if bc is not None:
             _sev = float(getattr(bc, "infection_severity", 0.0) or 0.0)
             if _sev > 0.0:
-                _sev = min(1.0, _sev + 0.005)
+                _sev = min(1.0, _sev + _INFECTION_SEVERITY_PER_SEC * dt)
                 bc.infection_severity = _sev
+                _idrain = _sev * _INFECTION_DRAIN_PER_SEC * dt
                 bc.energy = max(
-                    0.0, float(getattr(bc, "energy", 0.0)) - _sev * 2.0)
-                self._e_infdrain_sum += _sev * 2.0  # ENERGY_CALIB
+                    0.0, float(getattr(bc, "energy", 0.0)) - _idrain)
+                self._e_infdrain_sum += _idrain  # ENERGY_CALIB
         # Death-check: голод (energy<=0) + старость (telomere AGONY) + инфекция
         # (severity>=1.0). Жажда/инфекция грызут energy → starvation; критическая
         # инфекция — отдельная причина. Единый death-envelope (Фрай: градиентно).
@@ -5223,17 +5237,15 @@ class LocalColonyCompute:
                     self._nav["flip"] / _nt, self._nav["mnorm"] / _nt)
                 # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
                 # server-тика (handle_tick ×2). applies = реальные server-тики.
-                _mt = max(1, self._metab_applies + self._metab_skips)
                 _ma = max(1, self._metab_applies)
                 logger.info(
-                    "METAB_DIAG applies=%d skips=%d skip_rate=%.3f "
-                    "mean_step_cost=%.3f mean_dworld=%.2f",
-                    self._metab_applies, self._metab_skips,
-                    self._metab_skips / _mt, self._metab_sc_sum / _ma,
-                    self._metab_dworld_sum / _ma)
+                    "METAB_DIAG applies=%d mean_rate_per_sec=%.3f mean_dt=%.2f "
+                    "mean_drain_per_apply=%.3f",
+                    self._metab_applies, self._metab_sc_sum / _ma,
+                    self._metab_dt_sum / _ma,
+                    (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma))
                 self._metab_applies = 0
-                self._metab_skips = 0
-                self._metab_dworld_sum = 0
+                self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
