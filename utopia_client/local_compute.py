@@ -2492,7 +2492,13 @@ class LocalColonyCompute:
                             _reason = str((_ds[0] or {}).get("reason", "suppressed"))
                         except Exception:
                             pass
-                        self._enter_paralysis(cid, _reason)
+                        # starvation/energy — домен триггера 1 (energy≤0), НЕ
+                        # дублируем: P40 не должен слать death_suppressed по
+                        # energy-оси (контракт Фрая «P40 не пишет owned energy»);
+                        # если шлёт — игнорим, иначе ре-арм глушит recovery.
+                        # Триггер 2 — только non-energy векторы (pvp/age/...).
+                        if "starv" not in _reason.lower():
+                            self._enter_paralysis(cid, _reason)
                 # Body Migration метаболизм (31.05.2026, Бендер; контракт
                 # Хьюберт): client-authoritative энергозатрата/гидрация/теломеры.
                 # P40 шлёт effective rates (step_cost_now/thirst_now/
@@ -4343,8 +4349,14 @@ class LocalColonyCompute:
         death_suppressed от P40). Idempotent: повторный вызов в активном
         параличе НЕ продлевает (избегаем «вечного» паралича от потока событий).
         record paralysis_enter — P40 через projection False→True."""
-        if cid in self._paralysis_until and time.monotonic() < self._paralysis_until[cid]:
-            return  # уже парализован — не продлеваем
+        # Idempotent: если cid уже в паралич-цикле (ДАЖЕ с истёкшим дедлайном) —
+        # НЕ ре-армим. Иначе поток триггеров (P40 шлёт death_suppressed каждый
+        # тик при energy=0) ре-армил бы дедлайн на каждом expiry → recovery в
+        # _apply_metabolism никогда не срабатывал → вечный паралич, energy
+        # застряла на 0 (баг найден live 01.06: 419 start / 1 recovery). Снятие
+        # дедлайна — ТОЛЬКО recovery (по expiry) или remove_creature.
+        if cid in self._paralysis_until:
+            return
         self._paralysis_until[cid] = time.monotonic() + _PARALYSIS_SEC
         logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
                     cid, reason, _PARALYSIS_SEC)

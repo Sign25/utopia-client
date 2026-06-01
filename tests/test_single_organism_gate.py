@@ -285,6 +285,20 @@ def test_enter_paralysis_idempotent(compute_with_two_zodchiy):
     assert c._paralysis_until[cid] == d1
 
 
+def test_enter_paralysis_no_rearm_when_expired(compute_with_two_zodchiy):
+    """Баг live 01.06: _enter_paralysis НЕ ре-армит при ИСТЁКШЕМ дедлайне —
+    иначе поток death_suppressed глушил recovery (419 start / 1 recovery)."""
+    import time
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c._paralysis_until[cid] = time.monotonic() - 1.0   # ИСТЁКШИЙ дедлайн
+    d_expired = c._paralysis_until[cid]
+    c._enter_paralysis(cid, "starved")                 # не должен ре-армить
+    assert c._paralysis_until[cid] == d_expired         # дедлайн НЕ обновлён →
+    #                                                     recovery в metab снимет
+
+
 # ── Гейт колониального mental_break (Фрай watch-item, §1) ─────────────
 
 def _set_loner_biochem(bc):
