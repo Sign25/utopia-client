@@ -1,6 +1,6 @@
 """Body Migration метаболизм client-side (31.05.2026, Бендер; контракт Хьюберт).
 
-P40 шлёт effective rates (step_cost_now/telomere_decay_now/thirst_now), client
+P40 шлёт effective rates (step_cost_per_sec/telomere_decay_per_sec/thirst_per_sec), client
 интегрирует energy/hydration/telomere + death-check (голод energy<=0 / старость
 telomere AGONY) → projection alive=False → P40 убирает. Закрывает death pressure
 (P40 phase-out не тикал owned → 9× перенаселение).
@@ -51,8 +51,8 @@ def _apply(c, cid, rates, dt=1.0):
 
 def test_energy_decay():
     c, org, bc = _compute_with_org(energy=500.0)
-    _apply(c, "c1", {"step_cost_now": 30.0,    # 30/сек × 1с
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    _apply(c, "c1", {"step_cost_per_sec": 30.0,    # 30/сек × 1с
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})
     assert bc.energy == 470.0
     assert "c1" not in c._dead_cids
 
@@ -63,8 +63,8 @@ def test_metab_first_apply_only_records():
     _orig = _lcm.time.time
     _lcm.time.time = lambda: 1000.0
     try:
-        c._apply_metabolism("c1", {"step_cost_now": 10.0,
-                                   "telomere_decay_now": 0.0, "thirst_now": 0.0})
+        c._apply_metabolism("c1", {"step_cost_per_sec": 10.0, "_per_sec": True,
+                                   "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})
     finally:
         _lcm.time.time = _orig
     assert bc.energy == 500.0                  # не дренил (нет интервала)
@@ -72,20 +72,31 @@ def test_metab_first_apply_only_records():
 
 
 def test_metab_drain_scales_with_dt():
-    # Wall-clock интеграция: drain = rate × dt, независимо от частоты тиков.
+    # Wall-clock интеграция (per_sec режим): drain = rate × dt.
     c, org, bc = _compute_with_org(energy=500.0)
-    r = {"step_cost_now": 10.0, "telomere_decay_now": 0.0, "thirst_now": 0.0}
+    r = {"step_cost_per_sec": 10.0, "_per_sec": True,
+         "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0}
     _apply(c, "c1", r, dt=1.0)
     assert bc.energy == 490.0                  # 10 × 1с
     _apply(c, "c1", r, dt=2.0)
     assert bc.energy == 470.0                  # 10 × 2с = 20
 
 
-def test_metab_dt_clamped():
-    # Reconnect-разрыв: dt клемпуется (_MAX_METAB_DT=3) — не убить разом.
+def test_metab_legacy_now_no_dt_scale():
+    # LEGACY (*_now, нет _per_sec): dt=1 всегда → per-apply (без over-drain).
     c, org, bc = _compute_with_org(energy=500.0)
-    _apply(c, "c1", {"step_cost_now": 10.0, "telomere_decay_now": 0.0,
-                     "thirst_now": 0.0}, dt=100.0)
+    r = {"step_cost_per_sec": 10.0, "telomere_decay_per_sec": 0.0,
+         "thirst_per_sec": 0.0}  # без "_per_sec"
+    _apply(c, "c1", r, dt=2.0)                  # dt=2, но legacy → ×1
+    assert bc.energy == 490.0                   # 10 × 1 (не 20)
+
+
+def test_metab_dt_clamped():
+    # Reconnect-разрыв (per_sec): dt клемпуется (_MAX_METAB_DT=3) — не убить разом.
+    c, org, bc = _compute_with_org(energy=500.0)
+    _apply(c, "c1", {"step_cost_per_sec": 10.0, "_per_sec": True,
+                     "telomere_decay_per_sec": 0.0,
+                     "thirst_per_sec": 0.0}, dt=100.0)
     assert bc.energy == 500.0 - 10.0 * 3.0     # клемп до 3с → 30
 
 
@@ -94,8 +105,8 @@ def test_thirst_decays_calibration_mode():
     cid). Смерть от жажды ОТКЛ (см. ниже). Аккумулятор thirst_sum растёт."""
     c, org, bc = _compute_with_org(hydration=80.0)
     c._hydration_active.add("c1")
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 15.0})
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 15.0})
     assert bc.hydration == 65.0  # декей применён (калибровка)
     assert c._hyd_thirst_sum == 15.0  # аккумулятор для calib-лога
 
@@ -104,8 +115,8 @@ def test_thirst_unconditional_now():
     """01.06: водный контур client-authoritative — жажда БЕЗУСЛОВНА (доход
     теперь client-side из террейна, gate _hydration_active убран)."""
     c, org, bc = _compute_with_org(hydration=80.0)
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 15.0})
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 15.0})
     assert bc.hydration == 65.0  # декей применён даже без _hydration_active
 
 
@@ -115,8 +126,8 @@ def test_no_dehydration_death_while_damage_disabled():
     c, org, bc = _compute_with_org(energy=342.0, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
     c._dehydration_damage_enabled = False  # явно (дефолт 0.11.34 = True)
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 30.0})
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 30.0})
     assert "c1" not in c._dead_cids  # ЖИВ (energy_drain выключен)
     assert bc.energy == 342.0       # энергия не тронута жаждой
 
@@ -230,8 +241,8 @@ def test_infection_ticks_and_drains_energy():
     energy -= 60/сек × severity. dt=1с: severity 0.5→0.65, drain 0.65×60=39."""
     c, org, bc = _compute_with_org(energy=100.0)
     bc.infection_severity = 0.5
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0}, dt=1.0)
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0}, dt=1.0)
     assert abs(bc.infection_severity - 0.65) < 1e-6
     assert abs(bc.energy - (100.0 - 0.65 * 60.0)) < 1e-6
 
@@ -241,8 +252,8 @@ def test_infection_death_at_severity_1():
     c, org, bc = _compute_with_org(energy=500.0)
     c.organisms["c1"].telomere = 0.999
     bc.infection_severity = 0.95
-    _apply(c, "c1", {"step_cost_now": 0.0,         # +0.15×1 → 1.0 cap
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0}, dt=1.0)
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,         # +0.15×1 → 1.0 cap
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0}, dt=1.0)
     assert bc.infection_severity >= 1.0
     assert "c1" in c._dead_cids
 
@@ -373,8 +384,8 @@ def test_dehydration_energy_drain_when_enabled():
     рекалиброванный дрейн под client-tick, не полный φ²)."""
     c, org, bc = _compute_with_org(energy=100.0, hydration=10.0)
     c._dehydration_damage_enabled = True
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})  # dt=1
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})  # dt=1
     assert abs(bc.energy - (100.0 - 1.618033988749895 ** 2 * 0.1)) < 1e-6
 
 
@@ -386,8 +397,8 @@ def test_dehydration_death_via_energy():
     c, org, bc = _compute_with_org(energy=0.3, hydration=0.0)
     c.organisms["c1"].telomere = 0.999
     c._dehydration_damage_enabled = True
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})  # dt=1
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})  # dt=1
     assert bc.energy == 0.0          # 0.3 − φ³×0.1≈0.424 → clamp 0
     assert "c1" in c._dead_cids      # смерть через энергию
 
@@ -405,15 +416,15 @@ def test_delta_hydration_income_still_works():
 
 def test_telomere_decay():
     c, org, bc = _compute_with_org(telomere=0.5)
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.1, "thirst_now": 0.0})  # 0.1×1с
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.1, "thirst_per_sec": 0.0})  # 0.1×1с
     assert abs(org.telomere - 0.4) < 1e-9
 
 
 def test_starvation_death():
     c, org, bc = _compute_with_org(energy=20.0)
-    _apply(c, "c1", {"step_cost_now": 30.0,  # 30×1 > energy → 0
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    _apply(c, "c1", {"step_cost_per_sec": 30.0,  # 30×1 > energy → 0
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})
     assert bc.energy == 0.0
     assert "c1" in c._dead_cids  # голод
 
@@ -425,8 +436,8 @@ def test_telomere_agony_death():
     # подберём telomere в фазе AGONY
     assert get_phase(0.0) == TelomerePhase.AGONY
     org.telomere = 0.0
-    _apply(c, "c1", {"step_cost_now": 0.0,
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    _apply(c, "c1", {"step_cost_per_sec": 0.0,
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})
     assert "c1" in c._dead_cids  # старость
 
 
@@ -439,8 +450,8 @@ def test_no_rates_noop():
 
 def test_clamp_energy_nonnegative():
     c, org, bc = _compute_with_org(energy=10.0)
-    _apply(c, "c1", {"step_cost_now": 999.0,  # 999×1 ≫ energy → 0
-                     "telomere_decay_now": 0.0, "thirst_now": 0.0})
+    _apply(c, "c1", {"step_cost_per_sec": 999.0,  # 999×1 ≫ energy → 0
+                     "telomere_decay_per_sec": 0.0, "thirst_per_sec": 0.0})
     assert bc.energy == 0.0  # не уходит в минус
 
 

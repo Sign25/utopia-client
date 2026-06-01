@@ -2103,7 +2103,8 @@ class LocalColonyCompute:
                     intero_per_cid: Optional[dict] = None,
                     world_tick: int = 0,
                     rates_per_cid: Optional[dict] = None,
-                    on_flora_per_cid: Optional[dict] = None) -> dict:
+                    on_flora_per_cid: Optional[dict] = None,
+                    carried_food_per_cid: Optional[dict] = None) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
@@ -2180,8 +2181,9 @@ class LocalColonyCompute:
                 # Phase 4 (01.06.2026): контекстный шейпинг логитов до motor_delta
                 # (порт _decide_action) — даёт сигнал «иди к еде/беги/атакуй»,
                 # без которого ActionSelector коллапсирует в move-only → голод.
-                # Флора-под-ногами (до try — нужно и зеркалу carried_food ниже).
+                # on_flora + carried_food (P40 authoritative > client зеркало).
                 _onf = bool((on_flora_per_cid or {}).get(cid, False))
+                _p40_cf = (carried_food_per_cid or {}).get(cid)  # None если нет
                 try:
                     _diet = float((self.traits.get(cid) or {}).get(
                         "diet_gene", 0.5) or 0.5)
@@ -2195,7 +2197,7 @@ class LocalColonyCompute:
                     # motor_policy доучивается есть до затухания инстинкта →
                     # Lamarckian (eat→eff↑→income↑). passive_eating — бэкстоп.
                     self._apply_newborn_instinct(
-                        cid, logits[0], world_tick, _onf)
+                        cid, logits[0], world_tick, _onf, _p40_cf)
                 except Exception as e:
                     logger.debug("action shaping %s: %s", cid, e)
 
@@ -2214,11 +2216,10 @@ class LocalColonyCompute:
                     action = int(selector.select(logits, n_actions=N_ACTIONS))
                 out[cid] = {"action": action, "target_id": None}
 
-                # carried_food зеркало (mirror server world.py:3048-3141) для
-                # newborn EAT-инстинкта: GATHER на флоре +1 (cap5), EAT/
-                # SHARE_FOOD -1. Только для трекаемых newborn (экономия + без
-                # утечки на старых особях).
-                if cid in self._birth_tick:
+                # carried_food зеркало — ТОЛЬКО fallback, если P40 не шлёт
+                # authoritative carried_food (переходный период). Когда P40
+                # шлёт (_p40_cf не None) — зеркало не нужно (P40 = истина).
+                if _p40_cf is None and cid in self._birth_tick:
                     self._update_carried_food_mirror(cid, action, _onf)
 
                 # NAV_DIAG (Фрай): измеряем навигацию к еде + кто доминирует.
@@ -3309,16 +3310,17 @@ class LocalColonyCompute:
     _CARRIED_FOOD_CAP = 5            # F(5) (world.py:735, carried_food cap)
 
     def _apply_newborn_instinct(self, cid: str, logits, world_tick: int,
-                                on_flora: bool) -> None:
+                                on_flora: bool,
+                                carried_food: "Optional[int]" = None) -> None:
         """Newborn-инстинкт GATHER/EAT (порт server phase_a.py:748-755).
 
         age = world_tick - birth_tick; instinct = max(0, 1 - age/500) — линейно
         затухает за 500 тиков. Пока instinct>0:
           GATHER(13) += 2*instinct — если на флоре и carried_food<5;
           EAT(14)    += 2*instinct — если carried_food>0.
-        Только client-рождённые (есть birth_tick); остальные → no-op. logits —
-        torch[16]-вью, мутируется in-place. Когда инстинкт затух — снимаем
-        трекинг (особь «выросла», motor_policy ест сама на выученном reward)."""
+        on_flora + carried_food — P40 authoritative (9f8d99d), убирает desync;
+        carried_food=None → fallback на client-зеркало (переходный период).
+        Только client-рождённые (есть birth_tick); остальные → no-op."""
         bt = self._birth_tick.get(cid)
         if bt is None:
             return
@@ -3328,7 +3330,8 @@ class LocalColonyCompute:
             self._birth_tick.pop(cid, None)
             self._carried_food.pop(cid, None)
             return
-        carried = int(self._carried_food.get(cid, 0))
+        carried = (int(carried_food) if carried_food is not None
+                   else int(self._carried_food.get(cid, 0)))
         if on_flora and carried < self._CARRIED_FOOD_CAP:
             logits[13] += 2.0 * instinct   # GATHER когда есть что собрать
         if carried > 0:
@@ -5069,24 +5072,32 @@ class LocalColonyCompute:
         # dt между applies → energy -= rate × dt. Tick-mismatch уходит независимо
         # от client TPS (handle_tick ~раз в 2.4с при dworld~36). dt клемпуется,
         # чтобы reconnect-разрыв не убил разом; первый apply — только засечь время.
+        # LEGACY (P40 ещё шлёт *_now): dt=1 → per-apply, старое поведение без
+        # over-drain. Авто-апгрейд на dt-интеграцию когда P40 пришлёт *_per_sec.
+        _per_sec = bool(rates.get("_per_sec"))
         _now = time.time()
         _last_wall = self._last_metab_wall.get(cid)
         self._last_metab_wall[cid] = _now
-        if _last_wall is None:
-            return
-        dt = min(_MAX_METAB_DT, max(0.0, _now - _last_wall))
-        if dt <= 0.0:
-            return
+        if _per_sec:
+            if _last_wall is None:
+                return
+            dt = min(_MAX_METAB_DT, max(0.0, _now - _last_wall))
+            if dt <= 0.0:
+                return
+        else:
+            dt = 1.0  # legacy *_now: per-apply (rate as-is), без dt-масштаба
         self._metab_applies += 1
         self._metab_dt_sum += dt
         bc = self.biochem.get(cid)
         org = self.organisms.get(cid)
         try:
-            _sc_rate = float(rates.get("step_cost_now", 0.0) or 0.0)
+            # *_per_sec (контракт Хьюберта); ws_client нормализует *_now→*_per_sec
+            # на переходный период (fallback), чтобы не было окна rate=0.
+            _sc_rate = float(rates.get("step_cost_per_sec", 0.0) or 0.0)
             self._metab_sc_sum += _sc_rate          # per-sec rate (METAB_DIAG)
             step_cost = _sc_rate * dt                # energy/сек × сек
-            thirst = float(rates.get("thirst_now", 0.0) or 0.0) * dt
-            tel_decay = float(rates.get("telomere_decay_now", 0.0) or 0.0) * dt
+            thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
+            tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
         except (TypeError, ValueError):
             return
         if bc is not None:

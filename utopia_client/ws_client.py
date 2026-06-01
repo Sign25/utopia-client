@@ -1616,9 +1616,12 @@ class ColonyWSClient:
         events_per_cid: dict = {}
         intero_per_cid: dict = {}
         rates_per_cid: dict = {}
-        # Newborn-инстинкт (01.06.2026, Фрай/Хьюберт): флора-под-ногами per cid
-        # для GATHER-bias. cache.flora даёт карту, _resolve_pos — позицию.
+        # Newborn-инстинкт (01.06.2026, Фрай/Хьюберт): on_flora + carried_food.
+        # P40 шлёт authoritative on_flora/flora_kind/carried_food (deploy 9f8d99d)
+        # — убирает desync (client-угадывание по stale cache.flora+creature_pos →
+        # p40_ate=0). Предпочитаем P40, fallback на кэш (переходный период).
         on_flora_per_cid: dict = {}
+        carried_food_per_cid: dict = {}
         cache = getattr(self, "world_cache", None)
         local_builder_ready = bool(
             cache is not None and getattr(cache, "is_bootstrapped", False))
@@ -1712,10 +1715,20 @@ class ColonyWSClient:
             _p40_dh = (float(c.get("delta_hydration", 0.0) or 0.0)
                        if "delta_hydration" in c else None)
             _rc = self._resolve_pos(cid_s, c)
-            # Флора-под-ногами (newborn GATHER-инстинкт). Та же flora_pos, что
-            # passive-income — особь ТОЧНО на flora-тайле.
-            on_flora_per_cid[cid_s] = bool(
-                _rc is not None and (_rc[0], _rc[1]) in flora_pos)
+            # on_flora: P40 authoritative (9f8d99d) > client cache.flora fallback.
+            _p40_onf = c.get("on_flora")
+            if _p40_onf is not None:
+                on_flora_per_cid[cid_s] = bool(_p40_onf)
+            else:
+                on_flora_per_cid[cid_s] = bool(
+                    _rc is not None and (_rc[0], _rc[1]) in flora_pos)
+            # carried_food: P40 authoritative (physics на P40) — если шлёт.
+            _p40_cf = c.get("carried_food")
+            if _p40_cf is not None:
+                try:
+                    carried_food_per_cid[cid_s] = int(_p40_cf)
+                except (TypeError, ValueError):
+                    pass
             # NAV_VIS (01.06.2026, Фрай): видят ли флору в радиусе зрения (vr) +
             # on_flora-rate. Низкий sees_rate → «пустыни»/мало флоры; высокий
             # sees, низкий onf → видят, но не доходят (навигация). Аккумулируем.
@@ -1768,13 +1781,27 @@ class ColonyWSClient:
             # Body Migration метаболизм (31.05.2026, контракт Хьюберт): P40 шлёт
             # effective per-tick rates для owned-zodchiy. Client интегрирует
             # (energy/hydration/telomere) в handle_tick → _apply_metabolism.
-            if ("step_cost_now" in c or "telomere_decay_now" in c
-                    or "thirst_now" in c):
+            # Per-sec контракт (01.06.2026, Хьюберт): P40 переименовывает
+            # *_now → *_per_sec (energy/сек). Нормализуем в *_per_sec, предпочитая
+            # новые ключи, с fallback на *_now — НЕТ окна rate=0 в переходный
+            # период (когда P40 уже шлёт *_per_sec, а handler ждал *_now).
+            _has_ps = any(k in c for k in (
+                "step_cost_per_sec", "telomere_decay_per_sec",
+                "thirst_per_sec"))
+            if _has_ps or any(k in c for k in (
+                    "step_cost_now", "telomere_decay_now", "thirst_now")):
                 rates_per_cid[cid_s] = {
-                    "step_cost_now": float(c.get("step_cost_now", 0.0) or 0.0),
-                    "telomere_decay_now": float(
-                        c.get("telomere_decay_now", 0.0) or 0.0),
-                    "thirst_now": float(c.get("thirst_now", 0.0) or 0.0),
+                    "step_cost_per_sec": float(c.get(
+                        "step_cost_per_sec", c.get("step_cost_now", 0.0)) or 0.0),
+                    "telomere_decay_per_sec": float(c.get(
+                        "telomere_decay_per_sec",
+                        c.get("telomere_decay_now", 0.0)) or 0.0),
+                    "thirst_per_sec": float(c.get(
+                        "thirst_per_sec", c.get("thirst_now", 0.0)) or 0.0),
+                    # Режим: P40 уже шлёт *_per_sec → wall-clock dt-интеграция;
+                    # только *_now (legacy) → dt=1 (per-apply, без регресса/over-
+                    # drain). Авто-апгрейд когда Хьюберт завершит rename.
+                    "_per_sec": _has_ps,
                 }
         # NAV_VIS периодический лог (раз в ~300 батчей ≈ 60с при 5Гц).
         if hasattr(self, "_nav_vis"):
@@ -1789,7 +1816,7 @@ class ColonyWSClient:
                     _nv["cids"])
                 self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
         return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
-                on_flora_per_cid)
+                on_flora_per_cid, carried_food_per_cid)
 
     @staticmethod
     def _flora_in_radius(row: int, col: int, flora_pos: dict, vr: int) -> bool:
@@ -1816,7 +1843,8 @@ class ColonyWSClient:
         # child_org после mate-pair кроссинговера, регистрируем + Y50.
         self._attach_pending_newborns(creatures)
         (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
-         on_flora_per_cid) = self._collect_obs_batch(creatures)
+         on_flora_per_cid, carried_food_per_cid) = \
+            self._collect_obs_batch(creatures)
         if not obs_per_cid:
             return
         self._on_flora_per_cid = on_flora_per_cid
@@ -1954,7 +1982,7 @@ class ColonyWSClient:
             creatures_out = await asyncio.to_thread(
                 self._run_tick_and_build,
                 obs_per_cid, events_per_cid, intero_per_cid, world_tick,
-                rates_per_cid, on_flora_per_cid)
+                rates_per_cid, on_flora_per_cid, carried_food_per_cid)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return
@@ -2184,7 +2212,7 @@ class ColonyWSClient:
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
                             intero_per_cid, world_tick, rates_per_cid=None,
-                            on_flora_per_cid=None):
+                            on_flora_per_cid=None, carried_food_per_cid=None):
         """Offload-worker (0.11.16): handle_tick + сборка creatures_out с
         phase_emas. Запускается в asyncio.to_thread — torch-forward'ы N орг не
         блокируют ws-event-loop. Весь compute-доступ изолирован здесь; на
@@ -2196,7 +2224,8 @@ class ColonyWSClient:
         actions = self.compute.handle_tick(
             obs_per_cid, events_per_cid=events_per_cid,
             intero_per_cid=intero_per_cid, world_tick=world_tick,
-            rates_per_cid=rates_per_cid, on_flora_per_cid=on_flora_per_cid)
+            rates_per_cid=rates_per_cid, on_flora_per_cid=on_flora_per_cid,
+            carried_food_per_cid=carried_food_per_cid)
         if not actions:
             return None
         creatures_out: list = []

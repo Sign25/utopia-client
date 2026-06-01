@@ -49,6 +49,29 @@ def test_instinct_gather_on_flora_fresh():
     assert lg[14].item() == 0.0  # нечего есть
 
 
+def test_instinct_uses_p40_carried_food_over_mirror():
+    # P40 authoritative carried_food (9f8d99d) > client-зеркало (убирает desync).
+    c = _c()
+    c._birth_tick["n"] = 0
+    c._carried_food["n"] = 0          # зеркало говорит 0
+    lg = torch.zeros(16)
+    # P40 говорит carried=3 → EAT bias, несмотря на зеркало=0
+    c._apply_newborn_instinct("n", lg, world_tick=0, on_flora=False,
+                              carried_food=3)
+    assert abs(lg[14].item() - 2.0) < 1e-6   # EAT по P40-истине
+
+
+def test_instinct_fallback_to_mirror_when_p40_none():
+    # carried_food=None (P40 не шлёт) → fallback на зеркало.
+    c = _c()
+    c._birth_tick["n"] = 0
+    c._carried_food["n"] = 2
+    lg = torch.zeros(16)
+    c._apply_newborn_instinct("n", lg, world_tick=0, on_flora=False,
+                              carried_food=None)
+    assert abs(lg[14].item() - 2.0) < 1e-6   # EAT по зеркалу
+
+
 def test_instinct_eat_when_carrying():
     # carried=3 → EAT +2; на флоре и <5 → ещё и GATHER +2.
     c = _c()
