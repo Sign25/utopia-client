@@ -228,6 +228,32 @@ def cmd_set_genesis_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tag_adam(args: argparse.Namespace) -> int:
+    """Single-organism pivot этап 1: пометить cid как Адама на P40 (LAN).
+
+    Preconditions (иначе 400/404): cid уже спроецирован как owned-zodchiy в
+    Мире (клиент в run + single_organism, projection_batch self-heal'ил cid).
+    Дёргать ПОСЛЕ того, как heartbeat показал n_alive>=1 для этого cid.
+    """
+    cfg = load_config()
+    if not cfg.get("server"):
+        print("Конфиг пуст — сначала запусти клиент (run).", flush=True)
+        return 1
+    p40_url = str(os.environ.get("UTOPIA_P40_URL")
+                  or cfg.get("p40_url") or DEFAULT_P40_URL)
+    api = UtopiaAPI(cfg["server"], cfg.get("token", ""))
+    print(f"tag_adam cid={args.cid} → {p40_url}/api/world/adam/tag", flush=True)
+    resp = api.tag_adam(p40_url, args.cid)
+    if resp is None:
+        print("tag_adam: НЕ удалось (см. лог). Проверь, что cid спроецирован "
+              "как owned-zodchiy в Мире (n_alive>=1).", flush=True)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False), flush=True)
+    print(f"✓ Адам помечен: adam_cid={resp.get('adam_cid')} "
+          f"passive_flora_eating={resp.get('passive_flora_eating')}", flush=True)
+    return 0
+
+
 def cmd_benchmark(args: argparse.Namespace) -> int:
     cfg = _ensure_config()
     print("Замер производительности…")
@@ -978,6 +1004,9 @@ def main(argv: list[str] | None = None) -> int:
     p_gm.add_argument("mode", choices=["donor", "fresh"],
                       help="donor — старт от обученных доноров; "
                            "fresh — с чистого листа")
+    p_tag = sub.add_parser("tag-adam",
+                           help="Single-organism: пометить cid как Адама на P40")
+    p_tag.add_argument("cid", help="cid спроецированного owned-zodchiy")
     args = p.parse_args(argv)
     if args.cmd == "run":
         return cmd_run(args)
@@ -989,6 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_token(args)
     if args.cmd == "set-genesis-mode":
         return cmd_set_genesis_mode(args)
+    if args.cmd == "tag-adam":
+        return cmd_tag_adam(args)
     if args.cmd == "bench-gpu":
         from .gpu_bench import cmd_bench_gpu
         return cmd_bench_gpu(args)

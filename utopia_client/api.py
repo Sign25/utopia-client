@@ -266,6 +266,43 @@ class UtopiaAPI:
             logger.warning("trigger_p40_lineage_upgrade error: %s", e)
             return None
 
+    def tag_adam(
+        self, p40_url: str, cid: str, timeout: float = 5.0,
+    ) -> dict | None:
+        """Single-organism pivot (ТЗ e3cc81b, этап 1): пометить cid как Адама.
+
+        Endpoint (Хьюберт, HEAD 33025c6): `POST /api/world/adam/tag`
+        body `{cid}` → `{adam_cid, owner_user_id, previous_cid,
+        passive_flora_eating}`. Side-effects на P40: is_adam на CreatureState +
+        OwnedProjection, глобал _adam_cid, авто passive_flora_eating=True, сброс
+        предыдущего tag (один Адам), immortality (7-chokepoint + §3 paralysis)
+        с момента tag.
+
+        КРИТИЧНО (порядок, иначе 400/404): cid должен УЖЕ существовать как
+        owned-zodchiy проекция в Мире (cid в world + owner != пусто +
+        lineage=="zodchiy"). Поэтому сначала спроецировать cid через
+        projection_batch (P40 self-heal'ит unknown cid в owned baseline), и
+        только ПОТОМ дёргать этот вызов.
+
+        Возвращает JSON при 200, None при ошибке/таймауте. Не падает.
+        """
+        if not cid:
+            logger.warning("tag_adam: empty cid")
+            return None
+        url = f"{p40_url.rstrip('/')}/api/world/adam/tag"
+        try:
+            r = requests.post(url, json={"cid": str(cid)}, timeout=timeout)
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    return {}
+            logger.warning("tag_adam HTTP %d: %s", r.status_code, r.text[:200])
+            return None
+        except Exception as e:
+            logger.warning("tag_adam error: %s", e)
+            return None
+
     def fetch_seed(self, dest_path: str) -> bool:
         return self._fetch_seed_url(f"{self.server}/api/seed", dest_path,
                                     label="seed")
