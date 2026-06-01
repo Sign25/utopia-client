@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.60"  # bias_scale curriculum (порт server loop.py:603-636 + routes_world). КОРЕНЬ подтверждён NAV-данными: motor_policy перебивал shaping (flip_rate 0.6, motor_norm≈shaping) → не доходили до флоры (onf_rate 0.09). Кроссфейд own_contribution=max(0,1-bias_scale)×motor_delta: untrained→motor подавлен→флора-градиент ведёт→доходят→едят→обучаются→bias decay→motor автономен. BS в shaping динамический
+__version__ = "0.11.61"  # bias_scale energy-health guard: декей bias только когда колония self-sustaining (income≥cost), не «по населению». Баг 0.11.60: колония закреплена на cap (elite-restore) но голодает → population-ratio=1.0 → bias декеил 1.0→0.30 → untrained motor возвращался → самоподрыв. Кроссфейд работает (gather_onf 1→21 при bias≈1.0), но income≪cost ×8 — энергобаланс отдельный блокер

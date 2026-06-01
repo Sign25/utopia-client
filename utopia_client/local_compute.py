@@ -3331,8 +3331,17 @@ class LocalColonyCompute:
         floor = max(1.0, target * 0.5)
         effective_target = max(self._alive_ema, floor)
         ratio = n_alive / effective_target if effective_target > 0 else 1.0
+        # Energy-health guard (01.06.2026): декей bias (отпустить motor) ТОЛЬКО
+        # когда колония энергетически self-sustaining (income≥cost). На сервере
+        # население-at-target ⟹ здорова (обученные мозги кормят); у нас колония
+        # закреплена на cap через elite-restore, но ГОЛОДАЕТ (net<0) → чистый
+        # population-ratio давал ratio=1.0 → bias декеил 1.0→0.30 → untrained
+        # motor возвращался → фуражировка деградировала (самоподрыв). Смысл
+        # curriculum — отпускать motor когда выучилась, а признак — баланс, не cap.
+        _healthy = (self._last_window is not None
+                    and float(self._last_window.get("ratio", 0.0)) >= 1.0)
         old = self._bias_scale
-        if ratio >= 0.95:
+        if ratio >= 0.95 and _healthy:
             self._bias_scale = max(0.0, self._bias_scale - 0.05)
         elif ratio < 0.7:
             self._bias_scale = min(1.0, self._bias_scale + 0.1)

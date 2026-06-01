@@ -44,16 +44,27 @@ def test_throttle_under_1000_ticks():
     assert c._bias_last_update_tick == 0
 
 
-def test_decays_when_at_target():
+def test_decays_when_at_target_and_healthy():
     c = _c(target=20)
     _populate(c, 20)                      # n_alive=20, ema→20, ratio=1.0
+    c._last_window = {"ratio": 1.2}       # энергетически здорова (income>cost)
     c._update_bias_curriculum(1000)
-    assert abs(c._bias_scale - 0.95) < 1e-9   # ratio>=0.95 → -0.05
+    assert abs(c._bias_scale - 0.95) < 1e-9   # ratio>=0.95 И healthy → -0.05
+
+
+def test_no_decay_when_at_target_but_starving():
+    # Ключевой фикс: население at-target, но net<0 → НЕ декеим (motor подавлен).
+    c = _c(target=20)
+    _populate(c, 20)                      # ratio=1.0
+    c._last_window = {"ratio": 0.1}       # голодает (income≪cost)
+    c._update_bias_curriculum(1000)
+    assert c._bias_scale == 1.0           # held — motor остаётся подавлен
 
 
 def test_holds_in_band():
     c = _c(target=20)
     _populate(c, 16)                      # ratio=16/20=0.8 → держим
+    c._last_window = {"ratio": 1.5}       # даже здоровая — band держит
     c._update_bias_curriculum(1000)
     assert c._bias_scale == 1.0
 
