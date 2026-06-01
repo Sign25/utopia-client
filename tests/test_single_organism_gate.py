@@ -240,5 +240,46 @@ def test_paralysis_recovery_grants_energy(compute_with_two_zodchiy):
     c._paralysis_until[cid] = time.monotonic() - 1.0    # срок истёк
     c._apply_metabolism(cid, {"step_cost_per_sec": 0.0})
     assert cid not in c._paralysis_until                # снят
-    assert c.biochem[cid].energy == c._recovery_energy  # +45 (max/φ⁷)
+    assert c.biochem[cid].energy == c._recovery_energy  # +73 (max/φ⁶)
     assert cid not in c._dead_cids
+
+
+# ── §3 mirror-контракт: projection-поля + триггер 2 (Хьюберт 2b0f3a2) ──
+
+def test_projection_includes_paralysis_fields(compute_with_two_zodchiy):
+    """build_projection_batch несёт paralyzed + paralysis_ticks_remaining."""
+    import time
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.organisms))
+    c._paralysis_until[cid] = time.monotonic() + 2.0   # активный паралич
+    projs = {p["cid"]: p for p in c.build_projection_batch()}
+    assert projs[cid]["paralyzed"] is True
+    assert projs[cid]["paralysis_ticks_remaining"] > 0
+    # Не-парализованный сосед → False/0.
+    other = [x for x in c.organisms if x != cid][0]
+    assert projs[other]["paralyzed"] is False
+    assert projs[other]["paralysis_ticks_remaining"] == 0
+
+
+def test_death_suppressed_triggers_paralysis_energy_independent(
+        compute_with_two_zodchiy):
+    """Триггер 2: death_suppressed → paralysis ДАЖЕ при energy>0 (Фрай)."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c.biochem[cid].energy = 600.0          # здоров, НЕ голодает
+    c._enter_paralysis(cid, "pvp_kill")    # как из handle_tick на death_suppressed
+    assert cid in c._paralysis_until        # парализован независимо от energy
+    assert cid not in c._dead_cids
+
+
+def test_enter_paralysis_idempotent(compute_with_two_zodchiy):
+    """Повторный _enter_paralysis в активном параличе не продлевает дедлайн."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    c._enter_paralysis(cid, "starved")
+    d1 = c._paralysis_until[cid]
+    c._enter_paralysis(cid, "pvp_kill")    # поток событий не должен «вечнить»
+    assert c._paralysis_until[cid] == d1

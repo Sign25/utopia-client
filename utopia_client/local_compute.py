@@ -2454,6 +2454,18 @@ class LocalColonyCompute:
                              if events_per_cid is not None else None)
                 self._apply_biochem_events(cid, _bc_event)
                 self._apply_biochem_decay(cid)
+                # §3 триггер 2 (Хьюберт 2b0f3a2 / Фрай): death_suppressed от P40
+                # (chokepoint suppress'нул PvP/age/...) → paralysis, ДАЖЕ если
+                # energy>0 (отдельный вход, не через energy≤0). Reason — для лога.
+                if self._single_organism and _bc_event:
+                    _ds = _bc_event.get("death_suppressed")
+                    if _ds:
+                        _reason = "suppressed"
+                        try:
+                            _reason = str((_ds[0] or {}).get("reason", "suppressed"))
+                        except Exception:
+                            pass
+                        self._enter_paralysis(cid, _reason)
                 # Body Migration метаболизм (31.05.2026, Бендер; контракт
                 # Хьюберт): client-authoritative энергозатрата/гидрация/теломеры.
                 # P40 шлёт effective rates (step_cost_now/thirst_now/
@@ -4285,6 +4297,31 @@ class LocalColonyCompute:
         return natural_selection_snapshot(
             self.biochem, capacity=capacity, top_n_to_emit=3)
 
+    # ── §3 paralysis state (single-organism) ────────────────────────────
+
+    def _paralysis_state(self, cid: str) -> tuple[bool, int]:
+        """(paralyzed, ticks_remaining) для cid. ticks ≈ P40-тики @30TPS из
+        wall-clock остатка. Снимает истёкший дедлайн как побочный эффект чтения
+        в projection (recovery-грант энергии делает _apply_metabolism)."""
+        until = self._paralysis_until.get(cid)
+        if until is None:
+            return False, 0
+        remaining = until - time.monotonic()
+        if remaining <= 0.0:
+            return False, 0
+        return True, max(0, round(remaining * 30.0))
+
+    def _enter_paralysis(self, cid: str, reason: str) -> None:
+        """Войти в паралич (единая точка для обоих триггеров: energy≤0 и
+        death_suppressed от P40). Idempotent: повторный вызов в активном
+        параличе НЕ продлевает (избегаем «вечного» паралича от потока событий).
+        record paralysis_enter — P40 через projection False→True."""
+        if cid in self._paralysis_until and time.monotonic() < self._paralysis_until[cid]:
+            return  # уже парализован — не продлеваем
+        self._paralysis_until[cid] = time.monotonic() + _PARALYSIS_SEC
+        logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
+                    cid, reason, _PARALYSIS_SEC)
+
     # ── Colony Ownership Migration §5.2: projection_batch ────────────────
 
     def build_projection_batch(self) -> list[dict]:
@@ -4328,6 +4365,12 @@ class LocalColonyCompute:
                 proj["telomere_scale"] = float(getattr(org, "telomere", 1.0))
             except Exception:
                 pass
+            # §3 paralysis mirror (контракт Хьюберта 2b0f3a2): client →  P40.
+            # P40 читает для force-STAY override + record_adam_event на
+            # transition False→True. client = единственный хозяин paralysis.
+            _par, _ticks = self._paralysis_state(cid)
+            proj["paralyzed"] = bool(_par)
+            proj["paralysis_ticks_remaining"] = int(_ticks)
             if bc is not None:
                 # 7 ephemeral (без histamine = mirror infection_severity)
                 proj["chem"] = {
@@ -5243,18 +5286,16 @@ class LocalColonyCompute:
             if bc is not None:
                 now_m = time.monotonic()
                 until = self._paralysis_until.get(cid)
-                if until is not None:
-                    if now_m >= until:
-                        self._paralysis_until.pop(cid, None)
-                        bc.energy = float(self._recovery_energy)
-                        logger.info(
-                            "paralysis recovery cid=%s -> energy=%.1f",
-                            cid, self._recovery_energy)
-                elif float(getattr(bc, "energy", 1.0)) <= 0.0:
-                    self._paralysis_until[cid] = now_m + _PARALYSIS_SEC
-                    logger.info(
-                        "paralysis start cid=%s energy<=0 -> STAY %.1fs "
-                        "(NOT death)", cid, _PARALYSIS_SEC)
+                if until is not None and now_m >= until:
+                    # Конец паралича → recovery-грант (ЭНЕРГИЯ, не время).
+                    self._paralysis_until.pop(cid, None)
+                    bc.energy = float(self._recovery_energy)
+                    logger.info("paralysis recovery cid=%s -> energy=%.1f",
+                                cid, self._recovery_energy)
+                elif until is None and float(getattr(bc, "energy", 1.0)) <= 0.0:
+                    # Триггер 1: голод (energy≤0). Триггер 2 (death_suppressed
+                    # от P40, energy-независим) — в handle_tick.
+                    self._enter_paralysis(cid, "starved")
         else:
             # Death-check (колониальный режим): голод (energy<=0) + старость
             # (telomere AGONY) + инфекция (severity>=1.0). Жажда/инфекция грызут

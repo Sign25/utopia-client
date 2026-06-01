@@ -1706,6 +1706,13 @@ class ColonyWSClient:
             _ic = c.get("infection_contact")
             if _ic:
                 events_per_cid[cid_s]["infection_contact"] = _ic
+            # §3 death_suppressed (Хьюберт 2b0f3a2): P40 chokepoint suppress'нул
+            # death-вектор (PvP/age/...) → events.death_suppressed=[{reason}].
+            # Второй вход в paralysis (energy-независим, Фрай). Клиент применяет
+            # paralysis своей механикой (handle_tick → _enter_paralysis).
+            _ds = c.get("death_suppressed")
+            if _ds:
+                events_per_cid[cid_s]["death_suppressed"] = _ds
             # Hydration income (31.05→01.06.2026, Шеф): питьё — из бесконечного
             # террейна (WATER-тайл ничего не расходует, арбитраж P40 не нужен, в
             # отличие от еды-сущности). Клиент владеет всем водным контуром:
