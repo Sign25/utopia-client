@@ -1868,13 +1868,18 @@ class ColonyWSClient:
             self._actions_batches_sent += 1
         except Exception as e:
             logger.warning("actions_batch send failed: %s", e)
-        # F5 skill-growth (01.06.2026, Фрай): traits изменились within-life →
-        # re-announce P40 (рейты/бой считаются от traits). _skill_changed_cids
-        # разрежен (только реальные изменения раз в 200 тиков) → не спамит.
+        # F5 skill-growth re-announce (01.06.2026, Фрай) — THROTTLED 0.11.48:
+        # без throttle спамил ~1/сек (3038/час!) → WS-сатурация → keepalive-
+        # таймауты → срыв obs/кормёжки → энергоголод → вымирание (ночь 31.05).
+        # Батчим: re-announce раз в ~30с (traits меняются медленно, P40-
+        # пропагация может подождать; client-authoritative — traits в store).
         try:
             if getattr(self.compute, "_skill_changed_cids", None):
-                self.compute._skill_changed_cids.clear()
-                await self._maybe_send_traits_announce(force=True)
+                _now = time.monotonic()
+                if _now - getattr(self, "_last_skill_announce_ts", 0.0) >= 30.0:
+                    self._last_skill_announce_ts = _now
+                    self.compute._skill_changed_cids.clear()
+                    await self._maybe_send_traits_announce(force=True)
         except Exception as e:
             logger.debug("skill traits re-announce failed: %s", e)
 
