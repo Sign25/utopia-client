@@ -73,10 +73,15 @@ def test_set_single_organism_revives_dead_marked(compute_with_two_zodchiy):
     c._dead_cids.add(cid)              # «умер» в pre-flag окне
     c._paralysis_until[cid] = 999.0
     c.biochem[cid].energy = 0.0
+    c.biochem[cid].cortisol = 99.5     # bug-накопленный мусорный стресс
+    c.biochem[cid].serotonin = 0.0
+    c.biochem[cid].mental_break = "catatonic"
     c.set_single_organism(True)
     assert cid not in c._dead_cids      # оживлён
     assert cid not in c._paralysis_until
     assert c.biochem[cid].energy == c._recovery_energy  # стартовая энергия
+    assert c.biochem[cid].cortisol < 80.0   # стресс очищен → не catatonic
+    assert c.biochem[cid].mental_break == ""
 
 
 def test_set_single_organism_returns_and_toggles(compute_with_two_zodchiy):

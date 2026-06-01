@@ -1990,8 +1990,23 @@ class LocalColonyCompute:
                 self._dead_cids.discard(_cid)
                 self._paralysis_until.pop(_cid, None)
                 _bc = self.biochem.get(_cid)
-                if _bc is not None and float(getattr(_bc, "energy", 0.0)) <= 0.0:
-                    _bc.energy = float(self._recovery_energy)
+                if _bc is not None:
+                    if float(getattr(_bc, "energy", 0.0)) <= 0.0:
+                        _bc.energy = float(self._recovery_energy)
+                    # Очистка bug-corrupted стресс-биохимии: за часы голода
+                    # (routing-баг) cortisol застревал на максимуме (99.5) →
+                    # catatonic → force STAY → не может добывать → стресс-спираль
+                    # не разрывается. Сброс к здоровому baseline — одноразовая
+                    # очистка МУСОРА от бага (не маскировка реального стресса:
+                    # это накопленный артефакт сломанного периода). Мозг (веса/
+                    # Hebbian) не трогаем — он не corrupted.
+                    try:
+                        _bc.cortisol = float(getattr(_bc, "baseline_cortisol", 10.0))
+                        _bc.serotonin = float(getattr(_bc, "baseline_serotonin", 50.0))
+                        _bc.mental_break = ""
+                        _bc.mental_break_ticks = 0
+                    except Exception:
+                        pass
                 _revived += 1
             if _revived:
                 logger.info(
