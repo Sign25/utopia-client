@@ -2132,10 +2132,24 @@ class ColonyWSClient:
         if not biochem or cache is None:
             return
         try:
-            berry_pos = {(int(r), int(c)) for (r, c, k) in cache.flora
+            _flora = list(cache.flora)
+            berry_pos = {(int(r), int(c)) for (r, c, k) in _flora
                          if int(k) in self._BERRY_FRUIT_KINDS}
         except Exception:
             return
+        # Диагностика распределения типов флоры (даже если berry нет) — чтобы
+        # отличить «нет berry рядом (тундра)» от «kind в кэше битый».
+        self._food_seek_diag = getattr(self, "_food_seek_diag", 0) + 1
+        if self._food_seek_diag >= 200:
+            self._food_seek_diag = 0
+            _grass = sum(1 for (_r, _c, k) in _flora if int(k) == 1)
+            _berry = sum(1 for (_r, _c, k) in _flora if int(k) == 2)
+            _fruit = sum(1 for (_r, _c, k) in _flora if int(k) in (3, 4, 5, 6))
+            _other = len(_flora) - _grass - _berry - _fruit
+            logger.info(
+                "FLORA_KINDS total=%d grass=%d berry=%d fruit=%d other=%d "
+                "berry_fruit_pos=%d", len(_flora), _grass, _berry, _fruit,
+                _other, len(berry_pos))
         if not berry_pos:
             return
         pos = {}
@@ -2166,12 +2180,11 @@ class ColonyWSClient:
             if fd is not None:
                 entry["action"] = int(fd)
                 n_seek += 1
-        self._food_seek_diag = getattr(self, "_food_seek_diag", 0) + 1
-        if self._food_seek_diag >= 200:
-            self._food_seek_diag = 0
-            logger.info(
-                "FOOD_SEEK_DIAG berry_fruit_tiles=%d hungry=%d seek_override=%d",
-                len(berry_pos), n_hungry, n_seek)
+        if n_seek or n_hungry:
+            self._food_seek_overrides = getattr(
+                self, "_food_seek_overrides", 0) + n_seek
+            logger.debug("FOOD_SEEK hungry=%d seek_override=%d berry_pos=%d",
+                         n_hungry, n_seek, len(berry_pos))
 
     def _near_water(self, row: int, col: int) -> bool:
         """Организм на ИЛИ рядом (5 клеток, радиус 1: self + 4 соседа) с
