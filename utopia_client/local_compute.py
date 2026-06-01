@@ -480,6 +480,13 @@ class LocalColonyCompute:
         self._higher_sfnn_default: bool = True
         self._motor_sfnn_default: bool = True
 
+        # Single-organism pivot (01.06.2026, ТЗ e3cc81b): режим одного
+        # самообучающегося Адама вместо колонии. Под флагом гейтятся
+        # КОЛОНИАЛЬНЫЕ механики (репродукция/speciation/...) — код НЕ удаляется,
+        # пригодится для Зоопарка Эпохи 2. Дефолт False (колониальный режим);
+        # включается через cmd["flags"]["single_organism"] → set_single_organism.
+        self._single_organism: bool = False
+
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
         # хранится только evolvable rule (A/B/C/D/η + τ + R3 + td_coupling +
@@ -656,6 +663,10 @@ class LocalColonyCompute:
 
     def _assign_species(self, cid: str, organism, tick: int = 0) -> None:
         """Назначить species_id особи через client-local registry (идемпотентно)."""
+        # Single-organism pivot (ТЗ e3cc81b §1): видообразование — колониальная
+        # механика (нет популяции — нет видов). Под флагом не назначаем.
+        if self._single_organism:
+            return
         if cid in self.species_id:
             return
         reg = self._ensure_species_registry()
@@ -1893,6 +1904,26 @@ class LocalColonyCompute:
         logger.info("set_basic_sfnn(%s) — changed %d / %d organisms",
                     on, n_changed, len(self.organisms))
         return n_changed
+
+    # ── Single-organism pivot (01.06.2026, ТЗ e3cc81b) ──────────────────
+
+    def set_single_organism(self, on: bool) -> bool:
+        """Включить/выключить режим одного организма (Адам).
+
+        В отличие от set_*_sfnn это compute-level mode-флаг, а не per-organism
+        genome-атрибут: под ним гейтятся КОЛОНИАЛЬНЫЕ механики (репродукция
+        client/P40, speciation, Z2.b topology-crossover). Код механик НЕ
+        удаляется — нужен для Зоопарка Эпохи 2. Возвращает применённое значение.
+
+        Идемпотентно: повторный вызов с тем же значением — no-op (только лог при
+        изменении). Сами особи не трогаются — выбор/эвакуация Адама это этап 1.
+        """
+        on = bool(on)
+        if on != self._single_organism:
+            logger.info("set_single_organism: %s → %s (n_organisms=%d)",
+                        self._single_organism, on, len(self.organisms))
+        self._single_organism = on
+        return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
 
@@ -4440,6 +4471,14 @@ class LocalColonyCompute:
             List of child cids которые были built + emitted (или пустой
             если embodied_client недоступен).
         """
+        # Single-organism pivot (01.06.2026, ТЗ e3cc81b §1): репродукция —
+        # колониальная механика, под флагом отключена (Адам не размножается,
+        # развитие — не через поколения). Defense-in-depth: main.py уже гейтит
+        # вызов через cfg["local_repro_enabled"], но гейтим и на входе, чтобы
+        # любой путь (тест/будущий caller) уважал режим. Код ниже сохранён.
+        if self._single_organism:
+            return []
+
         import time as _time
         import uuid as _uuid
 

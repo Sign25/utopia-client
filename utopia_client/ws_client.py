@@ -2554,6 +2554,15 @@ class ColonyWSClient:
             except Exception as e:
                 logger.warning("newborn reject send failed: %s", e)
 
+        # Single-organism pivot (01.06.2026, ТЗ e3cc81b §1): под флагом
+        # репродукция отключена. P40 в single-режиме не должен слать
+        # mate_request (контракт Б2 с Хьюбертом), но если прислал — вежливо
+        # отклоняем, не собирая ребёнка. Код кроссинговера ниже сохранён.
+        if self.compute is not None and getattr(
+                self.compute, "_single_organism", False):
+            await _reject("single_organism")
+            return
+
         if not mother_cid or self.compute is None:
             await _reject("no_compute")
             return

@@ -488,6 +488,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_sfnn_motor: bool | None = None
     # SFNN S6.9: то же для 10 базовых тканей.
     applied_sfnn_basic: bool | None = None
+    # Single-organism pivot (ТЗ e3cc81b): применённый флаг single_organism.
+    applied_single_organism: bool | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -670,6 +672,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                                         target_basic, n)
                         except Exception as e:
                             logger.warning("set_basic_sfnn failed: %s", e)
+
+                    # Single-organism pivot (01.06.2026, ТЗ e3cc81b): флаг
+                    # гейтит колониальные механики (репродукция/speciation).
+                    # Применяем независимо от desired state — флаг может
+                    # переключиться, когда колония уже в run.
+                    target_single = bool(flags.get("single_organism", False))
+                    if target_single != applied_single_organism \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_single_organism(target_single)
+                            applied_single_organism = target_single
+                            logger.info("single_organism → %s", target_single)
+                        except Exception as e:
+                            logger.warning("set_single_organism failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:
