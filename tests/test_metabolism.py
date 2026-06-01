@@ -271,6 +271,26 @@ def test_speciation_empty_topology_collapses_to_founder():
     assert reg.created == 0    # новый вид НЕ создан
 
 
+def test_snapshot_elite_health_gate(tmp_path):
+    """Elite (Фрай): снимок только при здоровой колонии (>=min_alive живых с
+    energy>0) — не затирать elite умирающей колонией. Мёртвые/energy=0 не в счёт."""
+    pytest.importorskip("environment.biochemistry")
+    import types
+    from utopia_client.biochemistry import make_default
+    c = LocalColonyCompute(device="cpu")
+    # c0 energy=0, c1 dead, c2/c3/c4 здоровы → alive-healthy = 3
+    specs = [(0.0, False), (500.0, True), (500.0, False), (500.0, False),
+             (500.0, False)]
+    for i, (e, dead) in enumerate(specs):
+        cid = f"c{i}"
+        c.organisms[cid] = types.SimpleNamespace(generation=0, telomere=1.0)
+        b = make_default(); b.energy = e
+        c.biochem[cid] = b
+        if dead:
+            c._dead_cids.add(cid)
+    assert c.snapshot_elite(str(tmp_path), min_alive=4) == 0  # 3 < 4 → гейт
+
+
 def test_motor_reward_baseline_cleanup():
     """Phase 4 #1: REINFORCE-baseline dict существует и чистится в remove."""
     c = LocalColonyCompute(device="cpu")

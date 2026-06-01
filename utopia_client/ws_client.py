@@ -450,6 +450,12 @@ class ColonyWSClient:
                     self.compute.save_all_states,
                     colony_state_dir(self.colony_name))
                 logger.debug("periodic local-save: %d creatures", n)
+                # Elite snapshot (02.06.2026, Фрай): снимок здоровых обученных
+                # мозгов в elite-слот (переживает вымирание) → recovery поднимает
+                # оттуда. snapshot_elite сам гейтит на здоровье (>=4 живых).
+                await asyncio.to_thread(
+                    self.compute.snapshot_elite,
+                    colony_state_dir(self.colony_name) / "elite")
             except Exception as e:
                 logger.warning("periodic save_all_states failed: %s", e)
 
@@ -649,6 +655,10 @@ class ColonyWSClient:
         # (n_local=0 ветка) или репродукцией, не legacy. Для остальных user'ов
         # (n_local=0 на старте) respawn остаётся штатным.
         if getattr(self, "_reject_incoming_seeds", False):
+            # Client-authoritative recovery (02.06.2026, Фрай): вымирание online
+            # → НЕ legacy-respawn (десинк клонов), а re-genesis из ELITE-слота
+            # (обученные мозги) → обучение продолжается, не с untrained-нуля.
+            await self._maybe_recover_from_elite(connect_ts)
             return False
         if self.n_alive_owned > 0:
             return False
@@ -686,6 +696,54 @@ class ColonyWSClient:
             since_alive,
             since_request if self._last_respawn_request_ts else -1)
         return True
+
+    async def _maybe_recover_from_elite(self, connect_ts: float) -> bool:
+        """Client-authoritative recovery (02.06.2026, Фрай): вымирание online →
+        re-genesis из elite-слота (обученные мозги, переживают вымирание). P40
+        auto_respawn отключён 28.05 (десинк клонов) → клиент восстанавливает
+        сам, НЕ ждёт reconnect. Cooldown EMPTY_WORLD_RETRY_SEC. Grace —
+        отличить транзитный obs-гэп от настоящего вымирания."""
+        if self.compute is None or self.n_alive_owned > 0:
+            return False
+        now = time.time()
+        ref = self.last_owned_alive_ts or connect_ts
+        if now - ref < EMPTY_WORLD_GRACE_SEC:
+            return False
+        if (getattr(self, "_last_elite_recover_ts", 0.0) > 0
+                and now - self._last_elite_recover_ts < EMPTY_WORLD_RETRY_SEC):
+            return False
+        # Подтверждаем РЕАЛЬНОЕ вымирание (compute пуст или все мертвы).
+        try:
+            alive = sum(1 for cid in list(self.compute.organisms.keys())
+                        if cid not in self.compute._dead_cids)
+        except Exception:
+            alive = 0
+        if alive > 0:
+            return False
+        try:
+            from .seed_loader import colony_state_dir
+            elite_dir = colony_state_dir(self.colony_name) / "elite"
+            restored = await asyncio.to_thread(
+                self.compute.restore_colony_from_local, elite_dir)
+            self._last_elite_recover_ts = now
+            if restored:
+                # Воскрешённые cid'ы могли остаться в _dead_cids → снимаем,
+                # иначе projection пометит alive=False сразу.
+                for cid in restored:
+                    self.compute._dead_cids.discard(cid)
+                self.last_owned_alive_ts = now  # сброс grace
+                self.n_alive_owned = len(restored)
+                logger.info(
+                    "ELITE RECOVERY: re-genesis %d обученных мозгов из elite "
+                    "(вымирание %.0fs) — обучение продолжается", len(restored),
+                    now - ref)
+                return True
+            logger.warning(
+                "ELITE RECOVERY: elite-слот пуст (%s) — нечего поднимать",
+                elite_dir)
+        except Exception as e:
+            logger.warning("ELITE RECOVERY failed: %s", e)
+        return False
 
     async def _empty_world_loop(self) -> None:
         """Phase G.3 watchdog: респавн при долгом n_alive_owned=0.

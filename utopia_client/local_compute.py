@@ -2423,6 +2423,46 @@ class LocalColonyCompute:
                 logger.warning("save_state %s torch.save failed: %s", cid, e)
         return n
 
+    def snapshot_elite(self, elite_dir, min_alive: int = 4) -> int:
+        """Elite preservation (02.06.2026, Фрай): снимок ЖИВЫХ обученных мозгов
+        колонии в отдельный elite-слот, который ПЕРЕЖИВАЕТ вымирание.
+
+        Основной persist (save_all_states) хранит ЖИВЫХ → при полном вымирании
+        пуст (учить не с чего). Elite — снимок последней ЗДОРОВОЙ колонии
+        (>= min_alive живых с energy>0). Снимаем только здоровых, чтобы elite
+        не затёрся умирающей колонией. Recovery (ws_client._maybe_recover_from_
+        elite) поднимает отсюда обученные мозги → эволюция продолжается, не
+        с untrained-нуля. Возвращает число сохранённых.
+        """
+        from pathlib import Path
+        torch = self._torch
+        alive = [cid for cid in self.organisms
+                 if cid not in self._dead_cids
+                 and float(getattr(self.biochem.get(cid), "energy", 0.0)
+                           or 0.0) > 0.0]
+        if len(alive) < min_alive:
+            return 0
+        ed = Path(elite_dir)
+        ed.mkdir(parents=True, exist_ok=True)
+        for f in ed.glob("*.pt"):  # чистим устаревший снимок
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        n = 0
+        for cid in alive:
+            payload = self.save_state(cid)
+            if not payload:
+                continue
+            try:
+                torch.save(payload, ed / f"{cid}.pt")
+                n += 1
+            except Exception as e:
+                logger.debug("snapshot_elite %s: %s", cid, e)
+        if n:
+            logger.info("snapshot_elite: %d обученных мозгов → elite", n)
+        return n
+
     def _get_hw_capacity(self) -> Optional[int]:
         """Расчётная ёмкость колонии по железу (vision body_migration.md §40/
         §145: `benchmark.py:estimate_population`). Кэш — бенчмарк дорогой
