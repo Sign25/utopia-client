@@ -418,6 +418,14 @@ class LocalColonyCompute:
         self._bootstrap_pending: set = set()  # cid restored → омолодить в handle_tick
         self._n_bootstrap_rejuv: int = 0      # счётчик омоложённых (verify ratio)
         self._n_natural_newborn: int = 0      # счётчик natural-родов (verify ratio)
+        # Stats colony_summary (01.06.2026, для UI /stats): агрегаты выживания/
+        # эволюции/обучения → push в public_meta. last_world_tick для age,
+        # deaths-by-cause кумулятивно, history — downsampled ring (~окно 2ч).
+        self._last_world_tick: int = 0
+        self._deaths_by_cause: dict = {"starvation": 0, "telomere": 0,
+                                       "infection": 0}
+        self._summary_history: deque = deque(maxlen=120)
+        self._last_window: Optional[dict] = None  # последняя 300-тик энерго-точка
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
@@ -2081,6 +2089,7 @@ class LocalColonyCompute:
         получают STAY (защита от рассинхронизации).
         """
         self.tick_ts.append(time.time())
+        self._last_world_tick = int(world_tick)  # для age/ts в colony_summary
         self._apply_bootstrap_pending(world_tick)
         out: dict = {}
         torch = self._torch
@@ -4170,6 +4179,42 @@ class LocalColonyCompute:
             projections.append(proj)
         return projections
 
+    def build_colony_summary(self) -> dict:
+        """Агрегат для UI /stats (extra.colony_summary): выживание (energy/
+        deaths), эволюция (species), обучение (newborn) + downsampled history.
+
+        Энерго-поля — из последнего 300-тик окна (_last_window, обновляется в
+        ENERGY_CALIB-блоке); n_alive/species/eff_mean/instinct_active — live;
+        deaths/natural/bootstrap — кумулятивно. history — ring (~окно 2ч)."""
+        alive = [c for c in self.organisms if c not in self._dead_cids]
+        n_alive = len(alive)
+        n_species = len({self.species_id.get(c) for c in alive
+                         if self.species_id.get(c) is not None})
+        effs = [int((self.traits.get(c) or {}).get("efficiency", 10))
+                for c in alive]
+        eff_mean = round(sum(effs) / len(effs), 2) if effs else 0.0
+        instinct_active = sum(1 for c in self._birth_tick if c in self.organisms)
+        w = self._last_window or {}
+        return {
+            "n_alive": n_alive,
+            "n_species_alive": n_species,
+            "eff_mean": eff_mean,
+            "energy": {
+                "income": float(w.get("inc", 0.0)),
+                "cost": float(w.get("cost", 0.0)),
+                "net": float(w.get("net", 0.0)),
+                "ratio": float(w.get("ratio", 0.0)),
+            },
+            "newborn": {
+                "natural": int(self._n_natural_newborn),
+                "bootstrap": int(self._n_bootstrap_rejuv),
+                "instinct_active": int(instinct_active),
+            },
+            "deaths": dict(self._deaths_by_cause),
+            "history": list(self._summary_history),
+            "ts": int(self._last_world_tick),
+        }
+
     # ── Phase 4 этап E+F (28.05.2026): local-only reproduction flow ────
 
     # 9 traits child inheritance — projection model (ТЗ 8b8f184 §4.1).
@@ -4973,6 +5018,10 @@ class LocalColonyCompute:
                 pass
         if dead and cid not in self._dead_cids:
             self._dead_cids.add(cid)
+            # deaths-by-cause для colony_summary (agony=telomere-фаза).
+            _bucket = "telomere" if cause == "agony" else cause
+            if _bucket in self._deaths_by_cause:
+                self._deaths_by_cause[_bucket] += 1
             logger.info(
                 "metabolic death cid=%s cause=%s energy=%.1f hydration=%.1f "
                 "telomere=%.3f infection=%.2f",
@@ -5023,6 +5072,21 @@ class LocalColonyCompute:
                            max(self._e_cost_sum + self._e_infdrain_sum, 1e-6)),
                     eff_mean, self._n_natural_newborn, self._n_bootstrap_rejuv,
                     _instinct_active)
+                # colony_summary history-точка (downsampled, шаг 300 тиков).
+                _ratio = (self._e_income_sum /
+                          max(self._e_cost_sum + self._e_infdrain_sum, 1e-6))
+                _n_alive = sum(1 for c in self.organisms
+                               if c not in self._dead_cids)
+                _n_sp = len({self.species_id.get(c) for c in self.organisms
+                             if c not in self._dead_cids
+                             and self.species_id.get(c) is not None})
+                _pt = {"t": int(self._last_world_tick), "alive": _n_alive,
+                       "inc": round(self._e_income_sum, 1),
+                       "cost": round(self._e_cost_sum, 1),
+                       "net": round(_net, 1), "ratio": round(_ratio, 3),
+                       "eff": round(eff_mean, 2), "sp": _n_sp}
+                self._summary_history.append(_pt)
+                self._last_window = _pt
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
@@ -5857,8 +5921,23 @@ class LocalColonyCompute:
                 except Exception:
                     pass
             loss_ema = float(self.loss_ema.get(cid, 0.0))
+            # Stats UI /stats (01.06.2026): эволюция (species/topo/gen) + обучение
+            # (age/inst/food). age/inst/food — только для трекаемых newborn.
+            _bt = self._birth_tick.get(cid)
+            _age = (max(0, int(self._last_world_tick) - int(_bt))
+                    if _bt is not None else None)
+            _inst = (round(max(0.0, 1.0 - _age / 500.0), 3)
+                     if _age is not None else None)
+            _food = (int(self._carried_food.get(cid, 0))
+                     if _bt is not None else None)
             out.append({
                 "cid": str(cid),
+                "species_id": self.species_id.get(cid),
+                "gen": int(getattr(org, "generation", 0) or 0),
+                "topo": len(getattr(org, "tissue_topology_genes", []) or []),
+                "age": _age,
+                "inst": _inst,
+                "food": _food,
                 "n_embd": n_embd,
                 "n_layer": n_layer,
                 "n_head": n_head,

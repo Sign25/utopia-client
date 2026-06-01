@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.57"  # Bootstrap (Фрай): restored-особи омолаживаются (birth_tick=now) → инстинкт активен → учатся есть как newborn (учит, не дарит энергию). Self-decay: пойдут natural-роды → restore редок → bootstrap сойдёт сам. INSTINCT_DIAG в ENERGY_CALIB (natural/bootstrap/instinct_active). Критерий: natural>0 + eff_mean 5→10
+__version__ = "0.11.58"  # Stats UI данные: build_colony_summary (выживание/эволюция/обучение + downsampled history) → public_meta.extra.colony_summary через heartbeat (без правки VPS, routes_me пробрасывает extra). Per-creature поля (species_id/gen/topo/age/inst/food) в _per_creature_stats → diagnostics.creatures → фронт. deaths-by-cause счётчик

@@ -263,7 +263,8 @@ def _make_ws(cfg: dict, name: str) -> ColonyWSClient:
 
 
 def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
-               bench: dict, n_alive: int = 0) -> bool:
+               bench: dict, n_alive: int = 0,
+               colony_summary: Optional[dict] = None) -> bool:
     extra = {
         "client_version": __version__,
         "estimated_population": bench.get("estimated_population", 0),
@@ -271,6 +272,10 @@ def _heartbeat(api: UtopiaAPI, name: str, status: str, tick: int,
         "gpu": bench.get("gpu", {"available": False}),
         "status": status,
     }
+    # colony_summary (01.06.2026, UI /stats): агрегат выживания/эволюции/
+    # обучения → public_meta.extra.colony_summary → useStatsData.
+    if colony_summary:
+        extra["colony_summary"] = colony_summary
     return api.push_stats(
         name=name,
         n_alive=n_alive,
@@ -783,7 +788,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 n_alive = ws.n_alive_owned if ws is not None else 0
                 world_tick = ws.last_world_tick if ws is not None else 0
                 ws_connected = ws.connected if ws is not None else False
-                ok = _heartbeat(api, name, current_state, world_tick, bench, n_alive)
+                _summary = None
+                if ws is not None and ws.compute is not None:
+                    try:
+                        _summary = ws.compute.build_colony_summary()
+                    except Exception as e:
+                        logger.debug("build_colony_summary failed: %s", e)
+                ok = _heartbeat(api, name, current_state, world_tick, bench,
+                                n_alive, _summary)
                 feed_snaps = world_feed.snapshots_received if world_feed else 0
                 feed_conn = world_feed.connected if world_feed else False
                 logger.info(
