@@ -155,33 +155,50 @@ def test_water_seek_uses_creature_pos_when_obs_lacks_rowcol():
 
 
 _GRASS = 1.618033988749895 ** -2
-_BERRY = (1.618033988749895 ** -2) * (1.618033988749895 ** 3)
+_BERRY = 1.618033988749895
+_TREE = 1.618033988749895 ** 3
+_VBONUS7 = 1.0 + (7 - 3) * 0.02  # vision=7 → 1.08
 
 
-def test_flora_income_grass_on_tile():
+def test_passive_flora_grass_diet0_eff10():
+    # faithful: grass × (1-diet) × kleiber(10)=1.0 × vbonus(1.08)
     cli = _client(_FakeWC(20, []))
-    assert abs(cli._flora_income(10, 10, {(10, 10): 1}) - _GRASS) < 1e-6
+    g = cli._passive_flora_income(10, 10, {(10, 10): 1}, 7, 0.0, 10.0)
+    assert abs(g - (_GRASS * _VBONUS7)) < 1e-6
 
 
-def test_flora_income_berry_adjacent():
+def test_passive_flora_diet_penalty():
+    # diet=0.5 → ×(1-0.5)=×0.5 (карнивор не ест траву)
     cli = _client(_FakeWC(20, []))
-    assert abs(cli._flora_income(10, 10, {(10, 11): 2}) - _BERRY) < 1e-6
+    g = cli._passive_flora_income(10, 10, {(10, 10): 1}, 7, 0.5, 10.0)
+    assert abs(g - (_GRASS * 0.5 * _VBONUS7)) < 1e-6
 
 
-def test_flora_income_best_nearby_wins():
-    # grass на тайле + berry рядом → berry (лучшая еда в радиусе)
+def test_passive_flora_kleiber_eff15():
+    # eff=15 → kleiber=(1.5)^(1/φ) > 1
     cli = _client(_FakeWC(20, []))
-    assert abs(cli._flora_income(10, 10, {(10, 10): 1, (11, 10): 2}) - _BERRY) < 1e-6
+    g = cli._passive_flora_income(10, 10, {(10, 10): 1}, 7, 0.0, 15.0)
+    kl = (1.5) ** (1.0 / 1.618033988749895)
+    assert abs(g - (_GRASS * kl * _VBONUS7)) < 1e-6
 
 
-def test_flora_income_none_beyond_radius():
+def test_passive_flora_vision_scan():
+    # vision=7 (<8) → только текущая клетка; сосед НЕ съеден
     cli = _client(_FakeWC(20, []))
-    assert cli._flora_income(10, 10, {(10, 13): 1}) == 0.0  # d=3 > радиус 1
+    assert cli._passive_flora_income(10, 10, {(10, 11): 1}, 7, 0.0, 10.0) == 0.0
+    # vision>=8 → орто-соседи сканируются → съеден
+    assert cli._passive_flora_income(10, 10, {(10, 11): 1}, 8, 0.0, 10.0) > 0.0
 
 
-def test_flora_income_empty():
+def test_passive_flora_fruit_higher():
     cli = _client(_FakeWC(20, []))
-    assert cli._flora_income(10, 10, {}) == 0.0
+    g = cli._passive_flora_income(10, 10, {(10, 10): 3}, 7, 0.0, 10.0)
+    assert abs(g - (_TREE * _VBONUS7)) < 1e-6
+
+
+def test_passive_flora_empty():
+    cli = _client(_FakeWC(20, []))
+    assert cli._passive_flora_income(10, 10, {}, 7, 0.0, 10.0) == 0.0
 
 
 def test_apply_water_seek_skips_hydrated():

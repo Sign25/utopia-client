@@ -1722,13 +1722,18 @@ class ColonyWSClient:
             # за 13мин. Кредитуем близость к flora (радиус 1), если P40 прислал 0
             # (приоритет ненулевого P40 — без двойного начисления on-flora).
             if events_per_cid[cid_s]["delta_energy"] == 0.0 and _rc is not None:
-                _fe = self._flora_income(_rc[0], _rc[1], flora_pos)
+                # Faithful passive_flora_eating (server world.py:3174-3259):
+                # traits vision/diet/eff из стора (дефолты server: vision=7,
+                # diet=0.5, eff=10). Заменяет прежний fixed _flora_income —
+                # чистый порт серверной формулы, без заплаток.
+                _tr = ((self.compute.traits.get(cid_s) or {})
+                       if self.compute is not None else {})
+                _fe = self._passive_flora_income(
+                    _rc[0], _rc[1], flora_pos,
+                    float(_tr.get("vision_radius", 7) or 7),
+                    float(_tr.get("diet_gene", 0.5) or 0.5),
+                    float(_tr.get("efficiency", 10) or 10))
                 if _fe > 0.0:
-                    # ОТКАТ kleiber-coupling (02.06.2026, Шеф «перемудрил»):
-                    # добавил серверный множитель (0.11.50), не проверив что eff
-                    # здоров → eff застряла на 5 → kleiber(5)=0.65 срезал income
-                    # → backfire → залатал floor'ом → no-op. Упрощаю до fixed
-                    # income; вернём корректную модель после описания Хьюберта.
                     events_per_cid[cid_s]["delta_energy"] = _fe
             # Brain migration (10.05.2026): intero_7 для S2.F insula forward.
             # Старые серверы поле не шлют → fallback пустой.
@@ -1959,9 +1964,10 @@ class ColonyWSClient:
     # owned ТОЧНО на flora (passive_eating), но зодчие ходят случайно (только
     # move-действия, Хьюберт) → почти не попадают → голод за 13мин. Клиент
     # кредитует близость (как воду), приоритет ненулевого P40.
-    _GRASS_ENERGY = 1.618033988749895 ** -2
-    _BERRY_ENERGY = (1.618033988749895 ** -2) * (1.618033988749895 ** 3)
-    _FLORA_KIND_ENERGY = {1: _GRASS_ENERGY, 2: _BERRY_ENERGY}
+    _GRASS_ENERGY = 1.618033988749895 ** -2        # φ⁻² ≈ 0.382 (GRASS=1)
+    _BERRY_ENERGY = 1.618033988749895              # φ ≈ 1.618 (BERRY=2)
+    _TREE_FRUIT_ENERGY = 1.618033988749895 ** 3    # φ³ ≈ 4.236 (FRUIT=3-6)
+    _FRUIT_KINDS = frozenset({3, 4, 5, 6})         # FloraType FRUIT_APPLE..DATE
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -2041,20 +2047,39 @@ class ColonyWSClient:
                 pass
         return None
 
-    def _flora_income(self, row, col, flora_pos) -> float:
-        """Энергия лучшей flora в радиусе 1 (5 клеток) от (row,col), иначе 0.0.
-        flora_pos: dict[(r,c) → kind]. GRASS→grass_energy, BERRY→berry_energy.
-        Симметрия с _near_water: близость к ресурсу = доход (P40 кредитует
-        owned только on-tile, а зодчие туда почти не доходят)."""
+    def _passive_flora_income(self, row, col, flora_pos,
+                              vision: float, diet: float, eff: float) -> float:
+        """Faithful порт server passive_flora_eating (world.py:3174-3259).
+        owned тикаются на клиенте (P40 phase-out) → клиент кормит по серверной
+        формуле, без заплаток. Vision-scan (current + vision>=8: 4 orth +
+        vision>=11: 4 diag), eat ОДНУ flora/тик:
+          gain = flora_energy(kind) × (1-diet_gene) × kleiber(eff) × vision_bonus
+        flora_energy: GRASS=φ⁻², BERRY=φ, FRUIT=φ³. kleiber=(eff/10)^(1/φ).
+        vision_bonus=1+(vision-3)×0.02. memory-бонус не портирован (memory_tiles
+        не трекаются на client)."""
         if not flora_pos:
             return 0.0
         r0, c0 = int(row), int(col)
-        best = 0.0
-        for dr, dc in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
-            k = flora_pos.get((r0 + dr, c0 + dc))
-            if k is not None:
-                best = max(best, self._FLORA_KIND_ENERGY.get(k, self._GRASS_ENERGY))
-        return best
+        cells = [(r0, c0)]
+        if vision >= 8:
+            cells += [(r0 - 1, c0), (r0 + 1, c0), (r0, c0 - 1), (r0, c0 + 1)]
+        if vision >= 11:
+            cells += [(r0 - 1, c0 - 1), (r0 - 1, c0 + 1),
+                      (r0 + 1, c0 - 1), (r0 + 1, c0 + 1)]
+        kleiber = (max(1.0, eff) / 10.0) ** (1.0 / 1.618033988749895)
+        vbonus = 1.0 + (vision - 3.0) * 0.02
+        for (r, c) in cells:
+            kind = flora_pos.get((r, c))
+            if kind is None:
+                continue
+            if kind in self._FRUIT_KINDS:
+                base = self._TREE_FRUIT_ENERGY
+            elif kind == 2:
+                base = self._BERRY_ENERGY
+            else:
+                base = self._GRASS_ENERGY
+            return base * (1.0 - diet) * kleiber * vbonus  # одна flora/тик
+        return 0.0
 
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
