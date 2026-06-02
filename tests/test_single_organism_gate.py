@@ -176,6 +176,113 @@ def test_self_obs_action_head_zero_init_and_learns():
     assert lp_after > lp_before     # выучила bias к rewarded-действию
 
 
+def test_insula_temp_near_identity_init():
+    """Направление (б): insula-temp голова zero-init → mu=0 → T_mod=1.0 ровно
+    (deterministic) → НИКАКОЙ модуляции на старте (near-identity, no-op)."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    assert c._enable_insula_temp(cid) is True
+    assert c._enable_insula_temp(cid) is False          # идемпотентно
+    so4 = torch.tensor([0.9, 0.01, 0.03, 1.0])
+    t_mod, log_tmod, ctx = c._insula_temp_factor(cid, so4, deterministic=True)
+    assert abs(t_mod - 1.0) < 1e-6                       # zero-init → T=1 ровно
+    assert abs(log_tmod) < 1e-6
+    assert ctx is not None
+
+
+def test_apply_insula_temp_gated_off_is_noop():
+    """Флаг off → _apply_insula_temp полный no-op (slice не тронут, ctx None).
+    Live-безопасность: пока _insula_temp_enabled=False, (б) не влияет ни на что."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute, N_ACTIONS
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    assert c._insula_temp_enabled is False              # дефолт OFF
+    c._enable_insula_temp(cid)                           # голова есть, но флаг off
+    sl = torch.randn(N_ACTIONS)
+    out, ctx = c._apply_insula_temp(cid, sl)
+    assert out is sl                                     # тот же тензор, не тронут
+    assert ctx is None
+
+
+def test_apply_insula_temp_preserves_argmax():
+    """Безопасность temperature: модуляция НЕ меняет НАПРАВЛЕНИЕ (argmax логитов
+    инвариантен к делению на T_mod>0) — структурно не может повторить action-head
+    corruption. Проверяем на нескольких случайных T_mod."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute, N_ACTIONS
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    c._enable_insula_temp(cid)
+    c._insula_temp_enabled = True
+    c.entropy_ema[cid] = 0.5
+    c.trace_norm_ema[cid] = 0.1
+    c.reward_var_ema[cid] = 0.2
+    for _ in range(30):
+        sl = torch.randn(N_ACTIONS)
+        out, _ctx = c._apply_insula_temp(cid, sl)
+        # T_mod>0 → деление сохраняет порядок логитов → argmax не меняется
+        assert int(out.argmax()) == int(sl.argmax())
+
+
+def test_insula_temp_reinforce_runs_and_baseline_updates():
+    """1-dim Gaussian REINFORCE-шаг исполняется, baseline (variance-reduction)
+    обновляется, голова остаётся near-identity после одного шага (малый lr)."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    c._enable_insula_temp(cid)
+    so4 = torch.tensor([0.9, 0.01, 0.03, 1.0])
+    _t, log_tmod, ctx = c._insula_temp_factor(cid, so4)
+    assert c._it_baseline.get(cid) == 0.0
+    c._insula_temp_reinforce(cid, ctx, advantage=1.0)
+    assert c._it_baseline.get(cid) != 0.0               # baseline сдвинулся (EMA)
+    # после одного шага голова всё ещё near-identity (T≈1, малый lr)
+    t_mod, _lt, _ = c._insula_temp_factor(cid, so4, deterministic=True)
+    assert 0.5 <= t_mod <= 2.0                           # в безопасном clamp-диапазоне
+
+
+def test_set_insula_temp_flag_channel(compute_with_two_zodchiy):
+    """client_flags-канал (б): set_insula_temp(True) под single_organism создаёт
+    головы + флаг on; (False) → флаг off (apply no-op), головы сохранены для
+    мгновенного ре-enable. Мгновенный on/off без деплоя (tripwire-откат Фрая)."""
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    assert c._insula_temp_enabled is False           # дефолт off
+    # включение
+    assert c.set_insula_temp(True) is True
+    assert c._insula_temp_enabled is True
+    cids = list(c.organisms.keys())
+    assert all(cid in c.insula_temp_head for cid in cids)   # головы созданы
+    # выключение (tripwire-откат): флаг off, головы остаются
+    assert c.set_insula_temp(False) is False
+    assert c._insula_temp_enabled is False
+    assert all(cid in c.insula_temp_head for cid in cids)   # сохранены для ре-enable
+    # apply теперь полный no-op (флаг off)
+    import torch
+    from utopia_client.local_compute import N_ACTIONS
+    sl = torch.randn(N_ACTIONS)
+    out, ctx = c._apply_insula_temp(cids[0], sl)
+    assert out is sl and ctx is None
+    # ре-enable мгновенно
+    assert c.set_insula_temp(True) is True
+    assert c._insula_temp_enabled is True
+
+
+def test_set_insula_temp_flag_before_single_organism(compute_with_two_zodchiy):
+    """Порядок флагов не важен: insula_temp=True ДО single_organism → головы
+    создаст set_single_organism при включении (флаг сохранён)."""
+    c = compute_with_two_zodchiy
+    assert c.set_insula_temp(True) is True            # single_organism ещё off
+    assert c._insula_temp_enabled is True
+    assert not c.insula_temp_head                      # головы ещё нет
+    c.set_single_organism(True)                        # включение → создаёт головы
+    assert all(cid in c.insula_temp_head for cid in c.organisms)
+
+
 def test_default_is_colony_mode(compute_with_two_zodchiy):
     """Дефолт — колониальный режим (флаг False)."""
     c = compute_with_two_zodchiy

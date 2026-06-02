@@ -516,6 +516,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_sfnn_basic: bool | None = None
     # Single-organism pivot (ТЗ e3cc81b): применённый флаг single_organism.
     applied_single_organism: bool | None = None
+    # Track 2 / направление (б) (Фрай 02.06.2026): применённый флаг insula_temp
+    # (insula-стресс → temperature-модуляция). Через client_flags → мгновенный
+    # on/off без деплоя: запуск по go Фрая, tripwire-откат при disruption.
+    applied_insula_temp: bool | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -712,6 +716,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("single_organism → %s", target_single)
                         except Exception as e:
                             logger.warning("set_single_organism failed: %s", e)
+
+                    # Track 2 / направление (б): insula-стресс → temperature-
+                    # модуляция. Мгновенный on/off без деплоя (запуск по go
+                    # Фрая; tripwire-откат при деградации foraging). edge-detect
+                    # как single_organism — применяем независимо от desired state.
+                    target_insula_temp = bool(flags.get("insula_temp", False))
+                    if target_insula_temp != applied_insula_temp \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_insula_temp(target_insula_temp)
+                            applied_insula_temp = target_insula_temp
+                            logger.info("insula_temp → %s", target_insula_temp)
+                        except Exception as e:
+                            logger.warning("set_insula_temp failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:

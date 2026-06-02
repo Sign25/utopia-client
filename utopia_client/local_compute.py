@@ -54,6 +54,19 @@ _SELF_OBS_OFFSET = 64
 _SELF_OBS_DIM = 4
 _BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM  # 68 — окно чтения мозга
 
+# Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
+# temperature-модуляция СУЩЕСТВУЮЩЕЙ motor-политики. НЕ отдельный actor.
+# Temperature только sharpen/flatten распределение действий → НЕ может толкнуть
+# неверное НАПРАВЛЕНИЕ → структурно не повторит провал action-head (1-dim policy,
+# низкая variance vs 16-dim). Вход — интероцептивный self-observable 4-вектор
+# (entropy/trace/reward_var/paralyzed = состояние «ума/стресса», субсумирует
+# мёртвый insula.last_stress). T_mod = exp(mu + σ·ε), mu = head(so4), zero-init →
+# mu=0 → T_mod≈1 (near-identity старт). σ мал → temperature-only jitter.
+# Clamp log T ∈ ±ln2 → T_mod ∈ [0.5, 2.0] (не может задавить/взорвать действие).
+_INSULA_TEMP_LOG_CLAMP = math.log(2.0)   # T_mod ∈ [0.5, 2.0]
+_INSULA_TEMP_SIGMA = 0.08                # σ exploration на log-T (мал → near-identity)
+_INSULA_TEMP_LR = 3e-4                   # << self_obs_head 1e-3: медленный, аккуратный
+
 # Колониально-специфичные mental_break (Фрай 01.06.2026): требуют колонию,
 # под single_organism для одиночки always-true/бессодержательны → гейтятся.
 #   loner    = oxytocin<10 + social_gap>500 — у одиночки oxytocin всегда→0
@@ -545,6 +558,19 @@ class LocalColonyCompute:
         # Код сохранён для rework (lower lr / variance reduction / иная интеграция).
         # Predictor self-observable (самомодель) остаётся включён — он non-destructive.
         self._self_obs_head_enabled: bool = False
+
+        # Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
+        # temperature-модуляция motor-политики (НЕ actor). Безопасная форма:
+        # temperature только sharpen/flatten, не меняет НАПРАВЛЕНИЕ → не повторит
+        # action-head corruption. head: Linear(_SELF_OBS_DIM→1) zero-init → mu=0 →
+        # T_mod≈1 (near-identity старт). 1-dim Gaussian policy REINFORCE (низкая
+        # variance). Под флагом, дефолт OFF — live не трогаем до закрепления
+        # viability + ОК Фрая (его порядок: viability → build dev-side → запуск).
+        self.insula_temp_head: dict = {}      # cid → nn.Linear(_SELF_OBS_DIM, 1)
+        self.insula_temp_head_opt: dict = {}  # cid → Adam (lr=_INSULA_TEMP_LR)
+        self._it_ctx: dict = {}               # cid → (so4_tensor, log_tmod) prev-тик
+        self._it_baseline: dict = {}          # cid → бегущая средняя advantage (variance-reduction)
+        self._insula_temp_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -1056,6 +1082,10 @@ class LocalColonyCompute:
         self.self_obs_head_opt.pop(cid, None)
         self._so_head_ctx.pop(cid, None)
         self._so_head_baseline.pop(cid, None)
+        self.insula_temp_head.pop(cid, None)  # Track 2 (б) insula-temp cleanup
+        self.insula_temp_head_opt.pop(cid, None)
+        self._it_ctx.pop(cid, None)
+        self._it_baseline.pop(cid, None)
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
         self.dopamine.pop(cid, None)
         self.imagination.pop(cid, None)
@@ -2052,7 +2082,46 @@ class LocalColonyCompute:
                 if _sh:
                     logger.info("single_organism: self-obs action head on "
                                 "%d organisms (Track 2)", _sh)
+            # Направление (б): insula-стресс → temperature-модуляция. За флагом,
+            # дефолт OFF (live не трогаем до закрепления viability + ОК Фрая).
+            # near-identity старт (T≈1), temperature-only → структурно безопасна.
+            if self._insula_temp_enabled:
+                _it = 0
+                for _cid in list(self.organisms.keys()):
+                    if self._enable_insula_temp(_cid):
+                        _it += 1
+                if _it:
+                    logger.info("single_organism: insula-temp modulation on "
+                                "%d organisms (Track 2 (б))", _it)
         return on
+
+    def set_insula_temp(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл (б) insula-temp модуляцию МГНОВЕННО
+        (без деплоя/рестарта). Запуск по go Фрая; tripwire-откат при деградации
+        foraging = client_flags.insula_temp=false (мгновенно, без execv).
+
+        on=True: ставит флаг + создаёт головы на всех organisms (идемпотентно),
+        ЕСЛИ single_organism активен (иначе головы создаст set_single_organism
+        при включении — порядок флагов не важен). on=False: флаг off →
+        _apply_insula_temp становится полным no-op; головы СОХРАНЯЮТСЯ для
+        мгновенного ре-enable (обучение продолжится с накопленного).
+        """
+        self._insula_temp_enabled = bool(on)
+        if on and self._single_organism:
+            cnt = 0
+            for cid in list(self.organisms.keys()):
+                if self._enable_insula_temp(cid):
+                    cnt += 1
+            if cnt:
+                logger.info("set_insula_temp: insula-temp on %d organisms "
+                            "(Track 2 (б))", cnt)
+        elif on:
+            logger.info("set_insula_temp: флаг ON, single_organism off — "
+                        "головы создадутся при включении single_organism")
+        else:
+            logger.info("set_insula_temp: OFF (модуляция no-op, головы "
+                        "сохранены для ре-enable)")
+        return self._insula_temp_enabled
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
 
@@ -2384,6 +2453,7 @@ class LocalColonyCompute:
                 # → доходят до еды; bias_scale→0 (обучена) → motor автономен.
                 _own = max(0.0, 1.0 - float(self._bias_scale))
                 _so_this_ctx = None
+                _it_this_ctx = None
                 if motor_delta is not None and _own > 0.0:
                     action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
                     # Track 2: self-obs→action голова — bias логитов от состояния
@@ -2402,10 +2472,17 @@ class LocalColonyCompute:
                             _so_this_ctx = [_so4t, None, _base]  # action ниже
                         except Exception as e:
                             logger.debug("self_obs head bias %s: %s", cid, e)
+                    # Направление (б): insula-temp модуляция (sharpen/flatten,
+                    # НЕ меняет направление). action_slice / T_mod до select.
+                    action_slice, _it_this_ctx = self._apply_insula_temp(
+                        cid, action_slice)
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
-                    action = int(selector.select(logits, n_actions=N_ACTIONS))
+                    logits_eff = logits[0, :N_ACTIONS]
+                    logits_eff, _it_this_ctx = self._apply_insula_temp(
+                        cid, logits_eff)
+                    action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
                 out[cid] = {"action": action, "target_id": None}
@@ -2506,6 +2583,14 @@ class LocalColonyCompute:
                             self._self_obs_head_reinforce(
                                 cid, self._so_head_ctx.get(cid), _adv)
                             self._so_head_ctx[cid] = _so_this_ctx
+                        # Направление (б): REINFORCE insula-temp голова (1-dim
+                        # Gaussian-policy). Та же ротация: награда r_imm_total за
+                        # ПРОШЛОЕ действие → обновляем ПРЕДЫДУЩИЙ temp-ctx
+                        # (baseline/variance-reduction внутри). this-tick → prev.
+                        if cid in self.insula_temp_head:
+                            self._insula_temp_reinforce(
+                                cid, self._it_ctx.get(cid), r_imm_total)
+                            self._it_ctx[cid] = _it_this_ctx
                         # Phase 5d (NEOL): TD-модулятор η для reward_output.
                         # td = β − EMA(β, α=0.01), mult = 1 + clip(td, ±0.5).
                         # Если S2.E off (нет beta → td=0.0) → mult=1.0 (no-op).
@@ -4439,6 +4524,115 @@ class LocalColonyCompute:
             opt.step()
         except Exception as e:
             logger.debug("self_obs_head reinforce %s: %s", cid, e)
+
+    # ── Track 2 / направление (б): insula-стресс → temperature-модуляция ──
+
+    def _enable_insula_temp(self, cid: str) -> bool:
+        """Создать insula-temp голову для cid (направление (б), Фрай).
+
+        Linear(_SELF_OBS_DIM→1), ZERO-init (вес+bias=0) → mu=0 → log_tmod≈0 →
+        T_mod≈1.0 (near-identity старт, действие НЕ меняется). Учится 1-dim
+        Gaussian-policy REINFORCE мапить интероцепцию (стресс/неуверенность) в
+        temperature (sharpen при уверенности, flatten при стрессе). Temperature
+        НЕ меняет направление действия → структурно безопасна. Идемпотентно.
+        """
+        if cid in self.insula_temp_head:
+            return False
+        torch = self._torch
+        nn = torch.nn
+        try:
+            head = nn.Linear(_SELF_OBS_DIM, 1).to(self.device)
+            with torch.no_grad():
+                head.weight.zero_()
+                head.bias.zero_()
+            self.insula_temp_head[cid] = head
+            self.insula_temp_head_opt[cid] = torch.optim.Adam(
+                head.parameters(), lr=_INSULA_TEMP_LR)
+            self._it_baseline.setdefault(cid, 0.0)
+            logger.info("insula-temp head enabled cid=%s (%d→1, zero-init, "
+                        "near-identity T≈1)", cid, _SELF_OBS_DIM)
+            return True
+        except Exception as e:
+            logger.warning("enable_insula_temp %s: %s", cid, e)
+            return False
+
+    def _insula_temp_factor(self, cid: str, so4, deterministic: bool = False):
+        """Вернуть (T_mod, log_tmod, ctx) для cid из self-observable so4.
+
+        T_mod = exp(clamp(mu + σ·ε, ±ln2)), mu = head(so4) (detached для forward).
+        deterministic=True → ε=0 (для тестов/проверки near-identity: zero-init
+        head → T_mod=1.0 ровно). ctx=(so4, log_tmod) для последующего REINFORCE.
+        Возвращает (None, None, None) если головы нет/ошибка.
+        """
+        head = self.insula_temp_head.get(cid)
+        if head is None:
+            return None, None, None
+        torch = self._torch
+        try:
+            with torch.no_grad():
+                mu = head(so4).reshape(())          # скаляр
+                if deterministic:
+                    eps = torch.zeros((), device=mu.device, dtype=mu.dtype)
+                else:
+                    eps = torch.randn((), device=mu.device, dtype=mu.dtype)
+                log_tmod = (mu + _INSULA_TEMP_SIGMA * eps).clamp(
+                    -_INSULA_TEMP_LOG_CLAMP, _INSULA_TEMP_LOG_CLAMP)
+                t_mod = float(torch.exp(log_tmod).item())
+            return t_mod, float(log_tmod.item()), (so4, float(log_tmod.item()))
+        except Exception as e:
+            logger.debug("insula_temp_factor %s: %s", cid, e)
+            return None, None, None
+
+    def _insula_temp_reinforce(self, cid: str, ctx, advantage: float) -> None:
+        """1-dim Gaussian-policy REINFORCE-шаг temperature-головы.
+
+        ctx=(so4, log_tmod_sampled). mu=head(so4) (grad). logπ(log_tmod|mu) =
+        -0.5·((log_tmod−mu)/σ)² (+const, отбрасываем). loss = −(adv−baseline)·logπ.
+        baseline = бегущая средняя advantage (variance-reduction, как Фрай просил).
+        Малый lr → медленный отход от near-identity. Adam-step.
+        """
+        head = self.insula_temp_head.get(cid)
+        opt = self.insula_temp_head_opt.get(cid)
+        if head is None or opt is None or ctx is None:
+            return
+        torch = self._torch
+        so4, log_tmod = ctx
+        try:
+            base = self._it_baseline.get(cid, 0.0)
+            adv = float(advantage) - float(base)
+            # обновляем baseline (EMA) ПОСЛЕ вычисления adv
+            self._it_baseline[cid] = (
+                (1.0 - _EMA_ALPHA) * float(base) + _EMA_ALPHA * float(advantage))
+            mu = head(so4).reshape(())             # grad через голову
+            logp = -0.5 * ((float(log_tmod) - mu) / _INSULA_TEMP_SIGMA) ** 2
+            loss = -logp * adv
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        except Exception as e:
+            logger.debug("insula_temp reinforce %s: %s", cid, e)
+
+    def _apply_insula_temp(self, cid: str, slice_t):
+        """Гейт + применение (б): slice / T_mod до select. Returns (slice, ctx).
+
+        Флаг off ИЛИ головы нет → возвращает (slice, None) (полный no-op). Иначе
+        строит so4, берёт T_mod (~1 near-identity), делит логиты, отдаёт ctx для
+        next-тик REINFORCE. T_mod>1 → flatter (explore при стрессе), <1 → sharper.
+        Никогда не меняет НАПРАВЛЕНИЕ — только остроту распределения.
+        """
+        if not self._insula_temp_enabled or cid not in self.insula_temp_head:
+            return slice_t, None
+        torch = self._torch
+        try:
+            so4 = torch.from_numpy(
+                self._build_self_observable(cid)).to(self.device)
+            t_mod, _log_tmod, ctx = self._insula_temp_factor(cid, so4)
+            if t_mod is None or not (0.0 < t_mod < 1e6):
+                return slice_t, None
+            return slice_t / t_mod, ctx
+        except Exception as e:
+            logger.debug("apply_insula_temp %s: %s", cid, e)
+            return slice_t, None
 
     # ── Phase 6 — Self-observable states ─────────────────────────────────
 
