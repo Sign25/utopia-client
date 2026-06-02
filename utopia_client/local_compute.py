@@ -1285,8 +1285,8 @@ class LocalColonyCompute:
         pred_sd = payload.get("predictor")
         if pred_sd is not None and self.predictor.get(cid) is not None:
             try:
-                # Сначала просто загружаем веса родителя.
-                self.predictor[cid].load_state_dict(pred_sd)
+                # Сначала просто загружаем веса родителя (robust к Track2 obs68).
+                self._load_predictor_sd(cid, pred_sd)
                 # Затем применяем Y50 noise: 0.5·parent + 0.5·noise(σ·std).
                 self._apply_y50_to_predictor(self.predictor[cid])
                 # Y50 поломал параметры — нужен свежий optimizer.
@@ -1434,7 +1434,7 @@ class LocalColonyCompute:
         pred_sd = payload.get("predictor")
         if pred_sd is not None and self.predictor.get(cid) is not None:
             try:
-                self.predictor[cid].load_state_dict(pred_sd)
+                self._load_predictor_sd(cid, pred_sd)  # robust к Track2 obs68
                 self.predictor_opt[cid] = self._torch.optim.Adam(
                     self.predictor[cid].parameters(), lr=1e-3)
             except Exception as e:
@@ -4311,10 +4311,26 @@ class LocalColonyCompute:
                     pred.parameters(), lr=1e-3)
             except Exception as e:
                 logger.warning("self-observable opt recreate %s: %s", cid, e)
+            # Stale prev_obs (obs64, до upgrade) не совпадёт с input_proj(68) →
+            # чистим: следующий forward стартует с prev=None (skip) → сохранит
+            # obs68 → дальше согласовано.
+            self.prev_obs.pop(cid, None)
             logger.info("self-observable enabled cid=%s (predictor 64→68, [I|0])",
                         cid)
             return True
         return False
+
+    def _load_predictor_sd(self, cid: str, pred_sd: dict) -> None:
+        """Robust load predictor state_dict (Track 2). Если сохранён РАСШИРЕННЫЙ
+        predictor (data_dim=68 → есть input_proj.* в sd), сначала upgrade rebuilt
+        predictor [I|0], потом load — ключи совпадут, обученный self-observable
+        input_proj переживёт restart. Иначе обычный load (64)."""
+        pred = self.predictor.get(cid)
+        if pred is None:
+            return
+        if any(str(k).startswith("input_proj") for k in pred_sd.keys()):
+            self._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM)
+        pred.load_state_dict(pred_sd)
 
     # ── Phase 6 — Self-observable states ─────────────────────────────────
 

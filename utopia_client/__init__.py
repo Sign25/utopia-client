@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.80"  # Track 2 (этап 4): self-observable obs — predictor читает obs68 (env64 + entropy/trace-norm/reward-var/paralyzed) через input_proj [I|0] (non-destructive, math-equivalence доказана). Адам начинает моделировать своё мета-состояние → основа для обучения active EAT. paralyzed-бит закрывает §3 обучающую половину
+__version__ = "0.11.81"  # Track 2 фикс: чистка stale prev_obs при upgrade (убрать транзиентный shape-mismatch 64 vs 68) + restore-robustness (_load_predictor_sd: upgrade-before-load → сохранённый расширенный predictor переживает рестарт, обученный self-observable не теряется)

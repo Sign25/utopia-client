@@ -123,6 +123,32 @@ def test_self_observable_predictor_integration():
     assert isinstance(intr, float)                        # dim-согласовано, не упало
 
 
+def test_load_predictor_sd_robust_to_obs68():
+    """Restart-robustness: сохранённый расширенный predictor (data_dim=68, input_proj)
+    грузится в свежий 64-predictor через upgrade-before-load."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    # «Сохранённый» расширенный predictor
+    saved = c._make_predictor_tissue()
+    c.predictor[cid] = saved
+    assert c._upgrade_tissue_input_dim(saved, 68) is True
+    sd = saved.state_dict()
+    assert any(str(k).startswith("input_proj") for k in sd.keys())  # есть input_proj
+    # Свежий 64-predictor + robust load
+    c.predictor[cid] = c._make_predictor_tissue()
+    assert int(c.predictor[cid].data_dim) == 64
+    c._load_predictor_sd(cid, sd)                  # должен upgrade + load
+    assert int(c.predictor[cid].data_dim) == 68    # расширен под сохранённый
+    # prev_obs чистится при enable (нет stale-mismatch)
+    c.prev_obs[cid] = torch.randn(1, 64)
+    c.predictor[cid] = c._make_predictor_tissue()
+    c.predictor_opt[cid] = torch.optim.Adam(c.predictor[cid].parameters(), lr=1e-3)
+    c._enable_self_observable(cid)
+    assert cid not in c.prev_obs                   # stale prev снят
+
+
 def test_default_is_colony_mode(compute_with_two_zodchiy):
     """Дефолт — колониальный режим (флаг False)."""
     c = compute_with_two_zodchiy
