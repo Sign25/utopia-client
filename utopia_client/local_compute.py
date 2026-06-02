@@ -4210,6 +4210,55 @@ class LocalColonyCompute:
             self.prev_obs[cid] = obs_tensor.detach()
         return intrinsic
 
+    # ── Track 2 (этап 4): self-observable obs — расширение восприятия ─────
+
+    def _build_self_observable(self, cid: str) -> "np.ndarray":
+        """4 self-observable сигнала для STATE_DIM obs[64:68] (Track 2).
+
+        Интероцепция ВЫСШЕГО порядка — мозг ощущает не тело, а свой УМ. Контракт
+        зафиксирован (cb8180b, порядок постоянный): entropy_ema («не уверен») /
+        trace_norm_ema («учусь») / reward_var_ema («среда изменилась») / paralyzed
+        («осознаёт паралич» — закрывает §3 обучающую половину). См. _SELF_OBS_*.
+        """
+        par, _ = self._paralysis_state(cid)
+        return np.array([
+            float(self.entropy_ema.get(cid, 0.0)),
+            float(self.trace_norm_ema.get(cid, 0.0)),
+            float(self.reward_var_ema.get(cid, 0.0)),
+            1.0 if par else 0.0,
+        ], dtype=np.float32)
+
+    def _upgrade_tissue_input_dim(self, tissue, new_data_dim: int) -> bool:
+        """Расширить read-окно ткани DATA_DIM(64)→new_data_dim (Track 2).
+
+        Добавляет input_proj Linear(new_data_dim→64) с PASSTHROUGH-init [I_64 | 0]:
+        первые 64 проходят как есть, новые dims → 0-влияние. Обученное ядро ткани
+        НЕ трогается → founding-мозг c103927 не дисраптится (math-equivalence на
+        первых 64); новые self-observable dims Hebbian/predictor доучивают сами.
+        Использует штатный механизм Tissue (data_dim>64 → input_proj, см.
+        core/tissue.py:163). Идемпотентно. Returns True если применено.
+        """
+        torch = self._torch
+        nn = torch.nn
+        try:
+            cur = int(getattr(tissue, "data_dim", _SELF_OBS_OFFSET))
+            if cur >= new_data_dim:
+                return False
+            proj = nn.Linear(new_data_dim, _SELF_OBS_OFFSET).to(self.device)
+            with torch.no_grad():
+                w = torch.zeros(_SELF_OBS_OFFSET, new_data_dim,
+                                dtype=proj.weight.dtype, device=self.device)
+                w[:, :_SELF_OBS_OFFSET] = torch.eye(
+                    _SELF_OBS_OFFSET, dtype=proj.weight.dtype, device=self.device)
+                proj.weight.copy_(w)   # [I_64 | 0] — passthrough первые 64
+                proj.bias.zero_()
+            tissue.input_proj = proj
+            tissue.data_dim = new_data_dim
+            return True
+        except Exception as e:
+            logger.warning("upgrade_tissue_input_dim failed: %s", e)
+            return False
+
     # ── Phase 6 — Self-observable states ─────────────────────────────────
 
     def _update_entropy_ema(self, cid: str, logits) -> None:

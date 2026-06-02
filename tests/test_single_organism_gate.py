@@ -59,6 +59,44 @@ def compute_with_two_zodchiy(tmp_path, monkeypatch):
 
 # ── set_single_organism ──────────────────────────────────────────────
 
+# ── Track 2: self-observable obs (расширение восприятия) ─────────────
+
+def test_build_self_observable():
+    """4 сигнала в контрактном порядке: entropy/trace/reward/paralyzed."""
+    import time
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    c.entropy_ema[cid] = 0.9
+    c.trace_norm_ema[cid] = 0.01
+    c.reward_var_ema[cid] = 0.03
+    c._paralysis_until[cid] = time.monotonic() + 5.0    # парализован
+    so = c._build_self_observable(cid)
+    assert len(so) == 4
+    assert abs(float(so[0]) - 0.9) < 1e-6      # entropy
+    assert abs(float(so[1]) - 0.01) < 1e-6     # trace_norm
+    assert abs(float(so[2]) - 0.03) < 1e-6     # reward_var
+    assert abs(float(so[3]) - 1.0) < 1e-6      # paralyzed
+
+
+def test_upgrade_tissue_input_dim_math_equivalence():
+    """[I|0]-init: input_proj(obs68) == obs64 → founding-мозг НЕ дисраптится."""
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    pred = c._make_predictor_tissue()
+    assert pred is not None
+    assert c._upgrade_tissue_input_dim(pred, 68) is True
+    assert c._upgrade_tissue_input_dim(pred, 68) is False   # идемпотентно
+    assert int(pred.data_dim) == 68
+    obs64 = torch.randn(1, 64)
+    self4 = torch.randn(1, 4)                  # любые self-observable
+    obs68 = torch.cat([obs64, self4], dim=-1)
+    out = pred.input_proj(obs68)
+    # passthrough первых 64 + ноль на новых 4 → math-equivalence
+    assert torch.allclose(out, obs64, atol=1e-5)
+
+
 def test_default_is_colony_mode(compute_with_two_zodchiy):
     """Дефолт — колониальный режим (флаг False)."""
     c = compute_with_two_zodchiy
