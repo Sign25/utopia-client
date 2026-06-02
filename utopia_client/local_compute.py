@@ -2012,6 +2012,17 @@ class LocalColonyCompute:
                 logger.info(
                     "single_organism: revived %d dead-marked особей "
                     "(bootstrap race fix)", _revived)
+            # Track 2 (этап 4): расширить восприятие — predictor читает
+            # self-observable (obs68). Non-destructive ([I|0]-init, math-equivalence
+            # доказана). Адам начинает моделировать своё мета-состояние → основа
+            # для обучения active EAT. Идемпотентно.
+            _so = 0
+            for _cid in list(self.predictor.keys()):
+                if self._enable_self_observable(_cid):
+                    _so += 1
+            if _so:
+                logger.info("single_organism: self-observable enabled on "
+                            "%d predictors (Track 2)", _so)
         return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -2268,6 +2279,20 @@ class LocalColonyCompute:
                 obs64 = obs_arr[:64]
                 obs_tensor = torch.from_numpy(obs64).to(self.device).unsqueeze(0)
 
+                # Track 2 (этап 4): вход predictor = obs68 (env64 + self-observable4)
+                # ЕСЛИ predictor расширен (_enable_self_observable). target остаётся
+                # obs64 — мозг СВОИМ состоянием моделирует мир (Phase 6 самосознание).
+                # Прочие ткани (forward/hebbian/motor) пока на obs64. [I|0]-init →
+                # на старте obs68→obs64 (math-equivalence), self доучивается.
+                _pred = self.predictor.get(cid)
+                pred_input = obs_tensor
+                if _pred is not None and int(
+                        getattr(_pred, "data_dim", _SELF_OBS_OFFSET)) == _BRAIN_INPUT_DIM:
+                    so = self._build_self_observable(cid)
+                    obs68 = np.concatenate([obs64, so]).astype(np.float32)
+                    pred_input = torch.from_numpy(obs68).to(
+                        self.device).unsqueeze(0)
+
                 heb = self.hebbian.get(cid)
                 if heb is not None:
                     try:
@@ -2281,7 +2306,8 @@ class LocalColonyCompute:
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
                 # в r_imm_total как baseline-сигнал.
-                intrinsic_now = self._predictor_train_step(cid, obs_tensor)
+                intrinsic_now = self._predictor_train_step(
+                    cid, obs_tensor, pred_input)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -4164,10 +4190,16 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("basic_sfnn_update %s/%s: %s", role, cid, e)
 
-    def _predictor_train_step(self, cid: str, obs_tensor) -> float:
+    def _predictor_train_step(self, cid: str, obs_tensor,
+                              input_tensor=None) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
 
         Идентично _predictor_train_step на P40 (routes_world.py:1149).
+
+        target = obs_tensor (obs64, env_{t+1} — что предсказываем). input_tensor
+        (Track 2) = то, что СОХРАНЯЕМ как prev_obs (вход следующего forward): obs68
+        (env+self) при расширенном восприятии, иначе obs64. Output ткани всегда
+        DATA_DIM=64 → MSE с obs64-target. None → input=target (backward-compat 64).
 
         Возвращает intrinsic_last (β·max(0, loss_ema_prev - loss_curr)).
         Если predictor нет или prev_obs пустой — 0.0 (но prev_obs обновится).
@@ -4176,6 +4208,8 @@ class LocalColonyCompute:
         pred = self.predictor.get(cid)
         opt = self.predictor_opt.get(cid)
         prev = self.prev_obs.get(cid)
+        if input_tensor is None:
+            input_tensor = obs_tensor
         intrinsic = 0.0
         self.intrinsic_last[cid] = 0.0
         if pred is not None and opt is not None and prev is not None:
@@ -4207,7 +4241,9 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.warning("predictor train %s: %s", cid, e)
         if pred is not None:
-            self.prev_obs[cid] = obs_tensor.detach()
+            # Track 2: храним ВХОД (obs68 при расширенном восприятии) — он станет
+            # prev для следующего forward. target (obs64) только для loss.
+            self.prev_obs[cid] = input_tensor.detach()
         return intrinsic
 
     # ── Track 2 (этап 4): self-observable obs — расширение восприятия ─────
@@ -4258,6 +4294,27 @@ class LocalColonyCompute:
         except Exception as e:
             logger.warning("upgrade_tissue_input_dim failed: %s", e)
             return False
+
+    def _enable_self_observable(self, cid: str) -> bool:
+        """Track 2: расширить восприятие predictor cid'а до obs68 (env+self).
+
+        Upgrade input_proj [I|0] + ПЕРЕСОЗДАТЬ optimizer (новый input_proj должен
+        обучаться, иначе self-observable dims навсегда нулевые). Идемпотентно
+        (если уже расширен — opt не трогаем). Returns True если применено сейчас.
+        """
+        pred = self.predictor.get(cid)
+        if pred is None:
+            return False
+        if self._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM):
+            try:
+                self.predictor_opt[cid] = self._torch.optim.Adam(
+                    pred.parameters(), lr=1e-3)
+            except Exception as e:
+                logger.warning("self-observable opt recreate %s: %s", cid, e)
+            logger.info("self-observable enabled cid=%s (predictor 64→68, [I|0])",
+                        cid)
+            return True
+        return False
 
     # ── Phase 6 — Self-observable states ─────────────────────────────────
 

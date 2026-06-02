@@ -97,6 +97,32 @@ def test_upgrade_tissue_input_dim_math_equivalence():
     assert torch.allclose(out, obs64, atol=1e-5)
 
 
+def test_self_observable_predictor_integration():
+    """Интеграция Track 2: enable → predictor train с obs68/target-obs64 dim-корректен."""
+    import numpy as np
+    import torch
+    from utopia_client.local_compute import LocalColonyCompute
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    c.predictor[cid] = c._make_predictor_tissue()
+    c.predictor_opt[cid] = torch.optim.Adam(
+        c.predictor[cid].parameters(), lr=1e-3)
+    c.entropy_ema[cid] = 0.0
+    c.trace_norm_ema[cid] = 0.0
+    c.reward_var_ema[cid] = 0.0
+    assert c._enable_self_observable(cid) is True
+    assert int(c.predictor[cid].data_dim) == 68
+    obs64 = torch.randn(1, 64)
+    so = c._build_self_observable(cid)                    # [4]
+    obs68 = torch.from_numpy(
+        np.concatenate([obs64.numpy().reshape(-1), so]).astype(np.float32)
+    ).unsqueeze(0)
+    assert obs68.shape == (1, 68)
+    c._predictor_train_step(cid, obs64, obs68)            # шаг 1: сохранит prev
+    intr = c._predictor_train_step(cid, obs64, obs68)     # шаг 2: forward(obs68)→64
+    assert isinstance(intr, float)                        # dim-согласовано, не упало
+
+
 def test_default_is_colony_mode(compute_with_two_zodchiy):
     """Дефолт — колониальный режим (флаг False)."""
     c = compute_with_two_zodchiy
