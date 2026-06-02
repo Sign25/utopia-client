@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.83"  # ОТКАТ self-obs→action головы: live-эксперимент показал деградацию foraging (income 123→45 за 1ч, 2 точки — высоковариативный REINFORCE поверх motor-политики шумел). Голова за флагом _self_obs_head_enabled=False (код сохранён для rework). Predictor self-observable остаётся (non-destructive). Адам восстанавливается
+__version__ = "0.11.84"  # ЗАПУСК (б) insula-temp моста (go Фрая 02.06): деплой плумбинга client_flags.insula_temp. После self-update set_insula_temp читает флаг; near-identity старт (T_mod=1.0, no-op) → доход не прыгает, мост учится медленно (lr 3e-4). Tripwire income 123→45 → откат флагом (insula_temp=false, без деплоя). Baseline до флипа: income 141 (settling >база 132)
