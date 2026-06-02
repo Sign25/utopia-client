@@ -539,6 +539,12 @@ class LocalColonyCompute:
         self.self_obs_head_opt: dict = {}    # cid → Adam
         self._so_head_ctx: dict = {}         # cid → (so4, action, base_logits) prev-тик
         self._so_head_baseline: dict = {}    # cid → бегущая средняя reward (REINFORCE baseline)
+        # ОТКЛЮЧЕНА 02.06.2026: live-эксперимент показал, что self-obs→action
+        # голова ДЕГРАДИРУЕТ foraging (income 123→45 за 1ч, 2 точки) — высоко-
+        # вариативный REINFORCE поверх работающей motor-политики добавлял шум.
+        # Код сохранён для rework (lower lr / variance reduction / иная интеграция).
+        # Predictor self-observable (самомодель) остаётся включён — он non-destructive.
+        self._self_obs_head_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -2036,14 +2042,16 @@ class LocalColonyCompute:
             if _so:
                 logger.info("single_organism: self-observable enabled on "
                             "%d predictors (Track 2)", _so)
-            # Track 2: self-obs→action голова (прямой обучаемый путь к действию).
-            _sh = 0
-            for _cid in list(self.organisms.keys()):
-                if self._enable_self_obs_action_head(_cid):
-                    _sh += 1
-            if _sh:
-                logger.info("single_organism: self-obs action head on "
-                            "%d organisms (Track 2)", _sh)
+            # Track 2: self-obs→action голова — ОТКЛЮЧЕНА (деградировала foraging,
+            # см. _self_obs_head_enabled). Код сохранён для rework.
+            if self._self_obs_head_enabled:
+                _sh = 0
+                for _cid in list(self.organisms.keys()):
+                    if self._enable_self_obs_action_head(_cid):
+                        _sh += 1
+                if _sh:
+                    logger.info("single_organism: self-obs action head on "
+                                "%d organisms (Track 2)", _sh)
         return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -2381,7 +2389,8 @@ class LocalColonyCompute:
                     # Track 2: self-obs→action голова — bias логитов от состояния
                     # (zero-init → старт без влияния, учится REINFORCE). Прямой
                     # путь self-observable (голод/неуверенность/паралич) → действие.
-                    _so_head = self.self_obs_head.get(cid)
+                    _so_head = (self.self_obs_head.get(cid)
+                                if self._self_obs_head_enabled else None)
                     if _so_head is not None:
                         try:
                             _so4t = torch.from_numpy(

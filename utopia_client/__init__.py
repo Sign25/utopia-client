@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.82"  # Track 2: self-obs→action REINFORCE-голова (Linear 4→16, zero-init=non-destructive) — прямой обучаемый путь self-observable (голод/неуверенность/паралич) → ДЕЙСТВИЕ. Закрывает плато (predictor лишь моделировал состояние, базовые ткани hebbian/insula-стресс путь к action не несут). Адам учится приоритезировать добычу по состоянию
+__version__ = "0.11.83"  # ОТКАТ self-obs→action головы: live-эксперимент показал деградацию foraging (income 123→45 за 1ч, 2 точки — высоковариативный REINFORCE поверх motor-политики шумел). Голова за флагом _self_obs_head_enabled=False (код сохранён для rework). Predictor self-observable остаётся (non-destructive). Адам восстанавливается
