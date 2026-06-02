@@ -5373,8 +5373,25 @@ class LocalColonyCompute:
                     # Конец паралича → recovery-грант (ЭНЕРГИЯ, не время).
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
-                    logger.info("paralysis recovery cid=%s -> energy=%.1f",
-                                cid, self._recovery_energy)
+                    # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
+                    # recovery = «передышка» → снимает не только паралич, но и
+                    # стресс-залипание catatonic (cortisol застревает на 99.5 от
+                    # хронического голода, ×0.995-декей не пробивает ре-спайк →
+                    # absorbing-STAY). На recovery облегчаем cortisol/serotonin →
+                    # catatonic self-limiting: Адам выходит в активное окно и
+                    # снова фуражит. НЕ маскировка (recovery — реальное событие
+                    # relief), а размыкание absorbing-петли.
+                    try:
+                        bc.cortisol = float(getattr(bc, "baseline_cortisol", 10.0))
+                        bc.serotonin = max(
+                            float(getattr(bc, "serotonin", 0.0)),
+                            float(getattr(bc, "baseline_serotonin", 50.0)))
+                        bc.mental_break = ""
+                        bc.mental_break_ticks = 0
+                    except Exception:
+                        pass
+                    logger.info("paralysis recovery cid=%s -> energy=%.1f "
+                                "(+стресс-relief)", cid, self._recovery_energy)
                 elif until is None and float(getattr(bc, "energy", 1.0)) <= 0.0:
                     # Триггер 1: голод (energy≤0). Триггер 2 (death_suppressed
                     # от P40, energy-независим) — в handle_tick.

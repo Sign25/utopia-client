@@ -263,6 +263,24 @@ def test_paralysis_recovery_grants_energy(compute_with_two_zodchiy):
     assert cid not in c._dead_cids
 
 
+def test_paralysis_recovery_relieves_catatonic_stress(compute_with_two_zodchiy):
+    """Фрай-инвариант: recovery размыкает absorbing-catatonic (cortisol-relief)."""
+    import time
+    c = compute_with_two_zodchiy
+    c.set_single_organism(True)
+    cid = next(iter(c.biochem))
+    bc = c.biochem[cid]
+    bc.energy = 0.0
+    bc.cortisol = 99.5                  # застрявший стресс → catatonic
+    bc.serotonin = 0.0
+    bc.mental_break = "catatonic"
+    c._paralysis_until[cid] = time.monotonic() - 1.0    # срок истёк → recovery
+    c._apply_metabolism(cid, {"step_cost_per_sec": 0.0})
+    assert bc.cortisol < 80.0           # стресс облегчён → не catatonic
+    assert bc.mental_break == ""        # залипание снято
+    assert bc.energy == c._recovery_energy
+
+
 # ── §3 mirror-контракт: projection-поля + триггер 2 (Хьюберт 2b0f3a2) ──
 
 def test_projection_includes_paralysis_fields(compute_with_two_zodchiy):
