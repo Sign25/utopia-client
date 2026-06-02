@@ -530,6 +530,15 @@ class LocalColonyCompute:
         # Recovery-грант энергии после паралича. Тюнится мной (Фрай): если
         # grass-only зацикливает — поднимаю (max/φ⁶≈73 / max/φ⁵≈118).
         self._recovery_energy: float = _RECOVERY_ENERGY_DEFAULT
+        # Track 2 (этап 4): self-obs→action REINFORCE-голова. Linear(4→N_ACTIONS),
+        # zero-init (non-destructive старт): мапит self-observable (голод/
+        # неуверенность/паралич) в bias логитов, учится REINFORCE-наградой. Прямой
+        # обучаемый путь self-observable → ДЕЙСТВИЕ (predictor его лишь моделирует;
+        # базовые ткани hebbian/insula-стресс этот путь не несут — investigation).
+        self.self_obs_head: dict = {}        # cid → nn.Linear(4, N_ACTIONS)
+        self.self_obs_head_opt: dict = {}    # cid → Adam
+        self._so_head_ctx: dict = {}         # cid → (so4, action, base_logits) prev-тик
+        self._so_head_baseline: dict = {}    # cid → бегущая средняя reward (REINFORCE baseline)
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -1037,6 +1046,10 @@ class LocalColonyCompute:
         self.reward_var_ema.pop(cid, None)
         self.reward_history.pop(cid, None)
         self._paralysis_until.pop(cid, None)  # §3 paralysis cleanup
+        self.self_obs_head.pop(cid, None)     # Track 2 head cleanup
+        self.self_obs_head_opt.pop(cid, None)
+        self._so_head_ctx.pop(cid, None)
+        self._so_head_baseline.pop(cid, None)
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F.
         self.dopamine.pop(cid, None)
         self.imagination.pop(cid, None)
@@ -2023,6 +2036,14 @@ class LocalColonyCompute:
             if _so:
                 logger.info("single_organism: self-observable enabled on "
                             "%d predictors (Track 2)", _so)
+            # Track 2: self-obs→action голова (прямой обучаемый путь к действию).
+            _sh = 0
+            for _cid in list(self.organisms.keys()):
+                if self._enable_self_obs_action_head(_cid):
+                    _sh += 1
+            if _sh:
+                logger.info("single_organism: self-obs action head on "
+                            "%d organisms (Track 2)", _sh)
         return on
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -2354,12 +2375,30 @@ class LocalColonyCompute:
                 # (untrained) → motor×0 → shaping (флора-градиент) ведёт чисто
                 # → доходят до еды; bias_scale→0 (обучена) → motor автономен.
                 _own = max(0.0, 1.0 - float(self._bias_scale))
+                _so_this_ctx = None
                 if motor_delta is not None and _own > 0.0:
                     action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
+                    # Track 2: self-obs→action голова — bias логитов от состояния
+                    # (zero-init → старт без влияния, учится REINFORCE). Прямой
+                    # путь self-observable (голод/неуверенность/паралич) → действие.
+                    _so_head = self.self_obs_head.get(cid)
+                    if _so_head is not None:
+                        try:
+                            _so4t = torch.from_numpy(
+                                self._build_self_observable(cid)).to(self.device)
+                            with torch.no_grad():
+                                _so_bias = _so_head(_so4t)
+                            _base = action_slice.detach()
+                            action_slice = action_slice + _so_bias
+                            _so_this_ctx = [_so4t, None, _base]  # action ниже
+                        except Exception as e:
+                            logger.debug("self_obs head bias %s: %s", cid, e)
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
                     action = int(selector.select(logits, n_actions=N_ACTIONS))
+                if _so_this_ctx is not None:
+                    _so_this_ctx[1] = action
                 out[cid] = {"action": action, "target_id": None}
 
                 # carried_food зеркало — ТОЛЬКО fallback, если P40 не шлёт
@@ -2446,6 +2485,18 @@ class LocalColonyCompute:
                         r_imm = self._compute_immediate_reward(event)
                         # Phase 2 — подмешать intrinsic в immediate.
                         r_imm_total = r_imm + intrinsic_now
+                        # Track 2: REINFORCE self-obs→action голова. events =
+                        # прошлый тик → r_imm_total = награда за ПРОШЛОЕ действие →
+                        # обновляем ПРЕДЫДУЩИЙ ctx. advantage = r − baseline (своя
+                        # бегущая средняя). Потом ротация: this-tick ctx → prev.
+                        if cid in self.self_obs_head:
+                            _b = self._so_head_baseline.get(cid, 0.0)
+                            _adv = r_imm_total - _b
+                            self._so_head_baseline[cid] = (
+                                0.99 * _b + 0.01 * r_imm_total)
+                            self._self_obs_head_reinforce(
+                                cid, self._so_head_ctx.get(cid), _adv)
+                            self._so_head_ctx[cid] = _so_this_ctx
                         # Phase 5d (NEOL): TD-модулятор η для reward_output.
                         # td = β − EMA(β, α=0.01), mult = 1 + clip(td, ±0.5).
                         # Если S2.E off (нет beta → td=0.0) → mult=1.0 (no-op).
@@ -4331,6 +4382,54 @@ class LocalColonyCompute:
         if any(str(k).startswith("input_proj") for k in pred_sd.keys()):
             self._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM)
         pred.load_state_dict(pred_sd)
+
+    def _enable_self_obs_action_head(self, cid: str) -> bool:
+        """Track 2: создать self-obs→action REINFORCE-голову для cid.
+
+        Linear(_SELF_OBS_DIM→N_ACTIONS), ZERO-init (вес+bias=0) → на старте bias=0
+        → действие Адама НЕ меняется (non-destructive). Учится REINFORCE: мапит
+        self-observable в bias логитов под награду. Идемпотентно.
+        """
+        if cid in self.self_obs_head:
+            return False
+        torch = self._torch
+        nn = torch.nn
+        try:
+            head = nn.Linear(_SELF_OBS_DIM, N_ACTIONS).to(self.device)
+            with torch.no_grad():
+                head.weight.zero_()
+                head.bias.zero_()
+            self.self_obs_head[cid] = head
+            self.self_obs_head_opt[cid] = torch.optim.Adam(
+                head.parameters(), lr=1e-3)
+            logger.info("self-obs action head enabled cid=%s (%d→%d, zero-init)",
+                        cid, _SELF_OBS_DIM, N_ACTIONS)
+            return True
+        except Exception as e:
+            logger.warning("enable_self_obs_action_head %s: %s", cid, e)
+            return False
+
+    def _self_obs_head_reinforce(self, cid: str, ctx, advantage: float) -> None:
+        """REINFORCE-шаг головы: ctx=(so4, action, base_logits). loss =
+        -log_softmax(base + head(so4))[action] · advantage. base — detached
+        (вклад organism+motor); градиент только через голову. Adam-step."""
+        head = self.self_obs_head.get(cid)
+        opt = self.self_obs_head_opt.get(cid)
+        if head is None or opt is None or ctx is None:
+            return
+        torch = self._torch
+        so4, action, base = ctx
+        try:
+            import torch.nn.functional as F
+            bias = head(so4)                       # grad через голову
+            final = base + bias                    # base detached
+            logp = F.log_softmax(final, dim=-1)[int(action)]
+            loss = -logp * float(advantage)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        except Exception as e:
+            logger.debug("self_obs_head reinforce %s: %s", cid, e)
 
     # ── Phase 6 — Self-observable states ─────────────────────────────────
 

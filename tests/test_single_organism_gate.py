@@ -149,6 +149,33 @@ def test_load_predictor_sd_robust_to_obs68():
     assert cid not in c.prev_obs                   # stale prev снят
 
 
+def test_self_obs_action_head_zero_init_and_learns():
+    """Голова zero-init (non-destructive старт) + учится REINFORCE: positive
+    advantage → logp rewarded-действия растёт."""
+    import torch
+    import torch.nn.functional as F
+    from utopia_client.local_compute import (
+        LocalColonyCompute, N_ACTIONS,
+    )
+    c = LocalColonyCompute(device="cpu")
+    cid = "adam"
+    assert c._enable_self_obs_action_head(cid) is True
+    assert c._enable_self_obs_action_head(cid) is False     # идемпотентно
+    so4 = torch.tensor([0.9, 0.01, 0.03, 1.0])
+    with torch.no_grad():
+        bias0 = c.self_obs_head[cid](so4)
+    assert torch.allclose(bias0, torch.zeros(N_ACTIONS), atol=1e-6)  # zero-init
+    base = torch.zeros(N_ACTIONS)
+    action = 5
+    lp_before = F.log_softmax(base + c.self_obs_head[cid](so4), -1)[action].item()
+    for _ in range(20):
+        c._self_obs_head_reinforce(cid, (so4, action, base), advantage=1.0)
+    with torch.no_grad():
+        lp_after = F.log_softmax(
+            base + c.self_obs_head[cid](so4), -1)[action].item()
+    assert lp_after > lp_before     # выучила bias к rewarded-действию
+
+
 def test_default_is_colony_mode(compute_with_two_zodchiy):
     """Дефолт — колониальный режим (флаг False)."""
     c = compute_with_two_zodchiy

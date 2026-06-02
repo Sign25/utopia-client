@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.81"  # Track 2 фикс: чистка stale prev_obs при upgrade (убрать транзиентный shape-mismatch 64 vs 68) + restore-robustness (_load_predictor_sd: upgrade-before-load → сохранённый расширенный predictor переживает рестарт, обученный self-observable не теряется)
+__version__ = "0.11.82"  # Track 2: self-obs→action REINFORCE-голова (Linear 4→16, zero-init=non-destructive) — прямой обучаемый путь self-observable (голод/неуверенность/паралич) → ДЕЙСТВИЕ. Закрывает плато (predictor лишь моделировал состояние, базовые ткани hebbian/insula-стресс путь к action не несут). Адам учится приоритезировать добычу по состоянию
