@@ -570,6 +570,7 @@ class LocalColonyCompute:
         self.insula_temp_head_opt: dict = {}  # cid → Adam (lr=_INSULA_TEMP_LR)
         self._it_ctx: dict = {}               # cid → (so4_tensor, log_tmod) prev-тик
         self._it_baseline: dict = {}          # cid → бегущая средняя advantage (variance-reduction)
+        self._it_last_tmod: dict = {}         # cid → последний T_mod (телеметрия обучения моста)
         self._insula_temp_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
@@ -4629,6 +4630,7 @@ class LocalColonyCompute:
             t_mod, _log_tmod, ctx = self._insula_temp_factor(cid, so4)
             if t_mod is None or not (0.0 < t_mod < 1e6):
                 return slice_t, None
+            self._it_last_tmod[cid] = t_mod   # телеметрия обучения моста
             return slice_t / t_mod, ctx
         except Exception as e:
             logger.debug("apply_insula_temp %s: %s", cid, e)
@@ -4752,6 +4754,26 @@ class LocalColonyCompute:
                           for cid, e, c, s, g, mb in per_cid_e))
         except Exception as _e:
             logger.debug("biochem debug log failed: %s", _e)
+        # INSULA_TEMP_DEBUG (Track 2 (б)): сигнал ОБУЧЕНИЯ моста — отличить
+        # «мало времени» от «не работает» (Фрай). t_mod (расход от 1.0),
+        # wnorm (L2 веса головы; zero-init=0 → расход = обучение), baseline
+        # (REINFORCE variance-reduction; растёт = мост видит advantage).
+        try:
+            if self.insula_temp_head:
+                _it_dbg = []
+                for cid, head in self.insula_temp_head.items():
+                    try:
+                        wnorm = float(head.weight.detach().norm().item())
+                    except Exception:
+                        wnorm = 0.0
+                    _it_dbg.append(
+                        f"{cid}:t_mod={round(float(self._it_last_tmod.get(cid, 1.0)), 4)},"
+                        f"wnorm={round(wnorm, 5)},"
+                        f"baseline={round(float(self._it_baseline.get(cid, 0.0)), 3)}")
+                logger.info("INSULA_TEMP_DEBUG cids_tmod_wnorm_baseline: %s",
+                            "; ".join(_it_dbg))
+        except Exception as _e:
+            logger.debug("insula_temp debug log failed: %s", _e)
         return {
             "n_active": n,
             "mental_break_counts": mb_counts,
