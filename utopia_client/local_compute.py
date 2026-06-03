@@ -4877,6 +4877,25 @@ class LocalColonyCompute:
                     float(self._motor_oja_scale), _ml)
         except Exception as _e:
             logger.debug("motor_learn debug log failed: %s", _e)
+        # SELECTOR_DEBUG (03.06, Фрай Шаг 1): downstream-кап ActionSelector —
+        # биндит ли temperature(→5.0)/ε решительный логит обратно к высокой
+        # entropy (anti-collapse, колониальное наследие, инверсия пивота).
+        # temp pinned high + entropy высокая + random_pct высокий → селектор
+        # флэттит policy (НЕ SFNN weight-update). argmax_share = lock-in watch.
+        try:
+            for cid, sel in self.action_selectors.items():
+                st = sel.get_stats()
+                ad = st.get("action_distribution") or []
+                _amax = max(range(len(ad)), key=lambda i: ad[i]) if ad else -1
+                _ashare = ad[_amax] if ad else 0.0
+                logger.info(
+                    "SELECTOR_DEBUG %s: temp=%.3f eps=%.4f avg_entropy=%.4f "
+                    "random_pct=%.1f argmax_action=%d argmax_share=%.3f",
+                    cid, st.get("temperature", 0.0), st.get("epsilon", 0.0),
+                    st.get("avg_entropy", 0.0), st.get("random_pct", 0.0),
+                    _amax, _ashare)
+        except Exception as _e:
+            logger.debug("selector debug log failed: %s", _e)
         return {
             "n_active": n,
             "mental_break_counts": mb_counts,

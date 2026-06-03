@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.89"  # Ступень 2 (a): motor Oja-scale (Фрай) — ослабление Oja-стабилизатора (−post²·W) через client_flags motor_oja_scale (число [0,1], мгновенно). С renorm_cap>1 «освобождает магнитуду» → тест в спокойствии: flip падает (заостряется) или стоит (fundamental)? oja_scale=1.0 дефолт=текущее (no-op). MOTOR_LEARN_DEBUG логирует oja_scale
+__version__ = "0.11.90"  # Ступень 2 Шаг 1 (Фрай — копали не тот слой): SELECTOR_DEBUG — лог ActionSelector статов Адама (temperature→5.0?/epsilon/avg_entropy/random_pct/argmax_share). Гипотеза: биндинг-кап downstream в селекторе (anti-collapse temp+ε флэттят решительный логит), НЕ SFNN weight-update. Только лог, поведение не меняется
