@@ -449,6 +449,13 @@ class LocalColonyCompute:
         # политика только reinforce, не дискриминирует. Server intent:
         # "REINFORCE по log_prob[a]·(r_imm_total − baseline)".
         self._motor_reward_baseline: dict = {}  # cid → float (EMA reward)
+        # MOTOR_LEARN телеметрия (03.06, full-world Ступень 2): диагностика
+        # доставки reward→policy (Фрай: исключить delivery-bug ПЕРВЫМ).
+        # adv_ema = EMA |advantage| (reward дискриминирует?), dw_ema = EMA ‖ΔW‖
+        # применённого (policy движется?). Вместе с motor_sfnn_steps + flip_rate
+        # разводят (i) delivery-bug / (ii) credit-fail / (iii) slow-learn.
+        self._motor_adv_ema: dict = {}   # cid → EMA |advantage|
+        self._motor_dw_ema: dict = {}    # cid → EMA ‖ΔW‖ (до renorm)
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -1116,6 +1123,8 @@ class LocalColonyCompute:
         self.motor_sfnn_row_norms.pop(cid, None)
         self.last_motor_delta.pop(cid, None)
         self._motor_reward_baseline.pop(cid, None)
+        self._motor_adv_ema.pop(cid, None)
+        self._motor_dw_ema.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -3967,8 +3976,13 @@ class LocalColonyCompute:
             # ниже бортуют величину; знак-флип = анти-Hebbian «отучивание»).
             advantage = max(-2.0, min(2.0, advantage))
             reward_gain = 1.0 + advantage
+            # MOTOR_LEARN: EMA |advantage| — дискриминирует ли reward (≠0 → доехал
+            # и варьирует; ≈0 → плоский reward = (i) или нет discrimination).
+            self._motor_adv_ema[cid] = (
+                0.98 * self._motor_adv_ema.get(cid, 0.0) + 0.02 * abs(advantage))
             clip_val = self._MOTOR_SFNN_DW_CLIP
             eps = self._MOTOR_SFNN_RENORM_EPS
+            _dw_norm_sum = 0.0   # ‖ΔW‖ применённого (до renorm) — policy движется?
             with torch.no_grad():
                 # Build name → parameter map для прямого in-place обновления.
                 params = dict(tissue.named_parameters())
@@ -4019,6 +4033,7 @@ class LocalColonyCompute:
                         dW = dW + D
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
+                    _dw_norm_sum += float(dW.norm().item())  # MOTOR_LEARN
                     W.data.add_(dW)
                     # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
                     if row_norms is not None:
@@ -4027,6 +4042,8 @@ class LocalColonyCompute:
                                 and target.shape[0] == W.shape[0]):
                             cur = W.data.norm(dim=1).clamp(min=eps)
                             W.data.mul_((target / cur).unsqueeze(1))
+            self._motor_dw_ema[cid] = (   # MOTOR_LEARN: EMA ‖ΔW‖ применённого
+                0.98 * self._motor_dw_ema.get(cid, 0.0) + 0.02 * _dw_norm_sum)
             self.motor_sfnn_steps += 1
         except Exception as e:
             logger.debug("motor_sfnn_update %s: %s", cid, e)
@@ -4778,6 +4795,22 @@ class LocalColonyCompute:
                     1 if self._insula_temp_enabled else 0, "; ".join(_it_dbg))
         except Exception as _e:
             logger.debug("insula_temp debug log failed: %s", _e)
+        # MOTOR_LEARN_DEBUG (03.06, Ступень 2): доставка reward→motor-policy.
+        # steps растёт → апдейт бежит (не (i)-skip); baseline≠0 → reward доезжает;
+        # adv_ema≠0 → reward дискриминирует; dw_ema≠0 → policy реально движется.
+        # Все ≠0 + flip держит 0.99 → (ii) credit-fail; dw_ema≈0/steps плоский →
+        # (i) delivery-bug. Логируем для cid с motor-baseline (обновлялись).
+        try:
+            if self._motor_reward_baseline:
+                _ml = "; ".join(
+                    f"{cid}:baseline={round(float(self._motor_reward_baseline.get(cid, 0.0)), 3)},"
+                    f"adv_ema={round(float(self._motor_adv_ema.get(cid, 0.0)), 4)},"
+                    f"dw_ema={round(float(self._motor_dw_ema.get(cid, 0.0)), 5)}"
+                    for cid in self._motor_reward_baseline)
+                logger.info("MOTOR_LEARN_DEBUG steps=%d cids: %s",
+                            int(self.motor_sfnn_steps), _ml)
+        except Exception as _e:
+            logger.debug("motor_learn debug log failed: %s", _e)
         return {
             "n_active": n,
             "mental_break_counts": mb_counts,
