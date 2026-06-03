@@ -2541,13 +2541,17 @@ class LocalColonyCompute:
                     # НЕ меняет направление). action_slice / T_mod до select.
                     action_slice, _it_this_ctx = self._apply_insula_temp(
                         cid, action_slice)
-                    self._logit_dbg[cid] = (_base_dbg, action_slice.detach())  # LOGIT_DEBUG
+                    self._logit_dbg[cid] = (_base_dbg, action_slice.detach(),
+                                            float(_own))  # LOGIT_DEBUG (motor применён)
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
+                    _base_dbg2 = logits[0, :N_ACTIONS].detach().clone()
                     logits_eff = logits[0, :N_ACTIONS]
                     logits_eff, _it_this_ctx = self._apply_insula_temp(
                         cid, logits_eff)
+                    self._logit_dbg[cid] = (_base_dbg2, logits_eff.detach(),
+                                            float(_own))  # LOGIT_DEBUG (motor НЕ применён, _own=0)
                     action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
@@ -4911,7 +4915,9 @@ class LocalColonyCompute:
         # Читать: base пикует, final flat → motor смазывает; обе flat → shaping/
         # base не пикует (reward не выучил preference).
         try:
-            for cid, (base_t, final_t) in self._logit_dbg.items():
+            torch = self._torch
+            for cid, _ld in self._logit_dbg.items():
+                base_t, final_t, _own_v = _ld
                 bp = torch.softmax(base_t, dim=-1)
                 fp = torch.softmax(final_t, dim=-1)
                 base_ent = float(-(bp * bp.clamp_min(1e-9).log()).sum().item())
@@ -4922,10 +4928,10 @@ class LocalColonyCompute:
                     _mu = float(md.abs().mean().item())
                     md_unif = float(md.std().item()) / _mu if _mu > 1e-9 else 0.0
                 logger.info(
-                    "LOGIT_DEBUG %s: base_ent=%.3f final_ent=%.3f (max2.77) "
+                    "LOGIT_DEBUG %s: own=%.2f base_ent=%.3f final_ent=%.3f (max2.77) "
                     "base_peak=%.3f final_peak=%.3f md_unif=%.3f "
                     "base_argmax=%d final_argmax=%d",
-                    cid, base_ent, final_ent, float(bp.max().item()),
+                    cid, _own_v, base_ent, final_ent, float(bp.max().item()),
                     float(fp.max().item()), md_unif,
                     int(bp.argmax().item()), int(fp.argmax().item()))
         except Exception as _e:
