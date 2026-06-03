@@ -528,6 +528,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Инстинкт-развязка (Фрай 03.06): сила food/prey/predator-направления,
     # развязанная от bias_scale (прекондишн навыка). Tune via client_flags.
     applied_instinct_dir_strength: float | None = None
+    # Голос мотора (Фрай 03.06 curriculum): множитель motor_delta под
+    # single_organism. Фаза 1 убавить / Фаза 2 fade-up (тест SFNN-модулятора).
+    applied_motor_voice: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -774,6 +777,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("instinct_dir_strength → %.2f", target_instinct)
                         except Exception as e:
                             logger.warning("set_instinct_dir_strength failed: %s", e)
+
+                    # Голос мотора (Фрай curriculum): Фаза 1/2 SFNN-модулятор-тест.
+                    target_voice = float(flags.get("motor_voice", 1.0))
+                    if target_voice != applied_motor_voice \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_voice(target_voice)
+                            applied_motor_voice = target_voice
+                            logger.info("motor_voice → %.2f", target_voice)
+                        except Exception as e:
+                            logger.warning("set_motor_voice failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:

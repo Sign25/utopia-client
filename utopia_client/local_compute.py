@@ -485,6 +485,12 @@ class LocalColonyCompute:
         # Дефолт 0.0 = текущее зануление (деплой нейтрален); активирую/тюню flag'ом
         # client_flags instinct_dir_strength после ОК Шефа+Фрая (стратег. сдвиг).
         self._instinct_dir_strength: float = 0.0
+        # Голос мотора (Фрай 03.06 curriculum): множитель motor_delta (_own) под
+        # single_organism. Фаза 1 — убавить (~0.2, прайор ведёт → плотный reward →
+        # мотор учит food-alignment, переучивает ATTACK-override); Фаза 2 — fade-up
+        # (0.2→1.0, тест адекватности SFNN-модулятора: держит alignment или срыв?).
+        # Дефолт 1.0 = полный мотор (текущее _own=1 при bias_scale=0). client_flags.
+        self._motor_voice: float = 1.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2214,6 +2220,20 @@ class LocalColonyCompute:
         self._instinct_dir_strength = v
         return v
 
+    def set_motor_voice(self, voice: float) -> float:
+        """Канал client_flags: голос мотора (_own множитель motor_delta) под
+        single_organism (Фрай curriculum). Фаза 1 ~0.2 (прайор ведёт), Фаза 2
+        fade-up к 1.0 (тест SFNN-модулятора). Кламп [0, 1]. Дефолт 1.0=полный."""
+        try:
+            v = float(voice)
+        except (TypeError, ValueError):
+            return self._motor_voice
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_voice:
+            logger.info("set_motor_voice: %.2f → %.2f", self._motor_voice, v)
+        self._motor_voice = v
+        return v
+
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
 
     def set_lineage_upgrade_pending(self, on: bool) -> int:
@@ -2545,7 +2565,12 @@ class LocalColonyCompute:
                 # max(0, 1-bias_scale) масштабирует motor_delta. bias_scale=1.0
                 # (untrained) → motor×0 → shaping (флора-градиент) ведёт чисто
                 # → доходят до еды; bias_scale→0 (обучена) → motor автономен.
-                _own = max(0.0, 1.0 - float(self._bias_scale))
+                # Голос мотора (Фрай 03.06 curriculum): под single_organism
+                # управляется _motor_voice (флаг) — Фаза 1 убавить (прайор ведёт →
+                # плотный reward → мотор учит alignment), Фаза 2 fade-up (тест
+                # адекватности SFNN-модулятора). Колония: старый bias_scale-кроссфейд.
+                _own = (float(self._motor_voice) if self._single_organism
+                        else max(0.0, 1.0 - float(self._bias_scale)))
                 _so_this_ctx = None
                 _it_this_ctx = None
                 if motor_delta is not None and _own > 0.0:
