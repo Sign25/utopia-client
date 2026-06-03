@@ -463,6 +463,13 @@ class LocalColonyCompute:
         # Управляется client_flags motor_renorm_cap (мгновенно, без рестарта).
         # Тест: cap↑ → flip падает = renorm был супрессором (починка, не fundamental).
         self._motor_renorm_growth_cap: float = 1.0
+        # MOTOR Oja-scale (03.06, Ступень 2, Фрай (a)): множитель Oja-вычитающего
+        # члена (−post²·W) в hebb_A. 1.0 → текущая полная Oja-стабилизация;
+        # <1.0 → Oja слабее → ΔW не сжимается при росте W → policy может реально
+        # заостриться (вместе с renorm_cap>1 «освобождает магнитуду»). Тест Фрая:
+        # в спокойствии (грасс вверх) свободная магнитуда → flip падает? Следить
+        # за tanh-saturation (motor_norm→4.0). client_flags motor_oja_scale.
+        self._motor_oja_scale: float = 1.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2155,6 +2162,23 @@ class LocalColonyCompute:
             logger.info("set_motor_renorm_cap: %.2f → %.2f",
                         self._motor_renorm_growth_cap, v)
         self._motor_renorm_growth_cap = v
+        return v
+
+    def set_motor_oja_scale(self, scale: float) -> float:
+        """Канал client_flags: множитель Oja-члена motor_policy (Ступень 2,
+        Фрай (a)). 1.0 → полная Oja (текущее); <1.0 → Oja слабее → ΔW не
+        самосжимается при росте W → policy может заостриться (с renorm_cap>1
+        «освобождает магнитуду»). Тест в спокойствии: flip падает? Следить за
+        tanh-saturation (motor_norm→4.0). Кламп [0, 1]. Реверс — scale=1.0."""
+        try:
+            v = float(scale)
+        except (TypeError, ValueError):
+            return self._motor_oja_scale
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_oja_scale:
+            logger.info("set_motor_oja_scale: %.2f → %.2f",
+                        self._motor_oja_scale, v)
+        self._motor_oja_scale = v
         return v
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -4046,8 +4070,12 @@ class LocalColonyCompute:
                     # (3) Row-wise L2-renorm к baseline (safety net ниже).
                     post_c = post - post.mean()
                     pre_c = pre - pre.mean()
+                    # Oja-scale (Фрай (a)): множитель вычитающего члена −post²·W.
+                    # 1.0 → полная Oja-стабилизация (текущее); <1.0 → Oja слабее →
+                    # ΔW не сжимается при росте W → policy может заостриться.
                     hebb_A = (torch.outer(post_c, pre_c)
-                              - post_c.square().unsqueeze(1) * W.data)
+                              - (self._motor_oja_scale
+                                 * post_c.square().unsqueeze(1) * W.data))
                     dW = A * hebb_A
                     if B != 0.0:
                         dW = dW + B * post.unsqueeze(1).expand_as(W)
@@ -4842,9 +4870,11 @@ class LocalColonyCompute:
                     f"adv_ema={round(float(self._motor_adv_ema.get(cid, 0.0)), 4)},"
                     f"dw_ema={round(float(self._motor_dw_ema.get(cid, 0.0)), 5)}"
                     for cid in self._motor_reward_baseline)
-                logger.info("MOTOR_LEARN_DEBUG steps=%d renorm_cap=%.2f cids: %s",
-                            int(self.motor_sfnn_steps),
-                            float(self._motor_renorm_growth_cap), _ml)
+                logger.info(
+                    "MOTOR_LEARN_DEBUG steps=%d renorm_cap=%.2f oja_scale=%.2f cids: %s",
+                    int(self.motor_sfnn_steps),
+                    float(self._motor_renorm_growth_cap),
+                    float(self._motor_oja_scale), _ml)
         except Exception as _e:
             logger.debug("motor_learn debug log failed: %s", _e)
         return {
