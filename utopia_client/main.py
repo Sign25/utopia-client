@@ -520,6 +520,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # (insula-стресс → temperature-модуляция). Через client_flags → мгновенный
     # on/off без деплоя: запуск по go Фрая, tripwire-откат при disruption.
     applied_insula_temp: bool | None = None
+    # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
+    # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
+    applied_motor_renorm_cap: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -730,6 +733,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("insula_temp → %s", target_insula_temp)
                         except Exception as e:
                             logger.warning("set_insula_temp failed: %s", e)
+
+                    # Ступень 2 (full-world): motor renorm growth-cap (числовой
+                    # флаг). Мгновенная рекалибровка renorm-супрессора без рестарта.
+                    target_renorm_cap = float(flags.get("motor_renorm_cap", 1.0))
+                    if target_renorm_cap != applied_motor_renorm_cap \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_renorm_cap(target_renorm_cap)
+                            applied_motor_renorm_cap = target_renorm_cap
+                            logger.info("motor_renorm_cap → %.2f", target_renorm_cap)
+                        except Exception as e:
+                            logger.warning("set_motor_renorm_cap failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:

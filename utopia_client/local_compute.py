@@ -456,6 +456,13 @@ class LocalColonyCompute:
         # разводят (i) delivery-bug / (ii) credit-fail / (iii) slow-learn.
         self._motor_adv_ema: dict = {}   # cid → EMA |advantage|
         self._motor_dw_ema: dict = {}    # cid → EMA ‖ΔW‖ (до renorm)
+        # MOTOR renorm growth-cap (03.06, Ступень 2, Фрай): рекалибровка row-L2-
+        # renorm, который пиннит магнитуду весов motor_policy → не даёт заостриться
+        # → flip 0.99. cap=1.0 → текущий пин (no-op default); cap>1 → строка может
+        # вырасти до target×cap (заострение возможно), но не взорваться (cap bounds).
+        # Управляется client_flags motor_renorm_cap (мгновенно, без рестарта).
+        # Тест: cap↑ → flip падает = renorm был супрессором (починка, не fundamental).
+        self._motor_renorm_growth_cap: float = 1.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2132,6 +2139,23 @@ class LocalColonyCompute:
             logger.info("set_insula_temp: OFF (модуляция no-op, головы "
                         "сохранены для ре-enable)")
         return self._insula_temp_enabled
+
+    def set_motor_renorm_cap(self, cap: float) -> float:
+        """Канал client_flags: рекалибровка motor renorm growth-cap (Ступень 2,
+        Фрай). cap=1.0 → пин магнитуды к target (текущее); cap>1 → веса motor_policy
+        могут вырасти до target×cap → policy может ЗАОСТРИТЬСЯ (тест: flip падает =
+        renorm был супрессором). Мгновенно, без рестарта. Анти-взрыв сохранён (cap
+        ограничивает рост). Реверс — cap=1.0."""
+        try:
+            v = float(cap)
+        except (TypeError, ValueError):
+            return self._motor_renorm_growth_cap
+        v = max(1.0, min(5.0, v))   # кламп [1, 5] (5 — потолок безопасности)
+        if v != self._motor_renorm_growth_cap:
+            logger.info("set_motor_renorm_cap: %.2f → %.2f",
+                        self._motor_renorm_growth_cap, v)
+        self._motor_renorm_growth_cap = v
+        return v
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
 
@@ -4036,12 +4060,23 @@ class LocalColonyCompute:
                     _dw_norm_sum += float(dW.norm().item())  # MOTOR_LEARN
                     W.data.add_(dW)
                     # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
+                    # Growth-cap (Фрай 03.06): cap=1.0 → пин к target (текущее);
+                    # cap>1 → строка растёт до target×cap (заострение возможно),
+                    # renorm DOWN только при превышении → анти-взрыв сохранён.
                     if row_norms is not None:
                         target = row_norms.get(synapse_type)
                         if (target is not None
                                 and target.shape[0] == W.shape[0]):
                             cur = W.data.norm(dim=1).clamp(min=eps)
-                            W.data.mul_((target / cur).unsqueeze(1))
+                            cap = float(self._motor_renorm_growth_cap)
+                            if cap <= 1.0:
+                                W.data.mul_((target / cur).unsqueeze(1))
+                            else:
+                                limit = target * cap
+                                scale = torch.where(
+                                    cur > limit, limit / cur,
+                                    torch.ones_like(cur))
+                                W.data.mul_(scale.unsqueeze(1))
             self._motor_dw_ema[cid] = (   # MOTOR_LEARN: EMA ‖ΔW‖ применённого
                 0.98 * self._motor_dw_ema.get(cid, 0.0) + 0.02 * _dw_norm_sum)
             self.motor_sfnn_steps += 1
@@ -4807,8 +4842,9 @@ class LocalColonyCompute:
                     f"adv_ema={round(float(self._motor_adv_ema.get(cid, 0.0)), 4)},"
                     f"dw_ema={round(float(self._motor_dw_ema.get(cid, 0.0)), 5)}"
                     for cid in self._motor_reward_baseline)
-                logger.info("MOTOR_LEARN_DEBUG steps=%d cids: %s",
-                            int(self.motor_sfnn_steps), _ml)
+                logger.info("MOTOR_LEARN_DEBUG steps=%d renorm_cap=%.2f cids: %s",
+                            int(self.motor_sfnn_steps),
+                            float(self._motor_renorm_growth_cap), _ml)
         except Exception as _e:
             logger.debug("motor_learn debug log failed: %s", _e)
         return {
