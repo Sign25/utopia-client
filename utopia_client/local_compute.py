@@ -3854,9 +3854,19 @@ class LocalColonyCompute:
             DS = (float(self._instinct_dir_strength)
                   if self._single_organism else BS)
             PHI = 1.6180339887
+            # Нормализация направления (Фрай 03.06, scaffold-restore): под
+            # single_organism obs-градиент МАЛ (~0.1, A/B-диагностик) → fw*g мизер,
+            # пик не пробивается. Единичный вектор направления × fw → сильный
+            # ОРИЕНТИР при УМЕРЕННОМ fw (не эскалация силы). Магнитуда «насколько
+            # близко» теряется — но для ориентации важно «куда», не «как слабо видно».
+            _norm = self._single_organism
+            def _unit(a, b):
+                m = (a * a + b * b) ** 0.5
+                return (a / m, b / m) if (m > 1e-6 and _norm) else (a, b)
             # Флора-градиент (иди к еде). Травоядный (diet→0) сильнее.
             g_ns = float(obs_arr[33]) if n > 34 else 0.0
             g_ew = float(obs_arr[34]) if n > 34 else 0.0
+            g_ns, g_ew = _unit(g_ns, g_ew)
             fw = (4.0 - 2.0 * diet) * DS
             logits[0] -= fw * g_ns; logits[1] += fw * g_ns
             logits[2] += fw * g_ew; logits[3] -= fw * g_ew
@@ -3864,6 +3874,7 @@ class LocalColonyCompute:
             p_ns = float(obs_arr[56]) if n > 58 else 0.0
             p_ew = float(obs_arr[57]) if n > 58 else 0.0
             p_prox = float(obs_arr[58]) if n > 58 else 0.0
+            p_ns, p_ew = _unit(p_ns, p_ew)
             pw = (2.0 + 4.0 * diet) * DS * min(p_prox + 0.1, 1.0)
             logits[0] -= pw * p_ns; logits[1] += pw * p_ns
             logits[2] += pw * p_ew; logits[3] -= pw * p_ew
@@ -3871,6 +3882,7 @@ class LocalColonyCompute:
             d_ns = float(obs_arr[59]) if n > 61 else 0.0
             d_ew = float(obs_arr[60]) if n > 61 else 0.0
             d_prox = float(obs_arr[61]) if n > 61 else 0.0
+            d_ns, d_ew = _unit(d_ns, d_ew)
             if d_prox > 0.05:
                 pf = 4.0 * DS * min(d_prox, 1.0)
                 logits[0] += pf * d_ns; logits[1] -= pf * d_ns
