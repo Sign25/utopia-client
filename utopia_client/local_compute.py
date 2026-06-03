@@ -2491,6 +2491,9 @@ class LocalColonyCompute:
 
                 with torch.no_grad():
                     logits = organism.forward(obs_tensor)
+                # LOGIT_DEBUG: raw org.forward (ДО shaping) — разводит (A)
+                # org.forward доминирует vs (B) obs-градиент слаб.
+                _raw_dbg = logits[0, :N_ACTIONS].detach().clone()
 
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
@@ -2568,8 +2571,10 @@ class LocalColonyCompute:
                     # НЕ меняет направление). action_slice / T_mod до select.
                     action_slice, _it_this_ctx = self._apply_insula_temp(
                         cid, action_slice)
-                    self._logit_dbg[cid] = (_base_dbg, action_slice.detach(),
-                                            float(_own))  # LOGIT_DEBUG (motor применён)
+                    self._logit_dbg[cid] = (
+                        _raw_dbg, _base_dbg, action_slice.detach(), float(_own),
+                        float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
+                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0)  # LOGIT_DEBUG
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
@@ -2577,8 +2582,10 @@ class LocalColonyCompute:
                     logits_eff = logits[0, :N_ACTIONS]
                     logits_eff, _it_this_ctx = self._apply_insula_temp(
                         cid, logits_eff)
-                    self._logit_dbg[cid] = (_base_dbg2, logits_eff.detach(),
-                                            float(_own))  # LOGIT_DEBUG (motor НЕ применён, _own=0)
+                    self._logit_dbg[cid] = (
+                        _raw_dbg, _base_dbg2, logits_eff.detach(), float(_own),
+                        float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
+                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0)  # LOGIT_DEBUG (_own=0)
                     action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
@@ -4949,23 +4956,22 @@ class LocalColonyCompute:
         try:
             torch = self._torch
             for cid, _ld in self._logit_dbg.items():
-                base_t, final_t, _own_v = _ld
+                raw_t, base_t, final_t, _own_v, g_ns, g_ew = _ld
+                rp = torch.softmax(raw_t, dim=-1)
                 bp = torch.softmax(base_t, dim=-1)
                 fp = torch.softmax(final_t, dim=-1)
+                raw_ent = float(-(rp * rp.clamp_min(1e-9).log()).sum().item())
                 base_ent = float(-(bp * bp.clamp_min(1e-9).log()).sum().item())
                 final_ent = float(-(fp * fp.clamp_min(1e-9).log()).sum().item())
-                md = self.last_motor_delta.get(cid)
-                md_unif = 0.0
-                if md is not None:
-                    _mu = float(md.abs().mean().item())
-                    md_unif = float(md.std().item()) / _mu if _mu > 1e-9 else 0.0
+                raw_spread = float(raw_t.std().item())   # (A): спред org.forward
                 logger.info(
-                    "LOGIT_DEBUG %s: own=%.2f base_ent=%.3f final_ent=%.3f (max2.77) "
-                    "base_peak=%.3f final_peak=%.3f md_unif=%.3f "
-                    "base_argmax=%d final_argmax=%d",
-                    cid, _own_v, base_ent, final_ent, float(bp.max().item()),
-                    float(fp.max().item()), md_unif,
-                    int(bp.argmax().item()), int(fp.argmax().item()))
+                    "LOGIT_DEBUG %s: own=%.2f raw_ent=%.3f raw_spread=%.3f "
+                    "base_ent=%.3f final_ent=%.3f (max2.77) base_peak=%.3f "
+                    "obs_grad=|%.3f,%.3f| raw_argmax=%d base_argmax=%d final_argmax=%d",
+                    cid, _own_v, raw_ent, raw_spread, base_ent, final_ent,
+                    float(bp.max().item()), g_ns, g_ew,
+                    int(rp.argmax().item()), int(bp.argmax().item()),
+                    int(fp.argmax().item()))
         except Exception as _e:
             logger.debug("logit debug log failed: %s", _e)
         return {
