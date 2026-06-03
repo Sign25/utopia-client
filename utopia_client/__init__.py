@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.11.92"  # LOGIT_DEBUG fix: torch=self._torch (был NameError → тихий fail, count=0) + захват в else-ветке + own= в логе (применяется ли motor: _own=max(0,1-bias_scale)). Локализация uniformity: base(organism+shaping) vs final(после motor)
+__version__ = "0.11.93"  # КОРЕНЬ ИСПРАВЛЕН (Фрай одобрил): инстинкт-развязка food/prey/predator-направления от bias_scale. set_single_organism морозил bias_scale=0 → _shape_action_logits зануляло food-direction (прекондишн навыка). Под single_organism direction=×_instinct_dir_strength (инстинкт-приор, всегда on, умеренный), не ×bias_scale. client_flags instinct_dir_strength (дефолт 0=нейтрально, активирую после ОК Шефа+Фрая). context-boosts+φ остаются curriculum

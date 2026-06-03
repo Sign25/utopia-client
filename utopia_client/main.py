@@ -525,6 +525,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_motor_renorm_cap: float | None = None
     # Ступень 2 (a): motor Oja-scale (ослабление Oja-стабилизатора для теста).
     applied_motor_oja_scale: float | None = None
+    # Инстинкт-развязка (Фрай 03.06): сила food/prey/predator-направления,
+    # развязанная от bias_scale (прекондишн навыка). Tune via client_flags.
+    applied_instinct_dir_strength: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -759,6 +762,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_oja_scale → %.2f", target_oja_scale)
                         except Exception as e:
                             logger.warning("set_motor_oja_scale failed: %s", e)
+
+                    # Инстинкт-развязка: сила food/prey/predator-направления
+                    # (Фрай — прекондишн навыка, развязан от bias_scale).
+                    target_instinct = float(flags.get("instinct_dir_strength", 0.0))
+                    if target_instinct != applied_instinct_dir_strength \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_instinct_dir_strength(target_instinct)
+                            applied_instinct_dir_strength = target_instinct
+                            logger.info("instinct_dir_strength → %.2f", target_instinct)
+                        except Exception as e:
+                            logger.warning("set_instinct_dir_strength failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:

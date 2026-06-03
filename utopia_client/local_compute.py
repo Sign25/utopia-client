@@ -475,6 +475,16 @@ class LocalColonyCompute:
         # Где equiprobable: base flat (shaping не пикует?) или motor_delta смазывает
         # (uniform blob, shift-инвариант)? cid → (base[16], final[16]) detached.
         self._logit_dbg: dict = {}
+        # Инстинкт-развязка (03.06, Фрай): food/prey/predator DIRECTION-градиенты
+        # в _shape_action_logits были ×bias_scale, а set_single_organism морозит
+        # bias_scale=0 → направление ЗАНУЛЕНО (прекондишн навыка снят, приняв за
+        # крутилку). Развязка: под single_organism direction = ×_instinct_dir_strength
+        # (всегда on, инстинкт/перцептивный приор), а НЕ ×bias_scale. УМЕРЕННАЯ
+        # сила → ориентир не диктат (мотор SFNN + insula-мост модулируют поверх).
+        # context-boosts (ATTACK/FLEE/BUILD) + φ остаются curriculum под bias_scale.
+        # Дефолт 0.0 = текущее зануление (деплой нейтрален); активирую/тюню flag'ом
+        # client_flags instinct_dir_strength после ОК Шефа+Фрая (стратег. сдвиг).
+        self._instinct_dir_strength: float = 0.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2187,6 +2197,23 @@ class LocalColonyCompute:
         self._motor_oja_scale = v
         return v
 
+    def set_instinct_dir_strength(self, strength: float) -> float:
+        """Канал client_flags: сила инстинкт-направления (food/prey/predator)
+        в _shape_action_logits под single_organism (Фрай 03.06). 0.0 → занулено
+        (текущее, прекондишн снят); умеренное (~0.3-0.6) → ориентир-приор, не
+        диктат (мотор+мост модулируют поверх). Развязано от bias_scale.
+        Кламп [0, 4] (4 = исходная full-сила). Реверс — 0.0. Тюнится эмпирически."""
+        try:
+            v = float(strength)
+        except (TypeError, ValueError):
+            return self._instinct_dir_strength
+        v = max(0.0, min(4.0, v))
+        if v != self._instinct_dir_strength:
+            logger.info("set_instinct_dir_strength: %.2f → %.2f",
+                        self._instinct_dir_strength, v)
+        self._instinct_dir_strength = v
+        return v
+
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
 
     def set_lineage_upgrade_pending(self, on: bool) -> int:
@@ -3814,18 +3841,23 @@ class LocalColonyCompute:
         try:
             n = len(obs_arr)
             BS = float(self._bias_scale)  # curriculum (порт server _bias_scale)
+            # DIRECTION-сила (Фрай 03.06): под single_organism развязана от
+            # bias_scale (который =0 зануляло прекондишн) → инстинкт-приор всегда on,
+            # умеренная сила. Колония — остаётся ×BS (curriculum crossfade сохранён).
+            DS = (float(self._instinct_dir_strength)
+                  if self._single_organism else BS)
             PHI = 1.6180339887
             # Флора-градиент (иди к еде). Травоядный (diet→0) сильнее.
             g_ns = float(obs_arr[33]) if n > 34 else 0.0
             g_ew = float(obs_arr[34]) if n > 34 else 0.0
-            fw = (4.0 - 2.0 * diet) * BS
+            fw = (4.0 - 2.0 * diet) * DS
             logits[0] -= fw * g_ns; logits[1] += fw * g_ns
             logits[2] += fw * g_ew; logits[3] -= fw * g_ew
             # Prey-градиент (охота). Карнивор (diet→1) сильнее.
             p_ns = float(obs_arr[56]) if n > 58 else 0.0
             p_ew = float(obs_arr[57]) if n > 58 else 0.0
             p_prox = float(obs_arr[58]) if n > 58 else 0.0
-            pw = (2.0 + 4.0 * diet) * BS * min(p_prox + 0.1, 1.0)
+            pw = (2.0 + 4.0 * diet) * DS * min(p_prox + 0.1, 1.0)
             logits[0] -= pw * p_ns; logits[1] += pw * p_ns
             logits[2] += pw * p_ew; logits[3] -= pw * p_ew
             # Predator-градиент (беги ПРОТИВ градиента).
@@ -3833,7 +3865,7 @@ class LocalColonyCompute:
             d_ew = float(obs_arr[60]) if n > 61 else 0.0
             d_prox = float(obs_arr[61]) if n > 61 else 0.0
             if d_prox > 0.05:
-                pf = 4.0 * BS * min(d_prox, 1.0)
+                pf = 4.0 * DS * min(d_prox, 1.0)
                 logits[0] += pf * d_ns; logits[1] -= pf * d_ns
                 logits[2] -= pf * d_ew; logits[3] += pf * d_ew
             # Структурные φ-штрафы (постоянные).
