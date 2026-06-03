@@ -4770,8 +4770,12 @@ class LocalColonyCompute:
                         f"{cid}:t_mod={round(float(self._it_last_tmod.get(cid, 1.0)), 4)},"
                         f"wnorm={round(wnorm, 5)},"
                         f"baseline={round(float(self._it_baseline.get(cid, 0.0)), 3)}")
-                logger.info("INSULA_TEMP_DEBUG cids_tmod_wnorm_baseline: %s",
-                            "; ".join(_it_dbg))
+                # enabled= — явный маркер состояния флага для A/B-окон (Ступень 0
+                # full-world): головы персистят при off → без маркера t_mod stale
+                # и on/off-окна не разделить. enabled=1 → мост влияет, =0 → no-op.
+                logger.info(
+                    "INSULA_TEMP_DEBUG enabled=%d cids_tmod_wnorm_baseline: %s",
+                    1 if self._insula_temp_enabled else 0, "; ".join(_it_dbg))
         except Exception as _e:
             logger.debug("insula_temp debug log failed: %s", _e)
         return {
