@@ -470,6 +470,11 @@ class LocalColonyCompute:
         # в спокойствии (грасс вверх) свободная магнитуда → flip падает? Следить
         # за tanh-saturation (motor_norm→4.0). client_flags motor_oja_scale.
         self._motor_oja_scale: float = 1.0
+        # LOGIT_DEBUG (03.06, Фрай): локализация uniformity policy-выхода —
+        # base (organism+shaping, до motor) vs final (action_slice, после motor).
+        # Где equiprobable: base flat (shaping не пикует?) или motor_delta смазывает
+        # (uniform blob, shift-инвариант)? cid → (base[16], final[16]) detached.
+        self._logit_dbg: dict = {}
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -1139,6 +1144,7 @@ class LocalColonyCompute:
         self._motor_reward_baseline.pop(cid, None)
         self._motor_adv_ema.pop(cid, None)
         self._motor_dw_ema.pop(cid, None)
+        self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -2513,6 +2519,7 @@ class LocalColonyCompute:
                 _so_this_ctx = None
                 _it_this_ctx = None
                 if motor_delta is not None and _own > 0.0:
+                    _base_dbg = logits[0, :N_ACTIONS].detach().clone()  # LOGIT_DEBUG: post-shaping, pre-motor
                     action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
                     # Track 2: self-obs→action голова — bias логитов от состояния
                     # (zero-init → старт без влияния, учится REINFORCE). Прямой
@@ -2534,6 +2541,7 @@ class LocalColonyCompute:
                     # НЕ меняет направление). action_slice / T_mod до select.
                     action_slice, _it_this_ctx = self._apply_insula_temp(
                         cid, action_slice)
+                    self._logit_dbg[cid] = (_base_dbg, action_slice.detach())  # LOGIT_DEBUG
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
@@ -4896,6 +4904,32 @@ class LocalColonyCompute:
                     _amax, _ashare)
         except Exception as _e:
             logger.debug("selector debug log failed: %s", _e)
+        # LOGIT_DEBUG (Фрай): локализация uniformity. base (organism+shaping, до
+        # motor) vs final (после motor). base_ent/final_ent = softmax-энтропия
+        # (макс ln16=2.77). md_unif = std/|mean| motor_delta (мал → uniform blob →
+        # shift-инвариант → не дифференцирует). base_peak/final_peak = argmax-доля.
+        # Читать: base пикует, final flat → motor смазывает; обе flat → shaping/
+        # base не пикует (reward не выучил preference).
+        try:
+            for cid, (base_t, final_t) in self._logit_dbg.items():
+                bp = torch.softmax(base_t, dim=-1)
+                fp = torch.softmax(final_t, dim=-1)
+                base_ent = float(-(bp * bp.clamp_min(1e-9).log()).sum().item())
+                final_ent = float(-(fp * fp.clamp_min(1e-9).log()).sum().item())
+                md = self.last_motor_delta.get(cid)
+                md_unif = 0.0
+                if md is not None:
+                    _mu = float(md.abs().mean().item())
+                    md_unif = float(md.std().item()) / _mu if _mu > 1e-9 else 0.0
+                logger.info(
+                    "LOGIT_DEBUG %s: base_ent=%.3f final_ent=%.3f (max2.77) "
+                    "base_peak=%.3f final_peak=%.3f md_unif=%.3f "
+                    "base_argmax=%d final_argmax=%d",
+                    cid, base_ent, final_ent, float(bp.max().item()),
+                    float(fp.max().item()), md_unif,
+                    int(bp.argmax().item()), int(fp.argmax().item()))
+        except Exception as _e:
+            logger.debug("logit debug log failed: %s", _e)
         return {
             "n_active": n,
             "mental_break_counts": mb_counts,
