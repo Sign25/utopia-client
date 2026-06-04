@@ -456,6 +456,13 @@ class LocalColonyCompute:
         # разводят (i) delivery-bug / (ii) credit-fail / (iii) slow-learn.
         self._motor_adv_ema: dict = {}   # cid → EMA |advantage|
         self._motor_dw_ema: dict = {}    # cid → EMA ‖ΔW‖ (до renorm)
+        # ΔW-инструментирование output_proj (Фрай 04.06): разводит (a) renorm
+        # проецирует радиальную компоненту вон vs (b) incoherent Hebbian под
+        # exploration. dw_radial_ema высокий (→1) → ΔW вдоль W → renorm режет = (a).
+        # dw_cos_ema осциллирует (→0/<0) → ΔW-направление скачет tick-to-tick = (b).
+        self._motor_dw_last: dict = {}       # cid → flat ΔW output_proj (пред. тик)
+        self._motor_dw_radial_ema: dict = {}  # cid → EMA доли ΔW вдоль W (renorm-cut)
+        self._motor_dw_cos_ema: dict = {}     # cid → EMA cos(ΔW_t, ΔW_t-1)
         # MOTOR renorm growth-cap (03.06, Ступень 2, Фрай): рекалибровка row-L2-
         # renorm, который пиннит магнитуду весов motor_policy → не даёт заостриться
         # → flip 0.99. cap=1.0 → текущий пин (no-op default); cap>1 → строка может
@@ -4317,6 +4324,25 @@ class LocalColonyCompute:
                     dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     _dw_norm_sum += float(dW.norm().item())  # MOTOR_LEARN
+                    # ΔW-инструментирование output_proj (Фрай 04.06): (a) vs (b).
+                    # ДО add_ — W.data ещё пред-апдейтный весовой вектор.
+                    if synapse_type == "output_proj":
+                        _wn = W.data.norm(dim=1).clamp(min=eps)   # ‖W[i]‖ per row
+                        _dwn = dW.norm(dim=1).clamp(min=eps)      # ‖ΔW[i]‖ per row
+                        # |cos(ΔW[i], W[i])| = доля ΔW вдоль W (renorm режет именно её)
+                        _radial = ((dW * W.data).sum(dim=1).abs() / (_wn * _dwn))
+                        _rf = float(_radial.mean().item())
+                        self._motor_dw_radial_ema[cid] = (
+                            0.95 * self._motor_dw_radial_ema.get(cid, _rf) + 0.05 * _rf)
+                        _dwf = dW.reshape(-1)
+                        _last = self._motor_dw_last.get(cid)
+                        if _last is not None and _last.shape == _dwf.shape:
+                            _cos = float(torch.nn.functional.cosine_similarity(
+                                _dwf, _last, dim=0).item())
+                            self._motor_dw_cos_ema[cid] = (
+                                0.95 * self._motor_dw_cos_ema.get(cid, _cos)
+                                + 0.05 * _cos)
+                        self._motor_dw_last[cid] = _dwf.clone()
                     W.data.add_(dW)
                     # SFNN S1.2c safety net: row-wise L2-renorm к baseline.
                     # Growth-cap (Фрай 03.06): cap=1.0 → пин к target (текущее);
@@ -5099,7 +5125,10 @@ class LocalColonyCompute:
                 _ml = "; ".join(
                     f"{cid}:baseline={round(float(self._motor_reward_baseline.get(cid, 0.0)), 3)},"
                     f"adv_ema={round(float(self._motor_adv_ema.get(cid, 0.0)), 4)},"
-                    f"dw_ema={round(float(self._motor_dw_ema.get(cid, 0.0)), 5)}"
+                    f"dw_ema={round(float(self._motor_dw_ema.get(cid, 0.0)), 5)},"
+                    # ΔW-направление (Фрай): radial→1 = renorm режет=(a); cos→0/<0 = incoherent=(b)
+                    f"dw_radial={round(float(self._motor_dw_radial_ema.get(cid, -1.0)), 3)},"
+                    f"dw_cos={round(float(self._motor_dw_cos_ema.get(cid, -9.0)), 3)}"
                     for cid in self._motor_reward_baseline)
                 logger.info(
                     "MOTOR_LEARN_DEBUG steps=%d renorm_cap=%.2f oja_scale=%.2f cids: %s",
