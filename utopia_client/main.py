@@ -531,6 +531,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Голос мотора (Фрай 03.06 curriculum): множитель motor_delta под
     # single_organism. Фаза 1 убавить / Фаза 2 fade-up (тест SFNN-модулятора).
     applied_motor_voice: float | None = None
+    # De-saturation tanh-головы motor (Фрай 04.06): T-override (выбить из залипшего
+    # экстремума + держать отзывчивой) + lr_scale (анти-saddle-flip).
+    applied_motor_temp: float | None = None
+    applied_motor_lr_scale: float | None = None
     # Glucose→energy конверсия (Фрай 04.06 экономика): rate, плотная еда→net-positive.
     applied_glucose_energy_rate: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
@@ -790,6 +794,30 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_voice → %.2f", target_voice)
                         except Exception as e:
                             logger.warning("set_motor_voice failed: %s", e)
+
+                    # De-saturation tanh-головы motor (Фрай 04.06): T-override.
+                    # >1 делит pre-tanh → залипшие ±0.99 дельты в отзывчивый
+                    # диапазон → градиент работает → REINFORCE выбивает из экстремума.
+                    target_motor_temp = float(flags.get("motor_temp", 0.0))
+                    if target_motor_temp != applied_motor_temp \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_temp(target_motor_temp)
+                            applied_motor_temp = target_motor_temp
+                            logger.info("motor_temp → %.2f", target_motor_temp)
+                        except Exception as e:
+                            logger.warning("set_motor_temp failed: %s", e)
+
+                    # Anti-saddle-flip (Фрай 04.06): множитель eta REINFORCE.
+                    target_motor_lr = float(flags.get("motor_lr_scale", 1.0))
+                    if target_motor_lr != applied_motor_lr_scale \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_lr_scale(target_motor_lr)
+                            applied_motor_lr_scale = target_motor_lr
+                            logger.info("motor_lr_scale → %.3f", target_motor_lr)
+                        except Exception as e:
+                            logger.warning("set_motor_lr_scale failed: %s", e)
 
                     # Glucose→energy конверсия (Фрай экономика): плотная еда→viable.
                     target_ger = float(flags.get("glucose_energy_rate", 0.0))

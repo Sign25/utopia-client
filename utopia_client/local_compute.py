@@ -470,6 +470,18 @@ class LocalColonyCompute:
         # в спокойствии (грасс вверх) свободная магнитуда → flip падает? Следить
         # за tanh-saturation (motor_norm→4.0). client_flags motor_oja_scale.
         self._motor_oja_scale: float = 1.0
+        # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
+        # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
+        # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
+        # _motor_temp: override T в _motor_forward (tanh(out/T)). >1 делит pre-tanh
+        # → дельты в отзывчивый варьирующий диапазон → градиент работает → REINFORCE
+        # выбивает из экстремума (а) И держит отзывчивой (б). 0.0 = use rule.temperature
+        # (текущее поведение). client_flags motor_temp. Реверс — 0.0.
+        self._motor_temp: float = 0.0
+        # _motor_lr_scale: множитель eta в _motor_sfnn_update_step (анти-saddle-flip,
+        # Фрай (б)). <1 → медленнее REINFORCE → меньше крупных перекидов через седло.
+        # 1.0 = текущее. client_flags motor_lr_scale. Реверс — 1.0.
+        self._motor_lr_scale: float = 1.0
         # LOGIT_DEBUG (03.06, Фрай): локализация uniformity policy-выхода —
         # base (organism+shaping, до motor) vs final (action_slice, после motor).
         # Где equiprobable: base flat (shaping не пикует?) или motor_delta смазывает
@@ -2210,6 +2222,40 @@ class LocalColonyCompute:
             logger.info("set_motor_oja_scale: %.2f → %.2f",
                         self._motor_oja_scale, v)
         self._motor_oja_scale = v
+        return v
+
+    def set_motor_temp(self, temp: float) -> float:
+        """Канал client_flags: де-сатурация tanh-головы motor_policy (Фрай 04.06).
+        Override T в _motor_forward: delta = tanh(out/T)·SCALE. T>1 делит pre-tanh →
+        залипшие ±0.99 дельты возвращаются в отзывчивый ВАРЬИРУЮЩИЙ диапазон (T-делёж
+        сохраняет относительные различия выходов, в отличие от clip) → градиент tanh
+        снова ≠0 → REINFORCE выбивает голову из застрявшего экстремума (а) и держит
+        отзывчивой (б). 0.0 → use rule.temperature (текущее). Кламп [0, 16]. Реверс —
+        0.0. Тест-вердикт Фрая: де-сатурир. голова сходится стабильно → SFNN+reg
+        адекватен; всё равно флипает → SFNN-head неадекватен → RL-head."""
+        try:
+            v = float(temp)
+        except (TypeError, ValueError):
+            return self._motor_temp
+        v = max(0.0, min(16.0, v))
+        if v != self._motor_temp:
+            logger.info("set_motor_temp: %.2f → %.2f", self._motor_temp, v)
+        self._motor_temp = v
+        return v
+
+    def set_motor_lr_scale(self, scale: float) -> float:
+        """Канал client_flags: множитель eta REINFORCE-апдейта motor_policy
+        (анти-saddle-flip, Фрай 04.06 (б)). <1.0 → медленнее обучение → меньше
+        крупных градиент-перекидов через седло (которые перебрасывают tanh-голову
+        между насыщенными экстремумами). 1.0 → текущее. Кламп [0, 1]. Реверс — 1.0."""
+        try:
+            v = float(scale)
+        except (TypeError, ValueError):
+            return self._motor_lr_scale
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_lr_scale:
+            logger.info("set_motor_lr_scale: %.3f → %.3f", self._motor_lr_scale, v)
+        self._motor_lr_scale = v
         return v
 
     def set_instinct_dir_strength(self, strength: float) -> float:
@@ -3983,7 +4029,12 @@ class LocalColonyCompute:
             with torch.no_grad():
                 out = tissue({"input": obs_tensor.detach()})["output"]
                 rule = self.motor_sfnn_rule.get(cid)
-                T = rule.temperature if rule is not None else 1.0
+                # De-saturation (Фрай 04.06): motor_temp>0 override'ит T ткани —
+                # делит pre-tanh, возвращая залипшую голову в отзывчивый диапазон.
+                if self._motor_temp > 0.0:
+                    T = self._motor_temp
+                else:
+                    T = rule.temperature if rule is not None else 1.0
                 delta = (torch.tanh(out[0, :_MOTOR_POLICY_N_ACTIONS] / T)
                           * _MOTOR_POLICY_SCALE)
             self.last_motor_delta[cid] = delta.detach().cpu()
@@ -4170,7 +4221,7 @@ class LocalColonyCompute:
                     coef = rule.coeffs.get(synapse_type)
                     if coef is None:
                         continue
-                    eta = float(coef.eta)
+                    eta = float(coef.eta) * self._motor_lr_scale  # anti-saddle-flip (Фрай 04.06)
                     A = float(coef.A)
                     B = float(coef.B)
                     C = float(coef.C)
