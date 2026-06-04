@@ -535,6 +535,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # экстремума + держать отзывчивой) + lr_scale (анти-saddle-flip).
     applied_motor_temp: float | None = None
     applied_motor_lr_scale: float | None = None
+    # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
+    # плоских равных +5/+5 (корень бистабильности мотора).
+    applied_reward_balance: float | None = None
+    applied_reward_weights: tuple | None = None
     # Glucose→energy конверсия (Фрай 04.06 экономика): rate, плотная еда→net-positive.
     applied_glucose_energy_rate: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
@@ -818,6 +822,30 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_lr_scale → %.3f", target_motor_lr)
                         except Exception as e:
                             logger.warning("set_motor_lr_scale failed: %s", e)
+
+                    # Reward-баланс forage/hunt (Фрай 04.06): серверный
+                    # энергобаланс вместо плоских равных +5/+5 (корень
+                    # бистабильности мотора). on + 3 веса.
+                    target_rbal = float(flags.get("reward_balance", 0.0))
+                    if target_rbal != applied_reward_balance \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_reward_balance(target_rbal)
+                            applied_reward_balance = target_rbal
+                            logger.info("reward_balance → %.1f", target_rbal)
+                        except Exception as e:
+                            logger.warning("set_reward_balance failed: %s", e)
+                    target_rw = (flags.get("reward_forage_w"),
+                                 flags.get("reward_kill_w"),
+                                 flags.get("reward_risk_w"))
+                    if target_rw != applied_reward_weights \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_reward_weights(*target_rw)
+                            applied_reward_weights = target_rw
+                            logger.info("reward_weights → %s", target_rw)
+                        except Exception as e:
+                            logger.warning("set_reward_weights failed: %s", e)
 
                     # Glucose→energy конверсия (Фрай экономика): плотная еда→viable.
                     target_ger = float(flags.get("glucose_energy_rate", 0.0))

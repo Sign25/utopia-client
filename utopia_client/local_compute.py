@@ -482,6 +482,15 @@ class LocalColonyCompute:
         # Фрай (б)). <1 → медленнее REINFORCE → меньше крупных перекидов через седло.
         # 1.0 = текущее. client_flags motor_lr_scale. Реверс — 1.0.
         self._motor_lr_scale: float = 1.0
+        # Reward-баланс forage/hunt (Фрай 04.06): порт серверного энергобаланса
+        # вместо плоских равных +5·ate/+5·killed (корень бистабильности мотора —
+        # два равных reward-аттрактора). _reward_balance_on>0 → энерго-диффер.
+        # формула (hunt φ⁷ vs forage φ⁴, risk=damage). Веса tunable. Дефолт 0 =
+        # старый плоский reward (колония + safety). Реверс — 0.
+        self._reward_balance_on: float = 0.0
+        self._reward_forage_w: float = 1.0   # ×φ⁴≈6.85 на ate
+        self._reward_kill_w: float = 1.0     # ×φ⁷≈29 на killed
+        self._reward_risk_w: float = 1.0     # ×damage_taken (риск hunt)
         # LOGIT_DEBUG (03.06, Фрай): локализация uniformity policy-выхода —
         # base (organism+shaping, до motor) vs final (action_slice, после motor).
         # Где equiprobable: base flat (shaping не пикует?) или motor_delta смазывает
@@ -2258,6 +2267,43 @@ class LocalColonyCompute:
         self._motor_lr_scale = v
         return v
 
+    def set_reward_balance(self, on: float) -> float:
+        """Канал client_flags: вкл серверный энергобаланс reward (Фрай 04.06).
+        >0 → differentiated value (hunt φ⁷≈29 yield + risk vs forage φ⁴≈6.85,
+        без риска) вместо плоских равных +5·ate/+5·killed → НЕ равные аттракторы
+        → контекстная policy, не бистабильность. 0 → старый плоский (колония +
+        safety). Кламп [0, 1]. Реверс — 0."""
+        try:
+            v = float(on)
+        except (TypeError, ValueError):
+            return self._reward_balance_on
+        v = max(0.0, min(1.0, v))
+        if v != self._reward_balance_on:
+            logger.info("set_reward_balance: %.1f → %.1f", self._reward_balance_on, v)
+        self._reward_balance_on = v
+        return v
+
+    def set_reward_weights(self, forage_w=None, kill_w=None, risk_w=None) -> tuple:
+        """Канал client_flags: tunable веса энергобаланс-reward (Фрай 04.06).
+        forage_w ×φ⁴(6.85) на ate; kill_w ×φ⁷(29) на killed; risk_w ×damage.
+        Дефолты 1.0 → forage 6.85, safe-kill 29, full-damage-kill ≈0. Кламп [0, 4]."""
+        def _clamp(x, cur):
+            if x is None:
+                return cur
+            try:
+                return max(0.0, min(4.0, float(x)))
+            except (TypeError, ValueError):
+                return cur
+        nf = _clamp(forage_w, self._reward_forage_w)
+        nk = _clamp(kill_w, self._reward_kill_w)
+        nr = _clamp(risk_w, self._reward_risk_w)
+        if (nf, nk, nr) != (self._reward_forage_w, self._reward_kill_w,
+                            self._reward_risk_w):
+            logger.info("set_reward_weights: forage %.2f kill %.2f risk %.2f",
+                        nf, nk, nr)
+        self._reward_forage_w, self._reward_kill_w, self._reward_risk_w = nf, nk, nr
+        return (nf, nk, nr)
+
     def set_instinct_dir_strength(self, strength: float) -> float:
         """Канал client_flags: сила инстинкт-направления (food/prey/predator)
         в _shape_action_logits под single_organism (Фрай 03.06). 0.0 → занулено
@@ -3297,20 +3343,39 @@ class LocalColonyCompute:
                     len(restored), dir_path)
         return restored
 
-    @staticmethod
-    def _compute_immediate_reward(event: dict) -> float:
+    # Серверный энергобаланс forage/hunt (Фрай 04.06, порт world.py):
+    #   prey_kill_energy = φ⁷ ≈ 29.03 (yield убийства, v4.0 абсолютный)
+    #   forage_yield     = φ⁴ ≈ 6.854 (yield добычи, ниже kill на φ³≈4.24×)
+    #   predator_damage  ≈ φ⁷       (риск = зеркало yield жертвы)
+    _KILL_YIELD: float = _PHI ** 7      # ≈ 29.03 = prey_kill_energy
+    _FORAGE_YIELD: float = _PHI ** 4    # ≈ 6.854 (forage < hunt, дифференцировано)
+
+    def _compute_immediate_reward(self, event: dict) -> float:
         """R3 immediate из событий тика.
 
-        14.05.2026: усилен ate (1.0→5.0, равно killed) и δenergy (×10).
-        Why: action-space collapse — REINFORCE не двигал политику, потому
-        что r_imm для ate-тика тонул в метаболическом шуме (δenergy·0.05 ≈
-        -0.0025), advantage около baseline=intrinsic_ema. reward_var_ema
-        наблюдался 1.7e-5 на live колонии.
+        14.05.2026: усилен ate (1.0→5.0, равно killed) и δenergy (×10) —
+        action-space collapse fix (r_imm тонул в метаболическом шуме).
+        04.06.2026 (Фрай): плоские РАВНЫЕ +5·ate / +5·killed = два равных
+        reward-аттрактора → бистабильность motor-головы (GATHER/+/suppress-ATTACK
+        ↔ DIG/−/boost-ATTACK). Под `reward_balance` — порт серверного энергобаланса
+        (environment/world.py): differentiated value через энергию + риск. Hunt
+        выше-yield (φ⁷≈29) но риск (damage ≈ зеркало yield), forage ниже-yield
+        (φ⁴≈6.85) без риска → НЕ равные аттракторы → контекстная policy (охоться
+        когда выгодно/безопасно, иначе форажь), не бистабильный флип. Веса tunable.
         """
         delta_energy = float(event.get("delta_energy", 0.0))
         ate = bool(event.get("ate", False))
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
+        if self._reward_balance_on > 0.0:
+            # Энерго-дифференцированный: hunt φ⁷ vs forage φ⁴, risk = damage.
+            # Дефолты весов 1.0: forage 6.85, safe-kill 29 (4.2×), full-damage
+            # kill 29−29≈0 (избегать) → safe-hunt > forage > risky-hunt = контекст.
+            return (delta_energy * 0.5
+                    + (self._FORAGE_YIELD * self._reward_forage_w if ate else 0.0)
+                    + (self._KILL_YIELD * self._reward_kill_w if killed else 0.0)
+                    - damage_taken * self._reward_risk_w)
+        # Дефолт (колония + safety): прежний плоский reward.
         return (delta_energy * 0.5
                 + (5.0 if ate else 0.0)
                 + (5.0 if killed else 0.0)
