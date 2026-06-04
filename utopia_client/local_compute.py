@@ -5830,17 +5830,15 @@ class LocalColonyCompute:
         try:
             if should_force_stay(bc):
                 # §3 (Фрай 04.06, инвариант recoverable-не-absorbing): под
-                # single_organism catatonic/exhaustion force-STAY АБСОРБИРУЕТ
-                # (force-STAY → не форажит → energy 0 → cort-спайк → catatonic
-                # держит; recovery размыкает на миг, но петля re-form'ится).
-                # Гейчу mb-force-STAY (СИГНАЛ mb/cortisol ОСТАЁТСЯ — не маскируем),
-                # оставляю glucose<5 faint (реальный метаболический обморок) +
-                # §3-паралич (выше). Адам форажит когда стрессован → relief →
-                # размыкание. Для §3-immortal одиночки catatonic-lock net-вреден.
-                if (self._single_organism
-                        and float(getattr(bc, "glucose", 100.0)) >= 5.0):
-                    pass  # catatonic/exhaustion — НЕ лочим (non-absorbing)
-                else:
+                # single_organism ВЕСЬ biochem force-STAY (catatonic/exhaustion/
+                # glucose<5-faint) АБСОРБИРУЕТ — force-STAY → не форажит → energy/
+                # glucose 0 → стресс → force-STAY держит (deep trough re-absorbing,
+                # даже после recovery). Гейчу ВСЕ (СИГНАЛ mb/cortisol/glucose
+                # ОСТАЁТСЯ — не маскируем). Адам форажит когда истощён/стрессован
+                # → relief (eat→glucose/energy↑) → размыкание. §3-паралич (выше,
+                # energy≤0, 3с) — единственный легитимный force-STAY (с recovery).
+                # Для §3-immortal одиночки biochem-lock net-вреден (нет death-исхода).
+                if not self._single_organism:
                     out[cid] = {"action": STAY, "target_id": None}
         except Exception as e:
             logger.debug("biochem force_stay cid=%s: %s", cid, e)
@@ -6128,6 +6126,13 @@ class LocalColonyCompute:
                         bc.serotonin = max(
                             float(getattr(bc, "serotonin", 0.0)),
                             float(getattr(bc, "baseline_serotonin", 50.0)))
+                        # Glucose-relief (Фрай 04.06): recovery восстанавливает и
+                        # glucose до baseline — иначе deep-trough (glucose→0) после
+                        # recovery держит glucose<5 faint → re-absorbing. Recovery =
+                        # полная «передышка» (energy+cort+ser+mb+glucose).
+                        bc.glucose = max(
+                            float(getattr(bc, "glucose", 0.0)),
+                            float(getattr(bc, "baseline_glucose", 50.0)))
                         bc.mental_break = ""
                         bc.mental_break_ticks = 0
                     except Exception:
