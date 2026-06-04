@@ -2624,7 +2624,8 @@ class LocalColonyCompute:
                     self._logit_dbg[cid] = (
                         _raw_dbg, _base_dbg, action_slice.detach(), float(_own),
                         float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
-                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0)  # LOGIT_DEBUG
+                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0,
+                        motor_delta.detach().clone())  # LOGIT_DEBUG + motor_delta (Phase-1 alignment-reader)
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
@@ -2635,7 +2636,8 @@ class LocalColonyCompute:
                     self._logit_dbg[cid] = (
                         _raw_dbg, _base_dbg2, logits_eff.detach(), float(_own),
                         float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
-                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0)  # LOGIT_DEBUG (_own=0)
+                        float(obs_arr[34]) if len(obs_arr) > 34 else 0.0,
+                        None)  # LOGIT_DEBUG (_own=0, нет motor_delta)
                     action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
@@ -5018,7 +5020,8 @@ class LocalColonyCompute:
         try:
             torch = self._torch
             for cid, _ld in self._logit_dbg.items():
-                raw_t, base_t, final_t, _own_v, g_ns, g_ew = _ld
+                raw_t, base_t, final_t, _own_v, g_ns, g_ew = _ld[:6]
+                md_t = _ld[6] if len(_ld) > 6 else None
                 rp = torch.softmax(raw_t, dim=-1)
                 bp = torch.softmax(base_t, dim=-1)
                 fp = torch.softmax(final_t, dim=-1)
@@ -5026,14 +5029,31 @@ class LocalColonyCompute:
                 base_ent = float(-(bp * bp.clamp_min(1e-9).log()).sum().item())
                 final_ent = float(-(fp * fp.clamp_min(1e-9).log()).sum().item())
                 raw_spread = float(raw_t.std().item())   # (A): спред org.forward
+                _b_argmax = int(bp.argmax().item())
+                # Phase-1 alignment-reader (Фрай 04.06): куда толкает САМ обучаемый
+                # motor_delta (SFNN-REINFORCE). m_argmax — топ-действие мотора;
+                # m_attack=motor_delta[5] — ATTACK-override (спадает→0 = переучен);
+                # m_atbase=motor_delta[base_argmax] — реинфорсит ли мотор пик прайора
+                # (food-dir): >0 = выравнивается, <0 = воюет с прайором; align=1 если
+                # топ мотора == пик прайора. ATTACK=5, food-movement=0..3, GATHER=13.
+                if md_t is not None:
+                    _m_argmax = int(md_t.argmax().item())
+                    _m_attack = float(md_t[5].item())
+                    _m_atbase = float(md_t[_b_argmax].item())
+                    _align = 1 if _m_argmax == _b_argmax else 0
+                    _motor_str = (" | motor: m_argmax=%d m_attack=%+.4f "
+                                  "m_atbase=%+.4f align=%d" % (
+                                      _m_argmax, _m_attack, _m_atbase, _align))
+                else:
+                    _motor_str = " | motor: n/a (own=0)"
                 logger.info(
                     "LOGIT_DEBUG %s: own=%.2f raw_ent=%.3f raw_spread=%.3f "
                     "base_ent=%.3f final_ent=%.3f (max2.77) base_peak=%.3f "
-                    "obs_grad=|%.3f,%.3f| raw_argmax=%d base_argmax=%d final_argmax=%d",
+                    "obs_grad=|%.3f,%.3f| raw_argmax=%d base_argmax=%d final_argmax=%d%s",
                     cid, _own_v, raw_ent, raw_spread, base_ent, final_ent,
                     float(bp.max().item()), g_ns, g_ew,
-                    int(rp.argmax().item()), int(bp.argmax().item()),
-                    int(fp.argmax().item()))
+                    int(rp.argmax().item()), _b_argmax,
+                    int(fp.argmax().item()), _motor_str)
         except Exception as _e:
             logger.debug("logit debug log failed: %s", _e)
         return {
