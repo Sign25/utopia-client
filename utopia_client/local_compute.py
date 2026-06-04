@@ -6300,6 +6300,20 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("biochem decay import failed cid=%s: %s", cid, e)
             return
+        # Loner cortisol-gate (Фрай 04.06): у by-design одиночки oxytocin всегда→0
+        # (растёт только от clan-proximity/mating, которых нет) → decay_step
+        # генерит loner-cortisol по oxytocin<10 → ХРОНИЧЕСКИЙ фоновый стресс
+        # (Адам никогда не un-alone → cort без разрешения). 0.12.1 гейтил force-STAY
+        # эффект + mb-флаг, но cortisol-ГЕНЕРАЦИЯ осталась. Колониальный артефакт
+        # (canonical colonial-cue → gate). Floor oxytocin ДО decay_step (≥20,
+        # нейтрально: loner<10 И pair-bond>75 оба ложны) → условие loner ложно →
+        # нет loner-cortisol. НЕ маскировка — для solo социо-изоляция бессмысленна.
+        if self._single_organism and bc is not None:
+            try:
+                if float(getattr(bc, "oxytocin", 0.0)) < 20.0:
+                    bc.oxytocin = 20.0
+            except Exception:
+                pass
         try:
             decay_step(bc, _FakeWorld())
         except Exception as e:
