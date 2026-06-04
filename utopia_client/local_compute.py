@@ -495,6 +495,7 @@ class LocalColonyCompute:
         self._motor_pg_on: float = 0.0
         self._motor_pg_lr: float = 1.618   # φ (Шеф: φ-коэффициенты)
         self._motor_pg_ctx: dict = {}      # cid → (sampled_action:int, π:Tensor[16])
+        self._motor_pg_steps: int = 0      # верификация: сколько раз PG реально бежал
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -4402,23 +4403,31 @@ class LocalColonyCompute:
                     # δ_a−π тангенциален (поднимает выбранное действие, опускает
                     # прочие) → может разучить колонию + выучить forage. Прочие
                     # синапсы и колониальный режим — Hebbian-Oja.
+                    # ВАЖНО: output_proj выдаёт 64-dim (DATA_DIM), а действий 16 —
+                    # motor_delta берёт post[:16]. PG градиент только на эти 16 строк
+                    # output_proj (rows 0:16 = action-логиты, rows 16:64 = 0).
+                    _NA = _MOTOR_POLICY_N_ACTIONS
                     _pg_ctx = (self._motor_pg_ctx.get(cid)
                                if self._motor_pg_on > 0.0 else None)
                     _use_pg = (synapse_type == "output_proj" and _pg_ctx is not None
-                               and _pg_ctx[1].shape[0] == post.shape[0])
+                               and _pg_ctx[1].shape[0] == _NA
+                               and post.shape[0] >= _NA)
                     if _use_pg:
                         _a_idx, _pi = _pg_ctx
                         _T = (self._motor_temp if self._motor_temp > 0.0
                               else (rule.temperature if rule is not None else 1.0))
                         _own_pg = (float(self._motor_voice) if self._single_organism
                                    else max(0.0, 1.0 - float(self._bias_scale)))
-                        _dtanh = 1.0 - torch.tanh(post / _T) ** 2  # ∂motor_delta/∂post
-                        _indic = -_pi.clone()
-                        if 0 <= _a_idx < _indic.shape[0]:
+                        _dtanh = 1.0 - torch.tanh(post[:_NA] / _T) ** 2  # [16]
+                        _indic = -_pi.clone()                            # [16]
+                        if 0 <= _a_idx < _NA:
                             _indic[_a_idx] += 1.0                  # δ_a − π
-                        _g = ((_own_pg * _MOTOR_POLICY_SCALE)
-                              * (_dtanh / max(_T, 1e-6)) * _indic)
+                        _g16 = ((_own_pg * _MOTOR_POLICY_SCALE)
+                                * (_dtanh / max(_T, 1e-6)) * _indic)  # [16]
+                        _g = torch.zeros_like(post)                   # [64]
+                        _g[:_NA] = _g16
                         dW = (self._motor_pg_lr * advantage) * torch.outer(_g, pre)
+                        self._motor_pg_steps += 1                     # верификация: PG бежит
                     else:
                         # SFNN S1.2c (14.05.2026): Hebbian-A с тремя стабилизаторами
                         # против tanh-saturation: (1) mean-центрирование post/pre;
