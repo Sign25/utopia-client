@@ -486,6 +486,15 @@ class LocalColonyCompute:
         # разлочить forage-learning. <1.0 = слабее. Дефолт 1.0 = как глобальный.
         self._motor_oja_scale_out: float = 1.0
         self._motor_renorm_cap_out: float = 1.0   # вторично: дать магнитуде survive
+        # Policy-gradient на output_proj (Фрай 04.06, rule-upgrade): тангенциальный
+        # REINFORCE credit к СЭМПЛИРОВАННОМУ действию (∇log π·advantage) вместо
+        # correlational Hebbian (radial=1 → залочен на вестигиальной КОЛОНИАЛЬНОЙ
+        # политике SHARE_FOOD/FLEE Адама-Зодчего). Может разучить колонию + выучить
+        # forage. _on>0 → заменяет Hebbian ТОЛЬКО на output_proj (прочие синапсы —
+        # Hebbian-представленческое). client_flags motor_pg + motor_pg_lr. Дефолт off.
+        self._motor_pg_on: float = 0.0
+        self._motor_pg_lr: float = 1.618   # φ (Шеф: φ-коэффициенты)
+        self._motor_pg_ctx: dict = {}      # cid → (sampled_action:int, π:Tensor[16])
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -1209,6 +1218,7 @@ class LocalColonyCompute:
         self._motor_dw_last.pop(cid, None)        # ΔW-инструментирование (Фрай 04.06)
         self._motor_dw_radial_ema.pop(cid, None)
         self._motor_dw_cos_ema.pop(cid, None)
+        self._motor_pg_ctx.pop(cid, None)         # policy-gradient контекст (Фрай 04.06)
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
@@ -2284,6 +2294,36 @@ class LocalColonyCompute:
         self._motor_renorm_cap_out = v
         return v
 
+    def set_motor_pg(self, on: float) -> float:
+        """Канал client_flags: policy-gradient на output_proj (Фрай 04.06, rule-
+        upgrade). >0 → тангенциальный REINFORCE credit к сэмплированному действию
+        (∇log π·advantage) заменяет correlational Hebbian на output_proj → может
+        разучить вестигиальную колониальную политику (SHARE_FOOD/FLEE) + выучить
+        forage. Прочие синапсы — Hebbian. Кламп [0, 1]. Реверс — 0."""
+        try:
+            v = float(on)
+        except (TypeError, ValueError):
+            return self._motor_pg_on
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_pg_on:
+            logger.info("set_motor_pg: %.1f → %.1f", self._motor_pg_on, v)
+        self._motor_pg_on = v
+        return v
+
+    def set_motor_pg_lr(self, lr: float) -> float:
+        """Канал client_flags: learning-rate policy-gradient output_proj (Фрай).
+        ΔW = pg_lr·advantage·outer(g, pre), бортуется clip ±0.01 + renorm_cap_out.
+        Дефолт φ=1.618. Кламп [0, 5]. φ-выровненные значения (Шеф): 0.618/1.618/2.618."""
+        try:
+            v = float(lr)
+        except (TypeError, ValueError):
+            return self._motor_pg_lr
+        v = max(0.0, min(5.0, v))
+        if v != self._motor_pg_lr:
+            logger.info("set_motor_pg_lr: %.3f → %.3f", self._motor_pg_lr, v)
+        self._motor_pg_lr = v
+        return v
+
     def set_motor_temp(self, temp: float) -> float:
         """Канал client_flags: де-сатурация tanh-головы motor_policy (Фрай 04.06).
         Override T в _motor_forward: delta = tanh(out/T)·SCALE. T>1 делит pre-tanh →
@@ -2773,6 +2813,14 @@ class LocalColonyCompute:
                         float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)  # predator-близость
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
+                    # Policy-gradient контекст (Фрай 04.06): сохранить СЭМПЛИРОВАННОЕ
+                    # действие + π=softmax(action_slice) для PG-апдейта output_proj
+                    # (∇log π·advantage к выбранному действию) на следующем тике —
+                    # тангенциальный credit, может разучить колонию + выучить forage.
+                    if self._motor_pg_on > 0.0:
+                        self._motor_pg_ctx[cid] = (
+                            int(action),
+                            torch.softmax(action_slice.detach(), dim=-1))
                 else:
                     _base_dbg2 = logits[0, :N_ACTIONS].detach().clone()
                     logits_eff = logits[0, :N_ACTIONS]
@@ -4346,36 +4394,52 @@ class LocalColonyCompute:
                     B = float(coef.B)
                     C = float(coef.C)
                     D = float(coef.D)
-                    # SFNN S1.2c (14.05.2026): три стабилизатора Hebbian-A
-                    # против tanh-saturation motor_delta:
-                    # (1) mean-центрирование post/pre — снимает DC-bias,
-                    #     без которого все строки W сонаправлялись с
-                    #     avg(pre) и output[i] коллапсировал в один знак;
-                    # (2) Oja-вычитающий член (−post_c²·W) — стабилизирует
-                    #     магнитуду строки (Oja 1982: ‖W_i‖ → ‖input‖);
-                    # (3) Row-wise L2-renorm к baseline (safety net ниже).
-                    post_c = post - post.mean()
-                    pre_c = pre - pre.mean()
-                    # Oja-scale (Фрай (a)): множитель вычитающего члена −post²·W.
-                    # 1.0 → полная Oja-стабилизация (текущее); <1.0 → Oja слабее →
-                    # ΔW не сжимается при росте W → policy может заостриться.
-                    # output_proj-specific Oja (Фрай 04.06): на policy-выходе Oja
-                    # свампит reward-направление → используем _out-версию (снижена);
-                    # на input/attn/mlp — глобальная (нормальная, представленческая).
-                    _oja_eff = (self._motor_oja_scale_out
-                                if synapse_type == "output_proj"
-                                else self._motor_oja_scale)
-                    hebb_A = (torch.outer(post_c, pre_c)
-                              - (_oja_eff
-                                 * post_c.square().unsqueeze(1) * W.data))
-                    dW = A * hebb_A
-                    if B != 0.0:
-                        dW = dW + B * post.unsqueeze(1).expand_as(W)
-                    if C != 0.0:
-                        dW = dW + C * pre.unsqueeze(0).expand_as(W)
-                    if D != 0.0:
-                        dW = dW + D
-                    dW = dW * (eta * reward_gain)
+                    # Policy-gradient на output_proj (Фрай 04.06, rule-upgrade):
+                    # тангенциальный REINFORCE credit к СЭМПЛИРОВАННОМУ действию
+                    # вместо correlational Hebbian (radial=1 → залочен на колониальной
+                    # политике). ΔW = pg_lr·advantage·outer(g, pre),
+                    #   g[j] = own·SCALE·(1−tanh²(post[j]/T))/T·(δ_aj − π[j]).
+                    # δ_a−π тангенциален (поднимает выбранное действие, опускает
+                    # прочие) → может разучить колонию + выучить forage. Прочие
+                    # синапсы и колониальный режим — Hebbian-Oja.
+                    _pg_ctx = (self._motor_pg_ctx.get(cid)
+                               if self._motor_pg_on > 0.0 else None)
+                    _use_pg = (synapse_type == "output_proj" and _pg_ctx is not None
+                               and _pg_ctx[1].shape[0] == post.shape[0])
+                    if _use_pg:
+                        _a_idx, _pi = _pg_ctx
+                        _T = (self._motor_temp if self._motor_temp > 0.0
+                              else (rule.temperature if rule is not None else 1.0))
+                        _own_pg = (float(self._motor_voice) if self._single_organism
+                                   else max(0.0, 1.0 - float(self._bias_scale)))
+                        _dtanh = 1.0 - torch.tanh(post / _T) ** 2  # ∂motor_delta/∂post
+                        _indic = -_pi.clone()
+                        if 0 <= _a_idx < _indic.shape[0]:
+                            _indic[_a_idx] += 1.0                  # δ_a − π
+                        _g = ((_own_pg * _MOTOR_POLICY_SCALE)
+                              * (_dtanh / max(_T, 1e-6)) * _indic)
+                        dW = (self._motor_pg_lr * advantage) * torch.outer(_g, pre)
+                    else:
+                        # SFNN S1.2c (14.05.2026): Hebbian-A с тремя стабилизаторами
+                        # против tanh-saturation: (1) mean-центрирование post/pre;
+                        # (2) Oja-вычитающий член (−post_c²·W, Oja 1982); (3) row-L2-
+                        # renorm к baseline (ниже). output_proj-specific Oja-scale.
+                        post_c = post - post.mean()
+                        pre_c = pre - pre.mean()
+                        _oja_eff = (self._motor_oja_scale_out
+                                    if synapse_type == "output_proj"
+                                    else self._motor_oja_scale)
+                        hebb_A = (torch.outer(post_c, pre_c)
+                                  - (_oja_eff
+                                     * post_c.square().unsqueeze(1) * W.data))
+                        dW = A * hebb_A
+                        if B != 0.0:
+                            dW = dW + B * post.unsqueeze(1).expand_as(W)
+                        if C != 0.0:
+                            dW = dW + C * pre.unsqueeze(0).expand_as(W)
+                        if D != 0.0:
+                            dW = dW + D
+                        dW = dW * (eta * reward_gain)
                     dW.clamp_(-clip_val, clip_val)
                     _dw_norm_sum += float(dW.norm().item())  # MOTOR_LEARN
                     # ΔW-инструментирование output_proj (Фрай 04.06): (a) vs (b).

@@ -538,6 +538,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # output_proj-specific развязка Oja/renorm (Фрай 04.06, верифиц. dw_radial≈1).
     applied_motor_oja_out: float | None = None
     applied_motor_renorm_cap_out: float | None = None
+    # Policy-gradient на output_proj (Фрай 04.06, rule-upgrade): разучить колонию.
+    applied_motor_pg: float | None = None
+    applied_motor_pg_lr: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -846,6 +849,27 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_renorm_cap_out → %.2f", target_rcap_out)
                         except Exception as e:
                             logger.warning("set_motor_renorm_cap_out failed: %s", e)
+
+                    # Policy-gradient на output_proj (Фрай 04.06): разучить
+                    # вестигиальную колониальную политику + выучить forage.
+                    target_pg = float(flags.get("motor_pg", 0.0))
+                    if target_pg != applied_motor_pg \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_pg(target_pg)
+                            applied_motor_pg = target_pg
+                            logger.info("motor_pg → %.1f", target_pg)
+                        except Exception as e:
+                            logger.warning("set_motor_pg failed: %s", e)
+                    target_pg_lr = float(flags.get("motor_pg_lr", 1.618))
+                    if target_pg_lr != applied_motor_pg_lr \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_pg_lr(target_pg_lr)
+                            applied_motor_pg_lr = target_pg_lr
+                            logger.info("motor_pg_lr → %.3f", target_pg_lr)
+                        except Exception as e:
+                            logger.warning("set_motor_pg_lr failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень
