@@ -5770,6 +5770,16 @@ class LocalColonyCompute:
                          cid, e)
             return
         try:
+            # §1 RE-GATE (Фрай 04.06): держащийся колониальный mb (loner/pair-bond,
+            # выставленный в restart-окне где single_organism ещё False) снять
+            # НЕМЕДЛЕННО под single_organism — НЕ ждать истечения hysteresis-ticks.
+            # Иначе loner держится N тиков и раздувает cortisol (3→39.6) →
+            # конфаундит Phase-1 alignment-reader. loner у by-design одиночки —
+            # колониальный артефакт, не реальный сигнал.
+            if (self._single_organism
+                    and bc.mental_break in _COLONIAL_MENTAL_BREAKS):
+                bc.mental_break = ""
+                bc.mental_break_ticks = 0
             if bc.mental_break_ticks > 0:
                 bc.mental_break_ticks -= 1
                 return
