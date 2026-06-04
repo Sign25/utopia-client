@@ -2768,7 +2768,9 @@ class LocalColonyCompute:
                         _raw_dbg, _base_dbg, action_slice.detach(), float(_own),
                         float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
                         float(obs_arr[34]) if len(obs_arr) > 34 else 0.0,
-                        motor_delta.detach().clone())  # LOGIT_DEBUG + motor_delta (Phase-1 alignment-reader)
+                        motor_delta.detach().clone(),  # LOGIT_DEBUG + motor_delta
+                        float(obs_arr[58]) if len(obs_arr) > 61 else 0.0,  # prey-близость (Шеф 04.06)
+                        float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)  # predator-близость
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
                 else:
@@ -2780,7 +2782,9 @@ class LocalColonyCompute:
                         _raw_dbg, _base_dbg2, logits_eff.detach(), float(_own),
                         float(obs_arr[33]) if len(obs_arr) > 34 else 0.0,
                         float(obs_arr[34]) if len(obs_arr) > 34 else 0.0,
-                        None)  # LOGIT_DEBUG (_own=0, нет motor_delta)
+                        None,  # LOGIT_DEBUG (_own=0, нет motor_delta)
+                        float(obs_arr[58]) if len(obs_arr) > 61 else 0.0,  # prey-близость (Шеф 04.06)
+                        float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)  # predator-близость
                     action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
@@ -5245,14 +5249,20 @@ class LocalColonyCompute:
                                       _m_argmax, _m_attack, _m_atbase, _align))
                 else:
                     _motor_str = " | motor: n/a (own=0)"
+                # Threat-телеметрия (Шеф 04.06): prey-близость(58)/predator-близость(61)
+                # — есть ли персистентная цель/угроза у Адама (1/dist, высокое=близко).
+                _prey_prox = float(_ld[7]) if len(_ld) > 8 else -1.0
+                _pred_prox = float(_ld[8]) if len(_ld) > 8 else -1.0
+                _threat_str = " | threat: prey_prox=%.3f pred_prox=%.3f" % (
+                    _prey_prox, _pred_prox)
                 logger.info(
                     "LOGIT_DEBUG %s: own=%.2f raw_ent=%.3f raw_spread=%.3f "
                     "base_ent=%.3f final_ent=%.3f (max2.77) base_peak=%.3f "
-                    "obs_grad=|%.3f,%.3f| raw_argmax=%d base_argmax=%d final_argmax=%d%s",
+                    "obs_grad=|%.3f,%.3f| raw_argmax=%d base_argmax=%d final_argmax=%d%s%s",
                     cid, _own_v, raw_ent, raw_spread, base_ent, final_ent,
                     float(bp.max().item()), g_ns, g_ew,
                     int(rp.argmax().item()), _b_argmax,
-                    int(fp.argmax().item()), _motor_str)
+                    int(fp.argmax().item()), _motor_str, _threat_str)
         except Exception as _e:
             logger.debug("logit debug log failed: %s", _e)
         return {
