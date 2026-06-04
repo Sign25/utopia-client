@@ -585,6 +585,15 @@ class LocalColonyCompute:
         # Recovery-грант энергии после паралича. Тюнится мной (Фрай): если
         # grass-only зацикливает — поднимаю (max/φ⁶≈73 / max/φ⁵≈118).
         self._recovery_energy: float = _RECOVERY_ENERGY_DEFAULT
+        # Glucose→energy конверсия (Фрай 04.06, экономика): энергия=P40 delta_e
+        # (yield) − step_cost (drain); glucose отдельно (apply_feed), конверсии НЕТ
+        # → излишек glucose maxится и ПРОПАДАЕТ, energy net-negative даже на макс.
+        # еде (glucose 99.7, energy↓). Фикс: излишек glucose (>baseline 50) → energy
+        # (per-sec rate × surplus × dt, glucose потребляется но не ниже baseline).
+        # Делает «плотная еда (glucose↑) → net-positive, бедная → net-negative»
+        # (skill важен/достижим). Тюнится client_flags glucose_energy_rate (дефолт
+        # 0=нейтрально, калибрую чтобы плотная еда давала net-positive).
+        self._glucose_energy_rate: float = 0.0
         # Track 2 (этап 4): self-obs→action REINFORCE-голова. Linear(4→N_ACTIONS),
         # zero-init (non-destructive старт): мапит self-observable (голод/
         # неуверенность/паралич) в bias логитов, учится REINFORCE-наградой. Прямой
@@ -2232,6 +2241,22 @@ class LocalColonyCompute:
         if v != self._motor_voice:
             logger.info("set_motor_voice: %.2f → %.2f", self._motor_voice, v)
         self._motor_voice = v
+        return v
+
+    def set_glucose_energy_rate(self, rate: float) -> float:
+        """Канал client_flags: rate конверсии излишка glucose→energy в _apply_
+        metabolism (Фрай экономика). 0=нет (текущее). Калибруется чтобы плотная
+        еда (glucose↑) давала net-positive energy. Кламп [0, 0.2] (per-sec ×
+        glucose-surplus). Реверс — 0.0."""
+        try:
+            v = float(rate)
+        except (TypeError, ValueError):
+            return self._glucose_energy_rate
+        v = max(0.0, min(0.2, v))
+        if v != self._glucose_energy_rate:
+            logger.info("set_glucose_energy_rate: %.4f → %.4f",
+                        self._glucose_energy_rate, v)
+        self._glucose_energy_rate = v
         return v
 
     # ── Zodchiy Z7.i.c (16.05.2026) ─────────────────────────────────────
@@ -5998,6 +6023,18 @@ class LocalColonyCompute:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
                 self._e_cost_sum += step_cost  # ENERGY_CALIB
+            # Glucose→energy конверсия (Фрай 04.06): излишек glucose (>baseline 50,
+            # от плотной еды) → energy. Делает экономику выигрываемой при хорошей
+            # добыче. glucose потребляется, но не ниже baseline. rate=0 → no-op.
+            _ger = float(self._glucose_energy_rate)
+            if _ger > 0.0:
+                _g = float(getattr(bc, "glucose", 0.0))
+                _surplus = _g - 50.0  # baseline_glucose
+                if _surplus > 0.0:
+                    _conv = min(_ger * _surplus * dt, _surplus)
+                    bc.energy = min(1000.0, float(getattr(bc, "energy", 0.0)) + _conv)
+                    bc.glucose = _g - _conv
+                    self._e_income_sum += _conv  # ENERGY_CALIB (доход)
             # Водный контур client-authoritative (01.06.2026, Шеф). Расход
             # жажды теперь БЕЗУСЛОВНЫЙ для всех owned-zodchiy (как на сервере):
             # доход (delta_hydration) теперь client-side из террейна

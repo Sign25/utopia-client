@@ -531,6 +531,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Голос мотора (Фрай 03.06 curriculum): множитель motor_delta под
     # single_organism. Фаза 1 убавить / Фаза 2 fade-up (тест SFNN-модулятора).
     applied_motor_voice: float | None = None
+    # Glucose→energy конверсия (Фрай 04.06 экономика): rate, плотная еда→net-positive.
+    applied_glucose_energy_rate: float | None = None
     # Z7.i.b (Zodchiy): последнее значение `lineage_upgrade_pending` из
     # client_flags. Триггер edge-detect: False/None → True вызывает
     # P40 Z7.g endpoint (один раз на rising edge). VPS-flag сейчас не
@@ -788,6 +790,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_voice → %.2f", target_voice)
                         except Exception as e:
                             logger.warning("set_motor_voice failed: %s", e)
+
+                    # Glucose→energy конверсия (Фрай экономика): плотная еда→viable.
+                    target_ger = float(flags.get("glucose_energy_rate", 0.0))
+                    if target_ger != applied_glucose_energy_rate \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_glucose_energy_rate(target_ger)
+                            applied_glucose_energy_rate = target_ger
+                            logger.info("glucose_energy_rate → %.4f", target_ger)
+                        except Exception as e:
+                            logger.warning("set_glucose_energy_rate failed: %s", e)
 
                     # Z7.i.b/c (Zodchiy, 16.05.2026): на rising edge флага
                     # lineage_upgrade_pending делаем ДВА действия:
