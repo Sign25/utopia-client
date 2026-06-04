@@ -535,6 +535,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # экстремума + держать отзывчивой) + lr_scale (анти-saddle-flip).
     applied_motor_temp: float | None = None
     applied_motor_lr_scale: float | None = None
+    # output_proj-specific развязка Oja/renorm (Фрай 04.06, верифиц. dw_radial≈1).
+    applied_motor_oja_out: float | None = None
+    applied_motor_renorm_cap_out: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -822,6 +825,27 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_lr_scale → %.3f", target_motor_lr)
                         except Exception as e:
                             logger.warning("set_motor_lr_scale failed: %s", e)
+
+                    # output_proj-specific Oja-развязка (Фрай 04.06): первично снять
+                    # лок (Oja свампит reward-направление на policy-выходе).
+                    target_oja_out = float(flags.get("motor_oja_out", 1.0))
+                    if target_oja_out != applied_motor_oja_out \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_oja_out(target_oja_out)
+                            applied_motor_oja_out = target_oja_out
+                            logger.info("motor_oja_out → %.2f", target_oja_out)
+                        except Exception as e:
+                            logger.warning("set_motor_oja_out failed: %s", e)
+                    target_rcap_out = float(flags.get("motor_renorm_cap_out", 1.0))
+                    if target_rcap_out != applied_motor_renorm_cap_out \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_renorm_cap_out(target_rcap_out)
+                            applied_motor_renorm_cap_out = target_rcap_out
+                            logger.info("motor_renorm_cap_out → %.2f", target_rcap_out)
+                        except Exception as e:
+                            logger.warning("set_motor_renorm_cap_out failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень

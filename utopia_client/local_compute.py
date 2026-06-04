@@ -477,6 +477,15 @@ class LocalColonyCompute:
         # в спокойствии (грасс вверх) свободная магнитуда → flip падает? Следить
         # за tanh-saturation (motor_norm→4.0). client_flags motor_oja_scale.
         self._motor_oja_scale: float = 1.0
+        # MOTOR output_proj-specific развязка (Фрай 04.06, верифицировано dw_radial≈1):
+        # Oja-член (−post²·W) РАДИАЛЕН по построению → свампит reward-направление
+        # (тангенциальное, к forage) на output_proj → ΔW радиален → renorm режет →
+        # policy залочена. Oja+renorm НОРМАЛЬНЫ на input/attn/mlp (представленческие),
+        # но НЕВЕРНЫ на policy-output. _out-версии применяются ТОЛЬКО к output_proj:
+        # снизить Oja (первично) → ΔW тангенциальнее → reward шейпит направление →
+        # разлочить forage-learning. <1.0 = слабее. Дефолт 1.0 = как глобальный.
+        self._motor_oja_scale_out: float = 1.0
+        self._motor_renorm_cap_out: float = 1.0   # вторично: дать магнитуде survive
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -2241,6 +2250,38 @@ class LocalColonyCompute:
             logger.info("set_motor_oja_scale: %.2f → %.2f",
                         self._motor_oja_scale, v)
         self._motor_oja_scale = v
+        return v
+
+    def set_motor_oja_out(self, scale: float) -> float:
+        """Канал client_flags: Oja-scale ТОЛЬКО на output_proj (Фрай 04.06,
+        верифицировано dw_radial≈1). Снижение → ΔW на policy-выходе тангенциальнее
+        (reward шейпит направление, не свампится радиальным Oja) → разлок forage-
+        learning. На input/attn/mlp Oja остаётся глобальной (нормальной). Кламп
+        [0, 1]. Реверс — 1.0. Минимально достаточно (передекрут → риск флипа)."""
+        try:
+            v = float(scale)
+        except (TypeError, ValueError):
+            return self._motor_oja_scale_out
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_oja_scale_out:
+            logger.info("set_motor_oja_out: %.2f → %.2f", self._motor_oja_scale_out, v)
+        self._motor_oja_scale_out = v
+        return v
+
+    def set_motor_renorm_cap_out(self, cap: float) -> float:
+        """Канал client_flags: renorm growth-cap ТОЛЬКО на output_proj (Фрай 04.06,
+        вторично к Oja). >1 → магнитуда строки output_proj может расти до target×cap
+        → тангенциальная компонента survive. На input/attn/mlp renorm нормальный.
+        Кламп [1, 5]. Реверс — 1.0."""
+        try:
+            v = float(cap)
+        except (TypeError, ValueError):
+            return self._motor_renorm_cap_out
+        v = max(1.0, min(5.0, v))
+        if v != self._motor_renorm_cap_out:
+            logger.info("set_motor_renorm_cap_out: %.2f → %.2f",
+                        self._motor_renorm_cap_out, v)
+        self._motor_renorm_cap_out = v
         return v
 
     def set_motor_temp(self, temp: float) -> float:
@@ -4314,8 +4355,14 @@ class LocalColonyCompute:
                     # Oja-scale (Фрай (a)): множитель вычитающего члена −post²·W.
                     # 1.0 → полная Oja-стабилизация (текущее); <1.0 → Oja слабее →
                     # ΔW не сжимается при росте W → policy может заостриться.
+                    # output_proj-specific Oja (Фрай 04.06): на policy-выходе Oja
+                    # свампит reward-направление → используем _out-версию (снижена);
+                    # на input/attn/mlp — глобальная (нормальная, представленческая).
+                    _oja_eff = (self._motor_oja_scale_out
+                                if synapse_type == "output_proj"
+                                else self._motor_oja_scale)
                     hebb_A = (torch.outer(post_c, pre_c)
-                              - (self._motor_oja_scale
+                              - (_oja_eff
                                  * post_c.square().unsqueeze(1) * W.data))
                     dW = A * hebb_A
                     if B != 0.0:
@@ -4356,7 +4403,11 @@ class LocalColonyCompute:
                         if (target is not None
                                 and target.shape[0] == W.shape[0]):
                             cur = W.data.norm(dim=1).clamp(min=eps)
-                            cap = float(self._motor_renorm_growth_cap)
+                            # output_proj-specific renorm-cap (Фрай: вторично — дать
+                            # тангенциальной магнитуде survive на policy-выходе).
+                            cap = float(self._motor_renorm_cap_out
+                                        if synapse_type == "output_proj"
+                                        else self._motor_renorm_growth_cap)
                             if cap <= 1.0:
                                 W.data.mul_((target / cur).unsqueeze(1))
                             else:
