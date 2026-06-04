@@ -5780,7 +5780,14 @@ class LocalColonyCompute:
                     and bc.mental_break in _COLONIAL_MENTAL_BREAKS):
                 bc.mental_break = ""
                 bc.mental_break_ticks = 0
-            if bc.mental_break_ticks > 0:
+            # Hysteresis-hold (Фрай 04.06): под single_organism УБИРАЕМ — recompute
+            # КАЖДЫЙ тик, чтобы держащийся stress-mb (catatonic от утихшего
+            # blight/cold_snap) снимался НЕМЕДЛЕННО когда условие ушло (cort упал
+            # <80), а не держался стейл N тиков. Флаг → проекция шлёт mb на P40 →
+            # P40 mirror-force-STAY → Адам не форажит даже при client-гейте; stale-
+            # hold блокирует. НЕ маскировка — условие реально изменилось (recompute
+            # вернёт текущее). Колония — hysteresis как было (anti-flicker).
+            if (not self._single_organism) and bc.mental_break_ticks > 0:
                 bc.mental_break_ticks -= 1
                 return
             new_state = compute_mental_break(bc, world_tick)
