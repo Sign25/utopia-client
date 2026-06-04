@@ -5829,7 +5829,19 @@ class LocalColonyCompute:
             return
         try:
             if should_force_stay(bc):
-                out[cid] = {"action": STAY, "target_id": None}
+                # §3 (Фрай 04.06, инвариант recoverable-не-absorbing): под
+                # single_organism catatonic/exhaustion force-STAY АБСОРБИРУЕТ
+                # (force-STAY → не форажит → energy 0 → cort-спайк → catatonic
+                # держит; recovery размыкает на миг, но петля re-form'ится).
+                # Гейчу mb-force-STAY (СИГНАЛ mb/cortisol ОСТАЁТСЯ — не маскируем),
+                # оставляю glucose<5 faint (реальный метаболический обморок) +
+                # §3-паралич (выше). Адам форажит когда стрессован → relief →
+                # размыкание. Для §3-immortal одиночки catatonic-lock net-вреден.
+                if (self._single_organism
+                        and float(getattr(bc, "glucose", 100.0)) >= 5.0):
+                    pass  # catatonic/exhaustion — НЕ лочим (non-absorbing)
+                else:
+                    out[cid] = {"action": STAY, "target_id": None}
         except Exception as e:
             logger.debug("biochem force_stay cid=%s: %s", cid, e)
 
