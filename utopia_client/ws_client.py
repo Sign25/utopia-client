@@ -1757,6 +1757,18 @@ class ColonyWSClient:
                     "vision_radius", 7) or 7)) if self.compute else 7
                 if self._flora_in_radius(_rc[0], _rc[1], flora_pos, _vr):
                     _nv["sees"] += 1
+                # ARRIVAL-диагностика (Фрай 05.06): локальная flora-плотность +
+                # достижимость — развести (a) distribution (локально пусто) vs
+                # (b) granularity/pathing (рядом есть, не ландится). Rate-limit.
+                self._flora_diag_n = getattr(self, "_flora_diag_n", 0) + 1
+                if self._flora_diag_n % 50 == 0:
+                    _n1, _n2, _n3, _nd, _wp = self._local_flora_diag(
+                        _rc[0], _rc[1], flora_pos)
+                    logger.info(
+                        "FLORA_LOCAL_DIAG cid=%s pos=(%d,%d) n_r1=%d n_r2=%d "
+                        "n_r3=%d nearest=%d water_path=%d global=%d",
+                        cid_s, _rc[0], _rc[1], _n1, _n2, _n3, _nd, _wp,
+                        len(flora_pos))
             _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
             if _p40_dh is not None and _p40_dh != 0.0:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh
@@ -1831,6 +1843,54 @@ class ColonyWSClient:
                 self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
         return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
                 on_flora_per_cid, carried_food_per_cid)
+
+    def _tile_water(self, row: int, col: int) -> bool:
+        """Один тайл = WATER? (для reachability-диагностики пути к флоре)."""
+        wc = getattr(self, "world_cache", None)
+        if wc is None:
+            return False
+        cfg = getattr(wc, "config", None)
+        terrain = getattr(wc, "terrain", b"")
+        if cfg is None or not terrain:
+            return False
+        size = int(getattr(cfg, "size", 0) or 0)
+        if size <= 0 or len(terrain) < size * size:
+            return False
+        r, c = int(row), int(col)
+        if 0 <= r < size and 0 <= c < size:
+            return terrain[r * size + c] == self._WATER_TILE
+        return False
+
+    def _local_flora_diag(self, row: int, col: int, flora_pos: dict):
+        """ARRIVAL-диагностика (Фрай 05.06): локальная flora-плотность вокруг
+        Адама (n в манхэттен-радиусе 1/2/3) + ближайшая дистанция + вода на
+        straight-line пути к ближайшей флоре. Разводит (a) distribution vs
+        (b) granularity/pathing. Возвращает (n1, n2, n3, nearest, water_path)."""
+        if not flora_pos:
+            return (0, 0, 0, -1, 0)
+        n1 = n2 = n3 = 0
+        nearest = 10 ** 9
+        nf = None
+        for (fr, fc) in flora_pos:
+            d = abs(fr - row) + abs(fc - col)
+            if d <= 1:
+                n1 += 1
+            if d <= 2:
+                n2 += 1
+            if d <= 3:
+                n3 += 1
+            if d < nearest:
+                nearest = d
+                nf = (fr, fc)
+        water_path = 0
+        if nf is not None and 0 < nearest <= 8:
+            steps = max(abs(nf[0] - row), abs(nf[1] - col)) or 1
+            for i in range(1, steps + 1):
+                rr = row + int(round((nf[0] - row) * i / steps))
+                cc = col + int(round((nf[1] - col) * i / steps))
+                if self._tile_water(rr, cc):
+                    water_path += 1
+        return (n1, n2, n3, (nearest if nf is not None else -1), water_path)
 
     @staticmethod
     def _flora_in_radius(row: int, col: int, flora_pos: dict, vr: int) -> bool:
