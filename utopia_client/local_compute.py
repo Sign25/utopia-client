@@ -496,6 +496,14 @@ class LocalColonyCompute:
         self._motor_pg_lr: float = 1.618   # φ (Шеф: φ-коэффициенты)
         self._motor_pg_ctx: dict = {}      # cid → (sampled_action:int, π:Tensor[16])
         self._motor_pg_steps: int = 0      # верификация: сколько раз PG реально бежал
+        # МЕДЛЕННЫЙ канал — порт серверного WorldTrainer (Фрай 05.06, MIGRATION GAP):
+        # batch-REINFORCE по буферу опыта (norm-advantage + adaptive-entropy +
+        # batch-стабильность) = учитель политики, которого не было на клиенте.
+        # _on>0 → вкл (заменяет per-tick PG; быстрый Hebbian остаётся). Per-cid
+        # MotorSlowTrainer + pending (action_t→reward_t+1 credit через P40-lag).
+        self._motor_slow_on: float = 0.0
+        self.motor_slow_trainer: dict = {}   # cid → MotorSlowTrainer
+        self._slow_pending: dict = {}        # cid → (obs[D], action, base_logits[16])
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -1220,6 +1228,8 @@ class LocalColonyCompute:
         self._motor_dw_radial_ema.pop(cid, None)
         self._motor_dw_cos_ema.pop(cid, None)
         self._motor_pg_ctx.pop(cid, None)         # policy-gradient контекст (Фрай 04.06)
+        self.motor_slow_trainer.pop(cid, None)    # медленный канал (Фрай 05.06)
+        self._slow_pending.pop(cid, None)
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
@@ -2295,6 +2305,23 @@ class LocalColonyCompute:
         self._motor_renorm_cap_out = v
         return v
 
+    def set_motor_slow(self, on: float) -> float:
+        """Канал client_flags: МЕДЛЕННЫЙ batch-REINFORCE канал (порт серверного
+        WorldTrainer, Фрай 05.06, MIGRATION GAP fix). >0 → вкл: buffer 200, batch 16,
+        train_every 10, norm-advantage, adaptive-entropy 0.15→2.0 — учитель политики
+        motor_policy. Гейчит per-tick Hebbian motor_policy + per-tick PG OFF (слабый
+        канал единственный учитель; быстрый Hebbian на ДРУГИХ тканях остаётся, как
+        сервер). Кламп [0, 1]. Реверс — 0."""
+        try:
+            v = float(on)
+        except (TypeError, ValueError):
+            return self._motor_slow_on
+        v = max(0.0, min(1.0, v))
+        if v != self._motor_slow_on:
+            logger.info("set_motor_slow: %.1f → %.1f", self._motor_slow_on, v)
+        self._motor_slow_on = v
+        return v
+
     def set_motor_pg(self, on: float) -> float:
         """Канал client_flags: policy-gradient на output_proj (Фрай 04.06, rule-
         upgrade). >0 → тангенциальный REINFORCE credit к сэмплированному действию
@@ -2737,7 +2764,11 @@ class LocalColonyCompute:
                 org = self.organisms.get(cid)
                 sfnn_on = bool(getattr(getattr(org, "genome", None),
                                         "sfnn_enabled", True))
-                if sfnn_on:
+                # Гейт (Фрай 05.06): при медленном канале Hebbian на motor_policy
+                # ВЫКЛ — renorm воевал бы с REINFORCE-градиентом; на сервере Hebbian
+                # на memory/brain, REINFORCE на policy (разные ткани). Слабый канал =
+                # единственный учитель motor_policy. Высшие/basic ткани — свой Hebbian.
+                if sfnn_on and self._motor_slow_on <= 0.0:
                     self._motor_sfnn_update_step(cid, events_per_cid,
                                                    intrinsic_now)
 
@@ -2818,10 +2849,44 @@ class LocalColonyCompute:
                     # действие + π=softmax(action_slice) для PG-апдейта output_proj
                     # (∇log π·advantage к выбранному действию) на следующем тике —
                     # тангенциальный credit, может разучить колонию + выучить forage.
-                    if self._motor_pg_on > 0.0:
+                    if self._motor_pg_on > 0.0 and self._motor_slow_on <= 0.0:
                         self._motor_pg_ctx[cid] = (
                             int(action),
                             torch.softmax(action_slice.detach(), dim=-1))
+                    # МЕДЛЕННЫЙ канал (Фрай 05.06, порт WorldTrainer): record
+                    # (obs, action, reward, base) + train каждые train_every. Credit:
+                    # pending action_t → reward из event ЭТОГО тика (P40-lag даёт
+                    # outcome предыдущего действия). base = прайор (_base_dbg, detach).
+                    if self._motor_slow_on > 0.0:
+                        _tr = self.motor_slow_trainer.get(cid)
+                        if _tr is None:
+                            try:
+                                from .slow_trainer import MotorSlowTrainer
+                                _tr = MotorSlowTrainer(
+                                    torch, self.motor_policy[cid],
+                                    _MOTOR_POLICY_SCALE)
+                                self.motor_slow_trainer[cid] = _tr
+                            except Exception as _e:
+                                logger.debug("slow_trainer init %s: %s", cid, _e)
+                        if _tr is not None:
+                            _ev = (events_per_cid.get(cid)
+                                   if events_per_cid is not None else None)
+                            _rew = (float(self._compute_immediate_reward(_ev))
+                                    if _ev is not None else 0.0)
+                            _rl = self.motor_sfnn_rule.get(cid)
+                            _T_m = (self._motor_temp if self._motor_temp > 0.0
+                                    else (_rl.temperature if _rl is not None else 1.0))
+                            _prev = self._slow_pending.get(cid)
+                            if _prev is not None:
+                                try:
+                                    _tr.record(_prev[0], _prev[1], _rew, _prev[2])
+                                    if _tr.should_train():
+                                        _tr.train_step(float(_own), float(_T_m))
+                                except Exception as _e:
+                                    logger.debug("slow_train %s: %s", cid, _e)
+                            self._slow_pending[cid] = (
+                                obs_tensor.detach().reshape(-1),
+                                int(action), _base_dbg)
                 else:
                     _base_dbg2 = logits[0, :N_ACTIONS].detach().clone()
                     logits_eff = logits[0, :N_ACTIONS]

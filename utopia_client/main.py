@@ -541,6 +541,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Policy-gradient на output_proj (Фрай 04.06, rule-upgrade): разучить колонию.
     applied_motor_pg: float | None = None
     applied_motor_pg_lr: float | None = None
+    # Медленный batch-REINFORCE канал (Фрай 05.06, порт WorldTrainer, MIGRATION GAP).
+    applied_motor_slow: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -870,6 +872,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_pg_lr → %.3f", target_pg_lr)
                         except Exception as e:
                             logger.warning("set_motor_pg_lr failed: %s", e)
+
+                    # Медленный batch-REINFORCE канал (Фрай 05.06, порт WorldTrainer).
+                    target_slow = float(flags.get("motor_slow", 0.0))
+                    if target_slow != applied_motor_slow \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_slow(target_slow)
+                            applied_motor_slow = target_slow
+                            logger.info("motor_slow → %.1f", target_slow)
+                        except Exception as e:
+                            logger.warning("set_motor_slow failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень
