@@ -2791,6 +2791,24 @@ class LocalColonyCompute:
                            if _bc2 is not None else 0.5)
                     _nf_cid = ((nearest_flora_per_cid or {}).get(cid)
                                if nearest_flora_per_cid is not None else None)
+                    # obs[62/63] инжект CLIENT-SIDE из nearest_flora-поля (Фрай 05.06):
+                    # Хьюберт шлёт поле (для прайора), но obs[62/63] не заполнил
+                    # server-side → инжектим сами (само-содержащееся). obs[62]=dist-
+                    # сигнал 1/(1+dist) (1=на флоре, →0 далеко), obs[63]=kind/3. Мотор
+                    # читает → медленный канал учит «GATHER↔высокий obs62» = контекст.
+                    if _nf_cid is not None and len(obs_arr) > 63:
+                        try:
+                            _d = float(_nf_cid.get("dist", 0.0) or 0.0)
+                            _k = float(_nf_cid.get("kind", 0) or 0)
+                            _o62 = 1.0 / (1.0 + max(0.0, _d))
+                            _o63 = _k / 3.0
+                            obs_arr[62] = _o62
+                            obs_arr[63] = _o63
+                            if obs_tensor.shape[-1] > 63:
+                                obs_tensor[0, 62] = _o62
+                                obs_tensor[0, 63] = _o63
+                        except Exception:
+                            pass
                     # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
                     # dist-тренд (arrival-прокси) + obs[62/63]. Rate-limit 1/50.
                     if _nf_cid is not None:
