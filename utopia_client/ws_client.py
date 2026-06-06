@@ -1820,7 +1820,11 @@ class ColonyWSClient:
             _has_ps = any(k in c for k in (
                 "step_cost_per_sec", "telomere_decay_per_sec",
                 "thirst_per_sec"))
-            if _has_ps or any(k in c for k in (
+            # §3.5 АСИНХРОННЫЕ ТЕМПЫ (Фрай 06.06): per-tick rate от Хьюберта
+            # (= per_sec / world_TPS, server знает TPS) → метаболизм Адама на
+            # ЕГО тиковой шкале, не wall-dt. _apply_metabolism применит per-apply.
+            _has_tick = "step_cost_per_tick" in c
+            if _has_ps or _has_tick or any(k in c for k in (
                     "step_cost_now", "telomere_decay_now", "thirst_now")):
                 rates_per_cid[cid_s] = {
                     "step_cost_per_sec": float(c.get(
@@ -1835,6 +1839,13 @@ class ColonyWSClient:
                     # drain). Авто-апгрейд когда Хьюберт завершит rename.
                     "_per_sec": _has_ps,
                 }
+                if _has_tick:
+                    rates_per_cid[cid_s]["step_cost_per_tick"] = float(
+                        c.get("step_cost_per_tick", 0.0) or 0.0)
+                    rates_per_cid[cid_s]["thirst_per_tick"] = float(
+                        c.get("thirst_per_tick", 0.0) or 0.0)
+                    rates_per_cid[cid_s]["telomere_decay_per_tick"] = float(
+                        c.get("telomere_decay_per_tick", 0.0) or 0.0)
         # NAV_VIS периодический лог (раз в ~300 батчей ≈ 60с при 5Гц).
         if hasattr(self, "_nav_vis"):
             self._nav_vis["batches"] += 1

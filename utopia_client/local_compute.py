@@ -6605,7 +6605,19 @@ class LocalColonyCompute:
         _now = time.time()
         _last_wall = self._last_metab_wall.get(cid)
         self._last_metab_wall[cid] = _now
-        if _per_sec:
+        # §3.5 АСИНХРОННЫЕ ТЕМПЫ (Фрай 06.06, body_migration.md): для owned-
+        # организма (Адам) тик клиента = ЕГО метаболизм, НЕ синхрон с миром
+        # (черепаха/гепард). Income копится per-client-tick (свой темп). Cost
+        # ДОЛЖЕН быть на той же тиковой шкале — иначе step_cost жжётся по wall-dt
+        # («темп гепарда»), а ест в своём → дренаж к §3 (баг, не «доход мал»).
+        # Фикс: step_cost_per_tick (Хьюберт: = step_cost_per_sec / world_TPS,
+        # сервер знает TPS) применяем per-apply БЕЗ wall-dt. Пока сервер не шлёт
+        # per-tick — fallback на wall-dt (колонии/legacy, поведение не меняется).
+        _tick_metab = (self._single_organism
+                       and rates.get("step_cost_per_tick") is not None)
+        if _tick_metab:
+            dt = 1.0  # per-client-tick: cost на шкале income (свой метаболизм)
+        elif _per_sec:
             if _last_wall is None:
                 return
             dt = min(_MAX_METAB_DT, max(0.0, _now - _last_wall))
@@ -6618,13 +6630,22 @@ class LocalColonyCompute:
         bc = self.biochem.get(cid)
         org = self.organisms.get(cid)
         try:
-            # *_per_sec (контракт Хьюберта); ws_client нормализует *_now→*_per_sec
-            # на переходный период (fallback), чтобы не было окна rate=0.
-            _sc_rate = float(rates.get("step_cost_per_sec", 0.0) or 0.0)
-            self._metab_sc_sum += _sc_rate          # per-sec rate (METAB_DIAG)
-            step_cost = _sc_rate * dt                # energy/сек × сек
-            thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
-            tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
+            if _tick_metab:
+                # §3.5: per-client-tick rate, применяется один раз за apply (БЕЗ
+                # wall-dt). Та же шкала, что income → per-tick net = серверный.
+                step_cost = float(rates.get("step_cost_per_tick", 0.0) or 0.0)
+                thirst = float(rates.get("thirst_per_tick", 0.0) or 0.0)
+                tel_decay = float(rates.get("telomere_decay_per_tick", 0.0) or 0.0)
+                self._metab_sc_sum += step_cost     # METAB_DIAG (теперь per-tick)
+                self._metab_tick_n = getattr(self, "_metab_tick_n", 0) + 1
+            else:
+                # *_per_sec (контракт Хьюберта); ws_client нормализует *_now→
+                # *_per_sec на переходный период (fallback), чтобы не было rate=0.
+                _sc_rate = float(rates.get("step_cost_per_sec", 0.0) or 0.0)
+                self._metab_sc_sum += _sc_rate      # per-sec rate (METAB_DIAG)
+                step_cost = _sc_rate * dt           # energy/сек × сек (wall-dt)
+                thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
+                tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
         except (TypeError, ValueError):
             return
         if bc is not None:
@@ -6869,15 +6890,18 @@ class LocalColonyCompute:
                 # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
                 # server-тика (handle_tick ×2). applies = реальные server-тики.
                 _ma = max(1, self._metab_applies)
+                _tick_n = getattr(self, "_metab_tick_n", 0)
                 logger.info(
-                    "METAB_DIAG applies=%d mean_rate_per_sec=%.3f mean_dt=%.2f "
-                    "mean_drain_per_apply=%.3f",
+                    "METAB_DIAG applies=%d mean_rate=%.4f mean_dt=%.2f "
+                    "mean_drain_per_apply=%.4f tick_mode=%d/%d",
                     self._metab_applies, self._metab_sc_sum / _ma,
                     self._metab_dt_sum / _ma,
-                    (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma))
+                    (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma),
+                    _tick_n, self._metab_applies)
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
+                self._metab_tick_n = 0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
