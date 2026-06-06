@@ -2680,7 +2680,8 @@ class LocalColonyCompute:
                     world_tick: int = 0,
                     rates_per_cid: Optional[dict] = None,
                     on_flora_per_cid: Optional[dict] = None,
-                    carried_food_per_cid: Optional[dict] = None) -> dict:
+                    carried_food_per_cid: Optional[dict] = None,
+                    nearest_flora_per_cid: Optional[dict] = None) -> dict:
         """Forward + ActionSelector + Hebbian update для всех cid.
 
         Args:
@@ -2788,7 +2789,10 @@ class LocalColonyCompute:
                     _bc2 = self.biochem.get(cid)
                     _er = (float(getattr(_bc2, "energy", 500.0)) / 1000.0
                            if _bc2 is not None else 0.5)
-                    self._shape_action_logits(logits[0], obs_arr, _diet, _er)
+                    _nf_cid = ((nearest_flora_per_cid or {}).get(cid)
+                               if nearest_flora_per_cid is not None else None)
+                    self._shape_action_logits(logits[0], obs_arr, _diet, _er,
+                                              nearest_flora=_nf_cid)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -4161,7 +4165,7 @@ class LocalColonyCompute:
             self._carried_food[cid] = cur - 1
 
     def _shape_action_logits(self, logits, obs_arr, diet: float,
-                             energy_ratio: float) -> None:
+                             energy_ratio: float, nearest_flora=None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4195,13 +4199,42 @@ class LocalColonyCompute:
             def _unit(a, b):
                 m = (a * a + b * b) ** 0.5
                 return (a / m, b / m) if (m > 1e-6 and _norm) else (a, b)
-            # Флора-градиент (иди к еде). Травоядный (diet→0) сильнее.
-            g_ns = float(obs_arr[33]) if n > 34 else 0.0
-            g_ew = float(obs_arr[34]) if n > 34 else 0.0
-            g_ns, g_ew = _unit(g_ns, g_ew)
-            fw = (4.0 - 2.0 * diet) * DS
-            logits[0] -= fw * g_ns; logits[1] += fw * g_ns
-            logits[2] += fw * g_ew; logits[3] -= fw * g_ew
+            # nearest_flora точный нав-ПОЛ (Хьюберт/Фрай 05.06): {dr,dc,dist,kind}|None,
+            # raw nearest-flora delta (Elder argmin). Заменяет грубый smell-градиент
+            # когда есть: dist==0 → GATHER/EAT буст (на тайле); dist>0 → точный шаг
+            # N/S/E/W по dr/dc ×min(1/dist,1) (ближе→резче); None → smell-fallback.
+            # Прайор = эвристика Старших как ПОЛ (точная нав + on-flora gather), мотор
+            # учит высшее поверх. obs[62/63]=dist/kind для контекст-обучения мотора.
+            # Конвенция: dr>0=флора южнее→SOUTH(1), dr<0→NORTH(0), dc>0→EAST(2), dc<0→WEST(3).
+            _nf = nearest_flora
+            if _nf is not None:
+                try:
+                    _dr = float(_nf.get("dr", 0.0))
+                    _dc = float(_nf.get("dc", 0.0))
+                    _dist = float(_nf.get("dist", 0.0))
+                    if _dist <= 0.0:
+                        logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
+                        logits[14] += 1.0 * DS    # EAT
+                    else:
+                        _w = (4.0 - 2.0 * diet) * DS * min(1.0 / _dist, 1.0)
+                        if _dr < 0:
+                            logits[0] += _w       # NORTH
+                        elif _dr > 0:
+                            logits[1] += _w       # SOUTH
+                        if _dc > 0:
+                            logits[2] += _w       # EAST
+                        elif _dc < 0:
+                            logits[3] += _w       # WEST
+                except Exception:
+                    _nf = None                    # битое поле → smell-fallback
+            if _nf is None:
+                # Smell-градиент fallback (иди к еде, центр-масс). diet→0 сильнее.
+                g_ns = float(obs_arr[33]) if n > 34 else 0.0
+                g_ew = float(obs_arr[34]) if n > 34 else 0.0
+                g_ns, g_ew = _unit(g_ns, g_ew)
+                fw = (4.0 - 2.0 * diet) * DS
+                logits[0] -= fw * g_ns; logits[1] += fw * g_ns
+                logits[2] += fw * g_ew; logits[3] -= fw * g_ew
             # Prey-градиент (охота). Карнивор (diet→1) сильнее.
             p_ns = float(obs_arr[56]) if n > 58 else 0.0
             p_ew = float(obs_arr[57]) if n > 58 else 0.0

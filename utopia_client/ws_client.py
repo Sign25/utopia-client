@@ -1629,6 +1629,7 @@ class ColonyWSClient:
         # p40_ate=0). Предпочитаем P40, fallback на кэш (переходный период).
         on_flora_per_cid: dict = {}
         carried_food_per_cid: dict = {}
+        nearest_flora_per_cid: dict = {}  # Хьюберт 05.06: {dr,dc,dist,kind}|None
         cache = getattr(self, "world_cache", None)
         local_builder_ready = bool(
             cache is not None and getattr(cache, "is_bootstrapped", False))
@@ -1736,6 +1737,11 @@ class ColonyWSClient:
             else:
                 on_flora_per_cid[cid_s] = bool(
                     _rc is not None and (_rc[0], _rc[1]) in flora_pos)
+            # nearest_flora точный нав-сигнал (Хьюберт 05.06): {dr,dc,dist,kind}|None
+            # (Elder argmin). Прайор: dist==0→GATHER, dist>0→точный шаг, None→smell.
+            _p40_nf = c.get("nearest_flora")
+            if _p40_nf is not None:
+                nearest_flora_per_cid[cid_s] = _p40_nf
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")
             if _p40_cf is not None:
@@ -1842,7 +1848,7 @@ class ColonyWSClient:
                     _nv["cids"])
                 self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
         return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
-                on_flora_per_cid, carried_food_per_cid)
+                on_flora_per_cid, carried_food_per_cid, nearest_flora_per_cid)
 
     def _tile_water(self, row: int, col: int) -> bool:
         """Один тайл = WATER? (для reachability-диагностики пути к флоре)."""
@@ -1917,11 +1923,12 @@ class ColonyWSClient:
         # child_org после mate-pair кроссинговера, регистрируем + Y50.
         self._attach_pending_newborns(creatures)
         (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
-         on_flora_per_cid, carried_food_per_cid) = \
+         on_flora_per_cid, carried_food_per_cid, nearest_flora_per_cid) = \
             self._collect_obs_batch(creatures)
         if not obs_per_cid:
             return
         self._on_flora_per_cid = on_flora_per_cid
+        self._nearest_flora_per_cid = nearest_flora_per_cid
         # Фаза 3.3A obs migration (11.05.2026): shadow-сборка obs из локального
         # кеша. Поведение не меняется — forward по-прежнему по серверному obs.
         # Сравниваем slot-by-slot, метрики идут в diagnostics(). После
@@ -2056,7 +2063,8 @@ class ColonyWSClient:
             creatures_out = await asyncio.to_thread(
                 self._run_tick_and_build,
                 obs_per_cid, events_per_cid, intero_per_cid, world_tick,
-                rates_per_cid, on_flora_per_cid, carried_food_per_cid)
+                rates_per_cid, on_flora_per_cid, carried_food_per_cid,
+                nearest_flora_per_cid)
         except Exception as e:
             logger.warning("handle_tick failed: %s", e)
             return
@@ -2393,7 +2401,8 @@ class ColonyWSClient:
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
                             intero_per_cid, world_tick, rates_per_cid=None,
-                            on_flora_per_cid=None, carried_food_per_cid=None):
+                            on_flora_per_cid=None, carried_food_per_cid=None,
+                            nearest_flora_per_cid=None):
         """Offload-worker (0.11.16): handle_tick + сборка creatures_out с
         phase_emas. Запускается в asyncio.to_thread — torch-forward'ы N орг не
         блокируют ws-event-loop. Весь compute-доступ изолирован здесь; на
@@ -2406,7 +2415,8 @@ class ColonyWSClient:
             obs_per_cid, events_per_cid=events_per_cid,
             intero_per_cid=intero_per_cid, world_tick=world_tick,
             rates_per_cid=rates_per_cid, on_flora_per_cid=on_flora_per_cid,
-            carried_food_per_cid=carried_food_per_cid)
+            carried_food_per_cid=carried_food_per_cid,
+            nearest_flora_per_cid=nearest_flora_per_cid)
         if not actions:
             return None
         creatures_out: list = []
