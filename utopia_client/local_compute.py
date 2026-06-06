@@ -596,7 +596,8 @@ class LocalColonyCompute:
         # gather/gather_onf — GATHER issued + на флоре (успех), flip — shaping-
         # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
-                           "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0}
+                           "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
+                           "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0}
         # Contract per-sec (01.06.2026, Хьюберт): server чист (0.272), двоение
         # у нас — obs 6Hz vs sim 30Hz, применяли rate лишний раз. Решение: P40
         # шлёт rate в energy/СЕК, client интегрирует energy -= rate × dt_wallclock
@@ -2844,6 +2845,14 @@ class LocalColonyCompute:
                         self._tile_yield_mem[cid] = max(
                             0, self._tile_yield_mem.get(cid, 0) - 1)
                     _staying = self._tile_yield_mem.get(cid, 0) > 0
+                    # YIELD_GATE-диаг (Фрай 06.06, read-only): частота срабатывания
+                    # gate + carried_food snapshot — проверка гипотезы «собирает
+                    # вместо ест» (gate ждёт delta_energy, а Адам GATHER'ит в склад).
+                    if _staying:
+                        self._nav["yield_fire"] += 1
+                    self._nav["cf_last"] = int(
+                        _p40_cf if _p40_cf is not None
+                        else self._carried_food.get(cid, 0))
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid,
                                               recent_yield=_staying)
@@ -2983,6 +2992,10 @@ class LocalColonyCompute:
                         self._nav["gather_onf"] += 1
                 elif action == 14:      # EAT
                     self._nav["eat"] += 1
+                if 0 <= action <= 3:    # move N/S/E/W (YIELD_GATE-диаг)
+                    self._nav["move"] += 1
+                elif action == 4:       # STAY
+                    self._nav["stay"] += 1
                 if motor_delta is not None:
                     try:
                         _sh_arg = int(torch.argmax(
@@ -6715,6 +6728,27 @@ class LocalColonyCompute:
                     self._nav["gather"], self._nav["gather_onf"],
                     self._nav["eat"], self._nav["p40_ate"],
                     self._nav["flip"] / _nt, self._nav["mnorm"] / _nt)
+                # YIELD_GATE_DIAG (Фрай 06.06, read-only): механизм-замер «доедай»-
+                # гейта. yield_fire_rate=доля тиков recent_yield=True (загорается ли
+                # гейт?). gather/eat/move/stay%=action-разбор. cf=carried_food (копит
+                # ли в склад?). g/e=glucose/energy (у пола?). Проверяет гипотезу:
+                # доминантный GATHER (в склад) + гейт ждёт delta_energy от passive-EAT
+                # → гейт почти не активен → бег не гасится → cost держится.
+                _g_snap = _e_snap = -1.0
+                try:
+                    for _bcv in self.biochem.values():
+                        _e_snap = float(getattr(_bcv, "energy", -1.0))
+                        _g_snap = float(getattr(_bcv, "glucose", -1.0))
+                        break  # single-organism: один Адам
+                except Exception:
+                    pass
+                logger.info(
+                    "YIELD_GATE ticks=%d yield_fire_rate=%.3f gather_pct=%.3f "
+                    "eat_pct=%.3f move_pct=%.3f stay_pct=%.3f cf=%d g=%.1f e=%.1f",
+                    self._nav["ticks"], self._nav["yield_fire"] / _nt,
+                    self._nav["gather"] / _nt, self._nav["eat"] / _nt,
+                    self._nav["move"] / _nt, self._nav["stay"] / _nt,
+                    self._nav["cf_last"], _g_snap, _e_snap)
                 # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
                 # server-тика (handle_tick ×2). applies = реальные server-тики.
                 _ma = max(1, self._metab_applies)
@@ -6736,7 +6770,8 @@ class LocalColonyCompute:
             self._e_cost_sum = 0.0
             self._e_infdrain_sum = 0.0
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
-                         "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0}
+                         "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
+                         "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.
