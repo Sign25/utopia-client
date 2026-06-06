@@ -2997,6 +2997,24 @@ class LocalColonyCompute:
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
                 out[cid] = {"action": action, "target_id": None}
+                # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
+                # за флагом park_test (контролируемое условие). По-тиковый лог,
+                # выровнен по world_tick для кросс-сверки со steps/tick сервера.
+                # Главный вопрос #1: совпадает ли мой STAY-тик с тем, что P40 НЕ
+                # сдвинул Адама (Хьюберт видит steps/tick=1.0 при моём STAY →
+                # подозрение STAY не исполняется). Гип-2: расходятся ли nf.dist==0
+                # и _onf (доходит до nav-цели, а P40 не считает on-flora).
+                if self._motor_park_test > 0.0:
+                    try:
+                        _nfd0 = (1 if (_nf_cid is not None
+                                       and float(_nf_cid.get("dist", -1.0)) == 0.0)
+                                 else 0)
+                        logger.info(
+                            "STAY_PROBE tick=%s cid=%s action=%d stay=%d "
+                            "nf_dist0=%d onf=%d", world_tick, cid, int(action),
+                            1 if action == 4 else 0, _nfd0, 1 if _onf else 0)
+                    except Exception:
+                        pass
 
                 # carried_food зеркало — ТОЛЬКО fallback, если P40 не шлёт
                 # authoritative carried_food (переходный период). Когда P40
