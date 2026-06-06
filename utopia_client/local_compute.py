@@ -2791,6 +2791,21 @@ class LocalColonyCompute:
                            if _bc2 is not None else 0.5)
                     _nf_cid = ((nearest_flora_per_cid or {}).get(cid)
                                if nearest_flora_per_cid is not None else None)
+                    # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
+                    # dist-тренд (arrival-прокси) + obs[62/63]. Rate-limit 1/50.
+                    if _nf_cid is not None:
+                        self._nf_diag_n = getattr(self, "_nf_diag_n", 0) + 1
+                        if self._nf_diag_n % 50 == 0:
+                            try:
+                                logger.info(
+                                    "FLORA_NAV_DIAG cid=%s dr=%s dc=%s dist=%s "
+                                    "kind=%s obs62=%.3f obs63=%.3f", cid,
+                                    _nf_cid.get("dr"), _nf_cid.get("dc"),
+                                    _nf_cid.get("dist"), _nf_cid.get("kind"),
+                                    float(obs_arr[62]) if len(obs_arr) > 63 else -1.0,
+                                    float(obs_arr[63]) if len(obs_arr) > 63 else -1.0)
+                            except Exception:
+                                pass
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
