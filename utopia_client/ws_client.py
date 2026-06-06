@@ -2079,16 +2079,33 @@ class ColonyWSClient:
         # выкашивала колонию. При low-hydration (<30% max) override action к
         # ближайшей воде (terrain из world_cache). После → ambient water_restore
         # на P40 → delta_hydration>0 → ось воды заработает (тогда вернём смерть).
-        try:
-            self._apply_water_seek(creatures, creatures_out)
-        except Exception as e:
-            logger.warning("water-seek override failed: %r", e)  # DIAG 0.11.32
-        # Berry/fruit-seek (01.06.2026, Хьюберт): ПОСЛЕ water (вода приоритет) —
-        # голодных ведём к высокоценной флоре (grass не кормит, net −7.85/сек).
-        try:
-            self._apply_food_seek(creatures, creatures_out)
-        except Exception as e:
-            logger.warning("food-seek override failed: %r", e)
+        # КОЛОНИАЛЬНЫЕ seek-рефлексы (Фрай 06.06): water/food-seek перезаписывают
+        # computed action на move-к-воде/ягоде ПОСЛЕ handle_tick, до отправки.
+        # Корень всей саги: Адам вечно голоден (energy~1<450) → food-seek клобберил
+        # КАЖДОЕ его действие (STAY/GATHER/прайор/мотор) на move-к-ягоде → P40
+        # видел только move, STAY/park никогда не доходили. Рефлексы — для zodchiy
+        # (не навигируют). У single-organism Адама СВОЯ выученная политика
+        # (прайор+мотор+park) → ОТКЛЮЧАЕМ рефлексы, ведёт он сам. ПАРНО с Хьюбертом
+        # (он гейтит анти-осц off для owned — иначе STAY переопределится на сервере).
+        _single = (bool(getattr(self.compute, "_single_organism", False))
+                   if self.compute is not None else False)
+        if not _single:
+            try:
+                self._apply_water_seek(creatures, creatures_out)
+            except Exception as e:
+                logger.warning("water-seek override failed: %r", e)  # DIAG 0.11.32
+            # Berry/fruit-seek (01.06.2026, Хьюберт): ПОСЛЕ water (вода приоритет) —
+            # голодных ведём к высокоценной флоре (grass не кормит, net −7.85/сек).
+            try:
+                self._apply_food_seek(creatures, creatures_out)
+            except Exception as e:
+                logger.warning("food-seek override failed: %r", e)
+        else:
+            # single-organism: рефлексы OFF, диаг 1/200 — подтвердить gate.
+            self._seek_gate_n = getattr(self, "_seek_gate_n", 0) + 1
+            if self._seek_gate_n % 200 == 1:
+                logger.info("SEEK_GATE single_organism → water/food-seek OFF "
+                            "(Адам ведёт выученной политикой, Фрай 06.06)")
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
