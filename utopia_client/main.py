@@ -543,6 +543,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_motor_pg_lr: float | None = None
     # Медленный batch-REINFORCE канал (Фрай 05.06, порт WorldTrainer, MIGRATION GAP).
     applied_motor_slow: float | None = None
+    applied_motor_park: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -883,6 +884,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_slow → %.1f", target_slow)
                         except Exception as e:
                             logger.warning("set_motor_slow failed: %s", e)
+
+                    # Изолирующий тест override-мотора (Фрай 06.06): on-flora →
+                    # STAY безусловно (паркуем). Обратимо. Обычно с motor_voice=0.
+                    target_park = float(flags.get("motor_park_test", 0.0))
+                    if target_park != applied_motor_park \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_park_test(target_park)
+                            applied_motor_park = target_park
+                            logger.info("motor_park_test → %.1f", target_park)
+                        except Exception as e:
+                            logger.warning("set_motor_park_test failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень

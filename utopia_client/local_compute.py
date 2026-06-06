@@ -553,6 +553,12 @@ class LocalColonyCompute:
         # (0.2→1.0, тест адекватности SFNN-модулятора: держит alignment или срыв?).
         # Дефолт 1.0 = полный мотор (текущее _own=1 при bias_scale=0). client_flags.
         self._motor_voice: float = 1.0
+        # ИЗОЛИРУЮЩИЙ ТЕСТ override-мотора (Фрай 06.06): на on-flora тиках STAY
+        # выигрывает безусловно (паркуем), мотор обычно ставят voice=0. Цель:
+        # если паркуется + net flip → виноват был override мотора (не фундамент);
+        # не паркуется даже при voice=0 → прайор сам не держит hold на dist=0.
+        # Обратимо через client_flags (motor_park_test). 0=off (штатно).
+        self._motor_park_test: float = 0.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -597,7 +603,8 @@ class LocalColonyCompute:
         # argmax != финал (motor_policy перебил выбор), mnorm — ||motor_delta||.
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                            "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
-                           "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0}
+                           "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
+                           "cf_p40_seen": 0}
         # Contract per-sec (01.06.2026, Хьюберт): server чист (0.272), двоение
         # у нас — obs 6Hz vs sim 30Hz, применяли rate лишний раз. Решение: P40
         # шлёт rate в energy/СЕК, client интегрирует energy -= rate × dt_wallclock
@@ -2463,6 +2470,20 @@ class LocalColonyCompute:
         self._motor_voice = v
         return v
 
+    def set_motor_park_test(self, on: float) -> float:
+        """Канал client_flags: изолирующий тест override-мотора (Фрай 06.06).
+        >0 → на on-flora тиках STAY выигрывает безусловно (паркуем). Обычно
+        ставят с motor_voice=0 (мотор из контура). Кламп [0,1]. 0=off."""
+        try:
+            v = max(0.0, min(1.0, float(on)))
+        except (TypeError, ValueError):
+            return self._motor_park_test
+        if v != self._motor_park_test:
+            logger.info("set_motor_park_test: %.1f → %.1f",
+                        self._motor_park_test, v)
+        self._motor_park_test = v
+        return v
+
     def set_glucose_energy_rate(self, rate: float) -> float:
         """Канал client_flags: rate конверсии излишка glucose→energy в _apply_
         metabolism (Фрай экономика). 0=нет (текущее). Калибруется чтобы плотная
@@ -2850,12 +2871,18 @@ class LocalColonyCompute:
                     # вместо ест» (gate ждёт delta_energy, а Адам GATHER'ит в склад).
                     if _staying:
                         self._nav["yield_fire"] += 1
+                    # cf-валидация (Фрай 06.06): P40 реально шлёт carried_food?
+                    # cf_p40_seen>0 → cf=значение валидно; =0 → cf=0 это «нет
+                    # сигнала» (caveat подтверждён), а не «склад пуст».
+                    if _p40_cf is not None:
+                        self._nav["cf_p40_seen"] += 1
                     self._nav["cf_last"] = int(
                         _p40_cf if _p40_cf is not None
                         else self._carried_food.get(cid, 0))
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid,
-                                              recent_yield=_staying)
+                                              recent_yield=_staying,
+                                              on_flora=_onf)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -4233,7 +4260,8 @@ class LocalColonyCompute:
 
     def _shape_action_logits(self, logits, obs_arr, diet: float,
                              energy_ratio: float, nearest_flora=None,
-                             recent_yield: bool = False) -> None:
+                             recent_yield: bool = False,
+                             on_flora: bool = False) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4353,6 +4381,17 @@ class LocalColonyCompute:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
             if energy_ratio < 0.3:
                 logits[12] += 1.0 * BS       # BUILD при низкой энергии (оборона)
+            # ИЗОЛИРУЮЩИЙ ТЕСТ override-мотора (Фрай 06.06): на on-flora тиках
+            # STAY выигрывает БЕЗУСЛОВНО — паркуем (перебивает структурный −1.0
+            # и все градиенты, включая хищника: тест короткий, §3/halo держат).
+            # Обычно ставят с motor_voice=0. Если паркуется + net flip → виноват
+            # override мотора; не паркуется → прайор сам не держит hold на dist=0.
+            if self._motor_park_test > 0.0 and on_flora:
+                try:
+                    _mx = float(logits[:16].max().item())
+                except Exception:
+                    _mx = 5.0
+                logits[4] = _mx + 5.0        # STAY доминирует безусловно
         except Exception as e:
             logger.debug("shape_action_logits failed: %s", e)
 
@@ -6742,13 +6781,24 @@ class LocalColonyCompute:
                         break  # single-organism: один Адам
                 except Exception:
                     pass
+                _mb_snap = ""
+                try:
+                    for _bcv in self.biochem.values():
+                        _mb_snap = str(getattr(_bcv, "mental_break", "")
+                                       or getattr(_bcv, "mb", "") or "")
+                        break
+                except Exception:
+                    pass
                 logger.info(
                     "YIELD_GATE ticks=%d yield_fire_rate=%.3f gather_pct=%.3f "
-                    "eat_pct=%.3f move_pct=%.3f stay_pct=%.3f cf=%d g=%.1f e=%.1f",
+                    "eat_pct=%.3f move_pct=%.3f stay_pct=%.3f cf=%d cf_p40=%d "
+                    "g=%.1f e=%.1f mb=%s park=%.0f voice=%.2f",
                     self._nav["ticks"], self._nav["yield_fire"] / _nt,
                     self._nav["gather"] / _nt, self._nav["eat"] / _nt,
                     self._nav["move"] / _nt, self._nav["stay"] / _nt,
-                    self._nav["cf_last"], _g_snap, _e_snap)
+                    self._nav["cf_last"], self._nav["cf_p40_seen"],
+                    _g_snap, _e_snap, _mb_snap or "-",
+                    self._motor_park_test, self._motor_voice)
                 # METAB_DIAG (Хьюберт ×2): skip_rate≈0.5 → подтверждает дубли
                 # server-тика (handle_tick ×2). applies = реальные server-тики.
                 _ma = max(1, self._metab_applies)
@@ -6771,7 +6821,8 @@ class LocalColonyCompute:
             self._e_infdrain_sum = 0.0
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                          "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
-                         "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0}
+                         "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
+                         "cf_p40_seen": 0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.
