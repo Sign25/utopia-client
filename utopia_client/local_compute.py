@@ -504,6 +504,13 @@ class LocalColonyCompute:
         self._motor_slow_on: float = 0.0
         self.motor_slow_trainer: dict = {}   # cid → MotorSlowTrainer
         self._slow_pending: dict = {}        # cid → (obs[D], action, base_logits[16])
+        # «Доедай, не убегай» (Фрай 06.06): пока текущий тайл ещё отдаёт (ate/
+        # delta_energy>0 в прошлый тик) прайор эмитит STAY/GATHER на месте, а НЕ
+        # «беги к ближайшей флоре» — иначе Адам бросает кормящий тайл и бегает
+        # каждый тик (cost > income). φ-гистерезис: память _TILE_YIELD_MEM тиков
+        # (Fib 2) чтобы один пустой тик не срывал в бегство; исчерпание → быстрый
+        # релиз (защита от idle-голода, критерий Хьюберта eats/sec≥1.62).
+        self._tile_yield_mem: dict = {}      # cid → остаток тиков «тайл кормит»
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -1230,6 +1237,7 @@ class LocalColonyCompute:
         self._motor_pg_ctx.pop(cid, None)         # policy-gradient контекст (Фрай 04.06)
         self.motor_slow_trainer.pop(cid, None)    # медленный канал (Фрай 05.06)
         self._slow_pending.pop(cid, None)
+        self._tile_yield_mem.pop(cid, None)       # «доедай» yield-память (Фрай 06.06)
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
@@ -2824,8 +2832,21 @@ class LocalColonyCompute:
                                     float(obs_arr[63]) if len(obs_arr) > 63 else -1.0)
                             except Exception:
                                 pass
+                    # «Доедай, не убегай» (Фрай 06.06): ground-truth «поел в
+                    # прошлый тик» (ate / delta_energy>0) → тайл ещё кормит →
+                    # прайор STAY/GATHER на месте, гасим nav-толчок. φ-гистерезис
+                    # _TILE_YIELD_MEM=2 (Fib): refill при отдаче, иначе decay.
+                    _ev_cid = (events_per_cid.get(cid) or {}) if events_per_cid else {}
+                    _de_cid = float(_ev_cid.get("delta_energy", 0.0) or 0.0)
+                    if bool(_ev_cid.get("ate")) or _de_cid > 0.0:
+                        self._tile_yield_mem[cid] = 2          # Fib refill
+                    else:
+                        self._tile_yield_mem[cid] = max(
+                            0, self._tile_yield_mem.get(cid, 0) - 1)
+                    _staying = self._tile_yield_mem.get(cid, 0) > 0
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
-                                              nearest_flora=_nf_cid)
+                                              nearest_flora=_nf_cid,
+                                              recent_yield=_staying)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -4198,7 +4219,8 @@ class LocalColonyCompute:
             self._carried_food[cid] = cur - 1
 
     def _shape_action_logits(self, logits, obs_arr, diet: float,
-                             energy_ratio: float, nearest_flora=None) -> None:
+                             energy_ratio: float, nearest_flora=None,
+                             recent_yield: bool = False) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4245,7 +4267,17 @@ class LocalColonyCompute:
                     _dr = float(_nf.get("dr", 0.0))
                     _dc = float(_nf.get("dc", 0.0))
                     _dist = float(_nf.get("dist", 0.0))
-                    if _dist <= 0.0:
+                    if recent_yield:
+                        # «Доедай, не убегай» (Фрай 06.06): текущий тайл ещё
+                        # отдаёт (ate/delta_energy в прошлый тик) → стой и собирай
+                        # на месте, nav-толчок к ближайшей флоре НЕ эмитим. φ-маг:
+                        # STAY+GATHER = PHI, EAT = 1/PHI. Отдача прекратится →
+                        # yield-память истечёт → nav возобновится сам. FLEE от
+                        # хищника (ниже, ×3) перебьёт STAY — бежим даже на еде.
+                        logits[4] += PHI * DS            # STAY (no-move)
+                        logits[13] += PHI * DS           # GATHER (доедай на месте)
+                        logits[14] += (1.0 / PHI) * DS   # EAT
+                    elif _dist <= 0.0:
                         logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
                         logits[14] += 1.0 * DS    # EAT
                     else:
