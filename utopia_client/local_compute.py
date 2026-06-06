@@ -608,7 +608,7 @@ class LocalColonyCompute:
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                            "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                            "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
-                           "cf_p40_seen": 0}
+                           "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0}
         # Contract per-sec (01.06.2026, Хьюберт): server чист (0.272), двоение
         # у нас — obs 6Hz vs sim 30Hz, применяли rate лишний раз. Решение: P40
         # шлёт rate в energy/СЕК, client интегрирует energy -= rate × dt_wallclock
@@ -3057,6 +3057,26 @@ class LocalColonyCompute:
                     self._nav["eat"] += 1
                 if 0 <= action <= 3:    # move N/S/E/W (YIELD_GATE-диаг)
                     self._nav["move"] += 1
+                    # NAV-HIT (Фрай 06.06): депишн-независимая метрика навигации —
+                    # идёт ли move В СТОРОНУ nearest_flora? Высокий hit-rate →
+                    # прайор навигирует; ~случайный (≤0.5) → бродит. dr<0→N(0),
+                    # dr>0→S(1), dc>0→E(2), dc<0→W(3). Считаем только когда есть
+                    # nf и dist>0 (есть куда идти).
+                    if _nf_cid is not None:
+                        try:
+                            _ndr = float(_nf_cid.get("dr", 0.0))
+                            _ndc = float(_nf_cid.get("dc", 0.0))
+                            _nds = float(_nf_cid.get("dist", 0.0))
+                            if _nds > 0.0:
+                                self._nav["nav_moves"] += 1
+                                _hit = ((action == 0 and _ndr < 0) or
+                                        (action == 1 and _ndr > 0) or
+                                        (action == 2 and _ndc > 0) or
+                                        (action == 3 and _ndc < 0))
+                                if _hit:
+                                    self._nav["nav_hit"] += 1
+                        except Exception:
+                            pass
                 elif action == 4:       # STAY
                     self._nav["stay"] += 1
                 if motor_delta is not None:
@@ -6833,13 +6853,16 @@ class LocalColonyCompute:
                         break
                 except Exception:
                     pass
+                _nmv = max(1, self._nav["nav_moves"])
                 logger.info(
                     "YIELD_GATE ticks=%d yield_fire_rate=%.3f gather_pct=%.3f "
-                    "eat_pct=%.3f move_pct=%.3f stay_pct=%.3f cf=%d cf_p40=%d "
-                    "g=%.1f e=%.1f mb=%s park=%.0f voice=%.2f",
+                    "eat_pct=%.3f move_pct=%.3f stay_pct=%.3f nav_hit_rate=%.3f "
+                    "nav_moves=%d cf=%d cf_p40=%d g=%.1f e=%.1f mb=%s "
+                    "park=%.0f voice=%.2f",
                     self._nav["ticks"], self._nav["yield_fire"] / _nt,
                     self._nav["gather"] / _nt, self._nav["eat"] / _nt,
                     self._nav["move"] / _nt, self._nav["stay"] / _nt,
+                    self._nav["nav_hit"] / _nmv, self._nav["nav_moves"],
                     self._nav["cf_last"], self._nav["cf_p40_seen"],
                     _g_snap, _e_snap, _mb_snap or "-",
                     self._motor_park_test, self._motor_voice)
@@ -6866,7 +6889,7 @@ class LocalColonyCompute:
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                          "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                          "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
-                         "cf_p40_seen": 0}
+                         "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.
