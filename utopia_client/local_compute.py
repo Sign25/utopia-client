@@ -559,6 +559,10 @@ class LocalColonyCompute:
         # не паркуется даже при voice=0 → прайор сам не держит hold на dist=0.
         # Обратимо через client_flags (motor_park_test). 0=off (штатно).
         self._motor_park_test: float = 0.0
+        # STAY-исполнение контроль (Фрай 06.06): >0 → эмитить STAY БЕЗУСЛОВНО
+        # каждый тик (не только on-flora). Чистый тест протокола: Хьюберт смотрит
+        # pos-delta — 0=STAY honored, ≠0=протокол-баг (P40 игнорит STAY). Обратимо.
+        self._motor_stay_force: float = 0.0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2484,6 +2488,20 @@ class LocalColonyCompute:
         self._motor_park_test = v
         return v
 
+    def set_motor_stay_force(self, on: float) -> float:
+        """Канал client_flags: STAY-исполнение контроль (Фрай 06.06). >0 →
+        STAY эмитится БЕЗУСЛОВНО каждый тик (не только on-flora). Чистый тест
+        протокола: P40 honored STAY или нет (Хьюберт смотрит pos-delta). 0=off."""
+        try:
+            v = max(0.0, min(1.0, float(on)))
+        except (TypeError, ValueError):
+            return self._motor_stay_force
+        if v != self._motor_stay_force:
+            logger.info("set_motor_stay_force: %.1f → %.1f",
+                        self._motor_stay_force, v)
+        self._motor_stay_force = v
+        return v
+
     def set_glucose_energy_rate(self, rate: float) -> float:
         """Канал client_flags: rate конверсии излишка glucose→energy в _apply_
         metabolism (Фрай экономика). 0=нет (текущее). Калибруется чтобы плотная
@@ -3004,7 +3022,7 @@ class LocalColonyCompute:
                 # сдвинул Адама (Хьюберт видит steps/tick=1.0 при моём STAY →
                 # подозрение STAY не исполняется). Гип-2: расходятся ли nf.dist==0
                 # и _onf (доходит до nav-цели, а P40 не считает on-flora).
-                if self._motor_park_test > 0.0:
+                if self._motor_park_test > 0.0 or self._motor_stay_force > 0.0:
                     try:
                         _nfd0 = (1 if (_nf_cid is not None
                                        and float(_nf_cid.get("dist", -1.0)) == 0.0)
@@ -4410,6 +4428,14 @@ class LocalColonyCompute:
                 except Exception:
                     _mx = 5.0
                 logits[4] = _mx + 5.0        # STAY доминирует безусловно
+            # STAY-исполнение контроль (Фрай 06.06): БЕЗУСЛОВНЫЙ STAY каждый тик
+            # (не только on-flora) — чистый тест honored-ли STAY на P40.
+            if self._motor_stay_force > 0.0:
+                try:
+                    _mx2 = float(logits[:16].max().item())
+                except Exception:
+                    _mx2 = 5.0
+                logits[4] = _mx2 + 5.0
         except Exception as e:
             logger.debug("shape_action_logits failed: %s", e)
 

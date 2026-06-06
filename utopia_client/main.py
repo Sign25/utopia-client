@@ -544,6 +544,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Медленный batch-REINFORCE канал (Фрай 05.06, порт WorldTrainer, MIGRATION GAP).
     applied_motor_slow: float | None = None
     applied_motor_park: float | None = None
+    applied_motor_stayf: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -896,6 +897,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_park_test → %.1f", target_park)
                         except Exception as e:
                             logger.warning("set_motor_park_test failed: %s", e)
+
+                    # STAY-исполнение контроль (Фрай 06.06): безусловный STAY,
+                    # тест honored-ли STAY на P40. Обратимо.
+                    target_stayf = float(flags.get("motor_stay_force", 0.0))
+                    if target_stayf != applied_motor_stayf \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_motor_stay_force(target_stayf)
+                            applied_motor_stayf = target_stayf
+                            logger.info("motor_stay_force → %.1f", target_stayf)
+                        except Exception as e:
+                            logger.warning("set_motor_stay_force failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень
