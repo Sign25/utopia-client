@@ -563,6 +563,14 @@ class LocalColonyCompute:
         # каждый тик (не только on-flora). Чистый тест протокола: Хьюберт смотрит
         # pos-delta — 0=STAY honored, ≠0=протокол-баг (P40 игнорит STAY). Обратимо.
         self._motor_stay_force: float = 0.0
+        # DAMAGE-канал (Фрай 07.06): predator damage_per_tick от сервера →
+        # авторитетный energy-ledger per-client-tick (§3.5-симметрично step_cost,
+        # БЕЗ drop на пропущенных тиках). _damage_factor = калибровка (мал→расти,
+        # обучающий сигнал не инстакил). 0=off (default, безопасно). §3 = защита.
+        self._damage_factor: float = 0.0
+        self._dmg_sum: float = 0.0           # Σ применённого урона (DAMAGE_DIAG)
+        self._dmg_rate_sum: float = 0.0      # Σ raw damage_per_tick (давление)
+        self._dmg_apply_n: int = 0           # тиков с урон>0
         # EEG tissue-activation ring (#2, 01.06.2026): нормированная [0,1]
         # активность тканей per snapshot для осциллографа /stats
         # (TissueActivityPanel). P40 world_meta.ring пуст для owned (тикаются
@@ -2500,6 +2508,19 @@ class LocalColonyCompute:
             logger.info("set_motor_stay_force: %.1f → %.1f",
                         self._motor_stay_force, v)
         self._motor_stay_force = v
+        return v
+
+    def set_damage_factor(self, f: float) -> float:
+        """Канал client_flags: калибровка damage-канала (Фрай 07.06). Множитель
+        к damage_per_tick от сервера → energy-ledger per-client-tick. Сперва малый
+        (обучающий сигнал, не инстакил), растить градуально. Кламп [0, 4]. 0=off."""
+        try:
+            v = max(0.0, min(4.0, float(f)))
+        except (TypeError, ValueError):
+            return self._damage_factor
+        if v != self._damage_factor:
+            logger.info("set_damage_factor: %.3f → %.3f", self._damage_factor, v)
+        self._damage_factor = v
         return v
 
     def set_glucose_energy_rate(self, rate: float) -> float:
@@ -6638,6 +6659,14 @@ class LocalColonyCompute:
                 tel_decay = float(rates.get("telomere_decay_per_tick", 0.0) or 0.0)
                 self._metab_sc_sum += step_cost     # METAB_DIAG (теперь per-tick)
                 self._metab_tick_n = getattr(self, "_metab_tick_n", 0) + 1
+                # DAMAGE-канал (Фрай 07.06): predator damage_per_tick → energy
+                # per-client-tick (§3.5-симметрично, без drop). ×_damage_factor
+                # (калибровка мал→расти). §3 = защита от смерти.
+                _dmg_rate = float(rates.get("damage_per_tick", 0.0) or 0.0)
+                _dmg = _dmg_rate * float(self._damage_factor)
+                if _dmg_rate > 0.0:
+                    self._dmg_rate_sum += _dmg_rate
+                    self._dmg_apply_n += 1
             else:
                 # *_per_sec (контракт Хьюберта); ws_client нормализует *_now→
                 # *_per_sec на переходный период (fallback), чтобы не было rate=0.
@@ -6646,12 +6675,20 @@ class LocalColonyCompute:
                 step_cost = _sc_rate * dt           # energy/сек × сек (wall-dt)
                 thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
                 tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
+                _dmg = 0.0                           # damage только per-tick (Адам)
         except (TypeError, ValueError):
             return
         if bc is not None:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
                 self._e_cost_sum += step_cost  # ENERGY_CALIB
+            # DAMAGE-канал: применяем predator-урон к авторитетной energy
+            # (per-client-tick, §3.5). Идёт в _e_cost_sum → ENERGY_CALIB net
+            # учитывает урон. §3 ловит energy≤0 → паралич, не смерть.
+            if _dmg > 0.0:
+                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - _dmg)
+                self._e_cost_sum += _dmg
+                self._dmg_sum += _dmg
             # Glucose→energy конверсия (Фрай 04.06): излишек glucose (>baseline 50,
             # от плотной еды) → energy. Делает экономику выигрываемой при хорошей
             # добыче. glucose потребляется, но не ниже baseline. rate=0 → no-op.
@@ -6898,10 +6935,22 @@ class LocalColonyCompute:
                     self._metab_dt_sum / _ma,
                     (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma),
                     _tick_n, self._metab_applies)
+                # DAMAGE_DIAG (Фрай 07.06): predator-давление + применённый урон.
+                # dmg_applied=Σ урона к energy за окно; pred_ticks=тиков под атакой;
+                # mean_rate=средний raw damage_per_tick; factor=калибровка.
+                logger.info(
+                    "DAMAGE_DIAG dmg_applied=%.1f pred_ticks=%d mean_rate=%.4f "
+                    "factor=%.3f",
+                    self._dmg_sum, self._dmg_apply_n,
+                    self._dmg_rate_sum / max(1, self._dmg_apply_n),
+                    self._damage_factor)
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
                 self._metab_tick_n = 0
+                self._dmg_sum = 0.0
+                self._dmg_rate_sum = 0.0
+                self._dmg_apply_n = 0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0

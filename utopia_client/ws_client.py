@@ -1846,6 +1846,10 @@ class ColonyWSClient:
                         c.get("thirst_per_tick", 0.0) or 0.0)
                     rates_per_cid[cid_s]["telomere_decay_per_tick"] = float(
                         c.get("telomere_decay_per_tick", 0.0) or 0.0)
+                    # DAMAGE-канал (Фрай 07.06): predator damage_per_tick →
+                    # energy per-client-tick (§3.5). 0 когда хищник не бьёт.
+                    rates_per_cid[cid_s]["damage_per_tick"] = float(
+                        c.get("damage_per_tick", 0.0) or 0.0)
         # NAV_VIS периодический лог (раз в ~300 батчей ≈ 60с при 5Гц).
         if hasattr(self, "_nav_vis"):
             self._nav_vis["batches"] += 1

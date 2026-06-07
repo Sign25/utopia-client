@@ -545,6 +545,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_motor_slow: float | None = None
     applied_motor_park: float | None = None
     applied_motor_stayf: float | None = None
+    applied_damage_factor: float | None = None
     # Reward-баланс forage/hunt (Фрай 04.06): серверный энергобаланс вместо
     # плоских равных +5/+5 (корень бистабильности мотора).
     applied_reward_balance: float | None = None
@@ -909,6 +910,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("motor_stay_force → %.1f", target_stayf)
                         except Exception as e:
                             logger.warning("set_motor_stay_force failed: %s", e)
+
+                    # DAMAGE-канал калибровка (Фрай 07.06): множитель урона
+                    # хищника к energy. Мал→расти. 0=off.
+                    target_dmg = float(flags.get("damage_factor", 0.0))
+                    if target_dmg != applied_damage_factor \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_damage_factor(target_dmg)
+                            applied_damage_factor = target_dmg
+                            logger.info("damage_factor → %.3f", target_dmg)
+                        except Exception as e:
+                            logger.warning("set_damage_factor failed: %s", e)
 
                     # Reward-баланс forage/hunt (Фрай 04.06): серверный
                     # энергобаланс вместо плоских равных +5/+5 (корень
