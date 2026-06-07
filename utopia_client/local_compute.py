@@ -3130,10 +3130,14 @@ class LocalColonyCompute:
                     except Exception:
                         pass
 
-                # F5 skill-growth (01.06.2026, Фрай): счётчик move (действия
-                # 0-3) + окно 200 тиков → _skill_growth_step (mirror world.py).
+                # F5 skill-growth (01.06.2026, Фрай): счётчик move (0-3) + окно
+                # 200 тиков → _skill_growth_step. §6 predator_defense: FLEE(10) =
+                # бегство-локомоция → тоже растит move_speed (×2: рывок 3 тайла,
+                # интенсивнее обычного шага; «бегство рабочее при move_speed>3»).
                 if 0 <= action <= 3:
                     self._skill_move[cid] = self._skill_move.get(cid, 0) + 1
+                elif action == 10:      # FLEE — flight локомоция (§6)
+                    self._skill_move[cid] = self._skill_move.get(cid, 0) + 2
                 _sw = self._skill_window_tick.setdefault(cid, world_tick)
                 if world_tick - _sw >= 200:
                     self._skill_growth_step(cid)
@@ -6645,6 +6649,14 @@ class LocalColonyCompute:
                     tr["efficiency"], tr["attack_power"], tr["move_speed"] = (
                         eff, atk, spd)
                     self._skill_changed_cids.add(cid)
+                # SKILL_DIAG (§6 predator_defense, Фрай 07.06): видимость роста
+                # трейтов от использования. atk растёт от киллов (φ-порог), spd
+                # от move+FLEE. move_speed>3 → бегство обгоняет хищника (speed=3).
+                if self._single_organism:
+                    logger.info(
+                        "SKILL_DIAG cid=%s atk=%d->%d move_speed=%d->%d eff=%d "
+                        "| kill=%d eat=%d move=%d", cid, atk0, atk, spd0, spd,
+                        eff, kill, eat, move)
             except Exception as e:
                 logger.debug("skill_growth %s: %s", cid, e)
         self._skill_eat[cid] = 0
