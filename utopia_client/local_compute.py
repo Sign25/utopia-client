@@ -6662,6 +6662,8 @@ class LocalColonyCompute:
                 # DAMAGE-канал (Фрай 07.06): predator damage_per_tick → energy
                 # per-client-tick (§3.5-симметрично, без drop). ×_damage_factor
                 # (калибровка мал→расти). §3 = защита от смерти.
+                if "damage_per_tick" in rates:
+                    self._dmg_key_n = getattr(self, "_dmg_key_n", 0) + 1
                 _dmg_rate = float(rates.get("damage_per_tick", 0.0) or 0.0)
                 _dmg = _dmg_rate * float(self._damage_factor)
                 if _dmg_rate > 0.0:
@@ -6940,10 +6942,11 @@ class LocalColonyCompute:
                 # mean_rate=средний raw damage_per_tick; factor=калибровка.
                 logger.info(
                     "DAMAGE_DIAG dmg_applied=%.1f pred_ticks=%d mean_rate=%.4f "
-                    "factor=%.3f",
+                    "factor=%.3f key_seen=%d/%d",
                     self._dmg_sum, self._dmg_apply_n,
                     self._dmg_rate_sum / max(1, self._dmg_apply_n),
-                    self._damage_factor)
+                    self._damage_factor,
+                    getattr(self, "_dmg_key_n", 0), self._metab_applies)
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
@@ -6951,6 +6954,7 @@ class LocalColonyCompute:
                 self._dmg_sum = 0.0
                 self._dmg_rate_sum = 0.0
                 self._dmg_apply_n = 0
+                self._dmg_key_n = 0
             except Exception as e:
                 logger.debug("WATER_CALIB log failed: %s", e)
             self._hyd_thirst_sum = 0.0
