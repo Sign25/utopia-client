@@ -3138,10 +3138,16 @@ class LocalColonyCompute:
                     self._skill_move[cid] = self._skill_move.get(cid, 0) + 1
                 elif action == 10:      # FLEE — flight локомоция (§6)
                     self._skill_move[cid] = self._skill_move.get(cid, 0) + 2
-                _sw = self._skill_window_tick.setdefault(cid, world_tick)
-                if world_tick - _sw >= 200:
+                # §6/§3.5 (Фрай 07.06): окно по CLIENT-тикам, НЕ world_tick.
+                # world_tick прыгает (~4-100/client-apply) → 200-world-окно
+                # истекало за 1-2 client-тика → move=0-2, пороги недостижимы,
+                # decay всегда → move_speed дренил к полу. Считаем client-applies.
+                _sn = self._skill_window_tick.get(cid, 0) + 1
+                if _sn >= 200:
                     self._skill_growth_step(cid)
-                    self._skill_window_tick[cid] = world_tick
+                    self._skill_window_tick[cid] = 0
+                else:
+                    self._skill_window_tick[cid] = _sn
 
                 # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
                 intero_tensor = None
