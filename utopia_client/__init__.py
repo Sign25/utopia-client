@@ -1,3 +1,3 @@
 """Utopia Client — клиент-приложение распределённой эволюции."""
 
-__version__ = "0.13.16"  # DAMAGE key-diag: pred_ticks=0 при pred_prox=1.0 — отличить «ключ не приходит» от «приходит =0 (нет реальных хитов)». DAMAGE_DIAG +key_seen=N/applies (раз ключ damage_per_tick в rates). Парсер верный (читается в _has_tick, tick_mode 300/300). | 0.13.15 DAMAGE-канал
+__version__ = "0.13.17"  # DAMAGE смоук ПРОЙДЕН (key_seen=284/300, pred_ticks=43, dmg_applied=102 при factor=0.090). +ATTACK(5)/FLEE(10)-эмиссия в DAMAGE_DIAG (ядро autotune-критерия «оборона растёт»; STAY_PROBE гейтнут off). | 0.13.16 key-diag

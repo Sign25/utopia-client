@@ -616,7 +616,7 @@ class LocalColonyCompute:
         self._nav: dict = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                            "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                            "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
-                           "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0}
+                           "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0, "attack": 0, "flee": 0}
         # Contract per-sec (01.06.2026, Хьюберт): server чист (0.272), двоение
         # у нас — obs 6Hz vs sim 30Hz, применяли rate лишний раз. Решение: P40
         # шлёт rate в energy/СЕК, client интегрирует energy -= rate × dt_wallclock
@@ -3100,6 +3100,10 @@ class LocalColonyCompute:
                             pass
                 elif action == 4:       # STAY
                     self._nav["stay"] += 1
+                if action == 5:         # ATTACK (DAMAGE-канал: оборона-эмиссия)
+                    self._nav["attack"] += 1
+                elif action == 10:      # FLEE
+                    self._nav["flee"] += 1
                 if motor_delta is not None:
                     try:
                         _sh_arg = int(torch.argmax(
@@ -6942,11 +6946,12 @@ class LocalColonyCompute:
                 # mean_rate=средний raw damage_per_tick; factor=калибровка.
                 logger.info(
                     "DAMAGE_DIAG dmg_applied=%.1f pred_ticks=%d mean_rate=%.4f "
-                    "factor=%.3f key_seen=%d/%d",
+                    "factor=%.3f key_seen=%d/%d attack=%d flee=%d",
                     self._dmg_sum, self._dmg_apply_n,
                     self._dmg_rate_sum / max(1, self._dmg_apply_n),
                     self._damage_factor,
-                    getattr(self, "_dmg_key_n", 0), self._metab_applies)
+                    getattr(self, "_dmg_key_n", 0), self._metab_applies,
+                    self._nav["attack"], self._nav["flee"])
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
@@ -6966,7 +6971,7 @@ class LocalColonyCompute:
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                          "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                          "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
-                         "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0}
+                         "cf_p40_seen": 0, "nav_hit": 0, "nav_moves": 0, "attack": 0, "flee": 0}
 
     def _apply_biochem_decay(self, cid: str) -> None:
         """Тиковый passive update 8 веществ + mental_break baseline-decay.

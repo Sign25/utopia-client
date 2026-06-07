@@ -1,33 +1,51 @@
 #!/usr/bin/env bash
-# Read-only client-balance метрики для подтверждения post-nav-fix плюса.
-# Метрики (Фрай): net/sec, eat-rate, glucose-level. НИЧЕГО не меняет.
+# Клиент-АВТОРИТЕТНЫЕ метрики (Фрай 06.06): net/sec, eats/sec, on-flora.
+# Кросс-чек к серверной дельте Хьюберта на том же окне. НИЧЕГО не меняет.
+# net/sec = net окна / wall-секунды окна (норм. по timestamp-дельте).
 LOG="/c/Users/Mr. Krabs/AppData/Roaming/utopia-client/client.log"
 N="${1:-8}"
 
-echo "=== BALANCE METRICS (last $N windows, ticks=300 each) ==="
-echo "-- net/sec + ratio (ENERGY_CALIB) --"
+_secs() { date -d "2026-06-06 $1" +%s 2>/dev/null; }
+
+echo "=== CLIENT-AUTHORITATIVE BALANCE (last $N windows) ==="
+echo "-- net/sec (ENERGY_CALIB, норм. на wall-сек окна) --"
+prev_ts=""
 grep "ENERGY_CALIB" "$LOG" | tail -"$N" | while read -r line; do
   ts=$(echo "$line" | awk '{print $2}' | cut -d',' -f1)
   net=$(echo "$line" | grep -oE 'net=-?[0-9.]+' | cut -d= -f2)
-  ratio=$(echo "$line" | grep -oE 'ratio=[0-9.]+' | cut -d= -f2)
   inc=$(echo "$line" | grep -oE 'income=[0-9.]+' | cut -d= -f2)
   cost=$(echo "$line" | grep -oE 'cost=[0-9.]+' | cut -d= -f2)
-  echo "  $ts net=$net ratio=$ratio (inc=$inc cost=$cost)"
+  cur=$(_secs "$ts")
+  if [ -n "$prev_ts" ] && [ -n "$cur" ]; then
+    dt=$((cur - prev_ts))
+    [ "$dt" -le 0 ] && dt=1
+    nps=$(awk "BEGIN{printf \"%.2f\", $net/$dt}")
+    echo "  $ts net/sec=$nps (net=$net за ${dt}s, inc=$inc cost=$cost)"
+  else
+    echo "  $ts net=$net (inc=$inc cost=$cost) [первое окно — dt n/a]"
+  fi
+  prev_ts=$cur
 done
 
-echo "-- eat-rate (NAV_DIAG: eat+p40_ate per 300t) + gather_onf + onf_rate --"
+echo "-- eats/sec + on-flora (NAV_DIAG, норм. на wall-сек) --"
+prev_ts=""
 grep "NAV_DIAG ticks=" "$LOG" | tail -"$N" | while read -r line; do
   ts=$(echo "$line" | awk '{print $2}' | cut -d',' -f1)
   eat=$(echo "$line" | grep -oE ' eat=[0-9]+' | cut -d= -f2)
   p40=$(echo "$line" | grep -oE 'p40_ate=[0-9]+' | cut -d= -f2)
-  go=$(echo "$line" | grep -oE 'gather_onf=[0-9]+' | cut -d= -f2)
   onf=$(echo "$line" | grep -oE 'onf_rate=[0-9.]+' | cut -d= -f2)
-  echo "  $ts eat-rate=$((eat + p40)) (eat=$eat p40=$p40) gather_onf=$go onf_rate=$onf"
+  go=$(echo "$line" | grep -oE 'gather_onf=[0-9]+' | cut -d= -f2)
+  cur=$(_secs "$ts")
+  tot=$((eat + p40))
+  if [ -n "$prev_ts" ] && [ -n "$cur" ]; then
+    dt=$((cur - prev_ts)); [ "$dt" -le 0 ] && dt=1
+    eps=$(awk "BEGIN{printf \"%.3f\", $tot/$dt}")
+    echo "  $ts eats/sec=$eps (eat+p40=$tot за ${dt}s) on_flora=$onf gather_onf=$go"
+  else
+    echo "  $ts eats=$tot on_flora=$onf gather_onf=$go [первое окно]"
+  fi
+  prev_ts=$cur
 done
 
-echo "-- glucose-level + viability (BIOCHEM_DEBUG, last 4) --"
-grep "BIOCHEM_DEBUG" "$LOG" | tail -4 | grep -oE 'c103927:e=[0-9.]+,cort=[0-9.]+,ser=[0-9.]+,g=[0-9.]+' | sed 's/^/  /'
-
-echo "-- VERDICT helper: avg net over last $N --"
-grep "ENERGY_CALIB" "$LOG" | tail -"$N" | grep -oE 'net=-?[0-9.]+' | cut -d= -f2 | \
-  awk '{s+=$1; n++} END {if(n>0) printf "  avg net=%.1f over %d windows  → %s\n", s/n, n, (s/n>=0?"PLUS (баланс встал)":"MINUS (ещё дефицит)")}'
+echo "-- glucose/energy/mb (BIOCHEM_DEBUG, last 4) --"
+grep "BIOCHEM_DEBUG" "$LOG" | tail -4 | grep -oE 'c103927:e=[0-9.]+,cort=[0-9.]+,ser=[0-9.]+,g=[0-9.]+,mb=[a-z]*' | sed 's/^/  /'
