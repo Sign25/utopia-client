@@ -4445,10 +4445,23 @@ class LocalColonyCompute:
             d_ew = float(obs_arr[60]) if n > 61 else 0.0
             d_prox = float(obs_arr[61]) if n > 61 else 0.0
             d_ns, d_ew = _unit(d_ns, d_ew)
-            if d_prox > 0.05:
-                pf = 4.0 * DS * min(d_prox, 1.0)
+            # Predator flee-MOVE (направление ПРОТИВ градиента) — ТОЛЬКО при
+            # ПРИБЛИЖЕНИИ (на контакте = стоять и бить, §4 predator_defense.md).
+            # Ослаблен до PHI*DS (был 4.0) — даёт направление, но FLEE-action
+            # (ниже, рывок 3 тайла, растит move_speed) должен доминировать.
+            if 0.05 < d_prox < 0.8:
+                pf = PHI * DS * min(d_prox, 1.0)
                 logits[0] += pf * d_ns; logits[1] -= pf * d_ns
                 logits[2] -= pf * d_ew; logits[3] += pf * d_ew
+            # §4 PREDATOR DEFENSE (predator_defense.md, Фрай 07.06): рефлекс-bias
+            # ACTION по obs[61], DS-scaled (активен под single_organism, где BS=0
+            # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник
+            # (slot 61), не добыча, не Старшие. Мягкий — мотор дотачивает.
+            if d_prox >= 0.8:            # хищник ВПЛОТНУЮ → «загнан → бей»
+                logits[5] += PHI * DS            # ATTACK bias
+                logits[10] -= (1.0 / PHI) * DS   # меньше беги на контакте
+            elif d_prox > 0.15:          # хищник ПРИБЛИЖАЕТСЯ → «создай дистанцию»
+                logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
             logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
@@ -4461,12 +4474,16 @@ class LocalColonyCompute:
             # не просто видна (prox>0.1) — иначе фуражёры впустую лезут в драку
             # (Хьюберт: ATTACK доминировал 36%). prox 0.1..0.3: prey виден но
             # далеко → нейтрально, prey-градиент сам подведёт. Магнитуда 2.0→1.5.
-            if p_prox <= 0.1:
-                logits[5] -= 1.0 * BS        # добычи нет — ATTACK бессмысленна
-            elif p_prox > 0.3:
-                logits[5] += 1.5 * BS        # добыча достижима
-                if diet > 0.7:
-                    logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
+            # Prey-ATTACK (охота) — ТОЛЬКО хищник/всеядный (diet>0.5). Травоядному
+            # Адаму ВЫКЛ (§4 predator_defense.md): удар-по-добыче = удары в воздух
+            # (ATTACK_REACH подтвердил: atk_contact~0). ATTACK теперь только на хищника.
+            if diet > 0.5:
+                if p_prox <= 0.1:
+                    logits[5] -= 1.0 * BS        # добычи нет — ATTACK бессмысленна
+                elif p_prox > 0.3:
+                    logits[5] += 1.5 * BS        # добыча достижима
+                    if diet > 0.7:
+                        logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
