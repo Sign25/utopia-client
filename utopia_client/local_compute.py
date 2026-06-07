@@ -2918,10 +2918,16 @@ class LocalColonyCompute:
                     self._nav["cf_last"] = int(
                         _p40_cf if _p40_cf is not None
                         else self._carried_food.get(cid, 0))
+                    # КОНТР-АТАКА (Фрай/Хьюберт 07.06): хищник УДАРИЛ Адама этот тик
+                    # (damage_taken>0) = хищник ТОЧНО был в radius=1 → надёжнейший
+                    # сигнал контакта (лучше obs[61], который лагает/не пикует). →
+                    # сильный ATTACK-bias «бей в ответ, пока он рядом».
+                    _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid,
                                               recent_yield=_staying,
-                                              on_flora=_onf)
+                                              on_flora=_onf,
+                                              just_hit=_just_hit)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -3106,7 +3112,7 @@ class LocalColonyCompute:
                     # (obs[61]) в момент эмиссии — контакт (≥0.5) vs воздух.
                     _pp = float(obs_arr[61]) if len(obs_arr) > 61 else 0.0
                     self._nav["atk_pp_sum"] += _pp
-                    if _pp >= 0.5:
+                    if _pp >= 0.85:   # истинный melee radius=1 (obs[61]≈1, dist≈1)
                         self._nav["atk_contact"] += 1
                 elif action == 10:      # FLEE
                     self._nav["flee"] += 1
@@ -4352,7 +4358,8 @@ class LocalColonyCompute:
     def _shape_action_logits(self, logits, obs_arr, diet: float,
                              energy_ratio: float, nearest_flora=None,
                              recent_yield: bool = False,
-                             on_flora: bool = False) -> None:
+                             on_flora: bool = False,
+                             just_hit: bool = False) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4457,11 +4464,25 @@ class LocalColonyCompute:
             # ACTION по obs[61], DS-scaled (активен под single_organism, где BS=0
             # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник
             # (slot 61), не добыча, не Старшие. Мягкий — мотор дотачивает.
-            if d_prox >= 0.8:            # хищник ВПЛОТНУЮ → «загнан → бей»
+            # КОНТР-АТАКА по факту удара (Хьюберт 07.06: landed=0 — Адам бил вне
+            # radius=1; obs[61] лагает). damage_taken>0 = хищник ТОЧНО был вплотную
+            # ЭТОТ тик → бей в ответ, СИЛЬНО, гаси бегство (стой в контакте).
+            if just_hit:
+                logits[5] += 2.0 * PHI * DS      # сильный ATTACK
+                logits[10] -= PHI * DS           # НЕ беги — он рядом, контратакуй
+                # подавить move-прочь (flee-MOVE) чтобы не выйти из radius=1
+                logits[0] *= 0.5; logits[1] *= 0.5
+                logits[2] *= 0.5; logits[3] *= 0.5
+            elif d_prox >= 0.85:         # хищник ВПЛОТНУЮ (obs[61]≈1, dist≈1) → бей
                 logits[5] += PHI * DS            # ATTACK bias
                 logits[10] -= (1.0 / PHI) * DS   # меньше беги на контакте
             elif d_prox > 0.15:          # хищник ПРИБЛИЖАЕТСЯ → «создай дистанцию»
                 logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок
+            # Штраф ATTACK вне контакта (Хьюберт 07.06): мотор шлёт ATTACK на dist≥2
+            # (atk_pp~0.44) → удары в воздух (landed=0). Гасим ATTACK когда хищник
+            # НЕ вплотную и нас НЕ ударили — фокус ударов на реальный radius=1.
+            if not just_hit and d_prox < 0.6:
+                logits[5] -= PHI * DS
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
             logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
