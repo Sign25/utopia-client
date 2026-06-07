@@ -584,6 +584,7 @@ class LocalColonyCompute:
         # Внутрижизненная эволюция тела → наследуется через crossover.
         self._skill_eat: dict = {}          # cid → eat count (окно 200т)
         self._skill_kill: dict = {}         # cid → kill count
+        self._skill_atk: dict = {}          # cid → melee-ATTACK count (§6 atk-growth)
         self._skill_move: dict = {}         # cid → move count
         self._skill_window_tick: dict = {}  # cid → world_tick последнего окна
         self._skill_changed_cids: set = set()  # cid с изменёнными traits → re-announce
@@ -1261,6 +1262,7 @@ class LocalColonyCompute:
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._skill_kill.pop(cid, None)
+        self._skill_atk.pop(cid, None)
         self._skill_move.pop(cid, None)
         self._skill_window_tick.pop(cid, None)
         self._skill_changed_cids.discard(cid)
@@ -3114,6 +3116,10 @@ class LocalColonyCompute:
                     self._nav["atk_pp_sum"] += _pp
                     if _pp >= 0.85:   # истинный melee radius=1 (obs[61]≈1, dist≈1)
                         self._nav["atk_contact"] += 1
+                        # §6: attack_power растёт от БОЕВОГО ИСПОЛЬЗОВАНИЯ (atk в
+                        # melee), клиент-надёжно — killed-события дропаются на
+                        # пропущенных тиках (§3.5), kill=1 vs server 14.
+                        self._skill_atk[cid] = self._skill_atk.get(cid, 0) + 1
                 elif action == 10:      # FLEE
                     self._nav["flee"] += 1
                     # FLEE pred_prox — сравнение: бежит-при-контакте (avoid) vs
@@ -6633,6 +6639,7 @@ class LocalColonyCompute:
         eat = self._skill_eat.get(cid, 0)
         kill = self._skill_kill.get(cid, 0)
         move = self._skill_move.get(cid, 0)
+        atk_use = self._skill_atk.get(cid, 0)  # §6: melee-ATTACK в окне
         if tr is not None:
             try:
                 eff0 = int(tr.get("efficiency", 10))  # server default 10 (не 5)
@@ -6642,7 +6649,11 @@ class LocalColonyCompute:
                 # Growth
                 if eat > 10:
                     eff = min(15, eff + 1)
-                if kill >= max(2, round(atk / 1.6180339887)):  # φ-порог
+                # §6 attack_power от боевого использования (melee-ATTACK) ИЛИ
+                # киллов. atk_use клиент-надёжен (kill дропается на §3.5 tick-skip).
+                # Порог φ-выровнен: ~13 melee-атак/окно или kill≥φ-порог.
+                if (kill >= max(2, round(atk / 1.6180339887))
+                        or atk_use >= 13):
                     atk = min(10, atk + 1)
                 if move > 100:
                     spd = min(10, spd + 1)
@@ -6661,12 +6672,13 @@ class LocalColonyCompute:
                 if self._single_organism:
                     logger.info(
                         "SKILL_DIAG cid=%s atk=%d->%d move_speed=%d->%d eff=%d "
-                        "| kill=%d eat=%d move=%d", cid, atk0, atk, spd0, spd,
-                        eff, kill, eat, move)
+                        "| kill=%d atk_use=%d eat=%d move=%d", cid, atk0, atk,
+                        spd0, spd, eff, kill, atk_use, eat, move)
             except Exception as e:
                 logger.debug("skill_growth %s: %s", cid, e)
         self._skill_eat[cid] = 0
         self._skill_kill[cid] = 0
+        self._skill_atk[cid] = 0
         self._skill_move[cid] = 0
 
     def _apply_metabolism(self, cid: str, rates: "Optional[dict]") -> None:
