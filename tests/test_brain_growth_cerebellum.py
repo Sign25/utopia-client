@@ -121,9 +121,11 @@ def _fake_org_with_cerebellum():
     return org
 
 
-def test_growth_default_gated_off():
+def test_growth_default_enabled_after_flip():
+    # Флип 0.13.36 (Фрай 08.06): рост ВКЛ по умолчанию. Доп.гейт single_organism
+    # в handle_tick → активен только для Адама. Kill-switch _growth_enabled=False.
     c = LocalColonyCompute(device="cpu")
-    assert c._growth_enabled is False  # ship dormant
+    assert c._growth_enabled is True
 
 
 def test_growth_no_propose_before_plateau():

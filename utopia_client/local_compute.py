@@ -356,7 +356,7 @@ class LocalColonyCompute:
         # ЗНАЧИМОМ сошедшемся Δloss_ema (Фрай: не любой Δ>0); backoff revert'ит
         # ребро (enabled=False) + защищает net/§3. Gated OFF (ship dormant) —
         # включить после live-проверки встраивания (cerebellum_out≠0, loss не взлетел).
-        self._growth_enabled: bool = False            # kill-switch
+        self._growth_enabled: bool = True             # kill-switch (флип 08.06: рост ВКЛ для Адама)
         self._growth_tracker = None                   # client-local innovation tracker (lazy)
         self._growth_rng = random.Random(0)           # детерминируемый выбор src-роли
         self._growth_state: dict = {}                 # cid → {gene, loss_before, ticks, par_before, energy_before}
