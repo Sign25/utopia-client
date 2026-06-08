@@ -328,6 +328,106 @@ def test_growth_cooldown_fallback_when_all_in_cooldown():
     assert org.tissue_topology_genes[-1].source_role in ("brain", "memory")
 
 
+def _backoff_window(c, cid, org, src_role, from_fallback):
+    """Хелпер: прогнать одно окно с гарантированным BACKOFF для роли src_role."""
+    from core.connection import ConnectionType
+    from core.tissue_topology import TissueConnectionGene
+    g = TissueConnectionGene(innovation=1, source_role=src_role,
+                             target_role="cerebellum",
+                             conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
+    org.tissue_topology_genes.append(g)
+    c._growth_dwell_ticks = 1
+    c._growth_state[cid] = {"gene": g, "loss_before": 0.20, "ticks": 0,
+                            "par_before": 0, "energy_before": 100.0,
+                            "from_fallback": from_fallback}
+    c.loss_ema[cid] = 0.20   # без улучшения → backoff
+    c._brain_growth_step(cid)
+
+
+def test_growth_saturation_after_fallback_streak():
+    from utopia_client.biochemistry import make_default
+    c = LocalColonyCompute(device="cpu")
+    c._growth_saturation_threshold = 3
+    cid = "c1"
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.predictor[cid] = c._make_predictor_tissue()
+    bc = make_default(); bc.energy = 100.0
+    c.biochem[cid] = bc
+    for _ in range(3):
+        _backoff_window(c, cid, org, "motor", from_fallback=True)
+    assert c._growth_saturated is True
+    assert c._growth_fallback_streak >= 3
+
+
+def test_growth_no_saturation_when_fresh_candidate():
+    from utopia_client.biochemistry import make_default
+    c = LocalColonyCompute(device="cpu")
+    c._growth_saturation_threshold = 3
+    cid = "c1"
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.predictor[cid] = c._make_predictor_tissue()
+    bc = make_default(); bc.energy = 100.0
+    c.biochem[cid] = bc
+    for _ in range(5):
+        _backoff_window(c, cid, org, "motor", from_fallback=False)  # был свежий кандидат
+    assert c._growth_saturated is False
+    assert c._growth_fallback_streak == 0
+
+
+def test_growth_saturated_pauses_proposing():
+    c = LocalColonyCompute(device="cpu")
+    cid = "c1"
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.predictor[cid] = c._make_predictor_tissue()
+    c.loss_ema[cid] = 0.2
+    c.intrinsic_ema[cid] = 0.0
+    c._growth_plateau_ticks = 1
+    c._growth_saturated = True
+    c._brain_growth_step(cid)               # насыщено → не предлагает
+    assert cid not in c._growth_state
+    assert org.tissue_topology_genes == []
+
+
+def test_reset_growth_saturation():
+    c = LocalColonyCompute(device="cpu")
+    c._growth_saturated = True
+    c._growth_fallback_streak = 9
+    c.reset_growth_saturation()
+    assert c._growth_saturated is False
+    assert c._growth_fallback_streak == 0
+
+
+def test_growth_keep_resets_saturation():
+    from utopia_client.biochemistry import make_default
+    c = LocalColonyCompute(device="cpu")
+    cid = "c1"
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.predictor[cid] = c._make_predictor_tissue()
+    c._growth_dwell_ticks = 1
+    c._growth_saturated = True
+    c._growth_fallback_streak = 4
+    from core.connection import ConnectionType
+    from core.tissue_topology import TissueConnectionGene
+    g = TissueConnectionGene(innovation=1, source_role="brain",
+                             target_role="cerebellum",
+                             conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
+    org.tissue_topology_genes.append(g)
+    bc = make_default(); bc.energy = 100.0
+    c.biochem[cid] = bc
+    c._growth_state[cid] = {"gene": g, "loss_before": 0.20, "ticks": 0,
+                            "par_before": 0, "energy_before": 100.0,
+                            "from_fallback": True}
+    c.loss_ema[cid] = 0.15                  # улучшение → KEEP → сброс насыщения
+    c._brain_growth_step(cid)
+    assert g.enabled is True
+    assert c._growth_saturated is False
+    assert c._growth_fallback_streak == 0
+
+
 def test_growth_spike_above_floor_resets():
     """intrinsic поднялся значимо над трейлинг-floor = прогресс вернулся → сброс
     стагнации (не плато). Drift-robust self-referencing."""

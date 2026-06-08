@@ -380,6 +380,14 @@ class LocalColonyCompute:
         self._growth_propose_count: int = 0           # монотонные часы проб
         self._growth_rejected: dict = {}              # cid → {source_role: propose_count при отказе}
         self._growth_retry_cooldown: int = 13         # Fib — проб до повторной попытки отвергнутого
+        # SATURATION-guard (Шеф 08.06): когда полезные {роль}→cerebellum рёбра
+        # исчерпаны (все свежие кандидаты в cooldown → fallback гоняет оставшиеся
+        # бесполезные по кругу) — встать на ПАУЗУ, не churn'ить. Сигнал «связи
+        # насыщены → готов к фазе тканей §3.2». Снимается reset_growth_saturation()
+        # (вызвать при добавлении тканей — новые роли = новые кандидаты) или KEEP.
+        self._growth_fallback_streak: int = 0         # подряд fallback-backoff'ов
+        self._growth_saturated: bool = False          # пауза петли связей
+        self._growth_saturation_threshold: int = 5    # fallback-backoff'ов до насыщения
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -5399,6 +5407,8 @@ class LocalColonyCompute:
             return  # нет cerebellum → расти некуда (драйвер не отзовётся)
         st = self._growth_state.get(cid)
         if st is None:
+            if self._growth_saturated:
+                return  # связи насыщены — петля на паузе (до фазы тканей §3.2)
             # idle: ОТНОСИТЕЛЬНОЕ плато — intrinsic_ema у своего трейлинг-floor
             # (min за окно) N тиков подряд = learning-progress застрял (весами
             # учиться нечему → менять структуру). intrinsic выше floor (прогресс
@@ -5439,6 +5449,9 @@ class LocalColonyCompute:
         gene = st["gene"]
         if keep:
             self._growth_kept += 1
+            # KEEP = поиск ещё продуктивен → сбрасываем насыщение.
+            self._growth_fallback_streak = 0
+            self._growth_saturated = False
             logger.info("brain-growth KEEP cid=%s edge=%s→cerebellum Δloss=%.5f "
                         "(%.1f%%) kept=%d", cid, gene.source_role, delta,
                         100.0 * delta / max(1e-9, loss_before), self._growth_kept)
@@ -5453,6 +5466,21 @@ class LocalColonyCompute:
             self._growth_rejected.setdefault(cid, {})[gene.source_role] = (
                 self._growth_propose_count)
             self._growth_reverted += 1
+            # SATURATION: backoff из fallback (свежих кандидатов не было) → копим
+            # streak. Порог → пауза петли + сигнал готовности к фазе тканей.
+            if st.get("from_fallback"):
+                self._growth_fallback_streak += 1
+                if (not self._growth_saturated and self._growth_fallback_streak
+                        >= self._growth_saturation_threshold):
+                    self._growth_saturated = True
+                    n_active = sum(1 for g in (
+                        getattr(org, "tissue_topology_genes", []) or [])
+                        if getattr(g, "enabled", False))
+                    logger.info("brain-growth SATURATED cid=%s: полезные связи "
+                                "исчерпаны (active=%d), петля связей НА ПАУЗЕ — "
+                                "готов к фазе тканей §3.2", cid, n_active)
+            else:
+                self._growth_fallback_streak = 0  # был свежий кандидат → не насыщение
             logger.info("brain-growth BACKOFF cid=%s edge=%s→cerebellum Δloss=%.5f "
                         "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
                         delta, signif, net_ok, self._growth_reverted)
@@ -5501,6 +5529,7 @@ class LocalColonyCompute:
         cd = int(self._growth_retry_cooldown)
         fresh = [r for r in all_cand
                  if r not in rej or (self._growth_propose_count - rej[r]) >= cd]
+        used_fallback = not fresh   # свежих кандидатов нет → гоняем оставшиеся
         candidates = fresh if fresh else all_cand
         self._growth_propose_count += 1
         src = self._growth_rng.choice(candidates)
@@ -5523,10 +5552,21 @@ class LocalColonyCompute:
             "par_before": int(self._paralysis_window_n),
             "energy_before": (float(getattr(bc, "energy", 0.0))
                               if bc is not None else None),
+            "from_fallback": used_fallback,
         }
         logger.info("brain-growth PROPOSE cid=%s edge=%s→cerebellum loss_before=%.5f",
                     cid, src, self._growth_state[cid]["loss_before"])
         return True
+
+    def reset_growth_saturation(self) -> None:
+        """Снять насыщение роста связей. Вызывать при добавлении ТКАНЕЙ (§3.2):
+        новые роли = новые {роль}→cerebellum кандидаты → петле снова есть что
+        пробовать. Идемпотентно."""
+        if self._growth_saturated or self._growth_fallback_streak:
+            logger.info("brain-growth saturation reset (новые ткани/роли — "
+                        "петля связей возобновлена)")
+        self._growth_saturated = False
+        self._growth_fallback_streak = 0
 
     def _predictor_train_step(self, cid: str, obs_tensor,
                               input_tensor=None) -> float:
