@@ -2116,11 +2116,21 @@ class ColonyWSClient:
             except Exception as e:
                 logger.warning("food-seek override failed: %r", e)
         else:
-            # single-organism: рефлексы OFF, диаг 1/200 — подтвердить gate.
+            # single-organism (Фрай 08.06, аффорданс Гидратация): food-seek OFF
+            # (флору ведёт arrival-commit прайор+мотор), но WATER-seek ВКЛ — вода
+            # КРИТИЧНА-к-выживанию И НЕОТКРЫВАЕМА (obs БЕЗ water-градиента → Адам не
+            # может выучить нав к воде) → рефлекс-зачаток ОПРАВДАН доктриной
+            # «минимум врождённого». Не клобберит как food: фаирит ТОЛЬКО при жажде
+            # (hydration<30, _apply_water_seek), не каждый тик. Зеркало masked-фуража:
+            # вода была подпёрта water-halo, Адам пить активно не умел.
+            try:
+                self._apply_water_seek(creatures, creatures_out)
+            except Exception as e:
+                logger.warning("water-seek override failed: %r", e)
             self._seek_gate_n = getattr(self, "_seek_gate_n", 0) + 1
             if self._seek_gate_n % 200 == 1:
-                logger.info("SEEK_GATE single_organism → water/food-seek OFF "
-                            "(Адам ведёт выученной политикой, Фрай 06.06)")
+                logger.info("SEEK_GATE single_organism → food-seek OFF, "
+                            "WATER-seek ON (Гидратация, Фрай 08.06)")
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -2188,15 +2198,25 @@ class ColonyWSClient:
         r0, c0 = int(row), int(col)
         best = None
         best_d = 10**9
-        R = self._WATER_SEEK_RADIUS
-        for r in range(max(0, r0 - R), min(size, r0 + R + 1)):
-            base = r * size
-            for c in range(max(0, c0 - R), min(size, c0 + R + 1)):
-                if terrain[base + c] == self._WATER_TILE:
-                    d = abs(r - r0) + abs(c - c0)
-                    if 0 < d < best_d:
-                        best_d = d
-                        best = (r, c)
+        # ПРОГРЕССИВНОЕ расширение радиуса (Фрай 08.06, робастность): база 8 →
+        # 16→32→64→128→карта, стоп на ПЕРВОМ найденном кольце (ближайшая вода).
+        # Иначе при воде дальше базового радиуса возвращали None → слепой explore
+        # (мог идти в противоположную сторону) → дегидратация в водо-скудном месте.
+        # Скан только при жажде (вызов из _apply_water_seek), стоимость ограничена.
+        _base = self._WATER_SEEK_RADIUS
+        for R in (_base, _base * 2, _base * 4, _base * 8, _base * 16, size):
+            best = None
+            best_d = 10**9
+            for r in range(max(0, r0 - R), min(size, r0 + R + 1)):
+                base = r * size
+                for c in range(max(0, c0 - R), min(size, c0 + R + 1)):
+                    if terrain[base + c] == self._WATER_TILE:
+                        d = abs(r - r0) + abs(c - c0)
+                        if 0 < d < best_d:
+                            best_d = d
+                            best = (r, c)
+            if best is not None:
+                break
         if best is None:
             return None
         dr = best[0] - r0
@@ -2400,6 +2420,14 @@ class ColonyWSClient:
         n_seek = 0
         n_thirsty = 0
         n_near = 0
+        # ROBUSTNESS (Фрай 08.06): зеркало 4-way escape для воды. Трекаем pos
+        # жаждущего; нет прогресса к воде (pos застрял) ИЛИ воды нет в радиусе →
+        # ИССЛЕДУЙ ротацией 4 направлений → сменит pos/найдёт воду. Иначе хрупкость:
+        # вода недостижима (за препятствием) / далеко (>радиус) → пин/random.
+        if not hasattr(self, "_water_seek_pos"):
+            self._water_seek_pos = {}
+        if not hasattr(self, "_water_seek_stuck"):
+            self._water_seek_stuck = {}
         for entry in creatures_out:
             cid = entry.get("cid")
             bc = biochem.get(cid) if cid else None
@@ -2412,11 +2440,26 @@ class ColonyWSClient:
             if rc is None or rc[0] is None:
                 continue
             if self._near_water(rc[0], rc[1]):
+                # У воды (радиус 1) → пьёт (income _WATER_RESTORE φ⁷). НЕ оверрайдим
+                # (его политика; income восстановит hydration быстро). Стук-сброс.
                 n_near += 1
+                self._water_seek_stuck[cid] = 0
+                self._water_seek_pos[cid] = rc
+                continue
+            # Не у воды + жажда → веди к воде. Стук-детект (зеркало arrival-escape):
+            if self._water_seek_pos.get(cid) == rc:
+                self._water_seek_stuck[cid] = self._water_seek_stuck.get(cid, 0) + 1
+            else:
+                self._water_seek_stuck[cid] = 0
+            self._water_seek_pos[cid] = rc
+            _sn = self._water_seek_stuck.get(cid, 0)
             wd = self._water_seek_action(rc[0], rc[1])
-            if wd is not None:
-                entry["action"] = int(wd)
-                n_seek += 1
+            if wd is None or _sn >= 13:
+                # воды нет в радиусе ИЛИ пинуется (недостижима) → ИССЛЕДУЙ:
+                # ротация 4 кардинальных (sn//5)%4 → любое открытое сменит pos.
+                wd = [0, 2, 1, 3][(_sn // 5) % 4]   # N, E, S, W
+            entry["action"] = int(wd)
+            n_seek += 1
         if n_seek:
             self._water_seek_overrides = getattr(
                 self, "_water_seek_overrides", 0) + n_seek

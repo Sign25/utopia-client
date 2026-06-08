@@ -511,6 +511,11 @@ class LocalColonyCompute:
         # (Fib 2) чтобы один пустой тик не срывал в бегство; исчерпание → быстрый
         # релиз (защита от idle-голода, критерий Хьюберта eats/sec≥1.62).
         self._tile_yield_mem: dict = {}      # cid → остаток тиков «тайл кормит»
+        # ARRIVAL STUCK-DETECTION (Фрай 07.06): nearest_flora недостижима (через
+        # воду/препятствие) → Адам коммитит но не движется (pos застрял, onf=0).
+        # Трекаем вектор (dr,dc,dist); не меняется N тиков при dist>0 → абандон+обход.
+        self._arrival_last_nf: dict = {}     # cid → последний (dr,dc,dist)
+        self._arrival_stuck_n: dict = {}     # cid → тиков без прогресса к флоре
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -832,6 +837,14 @@ class LocalColonyCompute:
         self._e_income_sum: float = 0.0   # delta_energy (eat)
         self._e_cost_sum: float = 0.0     # step_cost
         self._e_infdrain_sum: float = 0.0  # infection-drain
+        # §3.5-ПОЛНОТА ledger (Фрай 07.06): компонентный net (income-cost-infdrain)
+        # недосчитывал метаб-цену berserk/атак/дегидрации → ложный net+ при energy,
+        # пилящей §3. net_true = реальная Δenergy за окно (authoritative, не врёт);
+        # residual = net_true − net_component = СУММА непосчитанных расходов/грантов.
+        # +paralysis_n: окна с §3-recovery несустейнабельны (грант +73 искажает Δ).
+        self._e_window_e0: float = -1.0   # energy на старте окна (для net_true)
+        self._paralysis_window_n: int = 0  # §3-recovery за окно
+        self._e_srv_cost_sum: float = 0.0  # серверная per-event цена (delta_e<0)
         self._hyd_thirst_sum: float = 0.0
         self._hyd_drink_sum: float = 0.0
         self._hyd_calib_ticks: int = 0
@@ -2925,11 +2938,52 @@ class LocalColonyCompute:
                     # сигнал контакта (лучше obs[61], который лагает/не пикует). →
                     # сильный ATTACK-bias «бей в ответ, пока он рядом».
                     _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
+                    # ARRIVAL STUCK-DETECTION (Фрай 07.06 go): вектор (dr,dc,dist)
+                    # к nearest_flora НЕ меняется N=13 тиков (φ-Fib) при dist>0 (не
+                    # на флоре) → цель недостижима (P40 блокит ход через воду) →
+                    # АБАНДОН: обход препятствия перпендикулярно (сторона чередуется
+                    # каждые 13 тиков). pos сменится → nf пересчёт → счётчик сброс →
+                    # фураж к достижимой флоре. _staying (ест) → не стак. server-незав.
+                    _abandon_dir = None
+                    if _nf_cid is not None and not _staying:
+                        _nfk = (_nf_cid.get("dr"), _nf_cid.get("dc"),
+                                _nf_cid.get("dist"))
+                        _nfd = _nf_cid.get("dist")
+                        if (_nfd is not None and float(_nfd) > 0.0
+                                and _nfk == self._arrival_last_nf.get(cid)):
+                            self._arrival_stuck_n[cid] = (
+                                self._arrival_stuck_n.get(cid, 0) + 1)
+                        else:
+                            self._arrival_stuck_n[cid] = 0
+                        self._arrival_last_nf[cid] = _nfk
+                        _sn = self._arrival_stuck_n.get(cid, 0)
+                        if _sn >= 13:
+                            # ROBUST escape (0.13.29): цель недостижима → СКАН всех
+                            # 4 кардинальных направлений (не только перпендикуляр —
+                            # ловушка может блокить N/S И флора по диагонали, escape
+                            # только E/W). Ротация каждые 5 тиков (sn//5)%4 → все 4
+                            # за 20 тиков, любое открытое сменит pos → стак-сброс.
+                            # Порядок [N,E,S,W] начинаем с ПЕРПЕНДИКУЛЯРА к флоре
+                            # (вероятнее открыт, чем сторона флоры).
+                            _dr0 = float(_nf_cid.get("dr", 0.0) or 0.0)
+                            _dc0 = float(_nf_cid.get("dc", 0.0) or 0.0)
+                            if abs(_dc0) >= abs(_dr0):   # флора E/W → старт с N/S
+                                _ring = [0, 1, 2, 3]     # N, S, E, W
+                            else:                         # флора N/S → старт с E/W
+                                _ring = [2, 3, 0, 1]     # E, W, N, S
+                            _abandon_dir = _ring[(_sn // 5) % 4]
+                            if self._nf_diag_n % 50 == 0:
+                                logger.info(
+                                    "ARRIVAL_STUCK cid=%s nf=%s stuck=%d "
+                                    "abandon_dir=%d", cid, _nfk, _sn, _abandon_dir)
+                    else:
+                        self._arrival_stuck_n[cid] = 0
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid,
                                               recent_yield=_staying,
                                               on_flora=_onf,
-                                              just_hit=_just_hit)
+                                              just_hit=_just_hit,
+                                              flora_abandon_dir=_abandon_dir)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -4375,7 +4429,8 @@ class LocalColonyCompute:
                              energy_ratio: float, nearest_flora=None,
                              recent_yield: bool = False,
                              on_flora: bool = False,
-                             just_hit: bool = False) -> None:
+                             just_hit: bool = False,
+                             flora_abandon_dir: "Optional[int]" = None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4417,7 +4472,16 @@ class LocalColonyCompute:
             # учит высшее поверх. obs[62/63]=dist/kind для контекст-обучения мотора.
             # Конвенция: dr>0=флора южнее→SOUTH(1), dr<0→NORTH(0), dc>0→EAST(2), dc<0→WEST(3).
             _nf = nearest_flora
-            if _nf is not None:
+            if flora_abandon_dir is not None:
+                # ARRIVAL ABANDON (Фрай 07.06 go): nearest_flora недостижима (стак
+                # детектнут в caller) → НЕ коммить к ней (и НЕ smell-fallback к той
+                # же цели) → обход препятствия перпендикулярно (flora_abandon_dir).
+                # Сильный шаг (2φ·DS, как arrival-commit) + не стой. pos сменится →
+                # nf пересчёт → стак-сброс → arrival-commit к достижимой флоре.
+                logits[int(flora_abandon_dir)] += 2.0 * PHI * DS
+                logits[4] -= PHI * DS          # не стой — двигайся в обход
+                _nf = None                     # smell-fallback ниже ОТКЛ (см. гейт)
+            elif _nf is not None:
                 try:
                     _dr = float(_nf.get("dr", 0.0))
                     _dc = float(_nf.get("dc", 0.0))
@@ -4435,6 +4499,29 @@ class LocalColonyCompute:
                     elif _dist <= 0.0:
                         logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
                         logits[14] += 1.0 * DS    # EAT
+                    elif _dist <= 1.0:
+                        # ARRIVAL COMMIT (Фрай 07.06, predator_defense-зеркало):
+                        # флора ВПЛОТНУЮ (dist≈1, cardinal-смежная) → ДОМИНАНТНЫЙ
+                        # финальный ШАГ НА тайл + анти-флип (гаси обратное напр.) +
+                        # не стой. Корень thrash: на dist=1 обычный _w УЖЕ макс
+                        # (min(1/dist,1)=1), но мотор (norm~1.6, flip 0.6) перебивал
+                        # argmax ~60% → осцилляция в 1 тайле, onf_rate=0, income=0.
+                        # Фикс — commit ×2φ (как ATTACK-контратака just_hit): сильный
+                        # prior, мотор дотачивает; анти-флип гасит реверс. Флора-
+                        # специфично (nearest_flora 62/63). С §4 predator (по obs[61],
+                        # ниже) НЕ конфликтует — хищник вплотную перебьёт (×0.5 move +
+                        # ATTACK/FLEE). Встанет НА тайл → след.тик dist=0 → GATHER/EAT.
+                        _cw = 2.0 * PHI * DS          # commit-сила шага
+                        _af = PHI * DS                # анти-флип обратного напр.
+                        if _dr < 0:
+                            logits[0] += _cw; logits[1] -= _af   # NORTH, гаси SOUTH
+                        elif _dr > 0:
+                            logits[1] += _cw; logits[0] -= _af   # SOUTH, гаси NORTH
+                        if _dc > 0:
+                            logits[2] += _cw; logits[3] -= _af   # EAST, гаси WEST
+                        elif _dc < 0:
+                            logits[3] += _cw; logits[2] -= _af   # WEST, гаси EAST
+                        logits[4] -= _af              # не стой — делай финальный шаг
                     else:
                         _w = (4.0 - 2.0 * diet) * DS * min(1.0 / _dist, 1.0)
                         if _dr < 0:
@@ -4447,8 +4534,10 @@ class LocalColonyCompute:
                             logits[3] += _w       # WEST
                 except Exception:
                     _nf = None                    # битое поле → smell-fallback
-            if _nf is None:
+            if _nf is None and flora_abandon_dir is None:
                 # Smell-градиент fallback (иди к еде, центр-масс). diet→0 сильнее.
+                # ОТКЛ при abandon (_nf=None из-за абандона) — иначе smell к ТОЙ ЖЕ
+                # недостижимой флоре-кластеру вернёт стак; обход уже задан выше.
                 g_ns = float(obs_arr[33]) if n > 34 else 0.0
                 g_ew = float(obs_arr[34]) if n > 34 else 0.0
                 g_ns, g_ew = _unit(g_ns, g_ew)
@@ -4476,28 +4565,28 @@ class LocalColonyCompute:
                 pf = PHI * DS * min(d_prox, 1.0)
                 logits[0] += pf * d_ns; logits[1] -= pf * d_ns
                 logits[2] -= pf * d_ew; logits[3] += pf * d_ew
-            # §4 PREDATOR DEFENSE (predator_defense.md, Фрай 07.06): рефлекс-bias
+            # §4 PREDATOR DEFENSE (predator_defense.md §11, Фрай 07.06): рефлекс-bias
             # ACTION по obs[61], DS-scaled (активен под single_organism, где BS=0
-            # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник
-            # (slot 61), не добыча, не Старшие. Мягкий — мотор дотачивает.
-            # КОНТР-АТАКА по факту удара (Хьюберт 07.06: landed=0 — Адам бил вне
-            # radius=1; obs[61] лагает). damage_taken>0 = хищник ТОЧНО был вплотную
-            # ЭТОТ тик → бей в ответ, СИЛЬНО, гаси бегство (стой в контакте).
+            # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник.
+            # ТРИГГЕР БОЯ = АТАКА (damage_taken>0), НЕ КОНТАКТ (Фрай §11 durable):
+            # старый mere-contact ATTACK (d_prox≥0.85) бил по ПРИСУТСТВИЮ → spam на
+            # predator-транзиенты (dmg=0, pred_ticks=0, attack=144-185) рвал forage
+            # И возвращал berserk-on-presence при climb pressure. Теперь: реально
+            # ударили → контратака; контакт БЕЗ урона (пассив/транзиент) → НЕ бей,
+            # пасись/настороже; приближается (не контакт) → уйди до удара.
             if just_hit:
+                # damage_taken>0 = хищник ТОЧНО ударил ЭТОТ тик → бей в ответ СИЛЬНО,
+                # гаси бегство + move-прочь (стой в radius=1, добей).
                 logits[5] += 2.0 * PHI * DS      # сильный ATTACK
-                logits[10] -= PHI * DS           # НЕ беги — он рядом, контратакуй
-                # подавить move-прочь (flee-MOVE) чтобы не выйти из radius=1
+                logits[10] -= PHI * DS           # НЕ беги — контратакуй
                 logits[0] *= 0.5; logits[1] *= 0.5
                 logits[2] *= 0.5; logits[3] *= 0.5
-            elif d_prox >= 0.85:         # хищник ВПЛОТНУЮ (obs[61]≈1, dist≈1) → бей
-                logits[5] += PHI * DS            # ATTACK bias
-                logits[10] -= (1.0 / PHI) * DS   # меньше беги на контакте
-            elif d_prox > 0.15:          # хищник ПРИБЛИЖАЕТСЯ → «создай дистанцию»
-                logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок
-            # Штраф ATTACK вне контакта (Хьюберт 07.06): мотор шлёт ATTACK на dist≥2
-            # (atk_pp~0.44) → удары в воздух (landed=0). Гасим ATTACK когда хищник
-            # НЕ вплотную и нас НЕ ударили — фокус ударов на реальный radius=1.
-            if not just_hit and d_prox < 0.6:
+            elif 0.15 < d_prox < 0.85:   # ПРИБЛИЖАЕТСЯ (не контакт) → создай дистанцию
+                logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок (уйди до удара)
+            # Контакт d_prox≥0.85 БЕЗ just_hit → НИ одна ветка: пасись/настороже.
+            # Подавляем ATTACK ВСЕГДА когда нас НЕ ударили (мотор не должен спамить
+            # бой на присутствие/в воздух) — единственный буст ATTACK = just_hit выше.
+            if not just_hit:
                 logits[5] -= PHI * DS
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
@@ -6586,7 +6675,16 @@ class LocalColonyCompute:
             if delta_e != 0.0:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
                 if delta_e > 0.0:
-                    self._e_income_sum += delta_e  # ENERGY_CALIB
+                    self._e_income_sum += delta_e  # ENERGY_CALIB income
+                else:
+                    # §3.5-ПОЛНОТА (Фрай 07.06): ОТРИЦАТЕЛЬНЫЙ delta_energy =
+                    # серверная per-event цена (атаки/combat/действия) — списывал
+                    # energy, но в ledger НЕ попадал (только delta>0 шёл в income).
+                    # Это и есть «непосчитанная метаб-цена berserk/атак»: LEDGER_FULL
+                    # вскрыл residual≈−250/окно при attack=140-202, dmg=0. Теперь в
+                    # cost → net_comp = истинный метаб-баланс (net+ перестанет врать).
+                    self._e_cost_sum += -delta_e
+                    self._e_srv_cost_sum += -delta_e  # отдельный диаг-аккумулятор
             # Hydration income (31.05.2026): присутствие ключа delta_hydration
             # в event = P40 шлёт питьё → активируем hydration-ось отбора для
             # этого cid (thirst-декей + жажда-смерть включатся в
@@ -6843,6 +6941,7 @@ class LocalColonyCompute:
                     # Конец паралича → recovery-грант (ЭНЕРГИЯ, не время).
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
+                    self._paralysis_window_n += 1  # §3.5-ledger: грант искажает Δ
                     # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
                     # recovery = «передышка» → снимает не только паралич, но и
                     # стресс-залипание catatonic (cortisol застревает на 99.5 от
@@ -6863,6 +6962,16 @@ class LocalColonyCompute:
                         bc.glucose = max(
                             float(getattr(bc, "glucose", 0.0)),
                             float(getattr(bc, "baseline_glucose", 50.0)))
+                        # Infection-relief (Фрай 08.06, вариант b): recovery чистит
+                        # и infection_severity — иначе absorbing-петля (recovery
+                        # снимает energy+стресс+mb, но инфекция ре-дренит сразу →
+                        # mb=inflammation возвращается → §3-цикл вечно; water лечит
+                        # ТОЛЬКО при severity<0.5 + water-seek гатнут → у Адама
+                        # severity~1.0 вода бессильна, recovery-клир единственный
+                        # путь). Инфекция остаётся ЖИВОЙ механикой (заражение тикает),
+                        # recovery её снимает как стресс — §3=«полная передышка».
+                        bc.infection_severity = 0.0
+                        bc.infected = False
                         bc.mental_break = ""
                         bc.mental_break_ticks = 0
                     except Exception:
@@ -6932,6 +7041,28 @@ class LocalColonyCompute:
                         for c in self.organisms]
                 eff_mean = (sum(effs) / len(effs)) if effs else 0.0
                 _net = self._e_income_sum - self._e_cost_sum - self._e_infdrain_sum
+                # §3.5-ПОЛНОТА (Фрай 07.06): net_true = реальная Δenergy за окно
+                # (authoritative bc.energy, не врёт); residual = net_true − net_comp
+                # = непосчитанные расходы/гранты (berserk/атаки/дегидрация/§3-грант).
+                # Автотюн ДОЛЖЕН читать net_true, не компонентный net.
+                _e_now = -1.0
+                try:
+                    for _bcv in self.biochem.values():
+                        _e_now = float(getattr(_bcv, "energy", -1.0))
+                        break  # single-organism: один Адам
+                except Exception:
+                    pass
+                _net_true = (_e_now - self._e_window_e0
+                             if (self._e_window_e0 >= 0.0 and _e_now >= 0.0)
+                             else _net)
+                _residual = _net_true - _net
+                logger.info(
+                    "LEDGER_FULL net_comp=%.1f net_true=%.1f residual=%.1f "
+                    "srv_cost=%.1f paralysis=%d e0=%.1f e1=%.1f (srv_cost=серверная "
+                    "per-event цена delta_e<0, теперь в ledger; residual→0+гранты "
+                    "после фикса; paralysis>0 = §3-несустейнабельно)",
+                    _net, _net_true, _residual, self._e_srv_cost_sum,
+                    self._paralysis_window_n, self._e_window_e0, _e_now)
                 # INSTINCT_DIAG (Фрай): natural-роды vs bootstrap-омоложение +
                 # сколько особей сейчас в активном инстинкте. Критерий успеха:
                 # natural>0 (пошли роды) + eff_mean ползёт 5→10. Если держится
@@ -7051,6 +7182,15 @@ class LocalColonyCompute:
             self._e_income_sum = 0.0
             self._e_cost_sum = 0.0
             self._e_infdrain_sum = 0.0
+            # §3.5-ledger: новое окно стартует с текущей energy (net_true база).
+            try:
+                for _bcv in self.biochem.values():
+                    self._e_window_e0 = float(getattr(_bcv, "energy", -1.0))
+                    break
+            except Exception:
+                self._e_window_e0 = -1.0
+            self._paralysis_window_n = 0
+            self._e_srv_cost_sum = 0.0
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                          "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                          "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
@@ -7129,7 +7269,19 @@ class LocalColonyCompute:
         # стресса держится, но ложный lock уходит. Recover existing catatonic
         # к ~40 за ~144 тика.
         try:
-            bc.cortisol = float(getattr(bc, "cortisol", 0.0)) * _CORTISOL_HOMEOSTASIS_DECAY
+            _cort_decay = _CORTISOL_HOMEOSTASIS_DECAY  # 0.995 базовый гомеостаз
+            # BERSERK cortisol-relief exit (Фрай 08.06, инвариант «нет залипших
+            # mental_break»): decay_step даёт relief ×0.98 ТОЛЬКО catatonic
+            # (biochemistry.py:474) → berserk был ABSORBING (cortisol не уходил →
+            # berserk вечен → форсил холостые ATTACK, srv_cost 300). Зеркалим
+            # catatonic-relief на берсерк client-side: при mb=berserk усиленный
+            # decay ×0.98 → cortisol спадает ниже berserk-порога → выходит, спам
+            # прекращается сам. Источник пина (ЖАЖДА: hydration~16 server-side,
+            # water-halo OFF Phase 2 — Хьюберт убирает параллельно) при выходимом
+            # берсерке даёт cortisol реально упасть. berserk НЕ-absorbing, как все mb.
+            if str(getattr(bc, "mental_break", "")) == "berserk":
+                _cort_decay = 0.98
+            bc.cortisol = float(getattr(bc, "cortisol", 0.0)) * _cort_decay
         except Exception as e:
             logger.debug("cortisol homeostasis cid=%s: %s", cid, e)
 
