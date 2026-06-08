@@ -373,6 +373,13 @@ class LocalColonyCompute:
         self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
         self._growth_kept: int = 0                    # принятых связей (метрика)
         self._growth_reverted: int = 0                # откатов (метрика)
+        # tried-set с COOLDOWN (Фрай/Шеф 08.06): не ретраить отвергнутое ребро
+        # _growth_retry_cooldown проб подряд (поиск покрывает новые рёбра). НЕ
+        # permanent (эпистаз: ребро, бесполезное сейчас, может помочь после смены
+        # графа) → через cooldown снова eligible. Часы — счётчик проб (монотонный).
+        self._growth_propose_count: int = 0           # монотонные часы проб
+        self._growth_rejected: dict = {}              # cid → {source_role: propose_count при отказе}
+        self._growth_retry_cooldown: int = 13         # Fib — проб до повторной попытки отвергнутого
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1256,6 +1263,7 @@ class LocalColonyCompute:
         self._growth_state.pop(cid, None)
         self._growth_intr_hist.pop(cid, None)
         self._growth_stagnation_n.pop(cid, None)
+        self._growth_rejected.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -5441,6 +5449,9 @@ class LocalColonyCompute:
                 apply_topology_overlay_to_org(org)
             except Exception as e:
                 logger.warning("brain-growth backoff %s: %s", cid, e)
+            # cooldown: отметить ребро отвергнутым (не ретраить ~cooldown проб).
+            self._growth_rejected.setdefault(cid, {})[gene.source_role] = (
+                self._growth_propose_count)
             self._growth_reverted += 1
             logger.info("brain-growth BACKOFF cid=%s edge=%s→cerebellum Δloss=%.5f "
                         "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
@@ -5479,10 +5490,19 @@ class LocalColonyCompute:
             org.tissue_topology_genes = genes
         taken = {g.source_role for g in genes
                  if g.enabled and g.target_role == "cerebellum"}
-        candidates = sorted(r for r in role_to_id
-                            if r != "cerebellum" and r not in taken)
-        if not candidates:
+        all_cand = sorted(r for r in role_to_id
+                          if r != "cerebellum" and r not in taken)
+        if not all_cand:
             return False
+        # COOLDOWN: предпочитаем рёбра, не отвергнутые за последние
+        # _growth_retry_cooldown проб. Если свежих нет (всё в cooldown) —
+        # fallback на all_cand (cooldown = предпочтение, не сталл).
+        rej = self._growth_rejected.get(cid, {})
+        cd = int(self._growth_retry_cooldown)
+        fresh = [r for r in all_cand
+                 if r not in rej or (self._growth_propose_count - rej[r]) >= cd]
+        candidates = fresh if fresh else all_cand
+        self._growth_propose_count += 1
         src = self._growth_rng.choice(candidates)
         gene = TissueConnectionGene(
             innovation=self._growth_tracker.reserve(src, "cerebellum"),

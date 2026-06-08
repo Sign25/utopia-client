@@ -287,6 +287,47 @@ def test_growth_relative_trigger_at_nonzero_floor():
     assert len(org.tissue_topology_genes) == 1
 
 
+def _growth_ready(c, cid="c1"):
+    org = _fake_org_with_cerebellum()   # роли: cerebellum, brain, memory
+    c.organisms[cid] = org
+    c.predictor[cid] = c._make_predictor_tissue()
+    c.loss_ema[cid] = 0.2
+    return org
+
+
+def test_growth_cooldown_skips_recently_rejected():
+    # brain отвергнут недавно (propose_count=5, сейчас 10 → 5<13) → выбран memory.
+    c = LocalColonyCompute(device="cpu")
+    c._growth_retry_cooldown = 13
+    org = _growth_ready(c)
+    c._growth_propose_count = 10
+    c._growth_rejected["c1"] = {"brain": 5}
+    assert c._propose_growth_edge("c1", org) is True
+    assert org.tissue_topology_genes[-1].source_role == "memory"
+
+
+def test_growth_cooldown_expires():
+    # brain отвергнут давно (count=2, сейчас 20 → 18>=13) → снова eligible.
+    c = LocalColonyCompute(device="cpu")
+    c._growth_retry_cooldown = 13
+    org = _growth_ready(c)
+    c._growth_propose_count = 20
+    c._growth_rejected["c1"] = {"memory": 19}   # memory в cooldown (1<13)
+    assert c._propose_growth_edge("c1", org) is True
+    assert org.tissue_topology_genes[-1].source_role == "brain"  # memory cooldown → brain
+
+
+def test_growth_cooldown_fallback_when_all_in_cooldown():
+    # оба в свежем cooldown → fallback (не сталл): всё равно предлагает.
+    c = LocalColonyCompute(device="cpu")
+    c._growth_retry_cooldown = 13
+    org = _growth_ready(c)
+    c._growth_propose_count = 6
+    c._growth_rejected["c1"] = {"brain": 5, "memory": 5}
+    assert c._propose_growth_edge("c1", org) is True
+    assert org.tissue_topology_genes[-1].source_role in ("brain", "memory")
+
+
 def test_growth_spike_above_floor_resets():
     """intrinsic поднялся значимо над трейлинг-floor = прогресс вернулся → сброс
     стагнации (не плато). Drift-robust self-referencing."""
