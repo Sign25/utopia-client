@@ -131,7 +131,6 @@ def test_growth_default_enabled_after_flip():
 def test_growth_no_propose_before_plateau():
     c = LocalColonyCompute(device="cpu")
     c._growth_plateau_ticks = 3
-    c._growth_plateau_intrinsic = 0.01
     cid = "c1"
     c.predictor[cid] = c._make_predictor_tissue()
     c.organisms[cid] = _fake_org_with_cerebellum()
@@ -146,7 +145,6 @@ def test_growth_no_propose_before_plateau():
 def test_growth_propose_after_plateau():
     c = LocalColonyCompute(device="cpu")
     c._growth_plateau_ticks = 3
-    c._growth_plateau_intrinsic = 0.01
     cid = "c1"
     c.predictor[cid] = c._make_predictor_tissue()
     org = _fake_org_with_cerebellum()
@@ -166,23 +164,21 @@ def test_growth_propose_after_plateau():
 def test_growth_resets_plateau_when_learning():
     c = LocalColonyCompute(device="cpu")
     c._growth_plateau_ticks = 3
-    c._growth_plateau_intrinsic = 0.01
     cid = "c1"
     c.predictor[cid] = c._make_predictor_tissue()
     c.organisms[cid] = _fake_org_with_cerebellum()
     c.loss_ema[cid] = 0.2
     c.intrinsic_ema[cid] = 0.0
     c._brain_growth_step(cid)            # плато n=1
-    c.intrinsic_ema[cid] = 0.5           # снова учится → сброс
+    c.intrinsic_ema[cid] = 0.5           # intrinsic поднялся над floor → прогресс → сброс
     c._brain_growth_step(cid)
-    assert c._growth_plateau_n[cid] == 0
+    assert c._growth_stagnation_n[cid] == 0
     assert cid not in c._growth_state
 
 
 def test_growth_no_new_propose_during_dwell():
     c = LocalColonyCompute(device="cpu")
     c._growth_plateau_ticks = 1
-    c._growth_plateau_intrinsic = 0.01
     c._growth_dwell_ticks = 100
     cid = "c1"
     c.predictor[cid] = c._make_predictor_tissue()
@@ -271,3 +267,41 @@ def test_growth_backoff_on_net_collapse():
     c._brain_growth_step(cid)
     assert g.enabled is False              # backoff несмотря на Δloss (net guard)
     assert c._growth_reverted == 1
+
+
+def test_growth_relative_trigger_at_nonzero_floor():
+    """Суть относительного триггера (Фрай 08.06): intrinsic floor у embodied-
+    Адама НЕ ноль (~0.005-0.009). Абсолютный порог 1e-3 НЕ сработал бы; относит.
+    ловит стагнацию у СВОЕГО floor → propose рождается."""
+    c = LocalColonyCompute(device="cpu")
+    c._growth_plateau_ticks = 3
+    cid = "c1"
+    c.predictor[cid] = c._make_predictor_tissue()
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.loss_ema[cid] = 0.2
+    for v in (0.005, 0.006, 0.0055):       # дрейф у floor ~0.005 >> 1e-3
+        c.intrinsic_ema[cid] = v
+        c._brain_growth_step(cid)
+    assert cid in c._growth_state          # propose сработал у nonzero-floor
+    assert len(org.tissue_topology_genes) == 1
+
+
+def test_growth_spike_above_floor_resets():
+    """intrinsic поднялся значимо над трейлинг-floor = прогресс вернулся → сброс
+    стагнации (не плато). Drift-robust self-referencing."""
+    c = LocalColonyCompute(device="cpu")
+    c._growth_plateau_ticks = 5
+    cid = "c1"
+    c.predictor[cid] = c._make_predictor_tissue()
+    org = _fake_org_with_cerebellum()
+    c.organisms[cid] = org
+    c.loss_ema[cid] = 0.2
+    for _ in range(2):                      # у floor → стагнация копится
+        c.intrinsic_ema[cid] = 0.005
+        c._brain_growth_step(cid)
+    assert c._growth_stagnation_n[cid] == 2
+    c.intrinsic_ema[cid] = 0.05             # спайк прогресса >> floor → сброс
+    c._brain_growth_step(cid)
+    assert c._growth_stagnation_n[cid] == 0
+    assert cid not in c._growth_state

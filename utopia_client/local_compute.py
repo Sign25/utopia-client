@@ -360,9 +360,15 @@ class LocalColonyCompute:
         self._growth_tracker = None                   # client-local innovation tracker (lazy)
         self._growth_rng = random.Random(0)           # детерминируемый выбор src-роли
         self._growth_state: dict = {}                 # cid → {gene, loss_before, ticks, par_before, energy_before}
-        self._growth_plateau_n: dict = {}             # cid → счётчик плато intrinsic
-        self._growth_plateau_intrinsic: float = 1e-3  # порог «нет learning-progress»
-        self._growth_plateau_ticks: int = 55          # Fib — устойчивое плато до propose
+        # ОТНОСИТЕЛЬНЫЙ триггер (Фрай 08.06): embodied intrinsic floor не ноль и
+        # дрейфует (0.005-0.009) → абсолютный порог хрупок. Плато = intrinsic у
+        # СВОЕГО трейлинг-floor (min за окно) + стагнация N тиков (перестал падать).
+        # Self-referencing, drift-robust. Floor — референс, не абсолютный уровень.
+        self._growth_intr_hist: dict = {}             # cid → deque[float] intrinsic_ema (трейлинг-floor)
+        self._growth_stagnation_n: dict = {}          # cid → тиков «у floor» подряд
+        self._growth_intr_window: int = 233           # Fib — окно трейлинг-floor
+        self._growth_near_floor_margin: float = _PHI_CONST ** -3  # φ⁻³≈0.236 «у floor»
+        self._growth_plateau_ticks: int = 55          # Fib — стагнация у floor до propose
         self._growth_dwell_ticks: int = 89            # Fib — окно пере-сходимости predictor'а
         self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
         self._growth_kept: int = 0                    # принятых связей (метрика)
@@ -1248,7 +1254,8 @@ class LocalColonyCompute:
         self._cerebellum_out.pop(cid, None)
         self._cerebellum_hooked.discard(cid)
         self._growth_state.pop(cid, None)
-        self._growth_plateau_n.pop(cid, None)
+        self._growth_intr_hist.pop(cid, None)
+        self._growth_stagnation_n.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -5384,15 +5391,25 @@ class LocalColonyCompute:
             return  # нет cerebellum → расти некуда (драйвер не отзовётся)
         st = self._growth_state.get(cid)
         if st is None:
-            # idle: копим плато intrinsic (learning-progress иссяк → менять структуру)
-            intr = float(self.intrinsic_ema.get(cid, 1.0))
-            if intr < self._growth_plateau_intrinsic:
-                n = self._growth_plateau_n.get(cid, 0) + 1
-                self._growth_plateau_n[cid] = n
+            # idle: ОТНОСИТЕЛЬНОЕ плато — intrinsic_ema у своего трейлинг-floor
+            # (min за окно) N тиков подряд = learning-progress застрял (весами
+            # учиться нечему → менять структуру). intrinsic выше floor (прогресс
+            # вернулся) → сброс. Self-referencing, drift-robust (Фрай 08.06).
+            intr = float(self.intrinsic_ema.get(cid, 0.0))
+            hist = self._growth_intr_hist.get(cid)
+            if hist is None:
+                hist = deque(maxlen=self._growth_intr_window)
+                self._growth_intr_hist[cid] = hist
+            hist.append(intr)
+            floor = min(hist)
+            near_floor = intr <= floor * (1.0 + self._growth_near_floor_margin)
+            if near_floor:
+                n = self._growth_stagnation_n.get(cid, 0) + 1
+                self._growth_stagnation_n[cid] = n
                 if n >= self._growth_plateau_ticks:
                     self._propose_growth_edge(cid, org)
             else:
-                self._growth_plateau_n[cid] = 0
+                self._growth_stagnation_n[cid] = 0  # intrinsic поднялся над floor → прогресс
             return
         # dwell: ждём пере-сходимости predictor'а с новым входом (Фрай: достаточно,
         # чтобы не принять шум за сигнал).
@@ -5429,7 +5446,8 @@ class LocalColonyCompute:
                         "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
                         delta, signif, net_ok, self._growth_reverted)
         self._growth_state.pop(cid, None)
-        self._growth_plateau_n[cid] = 0
+        # После keep/backoff — заново копим стагнацию у floor до следующего propose.
+        self._growth_stagnation_n[cid] = 0
 
     def _propose_growth_edge(self, cid: str, org) -> bool:
         """Предложить ОДНУ связь {роль}→cerebellum (gene-формат + innovation
