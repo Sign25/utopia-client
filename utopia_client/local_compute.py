@@ -339,6 +339,34 @@ class LocalColonyCompute:
         self.reward_history: dict = {}       # cid → deque[float] maxlen=10
         # Метрики счётчиков (для diagnostics endpoint).
         self.predictor_steps: int = 0
+        # Вариант A (08.06.2026, Фрай/Хьюберт): рост мозга при жизни. Predictor —
+        # узел графа ЧЕРЕЗ cerebellum (бит 18, TISSUE_ROLES_ZODCHIY). forward-hook
+        # ловит выход cerebellum-ткани → он становится входом обученного
+        # predictor'а. Связи {ткань}→cerebellum двигают вход прогноза → Δloss_ema
+        # реагирует напрямую = драйвер для propose/keep петли роста. Только
+        # single-Adam; граф client-local, в P40 не уходит (Хьюберт verified).
+        # _predictor_from_cerebellum — kill-switch (False → predictor на raw obs).
+        self._predictor_from_cerebellum: bool = True
+        self._cerebellum_tid: dict = {}      # cid → tissue_id | None (cache)
+        self._cerebellum_out: dict = {}      # cid → torch.Tensor [1,64] выход/тик
+        self._cerebellum_hooked: set = set() # cid с зарегистрированным hook
+        # Шаг 2 — петля роста связей (08.06, Фрай go): propose→dwell→Δloss_ema→
+        # keep/backoff, ОДНА связь {роль}→cerebellum за раз. Триггер — плато
+        # intrinsic (мозгу нечему учиться весами → менять структуру). keep на
+        # ЗНАЧИМОМ сошедшемся Δloss_ema (Фрай: не любой Δ>0); backoff revert'ит
+        # ребро (enabled=False) + защищает net/§3. Gated OFF (ship dormant) —
+        # включить после live-проверки встраивания (cerebellum_out≠0, loss не взлетел).
+        self._growth_enabled: bool = False            # kill-switch
+        self._growth_tracker = None                   # client-local innovation tracker (lazy)
+        self._growth_rng = random.Random(0)           # детерминируемый выбор src-роли
+        self._growth_state: dict = {}                 # cid → {gene, loss_before, ticks, par_before, energy_before}
+        self._growth_plateau_n: dict = {}             # cid → счётчик плато intrinsic
+        self._growth_plateau_intrinsic: float = 1e-3  # порог «нет learning-progress»
+        self._growth_plateau_ticks: int = 55          # Fib — устойчивое плато до propose
+        self._growth_dwell_ticks: int = 89            # Fib — окно пере-сходимости predictor'а
+        self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
+        self._growth_kept: int = 0                    # принятых связей (метрика)
+        self._growth_reverted: int = 0                # откатов (метрика)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1216,6 +1244,11 @@ class LocalColonyCompute:
         self.hebbian.pop(cid, None)
         self.predictor.pop(cid, None)
         self.predictor_opt.pop(cid, None)
+        self._cerebellum_tid.pop(cid, None)
+        self._cerebellum_out.pop(cid, None)
+        self._cerebellum_hooked.discard(cid)
+        self._growth_state.pop(cid, None)
+        self._growth_plateau_n.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -2823,6 +2856,11 @@ class LocalColonyCompute:
                     pred_input = torch.from_numpy(obs68).to(
                         self.device).unsqueeze(0)
 
+                # Вариант A: hook на cerebellum (один раз/cid) — ДО forward,
+                # чтобы organism.forward (ниже) наполнил _cerebellum_out[cid].
+                if self._predictor_from_cerebellum and self._single_organism:
+                    self._ensure_cerebellum_hook(cid, organism)
+
                 heb = self.hebbian.get(cid)
                 if heb is not None:
                     try:
@@ -2836,11 +2874,31 @@ class LocalColonyCompute:
                 # org.forward доминирует vs (B) obs-градиент слаб.
                 _raw_dbg = logits[0, :N_ACTIONS].detach().clone()
 
+                # Вариант A: вход predictor'а = выход cerebellum (связи кормят
+                # прогноз). Берём ПОСЛЕ organism.forward (hook наполнил
+                # _cerebellum_out). Только при совпадении размерности с predictor
+                # (64) — иначе остаёмся на obs-пути (predictor-68 не трогаем).
+                # target остаётся obs_{t+1} → loss_ema/intrinsic сопоставимы.
+                if (self._predictor_from_cerebellum and self._single_organism
+                        and _pred is not None):
+                    _cer = self._cerebellum_out.get(cid)
+                    if _cer is not None and int(getattr(
+                            _pred, "data_dim", _SELF_OBS_OFFSET)) == int(_cer.shape[-1]):
+                        pred_input = _cer
+
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
                 # в r_imm_total как baseline-сигнал.
                 intrinsic_now = self._predictor_train_step(
                     cid, obs_tensor, pred_input)
+
+                # Шаг 2 — петля роста связей (propose→dwell→Δloss_ema→keep/backoff).
+                # После train-step (loss_ema свежий). Gated: только single-Adam + флаг.
+                if self._growth_enabled and self._single_organism:
+                    try:
+                        self._brain_growth_step(cid)
+                    except Exception as e:
+                        logger.warning("brain-growth step %s: %s", cid, e)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -5260,6 +5318,177 @@ class LocalColonyCompute:
                     self.basic_tissue_sfnn_steps.get(role, 0) + 1)
             except Exception as e:
                 logger.debug("basic_sfnn_update %s/%s: %s", role, cid, e)
+
+    def _cerebellum_tissue_id(self, cid: str, org) -> "str | None":
+        """tissue_id ткани role=='cerebellum' (cache per cid). Вариант A:
+        cerebellum — каноничный in-graph узел (бит 18), через который связи
+        кормят прогноз. None если ткани нет → predictor остаётся на raw obs."""
+        if cid in self._cerebellum_tid:
+            return self._cerebellum_tid[cid]
+        tid = None
+        try:
+            for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
+                role = getattr(tissue, "role", None)
+                if role is None:
+                    spec = getattr(tissue, "spec", None)
+                    role = getattr(spec, "role", None) if spec is not None else None
+                if role == "cerebellum":
+                    tid = _tid
+                    break
+        except Exception as e:
+            logger.debug("cerebellum resolve %s: %s", cid, e)
+        self._cerebellum_tid[cid] = tid
+        return tid
+
+    def _ensure_cerebellum_hook(self, cid: str, org) -> None:
+        """Регистрирует forward-hook на cerebellum-ткани (один раз/cid): ловит
+        её выход в self._cerebellum_out[cid] (detach). Tissue — nn.Module,
+        forward → {port: tensor}. No-op (но помечает cid), если ткани нет."""
+        if cid in self._cerebellum_hooked:
+            return
+        tid = self._cerebellum_tissue_id(cid, org)
+        tissues = getattr(org, "tissues", {}) or {}
+        tissue = tissues.get(tid) if tid is not None else None
+        if tissue is None or not hasattr(tissue, "register_forward_hook"):
+            self._cerebellum_hooked.add(cid)  # нет ткани — больше не пытаемся
+            return
+
+        def _hook(_module, _inp, output, _cid=cid):
+            try:
+                if isinstance(output, dict) and output:
+                    t = next(iter(output.values()))
+                    self._cerebellum_out[_cid] = t.detach()
+            except Exception:
+                pass
+
+        try:
+            tissue.register_forward_hook(_hook)
+            logger.info("cerebellum hook cid=%s tid=%s (variant A: predictor "
+                        "input ← cerebellum)", cid, tid)
+        except Exception as e:
+            logger.warning("cerebellum hook %s: %s", cid, e)
+        self._cerebellum_hooked.add(cid)
+
+    # ── Шаг 2 — петля роста связей (in-life topology growth) ──────────────
+
+    def _brain_growth_step(self, cid: str) -> None:
+        """Один тик петли роста. idle→(плато intrinsic)→propose+dwell→измерить
+        Δloss_ema→keep/backoff. keep на ЗНАЧИМОМ сошедшемся улучшении; backoff
+        revert'ит ребро и защищает net/§3. Одна связь в полёте. Gated снаружи
+        (_growth_enabled + single_organism)."""
+        org = self.organisms.get(cid)
+        pred = self.predictor.get(cid)
+        if org is None or pred is None:
+            return
+        if self._cerebellum_tissue_id(cid, org) is None:
+            return  # нет cerebellum → расти некуда (драйвер не отзовётся)
+        st = self._growth_state.get(cid)
+        if st is None:
+            # idle: копим плато intrinsic (learning-progress иссяк → менять структуру)
+            intr = float(self.intrinsic_ema.get(cid, 1.0))
+            if intr < self._growth_plateau_intrinsic:
+                n = self._growth_plateau_n.get(cid, 0) + 1
+                self._growth_plateau_n[cid] = n
+                if n >= self._growth_plateau_ticks:
+                    self._propose_growth_edge(cid, org)
+            else:
+                self._growth_plateau_n[cid] = 0
+            return
+        # dwell: ждём пере-сходимости predictor'а с новым входом (Фрай: достаточно,
+        # чтобы не принять шум за сигнал).
+        st["ticks"] += 1
+        if st["ticks"] < self._growth_dwell_ticks:
+            return
+        # measure + keep/backoff
+        loss_before = float(st["loss_before"])
+        loss_after = float(self.loss_ema.get(cid, loss_before))
+        delta = loss_before - loss_after  # >0 = прогноз улучшился
+        signif = delta >= loss_before * self._growth_min_delta_frac
+        # net/§3-защита: §3 не ухудшился (par не вырос) И энергия не обвалилась.
+        net_ok = int(self._paralysis_window_n) <= int(st["par_before"])
+        bc = self.biochem.get(cid)
+        if bc is not None and st.get("energy_before") is not None:
+            net_ok = net_ok and (float(getattr(bc, "energy", 0.0))
+                                 >= float(st["energy_before"]) * 0.618)
+        keep = bool(signif and net_ok)
+        gene = st["gene"]
+        if keep:
+            self._growth_kept += 1
+            logger.info("brain-growth KEEP cid=%s edge=%s→cerebellum Δloss=%.5f "
+                        "(%.1f%%) kept=%d", cid, gene.source_role, delta,
+                        100.0 * delta / max(1e-9, loss_before), self._growth_kept)
+        else:
+            try:
+                gene.enabled = False
+                from core.tissue_topology import apply_topology_overlay_to_org
+                apply_topology_overlay_to_org(org)
+            except Exception as e:
+                logger.warning("brain-growth backoff %s: %s", cid, e)
+            self._growth_reverted += 1
+            logger.info("brain-growth BACKOFF cid=%s edge=%s→cerebellum Δloss=%.5f "
+                        "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
+                        delta, signif, net_ok, self._growth_reverted)
+        self._growth_state.pop(cid, None)
+        self._growth_plateau_n[cid] = 0
+
+    def _propose_growth_edge(self, cid: str, org) -> bool:
+        """Предложить ОДНУ связь {роль}→cerebellum (gene-формат + innovation
+        tracker как у Хьюберта, target=cerebellum чтобы двигать вход прогноза).
+        Записывает state для dwell. True если ребро добавлено."""
+        try:
+            from core.tissue_topology import (
+                TissueConnectionGene, apply_topology_overlay_to_org,
+                TissueInnovationTracker)
+            from core.connection import ConnectionType
+        except Exception as e:
+            logger.warning("brain-growth import %s: %s", cid, e)
+            return False
+        if self._growth_tracker is None:
+            self._growth_tracker = TissueInnovationTracker()
+        role_to_id: dict = {}
+        for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
+            role = getattr(tissue, "role", None)
+            if role is None:
+                spec = getattr(tissue, "spec", None)
+                role = getattr(spec, "role", None) if spec is not None else None
+            if role:
+                role_to_id[role] = _tid
+        if "cerebellum" not in role_to_id:
+            return False
+        genes = getattr(org, "tissue_topology_genes", None)
+        if genes is None:
+            genes = []
+            org.tissue_topology_genes = genes
+        taken = {g.source_role for g in genes
+                 if g.enabled and g.target_role == "cerebellum"}
+        candidates = sorted(r for r in role_to_id
+                            if r != "cerebellum" and r not in taken)
+        if not candidates:
+            return False
+        src = self._growth_rng.choice(candidates)
+        gene = TissueConnectionGene(
+            innovation=self._growth_tracker.reserve(src, "cerebellum"),
+            source_role=src, target_role="cerebellum",
+            conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
+        genes.append(gene)
+        try:
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            logger.warning("brain-growth apply %s: %s", cid, e)
+            genes.remove(gene)
+            return False
+        bc = self.biochem.get(cid)
+        self._growth_state[cid] = {
+            "gene": gene,
+            "loss_before": float(self.loss_ema.get(cid, 0.0)),
+            "ticks": 0,
+            "par_before": int(self._paralysis_window_n),
+            "energy_before": (float(getattr(bc, "energy", 0.0))
+                              if bc is not None else None),
+        }
+        logger.info("brain-growth PROPOSE cid=%s edge=%s→cerebellum loss_before=%.5f",
+                    cid, src, self._growth_state[cid]["loss_before"])
+        return True
 
     def _predictor_train_step(self, cid: str, obs_tensor,
                               input_tensor=None) -> float:
@@ -7925,6 +8154,11 @@ class LocalColonyCompute:
             "n_alive": n,
             "n_predictors": len(self.predictor),
             "n_prev_obs": len(self.prev_obs),
+            # Рост мозга при жизни (§6): принятых/откатанных связей + в полёте.
+            "tissue_topology_mutations_total": int(self._growth_kept),
+            "growth_kept": int(self._growth_kept),
+            "growth_reverted": int(self._growth_reverted),
+            "growth_in_flight": len(self._growth_state),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
             "intrinsic_reward_avg": (
@@ -8061,6 +8295,13 @@ class LocalColonyCompute:
                 "species_id": self.species_id.get(cid),
                 "gen": int(getattr(org, "generation", 0) or 0),
                 "topo": len(getattr(org, "tissue_topology_genes", []) or []),
+                # Рост мозга при жизни (§6 замер): topo_active = живые связи
+                # (enabled), tissue_topology_mutations_total = принятых ростом
+                # (kept). На флипе _growth_enabled это растёт с 0 — мозг меняется.
+                "topo_active": sum(
+                    1 for g in (getattr(org, "tissue_topology_genes", []) or [])
+                    if getattr(g, "enabled", False)),
+                "tissue_topology_mutations_total": int(self._growth_kept),
                 "age": _age,
                 "inst": _inst,
                 "food": _food,
