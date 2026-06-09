@@ -398,6 +398,24 @@ class LocalColonyCompute:
         self._growth_fallback_streak: int = 0         # подряд fallback-backoff'ов
         self._growth_saturated: bool = False          # пауза петли связей
         self._growth_saturation_threshold: int = 5    # fallback-backoff'ов до насыщения
+        # §10.8 РОСТ ТКАНЕЙ (Фрай 09.06): рост УЗЛАМИ (не рёбрами). После
+        # насыщения связей (19/19→cerebellum) петля растит НОВУЮ ТКАНЬ кандидатом:
+        # минт (_make_higher_tissue) + вставка в org.tissues + проводка {роль}→
+        # cerebellum → dwell → Δloss_ema → keep/backoff (как рёбра). Узел без
+        # входящего ребра = СЕНСОР (читает obs напрямую, workbench.forward:97-126).
+        # Драйвер prediction: keep-путь СПИТ, пока мир (погода/аффордансы Хьюберта,
+        # §10.9) не вернёт prediction-давление (loss 0.046 = пол на статичном мире).
+        # Дисциплина та же: одна за раз, dwell, keep/backoff, durable-персист,
+        # kill-switch. Client-local. Спек гибкий (читает obs, расширяемо под новый
+        # obs-канал погоды — координация с Хьюбертом).
+        self._tissue_growth_enabled: bool = False     # kill-switch (дефолт OFF, dormant)
+        self._tissue_growth_state: dict = {}          # cid → in-flight {role,tid,loss_before,ticks,...}
+        self._tissue_kept: int = 0                    # принятых тканей (метрика)
+        self._tissue_reverted: int = 0                # откатанных тканей
+        self._tissue_propose_count: int = 0           # монотонный счётчик (имена ролей grownN)
+        self._tissue_grown_specs: dict = {}           # cid → [{role,data_dim,n_embd}] KEEP'нутых (персист+recreate)
+        self._TISSUE_GROWTH_DATA_DIM: int = 64        # читает obs64 (сенсор); под погоду расширяемо
+        self._TISSUE_GROWTH_N_EMBD: int = 21          # sidecar 21/3/1 (как высшие)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1293,6 +1311,8 @@ class LocalColonyCompute:
         self._growth_intr_hist.pop(cid, None)
         self._growth_stagnation_n.pop(cid, None)
         self._growth_rejected.pop(cid, None)
+        self._tissue_growth_state.pop(cid, None)   # §10.8 рост тканей cleanup
+        self._tissue_grown_specs.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1671,6 +1691,34 @@ class LocalColonyCompute:
             logger.warning("restore_persisted_state: cid=%s unknown (skip)", cid)
             return
         org = self.organisms[cid]
+        # §10.8 рост тканей: ПЕРЕСОЗДАТЬ выросшие узлы ДО загрузки tissues_by_role
+        # (скелет фикс → роли grownN в нём нет → без recreate restore пропустит их
+        # веса). Создаём ткань из спека → tissues_by_role накатит веса (по роли) →
+        # overlay (ниже) проведёт {роль}→cerebellum (ген уже в topology_genes).
+        # Durable-инвариант: рост узлов переживает рестарт/сбой питания.
+        _gl0 = payload.get("growth_loop")
+        if isinstance(_gl0, dict) and (_gl0.get("grown_tissues") and hasattr(org, "tissues")):
+            _specs_ok = []
+            for _sp in (_gl0.get("grown_tissues") or []):
+                try:
+                    _role = str(_sp.get("role"))
+                    _dd = int(_sp.get("data_dim", 64))
+                    _ne = int(_sp.get("n_embd", 21))
+                    _t = self._make_higher_tissue(_role, data_dim=_dd, n_embd=_ne)
+                    if _t is not None:
+                        org.tissues[f"gt_{_role}"] = _t
+                        _specs_ok.append({"role": _role, "data_dim": _dd, "n_embd": _ne})
+                except Exception as e:
+                    logger.debug("restore grown tissue %s: %s", cid, e)
+            if _specs_ok:
+                self._tissue_grown_specs[cid] = _specs_ok
+                _maxn = self._tissue_propose_count
+                for _s in _specs_ok:
+                    try:
+                        _maxn = max(_maxn, int(str(_s["role"]).replace("grown", "")))
+                    except Exception:
+                        pass
+                self._tissue_propose_count = _maxn
         # tissues_by_role — bit-exact (no Y50)
         tbr = payload.get("tissues_by_role")
         if isinstance(tbr, dict) and tbr:
@@ -1746,6 +1794,9 @@ class LocalColonyCompute:
             try:
                 self._growth_kept = int(_gl.get("kept", self._growth_kept))
                 self._growth_reverted = int(_gl.get("reverted", self._growth_reverted))
+                self._tissue_kept = int(_gl.get("tissue_kept", self._tissue_kept))
+                self._tissue_reverted = int(
+                    _gl.get("tissue_reverted", self._tissue_reverted))
                 _hist = _gl.get("intr_hist") or []
                 if _hist:
                     self._growth_intr_hist[cid] = deque(
@@ -2973,6 +3024,13 @@ class LocalColonyCompute:
                         self._brain_growth_step(cid)
                     except Exception as e:
                         logger.warning("brain-growth step %s: %s", cid, e)
+                # §10.8 — петля роста ТКАНЕЙ (узлами). Gated отдельным флагом;
+                # растит узел ТОЛЬКО когда связи насыщены (узлы после рёбер).
+                if self._tissue_growth_enabled and self._single_organism:
+                    try:
+                        self._tissue_growth_step(cid)
+                    except Exception as e:
+                        logger.warning("tissue-growth step %s: %s", cid, e)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -3648,6 +3706,12 @@ class LocalColonyCompute:
                 "reverted": int(self._growth_reverted),
                 "intr_hist": list(_gi_hist) if _gi_hist is not None else [],
                 "stagnation_n": int(self._growth_stagnation_n.get(cid, 0)),
+                # §10.8 рост тканей: счётчики + СПЕКИ выросших узлов для recreate-
+                # on-restore (скелет фикс → новую роль restore не создаст без спека).
+                # Веса узлов едут в tissues_by_role (org.tissues их уже включает).
+                "tissue_kept": int(self._tissue_kept),
+                "tissue_reverted": int(self._tissue_reverted),
+                "grown_tissues": list(self._tissue_grown_specs.get(cid, [])),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -5648,6 +5712,165 @@ class LocalColonyCompute:
                         "петля связей возобновлена)")
         self._growth_saturated = False
         self._growth_fallback_streak = 0
+
+    def set_tissue_growth(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл §10.8 рост ТКАНЕЙ (узлами) МГНОВЕННО.
+        on=False (дефолт, kill-switch): петля тканей no-op (узлы не растут).
+        on=True: после насыщения связей петля растит ткань-кандидата. Растущие
+        ткани уже KEEP'нутые НЕ удаляются при off (живут; off лишь стопит новые
+        propose). Реверс мгновенный."""
+        self._tissue_growth_enabled = bool(on)
+        logger.info("set_tissue_growth: %s", on)
+        return self._tissue_growth_enabled
+
+    def _propose_growth_tissue(self, cid: str, org) -> bool:
+        """§10.8: предложить ОДНУ новую ТКАНЬ-кандидата (узел). Минт sidecar
+        21/3/1 (читает obs как сенсор — без входящего ребра) + вставка в
+        org.tissues + проводка {роль}→cerebellum (двигает вход прогноза) +
+        re-apply overlay. Записывает state для dwell. True если ткань добавлена."""
+        try:
+            from core.tissue_topology import (
+                TissueConnectionGene, apply_topology_overlay_to_org)
+            from core.connection import ConnectionType
+        except Exception as e:
+            logger.warning("tissue-growth import %s: %s", cid, e)
+            return False
+        tissues = getattr(org, "tissues", None)
+        if tissues is None:
+            return False
+        # cerebellum должен существовать (цель проводки)
+        if self._cerebellum_tissue_id(cid, org) is None:
+            return False
+        self._tissue_propose_count += 1
+        n = self._tissue_propose_count
+        role = f"grown{n}"
+        tid = f"gt{n}"
+        data_dim = int(self._TISSUE_GROWTH_DATA_DIM)
+        n_embd = int(self._TISSUE_GROWTH_N_EMBD)
+        tissue = self._make_higher_tissue(role, data_dim=data_dim, n_embd=n_embd)
+        if tissue is None:
+            return False
+        # Вставка узла в живой граф. Нет входящего ребра → forward трактует как
+        # сенсор → ткань читает obs (workbench.forward). Выход → cerebellum.
+        tissues[tid] = tissue
+        genes = getattr(org, "tissue_topology_genes", None)
+        if genes is None:
+            genes = []
+            org.tissue_topology_genes = genes
+        if self._growth_tracker is None:
+            try:
+                from core.tissue_topology import TissueInnovationTracker
+                self._growth_tracker = TissueInnovationTracker()
+            except Exception:
+                pass
+        innov = (self._growth_tracker.reserve(role, "cerebellum")
+                 if self._growth_tracker is not None else n)
+        gene = TissueConnectionGene(
+            innovation=innov, source_role=role, target_role="cerebellum",
+            conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
+        genes.append(gene)
+        try:
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            logger.warning("tissue-growth apply %s: %s", cid, e)
+            tissues.pop(tid, None)
+            genes.remove(gene)
+            return False
+        bc = self.biochem.get(cid)
+        self._tissue_growth_state[cid] = {
+            "role": role, "tid": tid, "gene": gene,
+            "spec": {"role": role, "data_dim": data_dim, "n_embd": n_embd},
+            "loss_before": float(self.loss_ema.get(cid, 0.0)),
+            "ticks": 0,
+            "par_before": int(self._paralysis_window_n),
+            "energy_before": (float(getattr(bc, "energy", 0.0))
+                              if bc is not None else None),
+        }
+        logger.info("brain-growth TISSUE-PROPOSE cid=%s role=%s loss_before=%.5f",
+                    cid, role, self._tissue_growth_state[cid]["loss_before"])
+        return True
+
+    def _remove_grown_tissue(self, cid: str, org, tid: str, role: str,
+                              gene=None) -> None:
+        """§10.8 backoff: убрать выросшую ткань-узел + её ребро из живого графа
+        (отключаем ген, удаляем ткань из org.tissues, re-apply overlay → forward
+        её больше не выполняет)."""
+        try:
+            genes = getattr(org, "tissue_topology_genes", None) or []
+            for g in list(genes):
+                if (getattr(g, "source_role", None) == role
+                        and getattr(g, "target_role", None) == "cerebellum"):
+                    try:
+                        genes.remove(g)
+                    except ValueError:
+                        pass
+            tissues = getattr(org, "tissues", None)
+            if tissues is not None:
+                tissues.pop(tid, None)
+            from core.tissue_topology import apply_topology_overlay_to_org
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            logger.warning("tissue-growth remove %s role=%s: %s", cid, role, e)
+
+    def _tissue_growth_step(self, cid: str) -> None:
+        """§10.8: propose→dwell→Δloss_ema→keep/backoff для ТКАНЕЙ-узлов. Растит
+        узел ТОЛЬКО когда связи насыщены (19/19) И intrinsic у floor (тот же
+        плато-критерий). keep на ЗНАЧИМОМ Δloss И net/§3 ok; иначе backoff (узел
+        удаляется). Драйвер prediction спит, пока мир не вернёт давление — тогда
+        keep оживёт; механизм/персист готовы заранее."""
+        org = self.organisms.get(cid)
+        pred = self.predictor.get(cid)
+        if org is None or pred is None:
+            return
+        if self._cerebellum_tissue_id(cid, org) is None:
+            return
+        st = self._tissue_growth_state.get(cid)
+        if st is None:
+            # Узлы — ПОСЛЕ рёбер: пока связь-петля не насытилась, ткани ждут.
+            if not self._growth_saturated:
+                return
+            # Плато intrinsic у трейлинг-floor (тот же критерий, что у рёбер).
+            intr = float(self.intrinsic_ema.get(cid, 0.0))
+            hist = self._growth_intr_hist.get(cid)
+            if not hist:
+                return
+            floor = min(hist)
+            if intr <= floor * (1.0 + self._growth_near_floor_margin):
+                self._propose_growth_tissue(cid, org)
+            return
+        # dwell — ждём пере-сходимости predictor'а с новым узлом.
+        st["ticks"] += 1
+        if st["ticks"] < self._growth_dwell_ticks:
+            return
+        loss_before = float(st["loss_before"])
+        loss_after = float(self.loss_ema.get(cid, loss_before))
+        delta = loss_before - loss_after
+        signif = delta >= loss_before * self._growth_min_delta_frac
+        net_ok = int(self._paralysis_window_n) <= int(st["par_before"])
+        bc = self.biochem.get(cid)
+        if bc is not None and st.get("energy_before") is not None:
+            net_ok = net_ok and (float(getattr(bc, "energy", 0.0))
+                                 >= float(st["energy_before"]) * 0.618)
+        keep = bool(signif and net_ok)
+        role = st["role"]
+        tid = st["tid"]
+        if keep:
+            self._tissue_kept += 1
+            # персист спек узла для recreate-on-restore (durable-инвариант).
+            self._tissue_grown_specs.setdefault(cid, []).append(st["spec"])
+            logger.info("brain-growth TISSUE-KEEP cid=%s role=%s Δloss=%.5f "
+                        "(%.1f%%) kept=%d", cid, role, delta,
+                        100.0 * delta / max(1e-9, loss_before), self._tissue_kept)
+            # новая ткань = новая роль → связь-петле снова есть {роль}→cerebellum.
+            self.reset_growth_saturation()
+        else:
+            self._remove_grown_tissue(cid, org, tid, role, st.get("gene"))
+            self._tissue_reverted += 1
+            logger.info("brain-growth TISSUE-BACKOFF cid=%s role=%s Δloss=%.5f "
+                        "signif=%s net_ok=%s reverted=%d", cid, role, delta,
+                        signif, net_ok, self._tissue_reverted)
+        self._tissue_growth_state.pop(cid, None)
+        self._growth_stagnation_n[cid] = 0  # заново копим стагнацию до след. propose
 
     def _predictor_train_step(self, cid: str, obs_tensor,
                               input_tensor=None) -> float:

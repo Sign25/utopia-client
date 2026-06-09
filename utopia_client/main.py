@@ -524,6 +524,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     # мгновенный on/off без рестарта; false = kill-switch (откат к бинарному
     # 30% water-seek), backoff если выживание падает.
     applied_felt_thirst_drive: bool | None = None
+    # §10.8 (Фрай 09.06.2026): рост ТКАНЕЙ (узлами). client_flags → мгновенный
+    # on/off; дефолт OFF (dormant). Растит узел после насыщения связей.
+    applied_tissue_growth: bool | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -779,6 +782,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("felt_thirst_drive → %s", target_felt_thirst)
                         except Exception as e:
                             logger.warning("set_felt_thirst_drive failed: %s", e)
+
+                    # §10.8: рост ТКАНЕЙ (узлами). Мгновенный on/off; дефолт OFF
+                    # (dormant). Растит узел после насыщения связей. edge-detect.
+                    target_tissue_growth = bool(flags.get("tissue_growth", False))
+                    if target_tissue_growth != applied_tissue_growth \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_tissue_growth(target_tissue_growth)
+                            applied_tissue_growth = target_tissue_growth
+                            logger.info("tissue_growth → %s", target_tissue_growth)
+                        except Exception as e:
+                            logger.warning("set_tissue_growth failed: %s", e)
 
                     # Ступень 2 (full-world): motor renorm growth-cap (числовой
                     # флаг). Мгновенная рекалибровка renorm-супрессора без рестарта.
