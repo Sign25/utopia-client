@@ -378,7 +378,13 @@ class LocalColonyCompute:
         self._growth_stagnation_n: dict = {}          # cid → тиков «у floor» подряд
         self._growth_intr_window: int = 233           # Fib — окно трейлинг-floor
         self._growth_near_floor_margin: float = _PHI_CONST ** -3  # φ⁻³≈0.236 «у floor»
-        self._growth_plateau_ticks: int = 55          # Fib — стагнация у floor до propose
+        self._growth_plateau_ticks: int = 55          # Fib — мин. окно истории до оценки плато
+        # §10.8 (Фрай 09.06): noise-robust плато — ДОЛЯ near-floor сэмплов ≥ порога
+        # ВМЕСТО 55-подряд (хрупкого к всплескам intrinsic от погодной осцилляции:
+        # 75.5% near-floor, но 25% всплесков сбивали consecutive-счётчик → плато не
+        # объявлялось). φ⁻¹≈0.618: срабатывает при СХОДИМОСТИ (~75% near-floor), НЕ
+        # при активном обучении (низкая доля). Калибр: ниже converged-rate 0.755.
+        self._growth_plateau_frac: float = _PHI_CONST ** -1  # φ⁻¹≈0.618
         self._growth_dwell_ticks: int = 89            # Fib — окно пере-сходимости predictor'а
         self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
         self._growth_kept: int = 0                    # принятых связей (метрика)
@@ -5539,6 +5545,42 @@ class LocalColonyCompute:
 
     # ── Шаг 2 — петля роста связей (in-life topology growth) ──────────────
 
+    def _intrinsic_plateaued(self, cid: str) -> bool:
+        """§10.8 (Фрай 09.06): noise-robust ОТНОСИТЕЛЬНОЕ плато. intrinsic СОШЁЛСЯ
+        (флуктуирует у трейлинг-floor) ⇔ доля near-floor сэмплов в окне ≥ φ⁻¹.
+        Устойчиво к всплескам (погода): 75.5% near-floor при сходимости проходит
+        порог 61.8%, а активное обучение (низкая доля near-floor) — нет. Заменяет
+        55-подряд (всплески сбивали consecutive). Нужна полная история (≥55)."""
+        hist = self._growth_intr_hist.get(cid)
+        if not hist or len(hist) < self._growth_plateau_ticks:
+            return False
+        floor = min(hist)
+        thr = floor * (1.0 + self._growth_near_floor_margin)
+        near = sum(1 for x in hist if x <= thr)
+        return (near / len(hist)) >= self._growth_plateau_frac
+
+    def _connections_saturated(self, org) -> bool:
+        """§10.8 (Фрай 09.06): ВСЕ не-cerebellum роли подключены к cerebellum
+        (enabled) = жёсткое насыщение связей (рёбра исчерпаны → расти узлами).
+        ГРАФ-derived (restart-robust, не stale-флаг _growth_saturated, который
+        сбрасывается на рестарте). Самокорректируется."""
+        tissues = getattr(org, "tissues", None) or {}
+        roles = set()
+        has_cer = False
+        for t in tissues.values():
+            r = getattr(t, "role", None)
+            if r == "cerebellum":
+                has_cer = True
+            elif r:
+                roles.add(r)
+        if not roles or not has_cer:
+            return False
+        genes = getattr(org, "tissue_topology_genes", None) or []
+        connected = {getattr(g, "source_role", None) for g in genes
+                     if getattr(g, "enabled", False)
+                     and getattr(g, "target_role", None) == "cerebellum"}
+        return roles.issubset(connected)
+
     def _brain_growth_step(self, cid: str) -> None:
         """Один тик петли роста. idle→(плато intrinsic)→propose+dwell→измерить
         Δloss_ema→keep/backoff. keep на ЗНАЧИМОМ сошедшемся улучшении; backoff
@@ -5552,27 +5594,22 @@ class LocalColonyCompute:
             return  # нет cerebellum → расти некуда (драйвер не отзовётся)
         st = self._growth_state.get(cid)
         if st is None:
-            if self._growth_saturated:
-                return  # связи насыщены — петля на паузе (до фазы тканей §3.2)
-            # idle: ОТНОСИТЕЛЬНОЕ плато — intrinsic_ema у своего трейлинг-floor
-            # (min за окно) N тиков подряд = learning-progress застрял (весами
-            # учиться нечему → менять структуру). intrinsic выше floor (прогресс
-            # вернулся) → сброс. Self-referencing, drift-robust (Фрай 08.06).
+            # Трейлинг-floor историю поддерживаем КАЖДЫЙ тик — она нужна и tissue-
+            # петле (даже когда связи насыщены и эта петля на паузе). Поэтому append
+            # ДО saturated-gate (иначе hist застывал бы → плато на стале-данных).
             intr = float(self.intrinsic_ema.get(cid, 0.0))
             hist = self._growth_intr_hist.get(cid)
             if hist is None:
                 hist = deque(maxlen=self._growth_intr_window)
                 self._growth_intr_hist[cid] = hist
             hist.append(intr)
-            floor = min(hist)
-            near_floor = intr <= floor * (1.0 + self._growth_near_floor_margin)
-            if near_floor:
-                n = self._growth_stagnation_n.get(cid, 0) + 1
-                self._growth_stagnation_n[cid] = n
-                if n >= self._growth_plateau_ticks:
-                    self._propose_growth_edge(cid, org)
-            else:
-                self._growth_stagnation_n[cid] = 0  # intrinsic поднялся над floor → прогресс
+            if self._growth_saturated:
+                return  # связи насыщены — петля РЁБЕР на паузе (рост узлами, §10.8)
+            # Noise-robust ОТНОСИТЕЛЬНОЕ плато (доля near-floor ≥ φ⁻¹): intrinsic
+            # СОШЁЛСЯ → весами учиться нечему → propose-EDGE. Устойчиво к всплескам
+            # погоды (см. _intrinsic_plateaued). Заменяет 55-подряд (Фрай 09.06).
+            if self._intrinsic_plateaued(cid):
+                self._propose_growth_edge(cid, org)
             return
         # dwell: ждём пере-сходимости predictor'а с новым входом (Фрай: достаточно,
         # чтобы не принять шум за сигнал).
@@ -5666,6 +5703,11 @@ class LocalColonyCompute:
         all_cand = sorted(r for r in role_to_id
                           if r != "cerebellum" and r not in taken)
         if not all_cand:
+            # ВСЕ роли→cerebellum уже есть = ЖЁСТКОЕ насыщение связей → ставим флаг
+            # (ROOT 2, Фрай 09.06): иначе после рестарта _growth_saturated=False, а
+            # ре-насыщение через fallback-backoff недостижимо (propose сразу выходит
+            # тут) → tissue-петля гатнута навечно. Теперь насыщение само ставится.
+            self._growth_saturated = True
             return False
         # COOLDOWN: предпочитаем рёбра, не отвергнутые за последние
         # _growth_retry_cooldown проб. Если свежих нет (всё в cooldown) —
@@ -5826,16 +5868,14 @@ class LocalColonyCompute:
             return
         st = self._tissue_growth_state.get(cid)
         if st is None:
-            # Узлы — ПОСЛЕ рёбер: пока связь-петля не насытилась, ткани ждут.
-            if not self._growth_saturated:
+            # Узлы — ПОСЛЕ рёбер: пока ВСЕ роли→cerebellum не подключены, ткани ждут.
+            # Граф-derived (ROOT 2, Фрай 09.06) — restart-robust, не stale-флаг
+            # _growth_saturated (он сбрасывается рестартом → дедлок).
+            if not self._connections_saturated(org):
                 return
-            # Плато intrinsic у трейлинг-floor (тот же критерий, что у рёбер).
-            intr = float(self.intrinsic_ema.get(cid, 0.0))
-            hist = self._growth_intr_hist.get(cid)
-            if not hist:
-                return
-            floor = min(hist)
-            if intr <= floor * (1.0 + self._growth_near_floor_margin):
+            # Тот же noise-robust плато-критерий (доля near-floor ≥ φ⁻¹), что у рёбер
+            # — устойчив к всплескам погоды. Заменяет мгновенный near-floor.
+            if self._intrinsic_plateaued(cid):
                 self._propose_growth_tissue(cid, org)
             return
         # dwell — ждём пере-сходимости predictor'а с новым узлом.
