@@ -7901,6 +7901,23 @@ class LocalColonyCompute:
             "sample": sample,
         }
 
+    def _growth_graph_counts(self, org=None) -> tuple:
+        """§6 рост (09.06): (закреплено, отвергнуто) ИЗ ГРАФА — durable, не из
+        волатильного счётчика _growth_kept (тот обнуляется на рестарте → врал «0»
+        в /stats, хотя связи живы). Адам стартует topo=0 → ВСЕ topology_genes
+        выращены петлёй: enabled = закреплённые связи, disabled = откатанные.
+        Граф персистит в .pt → всегда отражает реальность, переживает сбои питания.
+        org=None → сумма по всем организмам (агрегат); иначе по одному."""
+        orgs = [org] if org is not None else list(self.organisms.values())
+        kept = reverted = 0
+        for o in orgs:
+            for g in (getattr(o, "tissue_topology_genes", []) or []):
+                if getattr(g, "enabled", False):
+                    kept += 1
+                else:
+                    reverted += 1
+        return kept, reverted
+
     def diagnostics(self) -> dict:  # noqa: C901
         """Снимок метрик обучения для /api/diagnostics/training.
 
@@ -8354,14 +8371,19 @@ class LocalColonyCompute:
                 if epi_norms else 0.0),
         }
 
+        # §6 рост (09.06): «закреплено»/«отвергнуто» из ГРАФА (durable), НЕ из
+        # волатильного счётчика (тот обнулялся на рестарте → врал «0»). См.
+        # _growth_graph_counts.
+        _gk, _gr = self._growth_graph_counts()
+
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
             "n_prev_obs": len(self.prev_obs),
-            # Рост мозга при жизни (§6): принятых/откатанных связей + в полёте.
-            "tissue_topology_mutations_total": int(self._growth_kept),
-            "growth_kept": int(self._growth_kept),
-            "growth_reverted": int(self._growth_reverted),
+            # Рост мозга при жизни (§6): закреплённых/откатанных связей + в полёте.
+            "tissue_topology_mutations_total": _gk + _gr,
+            "growth_kept": _gk,
+            "growth_reverted": _gr,
             "growth_in_flight": len(self._growth_state),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
@@ -8494,18 +8516,22 @@ class LocalColonyCompute:
                      if _age is not None else None)
             _food = (int(self._carried_food.get(cid, 0))
                      if _bt is not None else None)
+            # §6 рост (09.06): «закреплено»/«отвергнуто» из ГРАФА (durable, не
+            # волатильный счётчик — тот обнулялся на рестарте, врал «0»). См.
+            # _growth_graph_counts.
+            _topo_enabled, _topo_reverted = self._growth_graph_counts(org)
+            _topo_total = _topo_enabled + _topo_reverted
             out.append({
                 "cid": str(cid),
                 "species_id": self.species_id.get(cid),
                 "gen": int(getattr(org, "generation", 0) or 0),
-                "topo": len(getattr(org, "tissue_topology_genes", []) or []),
-                # Рост мозга при жизни (§6 замер): topo_active = живые связи
-                # (enabled), tissue_topology_mutations_total = принятых ростом
-                # (kept). На флипе _growth_enabled это растёт с 0 — мозг меняется.
-                "topo_active": sum(
-                    1 for g in (getattr(org, "tissue_topology_genes", []) or [])
-                    if getattr(g, "enabled", False)),
-                "tissue_topology_mutations_total": int(self._growth_kept),
+                "topo": _topo_total,
+                # topo_active/growth_kept = живые (enabled) выросшие связи;
+                # growth_reverted = откатанные (disabled). Из графа → durable.
+                "topo_active": _topo_enabled,
+                "growth_kept": _topo_enabled,
+                "growth_reverted": _topo_reverted,
+                "tissue_topology_mutations_total": _topo_total,
                 "age": _age,
                 "inst": _inst,
                 "food": _food,
