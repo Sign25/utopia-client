@@ -94,11 +94,11 @@ def test_grown_tissue_specs_persisted():
         {"role": "grown1", "data_dim": 64, "n_embd": 21}]
 
 
-# ── полный mint/insert/remove (neurocore-gated) ─────────────────────────
+# ── редизайн a: predictor-сайдкар, ИЗОЛИРОВАН от графа/мотора (neurocore-gated) ──
 
-def test_propose_and_remove_tissue_node():
+def test_propose_sidecar_isolated_from_graph():
     pytest.importorskip("core.tissue")
-    pytest.importorskip("core.tissue_topology")
+    import torch
     c = _c()
     cb = c._make_higher_tissue("cerebellum", data_dim=64)
     if cb is None:
@@ -106,19 +106,26 @@ def test_propose_and_remove_tissue_node():
     org = types.SimpleNamespace(
         tissues={"cb": cb}, connections=[], tissue_topology_genes=[])
     c.organisms["a"] = org
+    c.predictor["a"] = object()
     c.loss_ema["a"] = 0.05
 
     assert c._propose_growth_tissue("a", org) is True
-    st = c._tissue_growth_state["a"]
-    role, tid = st["role"], st["tid"]
-    # узел вставлен в граф
-    assert tid in org.tissues
-    assert any(getattr(t, "role", None) == role for t in org.tissues.values())
-    # ребро {роль}→cerebellum проведено (overlay)
-    assert any(g.source_role == role and g.target_role == "cerebellum"
-               for g in org.tissue_topology_genes)
+    role = c._tissue_growth_state["a"]["role"]
+    # сайдкар в _grown_tissues, НЕ в графе (мотор изолирован)
+    assert role in c._grown_tissues["a"]
+    assert role not in {getattr(t, "role", None) for t in org.tissues.values()}
+    assert org.tissue_topology_genes == []          # НЕТ ребра →cerebellum
+    # вклад сайдкара во вход предиктора: [1, DATA_DIM]
+    gc = c._grown_pred_contribution("a", torch.zeros(1, 64))
+    assert gc is not None and gc.shape[-1] == 64
 
-    # backoff: узел + ребро удаляются
-    c._remove_grown_tissue("a", org, tid, role)
-    assert tid not in org.tissues
-    assert not any(g.source_role == role for g in org.tissue_topology_genes)
+    # backoff: сайдкар удаляется, граф нетронут
+    c._remove_grown_tissue("a", role=role)
+    assert not c._grown_tissues.get("a")
+    assert org.tissue_topology_genes == []
+
+
+def test_grown_contribution_none_without_sidecars():
+    c = _c()
+    import torch
+    assert c._grown_pred_contribution("a", torch.zeros(1, 64)) is None
