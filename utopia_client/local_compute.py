@@ -5757,11 +5757,38 @@ class LocalColonyCompute:
 
     def set_tissue_growth(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл §10.8 рост ТКАНЕЙ (узлами) МГНОВЕННО.
-        on=False (дефолт, kill-switch): петля тканей no-op (узлы не растут).
-        on=True: после насыщения связей петля растит ткань-кандидата. Растущие
-        ткани уже KEEP'нутые НЕ удаляются при off (живут; off лишь стопит новые
-        propose). Реверс мгновенный."""
+        on=True: после насыщения связей петля растит ткань-кандидата.
+        on=False (kill-switch) = ПОЛНЫЙ РЕВЕРТ (Фрай 09.06, после live-кризиса:
+        выросшие ткани кормят cerebellum→motor → возмущают поведение → Адам ушёл
+        в §3). Убираем ВСЕ выросшие ткани (узлы+рёбра) + чистим спеки/счётчик →
+        восстанавливаем до-ростовой мозг (выживание > прогноз-выигрыш). Также
+        срабатывает на рестарте: restore пересоздаёт grown из спеков → off-вызов
+        их убирает. Идемпотентно."""
         self._tissue_growth_enabled = bool(on)
+        if not on:
+            n_removed = 0
+            for cid in list(self.organisms.keys()):
+                org = self.organisms.get(cid)
+                if org is None:
+                    continue
+                tissues = getattr(org, "tissues", None) or {}
+                grown_roles = {s.get("role") for s in
+                               self._tissue_grown_specs.get(cid, [])
+                               if isinstance(s, dict)}
+                for _t in list(tissues.values()):
+                    r = getattr(_t, "role", None)
+                    if r and str(r).startswith("grown"):
+                        grown_roles.add(r)
+                for role in grown_roles:
+                    tid = next((_tid for _tid, _t in tissues.items()
+                                if getattr(_t, "role", None) == role), None)
+                    self._remove_grown_tissue(cid, org, tid, role)
+                    n_removed += 1
+                self._tissue_grown_specs.pop(cid, None)
+            if n_removed:
+                self._tissue_kept = 0
+                logger.info("set_tissue_growth OFF: РЕВЕРТ — убрано %d выросших "
+                            "тканей (восстановлен до-ростовой мозг)", n_removed)
         logger.info("set_tissue_growth: %s", on)
         return self._tissue_growth_enabled
 
