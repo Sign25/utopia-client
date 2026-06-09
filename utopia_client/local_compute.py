@@ -422,6 +422,15 @@ class LocalColonyCompute:
         self._tissue_grown_specs: dict = {}           # cid → [{role,data_dim,n_embd}] KEEP'нутых (персист+recreate)
         self._TISSUE_GROWTH_DATA_DIM: int = 64        # читает obs64 (сенсор); под погоду расширяемо
         self._TISSUE_GROWTH_N_EMBD: int = 21          # sidecar 21/3/1 (как высшие)
+        # §10.8 РЕДИЗАЙН (Фрай 09.06, после live-кризиса §3): (a) РАЗВЯЗКА ОТ МОТОРА.
+        # Выросшие ткани = PREDICTOR-САЙДКАРЫ: читают obs64, выход ДОБАВЛЯЕТСЯ во
+        # вход предиктора (изолированно). НЕ в графе → cerebellum/motor НЕ трогаются
+        # → поведение не возмущается → нет §3. Драйвер Δloss сохраняется (грон даёт
+        # предиктору новую фичу). (c) АБСОЛЮТНЫЙ §3-гейт: paralysis>0 → стоп propose.
+        # (b) rate-limit: пауза между propose (мотор/выживание восстанавливается).
+        self._grown_tissues: dict = {}                # cid → {role: Tissue} predictor-сайдкары
+        self._tissue_growth_cooldown: int = 233       # Fib — тиков паузы между propose (rate-limit b)
+        self._tissue_last_resolve: dict = {}          # cid → tick последнего keep/backoff
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1319,6 +1328,8 @@ class LocalColonyCompute:
         self._growth_rejected.pop(cid, None)
         self._tissue_growth_state.pop(cid, None)   # §10.8 рост тканей cleanup
         self._tissue_grown_specs.pop(cid, None)
+        self._grown_tissues.pop(cid, None)         # §10.8 редизайн a: сайдкары
+        self._tissue_last_resolve.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1697,13 +1708,12 @@ class LocalColonyCompute:
             logger.warning("restore_persisted_state: cid=%s unknown (skip)", cid)
             return
         org = self.organisms[cid]
-        # §10.8 рост тканей: ПЕРЕСОЗДАТЬ выросшие узлы ДО загрузки tissues_by_role
-        # (скелет фикс → роли grownN в нём нет → без recreate restore пропустит их
-        # веса). Создаём ткань из спека → tissues_by_role накатит веса (по роли) →
-        # overlay (ниже) проведёт {роль}→cerebellum (ген уже в topology_genes).
-        # Durable-инвариант: рост узлов переживает рестарт/сбой питания.
+        # §10.8 рост тканей (редизайн a): ПЕРЕСОЗДАТЬ выросшие ткани как PREDICTOR-
+        # САЙДКАРЫ (self._grown_tissues, НЕ в org.tissues/граф → мотор изолирован).
+        # Из спека + load весов (payload["grown_weights"]). Durable через рестарт.
         _gl0 = payload.get("growth_loop")
-        if isinstance(_gl0, dict) and (_gl0.get("grown_tissues") and hasattr(org, "tissues")):
+        _gw = payload.get("grown_weights") or {}
+        if isinstance(_gl0, dict) and _gl0.get("grown_tissues"):
             _specs_ok = []
             for _sp in (_gl0.get("grown_tissues") or []):
                 try:
@@ -1712,7 +1722,12 @@ class LocalColonyCompute:
                     _ne = int(_sp.get("n_embd", 21))
                     _t = self._make_higher_tissue(_role, data_dim=_dd, n_embd=_ne)
                     if _t is not None:
-                        org.tissues[f"gt_{_role}"] = _t
+                        if _role in _gw:
+                            try:
+                                _t.load_state_dict(_gw[_role])
+                            except Exception as e:
+                                logger.debug("restore grown weights %s/%s: %s", cid, _role, e)
+                        self._grown_tissues.setdefault(cid, {})[_role] = _t
                         _specs_ok.append({"role": _role, "data_dim": _dd, "n_embd": _ne})
                 except Exception as e:
                     logger.debug("restore grown tissue %s: %s", cid, e)
@@ -3016,6 +3031,12 @@ class LocalColonyCompute:
                     if _cer is not None and int(getattr(
                             _pred, "data_dim", _SELF_OBS_OFFSET)) == int(_cer.shape[-1]):
                         pred_input = _cer
+                # §10.8 (редизайн a): вклад выросших predictor-сайдкаров → во вход
+                # предиктора (изолирован от cerebellum/motor → мотор не возмущается).
+                if self._tissue_growth_enabled or self._grown_tissues.get(cid):
+                    _gc = self._grown_pred_contribution(cid, obs_tensor)
+                    if _gc is not None and int(_gc.shape[-1]) == int(pred_input.shape[-1]):
+                        pred_input = pred_input + _gc
 
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
@@ -3712,15 +3733,22 @@ class LocalColonyCompute:
                 "reverted": int(self._growth_reverted),
                 "intr_hist": list(_gi_hist) if _gi_hist is not None else [],
                 "stagnation_n": int(self._growth_stagnation_n.get(cid, 0)),
-                # §10.8 рост тканей: счётчики + СПЕКИ выросших узлов для recreate-
-                # on-restore (скелет фикс → новую роль restore не создаст без спека).
-                # Веса узлов едут в tissues_by_role (org.tissues их уже включает).
+                # §10.8 рост тканей: счётчики + СПЕКИ выросших predictor-сайдкаров
+                # для recreate-on-restore. Веса сайдкаров — отдельно (grown_weights),
+                # т.к. они НЕ в org.tissues (редизайн a: изоляция от мотора).
                 "tissue_kept": int(self._tissue_kept),
                 "tissue_reverted": int(self._tissue_reverted),
                 "grown_tissues": list(self._tissue_grown_specs.get(cid, [])),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
+        # §10.8 (редизайн a): веса выросших predictor-сайдкаров (НЕ в tissues_by_role).
+        try:
+            _gd = self._grown_tissues.get(cid)
+            if _gd:
+                payload["grown_weights"] = {r: t.state_dict() for r, t in _gd.items()}
+        except Exception as e:
+            logger.debug("save_state %s grown_weights: %s", cid, e)
         # Phase 6 — self-observable EMAs.
         if cid in self.entropy_ema:
             payload["entropy_ema"] = float(self.entropy_ema.get(cid, 0.0))
@@ -5768,86 +5796,39 @@ class LocalColonyCompute:
         if not on:
             n_removed = 0
             for cid in list(self.organisms.keys()):
-                org = self.organisms.get(cid)
-                if org is None:
-                    continue
-                tissues = getattr(org, "tissues", None) or {}
-                grown_roles = {s.get("role") for s in
-                               self._tissue_grown_specs.get(cid, [])
-                               if isinstance(s, dict)}
-                for _t in list(tissues.values()):
-                    r = getattr(_t, "role", None)
-                    if r and str(r).startswith("grown"):
-                        grown_roles.add(r)
-                for role in grown_roles:
-                    tid = next((_tid for _tid, _t in tissues.items()
-                                if getattr(_t, "role", None) == role), None)
-                    self._remove_grown_tissue(cid, org, tid, role)
-                    n_removed += 1
+                d = self._grown_tissues.get(cid) or {}
+                n_removed += len(d)
+                self._grown_tissues.pop(cid, None)
                 self._tissue_grown_specs.pop(cid, None)
+                self._tissue_growth_state.pop(cid, None)
             if n_removed:
                 self._tissue_kept = 0
                 logger.info("set_tissue_growth OFF: РЕВЕРТ — убрано %d выросших "
-                            "тканей (восстановлен до-ростовой мозг)", n_removed)
+                            "predictor-сайдкаров (до-ростовой мозг)", n_removed)
         logger.info("set_tissue_growth: %s", on)
         return self._tissue_growth_enabled
 
     def _propose_growth_tissue(self, cid: str, org) -> bool:
-        """§10.8: предложить ОДНУ новую ТКАНЬ-кандидата (узел). Минт sidecar
-        21/3/1 (читает obs как сенсор — без входящего ребра) + вставка в
-        org.tissues + проводка {роль}→cerebellum (двигает вход прогноза) +
-        re-apply overlay. Записывает state для dwell. True если ткань добавлена."""
-        try:
-            from core.tissue_topology import (
-                TissueConnectionGene, apply_topology_overlay_to_org)
-            from core.connection import ConnectionType
-        except Exception as e:
-            logger.warning("tissue-growth import %s: %s", cid, e)
-            return False
-        tissues = getattr(org, "tissues", None)
-        if tissues is None:
-            return False
-        # cerebellum должен существовать (цель проводки)
-        if self._cerebellum_tissue_id(cid, org) is None:
+        """§10.8 (Фрай 09.06 редизайн a): предложить ткань-кандидата как PREDICTOR-
+        САЙДКАР. Минт sidecar 21/3/1 (читает obs64), кладём в self._grown_tissues —
+        НЕ в org.tissues, НЕ в граф. Её выход добавляется во вход предиктора
+        (изолированно от cerebellum/motor) → улучшает ПРОГНОЗ без возмущения мотора.
+        Драйвер Δloss сохраняется. Записывает state для dwell. True если создана."""
+        pred = self.predictor.get(cid)
+        if pred is None:
             return False
         self._tissue_propose_count += 1
         n = self._tissue_propose_count
         role = f"grown{n}"
-        tid = f"gt{n}"
         data_dim = int(self._TISSUE_GROWTH_DATA_DIM)
         n_embd = int(self._TISSUE_GROWTH_N_EMBD)
         tissue = self._make_higher_tissue(role, data_dim=data_dim, n_embd=n_embd)
         if tissue is None:
             return False
-        # Вставка узла в живой граф. Нет входящего ребра → forward трактует как
-        # сенсор → ткань читает obs (workbench.forward). Выход → cerebellum.
-        tissues[tid] = tissue
-        genes = getattr(org, "tissue_topology_genes", None)
-        if genes is None:
-            genes = []
-            org.tissue_topology_genes = genes
-        if self._growth_tracker is None:
-            try:
-                from core.tissue_topology import TissueInnovationTracker
-                self._growth_tracker = TissueInnovationTracker()
-            except Exception:
-                pass
-        innov = (self._growth_tracker.reserve(role, "cerebellum")
-                 if self._growth_tracker is not None else n)
-        gene = TissueConnectionGene(
-            innovation=innov, source_role=role, target_role="cerebellum",
-            conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
-        genes.append(gene)
-        try:
-            apply_topology_overlay_to_org(org)
-        except Exception as e:
-            logger.warning("tissue-growth apply %s: %s", cid, e)
-            tissues.pop(tid, None)
-            genes.remove(gene)
-            return False
+        self._grown_tissues.setdefault(cid, {})[role] = tissue  # сайдкар, НЕ в графе
         bc = self.biochem.get(cid)
         self._tissue_growth_state[cid] = {
-            "role": role, "tid": tid, "gene": gene,
+            "role": role,
             "spec": {"role": role, "data_dim": data_dim, "n_embd": n_embd},
             "loss_before": float(self.loss_ema.get(cid, 0.0)),
             "ticks": 0,
@@ -5855,29 +5836,40 @@ class LocalColonyCompute:
             "energy_before": (float(getattr(bc, "energy", 0.0))
                               if bc is not None else None),
         }
-        logger.info("brain-growth TISSUE-PROPOSE cid=%s role=%s loss_before=%.5f",
-                    cid, role, self._tissue_growth_state[cid]["loss_before"])
+        logger.info("brain-growth TISSUE-PROPOSE cid=%s role=%s (predictor-sidecar, "
+                    "motor-isolated) loss_before=%.5f", cid, role,
+                    self._tissue_growth_state[cid]["loss_before"])
         return True
 
-    def _remove_grown_tissue(self, cid: str, org, tid: str, role: str,
+    def _grown_pred_contribution(self, cid: str, obs_tensor):
+        """§10.8 (редизайн a): агрегат выходов выросших predictor-сайдкаров (читают
+        obs64) → ДОБАВЛЯЕТСЯ во вход предиктора. None если сайдкаров нет. Грон НЕ в
+        графе → cerebellum/motor изолированы. [1, DATA_DIM]."""
+        d = self._grown_tissues.get(cid)
+        if not d:
+            return None
+        torch = self._torch
+        agg = None
+        for role, t in list(d.items()):
+            try:
+                with torch.no_grad():
+                    o = t({"input": obs_tensor.detach()})["output"]
+                agg = o if agg is None else (agg + o)
+            except Exception as e:
+                logger.debug("grown sidecar fwd %s/%s: %s", cid, role, e)
+        return agg
+
+    def _remove_grown_tissue(self, cid: str, org=None, tid=None, role: str = "",
                               gene=None) -> None:
-        """§10.8 backoff: убрать выросшую ткань-узел + её ребро из живого графа
-        (отключаем ген, удаляем ткань из org.tissues, re-apply overlay → forward
-        её больше не выполняет)."""
+        """§10.8 backoff/revert (редизайн a): убрать выросший predictor-сайдкар из
+        self._grown_tissues. Грон НЕ в графе → cerebellum/motor не трогаются. Параметры
+        org/tid/gene — для backward-compat вызовов, игнорируются."""
         try:
-            genes = getattr(org, "tissue_topology_genes", None) or []
-            for g in list(genes):
-                if (getattr(g, "source_role", None) == role
-                        and getattr(g, "target_role", None) == "cerebellum"):
-                    try:
-                        genes.remove(g)
-                    except ValueError:
-                        pass
-            tissues = getattr(org, "tissues", None)
-            if tissues is not None:
-                tissues.pop(tid, None)
-            from core.tissue_topology import apply_topology_overlay_to_org
-            apply_topology_overlay_to_org(org)
+            d = self._grown_tissues.get(cid)
+            if d is not None:
+                d.pop(role, None)
+                if not d:
+                    self._grown_tissues.pop(cid, None)
         except Exception as e:
             logger.warning("tissue-growth remove %s role=%s: %s", cid, role, e)
 
@@ -5896,16 +5888,22 @@ class LocalColonyCompute:
         st = self._tissue_growth_state.get(cid)
         if st is None:
             # Узлы — ПОСЛЕ рёбер: пока ВСЕ роли→cerebellum не подключены, ткани ждут.
-            # Граф-derived (ROOT 2, Фрай 09.06) — restart-robust, не stale-флаг
-            # _growth_saturated (он сбрасывается рестартом → дедлок).
+            # Граф-derived (ROOT 2, Фрай 09.06) — restart-robust, не stale-флаг.
             if not self._connections_saturated(org):
                 return
-            # Тот же noise-robust плато-критерий (доля near-floor ≥ φ⁻¹), что у рёбер
-            # — устойчив к всплескам погоды. Заменяет мгновенный near-floor.
+            # (c) АБСОЛЮТНЫЙ §3-ГЕЙТ (Фрай 09.06): paralysis>0 → НЕ растим (relative
+            # net_ok пропустил кумулятив → §3-кризис). Растём только когда Адам здоров.
+            if int(self._paralysis_window_n) > 0:
+                return
+            # (b) RATE-LIMIT: пауза между propose (выживание/мотор восстанавливается).
+            _last = self._tissue_last_resolve.get(cid)
+            if _last is not None and (self._last_world_tick - _last) < self._tissue_growth_cooldown:
+                return
+            # noise-robust плато (доля near-floor ≥ φ⁻¹), устойчив к всплескам погоды.
             if self._intrinsic_plateaued(cid):
                 self._propose_growth_tissue(cid, org)
             return
-        # dwell — ждём пере-сходимости predictor'а с новым узлом.
+        # dwell — ждём пере-сходимости predictor'а с новым сайдкаром.
         st["ticks"] += 1
         if st["ticks"] < self._growth_dwell_ticks:
             return
@@ -5920,18 +5918,16 @@ class LocalColonyCompute:
                                  >= float(st["energy_before"]) * 0.618)
         keep = bool(signif and net_ok)
         role = st["role"]
-        tid = st["tid"]
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)  # (b) rate-limit
         if keep:
             self._tissue_kept += 1
-            # персист спек узла для recreate-on-restore (durable-инвариант).
+            # персист спек сайдкара для recreate-on-restore (durable-инвариант).
             self._tissue_grown_specs.setdefault(cid, []).append(st["spec"])
             logger.info("brain-growth TISSUE-KEEP cid=%s role=%s Δloss=%.5f "
                         "(%.1f%%) kept=%d", cid, role, delta,
                         100.0 * delta / max(1e-9, loss_before), self._tissue_kept)
-            # новая ткань = новая роль → связь-петле снова есть {роль}→cerebellum.
-            self.reset_growth_saturation()
         else:
-            self._remove_grown_tissue(cid, org, tid, role, st.get("gene"))
+            self._remove_grown_tissue(cid, role=role)
             self._tissue_reverted += 1
             logger.info("brain-growth TISSUE-BACKOFF cid=%s role=%s Δloss=%.5f "
                         "signif=%s net_ok=%s reverted=%d", cid, role, delta,
