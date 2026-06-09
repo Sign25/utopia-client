@@ -186,6 +186,16 @@ _GLUCOSE_FLOOR_ENERGY_THRESHOLD = 200.0
 _CORTISOL_HOMEOSTASIS_DECAY = 0.995
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
 _INSULA_DATA_DIM = 71
+# §3.2 (Фрай 09.06.2026): client-authoritative интероцепция. Строим 7-вектор
+# ЛОКАЛЬНО из self.biochem (energy/hydration/cortisol/serotonin/infection —
+# точно из биохимии Адама; age/valence — carry последнего P40-intero). Снимает
+# P40-blind risk: insula не слепнет, если P40 перестанет слать intero.
+# Зеркало server-side _gather_interoception (NeuroCore/server/tick/sidecars.py:48)
+# — нормировки совпадают ТОЧЬ-В-ТОЧЬ (incl. raw-camel quirk slot[1]), иначе insula
+# получит сдвиг распределения входа.
+_CLIENT_MAX_ENERGY = 1309.0      # mirror cfg.max_energy default (_gather_interoception)
+_CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
+_CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
 # Совпадает с _DEFAULT_MODE_FLOOR_MAX на P40 (routes_world.py).
 _DEFAULT_MODE_FLOOR_MAX = 0.01
@@ -339,6 +349,55 @@ class LocalColonyCompute:
         self.reward_history: dict = {}       # cid → deque[float] maxlen=10
         # Метрики счётчиков (для diagnostics endpoint).
         self.predictor_steps: int = 0
+        # Вариант A (08.06.2026, Фрай/Хьюберт): рост мозга при жизни. Predictor —
+        # узел графа ЧЕРЕЗ cerebellum (бит 18, TISSUE_ROLES_ZODCHIY). forward-hook
+        # ловит выход cerebellum-ткани → он становится входом обученного
+        # predictor'а. Связи {ткань}→cerebellum двигают вход прогноза → Δloss_ema
+        # реагирует напрямую = драйвер для propose/keep петли роста. Только
+        # single-Adam; граф client-local, в P40 не уходит (Хьюберт verified).
+        # _predictor_from_cerebellum — kill-switch (False → predictor на raw obs).
+        self._predictor_from_cerebellum: bool = True
+        self._cerebellum_tid: dict = {}      # cid → tissue_id | None (cache)
+        self._cerebellum_out: dict = {}      # cid → torch.Tensor [1,64] выход/тик
+        self._cerebellum_hooked: set = set() # cid с зарегистрированным hook
+        # Шаг 2 — петля роста связей (08.06, Фрай go): propose→dwell→Δloss_ema→
+        # keep/backoff, ОДНА связь {роль}→cerebellum за раз. Триггер — плато
+        # intrinsic (мозгу нечему учиться весами → менять структуру). keep на
+        # ЗНАЧИМОМ сошедшемся Δloss_ema (Фрай: не любой Δ>0); backoff revert'ит
+        # ребро (enabled=False) + защищает net/§3. Gated OFF (ship dormant) —
+        # включить после live-проверки встраивания (cerebellum_out≠0, loss не взлетел).
+        self._growth_enabled: bool = True             # kill-switch (флип 08.06: рост ВКЛ для Адама)
+        self._growth_tracker = None                   # client-local innovation tracker (lazy)
+        self._growth_rng = random.Random(0)           # детерминируемый выбор src-роли
+        self._growth_state: dict = {}                 # cid → {gene, loss_before, ticks, par_before, energy_before}
+        # ОТНОСИТЕЛЬНЫЙ триггер (Фрай 08.06): embodied intrinsic floor не ноль и
+        # дрейфует (0.005-0.009) → абсолютный порог хрупок. Плато = intrinsic у
+        # СВОЕГО трейлинг-floor (min за окно) + стагнация N тиков (перестал падать).
+        # Self-referencing, drift-robust. Floor — референс, не абсолютный уровень.
+        self._growth_intr_hist: dict = {}             # cid → deque[float] intrinsic_ema (трейлинг-floor)
+        self._growth_stagnation_n: dict = {}          # cid → тиков «у floor» подряд
+        self._growth_intr_window: int = 233           # Fib — окно трейлинг-floor
+        self._growth_near_floor_margin: float = _PHI_CONST ** -3  # φ⁻³≈0.236 «у floor»
+        self._growth_plateau_ticks: int = 55          # Fib — стагнация у floor до propose
+        self._growth_dwell_ticks: int = 89            # Fib — окно пере-сходимости predictor'а
+        self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
+        self._growth_kept: int = 0                    # принятых связей (метрика)
+        self._growth_reverted: int = 0                # откатов (метрика)
+        # tried-set с COOLDOWN (Фрай/Шеф 08.06): не ретраить отвергнутое ребро
+        # _growth_retry_cooldown проб подряд (поиск покрывает новые рёбра). НЕ
+        # permanent (эпистаз: ребро, бесполезное сейчас, может помочь после смены
+        # графа) → через cooldown снова eligible. Часы — счётчик проб (монотонный).
+        self._growth_propose_count: int = 0           # монотонные часы проб
+        self._growth_rejected: dict = {}              # cid → {source_role: propose_count при отказе}
+        self._growth_retry_cooldown: int = 13         # Fib — проб до повторной попытки отвергнутого
+        # SATURATION-guard (Шеф 08.06): когда полезные {роль}→cerebellum рёбра
+        # исчерпаны (все свежие кандидаты в cooldown → fallback гоняет оставшиеся
+        # бесполезные по кругу) — встать на ПАУЗУ, не churn'ить. Сигнал «связи
+        # насыщены → готов к фазе тканей §3.2». Снимается reset_growth_saturation()
+        # (вызвать при добавлении тканей — новые роли = новые кандидаты) или KEEP.
+        self._growth_fallback_streak: int = 0         # подряд fallback-backoff'ов
+        self._growth_saturated: bool = False          # пауза петли связей
+        self._growth_saturation_threshold: int = 5    # fallback-backoff'ов до насыщения
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -511,6 +570,11 @@ class LocalColonyCompute:
         # (Fib 2) чтобы один пустой тик не срывал в бегство; исчерпание → быстрый
         # релиз (защита от idle-голода, критерий Хьюберта eats/sec≥1.62).
         self._tile_yield_mem: dict = {}      # cid → остаток тиков «тайл кормит»
+        # ARRIVAL STUCK-DETECTION (Фрай 07.06): nearest_flora недостижима (через
+        # воду/препятствие) → Адам коммитит но не движется (pos застрял, onf=0).
+        # Трекаем вектор (dr,dc,dist); не меняется N тиков при dist>0 → абандон+обход.
+        self._arrival_last_nf: dict = {}     # cid → последний (dr,dc,dist)
+        self._arrival_stuck_n: dict = {}     # cid → тиков без прогресса к флоре
         # MOTOR de-saturation (04.06, Фрай): tanh-голова бистабильна — pre-tanh
         # `out` большой → tanh(out/T) залипает ±0.99, градиент≈0 → залипает в
         # экстремуме (наблюдалось: alignment флипнулся +0.99→-0.91 и не вернулся).
@@ -637,6 +701,10 @@ class LocalColonyCompute:
         self._bias_last_update_tick: int = 0
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
+        # §3.2 (Фрай 09.06.2026): последний P40-intero[7] per-cid — для carry
+        # slots 2/6 (age/valence) в client-built intero + fallback, если
+        # биохимии нет. См. _build_client_intero.
+        self._last_p40_intero: dict = {}   # cid → np.ndarray[7]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
         # TD = β_local − EMA(β_local, α=0.01) per-cid, обновляется один раз за
         # тик в _compute_higher_tissues. effective_eta_reward = lr_reward ·
@@ -706,6 +774,13 @@ class LocalColonyCompute:
         self._it_baseline: dict = {}          # cid → бегущая средняя advantage (variance-reduction)
         self._it_last_tmod: dict = {}         # cid → последний T_mod (телеметрия обучения моста)
         self._insula_temp_enabled: bool = False
+        # §3.2 (Фрай 09.06.2026): felt-thirst gradual drive. False (дефолт) →
+        # текущий бинарный 30% water-seek (прод не меняется до go). True →
+        # градуальный felt-drive (intero[1]-афферент масштабирует приоритет
+        # рефлекса A, φ-onset 0.382). Мгновенный on/off через client_flags
+        # (felt_thirst_drive); kill-switch = false → откат к бинарному. См.
+        # ws_client._apply_water_seek.
+        self._felt_thirst_drive_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -832,6 +907,14 @@ class LocalColonyCompute:
         self._e_income_sum: float = 0.0   # delta_energy (eat)
         self._e_cost_sum: float = 0.0     # step_cost
         self._e_infdrain_sum: float = 0.0  # infection-drain
+        # §3.5-ПОЛНОТА ledger (Фрай 07.06): компонентный net (income-cost-infdrain)
+        # недосчитывал метаб-цену berserk/атак/дегидрации → ложный net+ при energy,
+        # пилящей §3. net_true = реальная Δenergy за окно (authoritative, не врёт);
+        # residual = net_true − net_component = СУММА непосчитанных расходов/грантов.
+        # +paralysis_n: окна с §3-recovery несустейнабельны (грант +73 искажает Δ).
+        self._e_window_e0: float = -1.0   # energy на старте окна (для net_true)
+        self._paralysis_window_n: int = 0  # §3-recovery за окно
+        self._e_srv_cost_sum: float = 0.0  # серверная per-event цена (delta_e<0)
         self._hyd_thirst_sum: float = 0.0
         self._hyd_drink_sum: float = 0.0
         self._hyd_calib_ticks: int = 0
@@ -1203,6 +1286,13 @@ class LocalColonyCompute:
         self.hebbian.pop(cid, None)
         self.predictor.pop(cid, None)
         self.predictor_opt.pop(cid, None)
+        self._cerebellum_tid.pop(cid, None)
+        self._cerebellum_out.pop(cid, None)
+        self._cerebellum_hooked.discard(cid)
+        self._growth_state.pop(cid, None)
+        self._growth_intr_hist.pop(cid, None)
+        self._growth_stagnation_n.pop(cid, None)
+        self._growth_rejected.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1226,6 +1316,7 @@ class LocalColonyCompute:
         self.imagination.pop(cid, None)
         self.planner.pop(cid, None)
         self.insula.pop(cid, None)
+        self._last_p40_intero.pop(cid, None)   # §3.2 carry cleanup
         # 13.05.2026: S2.D default_mode.
         self.default_mode.pop(cid, None)
         self.last_beta_local.pop(cid, None)
@@ -2269,6 +2360,19 @@ class LocalColonyCompute:
                         "сохранены для ре-enable)")
         return self._insula_temp_enabled
 
+    def set_felt_thirst_drive(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл §3.2 felt-thirst gradual drive МГНОВЕННО
+        (без деплоя/рестарта). on=True: рефлекс A (water-seek) масштабирует
+        приоритет по градуальному felt-сигналу жажды (intero[1]-афферент,
+        φ-onset 0.382) вместо бинарного порога 30%. on=False (kill-switch):
+        откат к проверенному бинарному 30% (read-only флаг — поведение
+        water-seek читает его per-тик; ткани/состояние не трогаются). Реверс
+        мгновенный. backoff: VPS/кабинет ставит false, если выживание падает."""
+        self._felt_thirst_drive_enabled = bool(on)
+        logger.info("set_felt_thirst_drive: %s (%s)", on,
+                    "градуальный felt-drive" if on else "бинарный 30% (kill-switch)")
+        return self._felt_thirst_drive_enabled
+
     def set_motor_renorm_cap(self, cap: float) -> float:
         """Канал client_flags: рекалибровка motor renorm growth-cap (Ступень 2,
         Фрай). cap=1.0 → пин магнитуды к target (текущее); cap>1 → веса motor_policy
@@ -2810,6 +2914,11 @@ class LocalColonyCompute:
                     pred_input = torch.from_numpy(obs68).to(
                         self.device).unsqueeze(0)
 
+                # Вариант A: hook на cerebellum (один раз/cid) — ДО forward,
+                # чтобы organism.forward (ниже) наполнил _cerebellum_out[cid].
+                if self._predictor_from_cerebellum and self._single_organism:
+                    self._ensure_cerebellum_hook(cid, organism)
+
                 heb = self.hebbian.get(cid)
                 if heb is not None:
                     try:
@@ -2823,11 +2932,31 @@ class LocalColonyCompute:
                 # org.forward доминирует vs (B) obs-градиент слаб.
                 _raw_dbg = logits[0, :N_ACTIONS].detach().clone()
 
+                # Вариант A: вход predictor'а = выход cerebellum (связи кормят
+                # прогноз). Берём ПОСЛЕ organism.forward (hook наполнил
+                # _cerebellum_out). Только при совпадении размерности с predictor
+                # (64) — иначе остаёмся на obs-пути (predictor-68 не трогаем).
+                # target остаётся obs_{t+1} → loss_ema/intrinsic сопоставимы.
+                if (self._predictor_from_cerebellum and self._single_organism
+                        and _pred is not None):
+                    _cer = self._cerebellum_out.get(cid)
+                    if _cer is not None and int(getattr(
+                            _pred, "data_dim", _SELF_OBS_OFFSET)) == int(_cer.shape[-1]):
+                        pred_input = _cer
+
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
                 # в r_imm_total как baseline-сигнал.
                 intrinsic_now = self._predictor_train_step(
                     cid, obs_tensor, pred_input)
+
+                # Шаг 2 — петля роста связей (propose→dwell→Δloss_ema→keep/backoff).
+                # После train-step (loss_ema свежий). Gated: только single-Adam + флаг.
+                if self._growth_enabled and self._single_organism:
+                    try:
+                        self._brain_growth_step(cid)
+                    except Exception as e:
+                        logger.warning("brain-growth step %s: %s", cid, e)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -2925,11 +3054,52 @@ class LocalColonyCompute:
                     # сигнал контакта (лучше obs[61], который лагает/не пикует). →
                     # сильный ATTACK-bias «бей в ответ, пока он рядом».
                     _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
+                    # ARRIVAL STUCK-DETECTION (Фрай 07.06 go): вектор (dr,dc,dist)
+                    # к nearest_flora НЕ меняется N=13 тиков (φ-Fib) при dist>0 (не
+                    # на флоре) → цель недостижима (P40 блокит ход через воду) →
+                    # АБАНДОН: обход препятствия перпендикулярно (сторона чередуется
+                    # каждые 13 тиков). pos сменится → nf пересчёт → счётчик сброс →
+                    # фураж к достижимой флоре. _staying (ест) → не стак. server-незав.
+                    _abandon_dir = None
+                    if _nf_cid is not None and not _staying:
+                        _nfk = (_nf_cid.get("dr"), _nf_cid.get("dc"),
+                                _nf_cid.get("dist"))
+                        _nfd = _nf_cid.get("dist")
+                        if (_nfd is not None and float(_nfd) > 0.0
+                                and _nfk == self._arrival_last_nf.get(cid)):
+                            self._arrival_stuck_n[cid] = (
+                                self._arrival_stuck_n.get(cid, 0) + 1)
+                        else:
+                            self._arrival_stuck_n[cid] = 0
+                        self._arrival_last_nf[cid] = _nfk
+                        _sn = self._arrival_stuck_n.get(cid, 0)
+                        if _sn >= 13:
+                            # ROBUST escape (0.13.29): цель недостижима → СКАН всех
+                            # 4 кардинальных направлений (не только перпендикуляр —
+                            # ловушка может блокить N/S И флора по диагонали, escape
+                            # только E/W). Ротация каждые 5 тиков (sn//5)%4 → все 4
+                            # за 20 тиков, любое открытое сменит pos → стак-сброс.
+                            # Порядок [N,E,S,W] начинаем с ПЕРПЕНДИКУЛЯРА к флоре
+                            # (вероятнее открыт, чем сторона флоры).
+                            _dr0 = float(_nf_cid.get("dr", 0.0) or 0.0)
+                            _dc0 = float(_nf_cid.get("dc", 0.0) or 0.0)
+                            if abs(_dc0) >= abs(_dr0):   # флора E/W → старт с N/S
+                                _ring = [0, 1, 2, 3]     # N, S, E, W
+                            else:                         # флора N/S → старт с E/W
+                                _ring = [2, 3, 0, 1]     # E, W, N, S
+                            _abandon_dir = _ring[(_sn // 5) % 4]
+                            if self._nf_diag_n % 50 == 0:
+                                logger.info(
+                                    "ARRIVAL_STUCK cid=%s nf=%s stuck=%d "
+                                    "abandon_dir=%d", cid, _nfk, _sn, _abandon_dir)
+                    else:
+                        self._arrival_stuck_n[cid] = 0
                     self._shape_action_logits(logits[0], obs_arr, _diet, _er,
                                               nearest_flora=_nf_cid,
                                               recent_yield=_staying,
                                               on_flora=_onf,
-                                              just_hit=_just_hit)
+                                              just_hit=_just_hit,
+                                              flora_abandon_dir=_abandon_dir)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -3156,16 +3326,29 @@ class LocalColonyCompute:
                     self._skill_window_tick[cid] = _sn
 
                 # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
+                # §3.2 (Фрай 09.06.2026): client-authoritative intero — строим
+                # ЛОКАЛЬНО из self.biochem (primary), P40-intero храним для carry
+                # slots 2/6 + fallback. Снимает P40-blind risk (insula не слепнет
+                # без P40-поля). См. _build_client_intero.
                 intero_tensor = None
                 if intero_per_cid is not None:
-                    intero_arr = intero_per_cid.get(cid)
-                    if intero_arr is not None:
+                    _p40_intero = intero_per_cid.get(cid)
+                    if _p40_intero is not None:
                         try:
-                            intero_tensor = torch.from_numpy(
-                                np.asarray(intero_arr, dtype=np.float32)
-                            ).to(self.device).unsqueeze(0)
+                            self._last_p40_intero[cid] = np.asarray(
+                                _p40_intero, dtype=np.float32).reshape(-1)
                         except Exception:
-                            intero_tensor = None
+                            pass
+                intero_arr = self._build_client_intero(cid)
+                if intero_arr is None:
+                    intero_arr = self._last_p40_intero.get(cid)  # fallback P40
+                if intero_arr is not None:
+                    try:
+                        intero_tensor = torch.from_numpy(
+                            np.asarray(intero_arr, dtype=np.float32).reshape(-1)
+                        ).to(self.device).unsqueeze(0)
+                    except Exception:
+                        intero_tensor = None
                 self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
 
                 # Z1 (16.05.2026, Зодчий) — apply-step 7 высших тканей
@@ -4375,7 +4558,8 @@ class LocalColonyCompute:
                              energy_ratio: float, nearest_flora=None,
                              recent_yield: bool = False,
                              on_flora: bool = False,
-                             just_hit: bool = False) -> None:
+                             just_hit: bool = False,
+                             flora_abandon_dir: "Optional[int]" = None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -4417,7 +4601,16 @@ class LocalColonyCompute:
             # учит высшее поверх. obs[62/63]=dist/kind для контекст-обучения мотора.
             # Конвенция: dr>0=флора южнее→SOUTH(1), dr<0→NORTH(0), dc>0→EAST(2), dc<0→WEST(3).
             _nf = nearest_flora
-            if _nf is not None:
+            if flora_abandon_dir is not None:
+                # ARRIVAL ABANDON (Фрай 07.06 go): nearest_flora недостижима (стак
+                # детектнут в caller) → НЕ коммить к ней (и НЕ smell-fallback к той
+                # же цели) → обход препятствия перпендикулярно (flora_abandon_dir).
+                # Сильный шаг (2φ·DS, как arrival-commit) + не стой. pos сменится →
+                # nf пересчёт → стак-сброс → arrival-commit к достижимой флоре.
+                logits[int(flora_abandon_dir)] += 2.0 * PHI * DS
+                logits[4] -= PHI * DS          # не стой — двигайся в обход
+                _nf = None                     # smell-fallback ниже ОТКЛ (см. гейт)
+            elif _nf is not None:
                 try:
                     _dr = float(_nf.get("dr", 0.0))
                     _dc = float(_nf.get("dc", 0.0))
@@ -4435,6 +4628,29 @@ class LocalColonyCompute:
                     elif _dist <= 0.0:
                         logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
                         logits[14] += 1.0 * DS    # EAT
+                    elif _dist <= 1.0:
+                        # ARRIVAL COMMIT (Фрай 07.06, predator_defense-зеркало):
+                        # флора ВПЛОТНУЮ (dist≈1, cardinal-смежная) → ДОМИНАНТНЫЙ
+                        # финальный ШАГ НА тайл + анти-флип (гаси обратное напр.) +
+                        # не стой. Корень thrash: на dist=1 обычный _w УЖЕ макс
+                        # (min(1/dist,1)=1), но мотор (norm~1.6, flip 0.6) перебивал
+                        # argmax ~60% → осцилляция в 1 тайле, onf_rate=0, income=0.
+                        # Фикс — commit ×2φ (как ATTACK-контратака just_hit): сильный
+                        # prior, мотор дотачивает; анти-флип гасит реверс. Флора-
+                        # специфично (nearest_flora 62/63). С §4 predator (по obs[61],
+                        # ниже) НЕ конфликтует — хищник вплотную перебьёт (×0.5 move +
+                        # ATTACK/FLEE). Встанет НА тайл → след.тик dist=0 → GATHER/EAT.
+                        _cw = 2.0 * PHI * DS          # commit-сила шага
+                        _af = PHI * DS                # анти-флип обратного напр.
+                        if _dr < 0:
+                            logits[0] += _cw; logits[1] -= _af   # NORTH, гаси SOUTH
+                        elif _dr > 0:
+                            logits[1] += _cw; logits[0] -= _af   # SOUTH, гаси NORTH
+                        if _dc > 0:
+                            logits[2] += _cw; logits[3] -= _af   # EAST, гаси WEST
+                        elif _dc < 0:
+                            logits[3] += _cw; logits[2] -= _af   # WEST, гаси EAST
+                        logits[4] -= _af              # не стой — делай финальный шаг
                     else:
                         _w = (4.0 - 2.0 * diet) * DS * min(1.0 / _dist, 1.0)
                         if _dr < 0:
@@ -4447,8 +4663,10 @@ class LocalColonyCompute:
                             logits[3] += _w       # WEST
                 except Exception:
                     _nf = None                    # битое поле → smell-fallback
-            if _nf is None:
+            if _nf is None and flora_abandon_dir is None:
                 # Smell-градиент fallback (иди к еде, центр-масс). diet→0 сильнее.
+                # ОТКЛ при abandon (_nf=None из-за абандона) — иначе smell к ТОЙ ЖЕ
+                # недостижимой флоре-кластеру вернёт стак; обход уже задан выше.
                 g_ns = float(obs_arr[33]) if n > 34 else 0.0
                 g_ew = float(obs_arr[34]) if n > 34 else 0.0
                 g_ns, g_ew = _unit(g_ns, g_ew)
@@ -4476,28 +4694,28 @@ class LocalColonyCompute:
                 pf = PHI * DS * min(d_prox, 1.0)
                 logits[0] += pf * d_ns; logits[1] -= pf * d_ns
                 logits[2] -= pf * d_ew; logits[3] += pf * d_ew
-            # §4 PREDATOR DEFENSE (predator_defense.md, Фрай 07.06): рефлекс-bias
+            # §4 PREDATOR DEFENSE (predator_defense.md §11, Фрай 07.06): рефлекс-bias
             # ACTION по obs[61], DS-scaled (активен под single_organism, где BS=0
-            # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник
-            # (slot 61), не добыча, не Старшие. Мягкий — мотор дотачивает.
-            # КОНТР-АТАКА по факту удара (Хьюберт 07.06: landed=0 — Адам бил вне
-            # radius=1; obs[61] лагает). damage_taken>0 = хищник ТОЧНО был вплотную
-            # ЭТОТ тик → бей в ответ, СИЛЬНО, гаси бегство (стой в контакте).
+            # зануляет старые BS-бусты → мотор машет невпопад). Цель СТРОГО хищник.
+            # ТРИГГЕР БОЯ = АТАКА (damage_taken>0), НЕ КОНТАКТ (Фрай §11 durable):
+            # старый mere-contact ATTACK (d_prox≥0.85) бил по ПРИСУТСТВИЮ → spam на
+            # predator-транзиенты (dmg=0, pred_ticks=0, attack=144-185) рвал forage
+            # И возвращал berserk-on-presence при climb pressure. Теперь: реально
+            # ударили → контратака; контакт БЕЗ урона (пассив/транзиент) → НЕ бей,
+            # пасись/настороже; приближается (не контакт) → уйди до удара.
             if just_hit:
+                # damage_taken>0 = хищник ТОЧНО ударил ЭТОТ тик → бей в ответ СИЛЬНО,
+                # гаси бегство + move-прочь (стой в radius=1, добей).
                 logits[5] += 2.0 * PHI * DS      # сильный ATTACK
-                logits[10] -= PHI * DS           # НЕ беги — он рядом, контратакуй
-                # подавить move-прочь (flee-MOVE) чтобы не выйти из radius=1
+                logits[10] -= PHI * DS           # НЕ беги — контратакуй
                 logits[0] *= 0.5; logits[1] *= 0.5
                 logits[2] *= 0.5; logits[3] *= 0.5
-            elif d_prox >= 0.85:         # хищник ВПЛОТНУЮ (obs[61]≈1, dist≈1) → бей
-                logits[5] += PHI * DS            # ATTACK bias
-                logits[10] -= (1.0 / PHI) * DS   # меньше беги на контакте
-            elif d_prox > 0.15:          # хищник ПРИБЛИЖАЕТСЯ → «создай дистанцию»
-                logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок
-            # Штраф ATTACK вне контакта (Хьюберт 07.06): мотор шлёт ATTACK на dist≥2
-            # (atk_pp~0.44) → удары в воздух (landed=0). Гасим ATTACK когда хищник
-            # НЕ вплотную и нас НЕ ударили — фокус ударов на реальный radius=1.
-            if not just_hit and d_prox < 0.6:
+            elif 0.15 < d_prox < 0.85:   # ПРИБЛИЖАЕТСЯ (не контакт) → создай дистанцию
+                logits[10] += PHI * PHI * DS * min(d_prox, 1.0)  # FLEE рывок (уйди до удара)
+            # Контакт d_prox≥0.85 БЕЗ just_hit → НИ одна ветка: пасись/настороже.
+            # Подавляем ATTACK ВСЕГДА когда нас НЕ ударили (мотор не должен спамить
+            # бой на присутствие/в воздух) — единственный буст ATTACK = just_hit выше.
+            if not just_hit:
                 logits[5] -= PHI * DS
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
@@ -5172,6 +5390,232 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("basic_sfnn_update %s/%s: %s", role, cid, e)
 
+    def _cerebellum_tissue_id(self, cid: str, org) -> "str | None":
+        """tissue_id ткани role=='cerebellum' (cache per cid). Вариант A:
+        cerebellum — каноничный in-graph узел (бит 18), через который связи
+        кормят прогноз. None если ткани нет → predictor остаётся на raw obs."""
+        if cid in self._cerebellum_tid:
+            return self._cerebellum_tid[cid]
+        tid = None
+        try:
+            for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
+                role = getattr(tissue, "role", None)
+                if role is None:
+                    spec = getattr(tissue, "spec", None)
+                    role = getattr(spec, "role", None) if spec is not None else None
+                if role == "cerebellum":
+                    tid = _tid
+                    break
+        except Exception as e:
+            logger.debug("cerebellum resolve %s: %s", cid, e)
+        self._cerebellum_tid[cid] = tid
+        return tid
+
+    def _ensure_cerebellum_hook(self, cid: str, org) -> None:
+        """Регистрирует forward-hook на cerebellum-ткани (один раз/cid): ловит
+        её выход в self._cerebellum_out[cid] (detach). Tissue — nn.Module,
+        forward → {port: tensor}. No-op (но помечает cid), если ткани нет."""
+        if cid in self._cerebellum_hooked:
+            return
+        tid = self._cerebellum_tissue_id(cid, org)
+        tissues = getattr(org, "tissues", {}) or {}
+        tissue = tissues.get(tid) if tid is not None else None
+        if tissue is None or not hasattr(tissue, "register_forward_hook"):
+            self._cerebellum_hooked.add(cid)  # нет ткани — больше не пытаемся
+            return
+
+        def _hook(_module, _inp, output, _cid=cid):
+            try:
+                if isinstance(output, dict) and output:
+                    t = next(iter(output.values()))
+                    self._cerebellum_out[_cid] = t.detach()
+            except Exception:
+                pass
+
+        try:
+            tissue.register_forward_hook(_hook)
+            logger.info("cerebellum hook cid=%s tid=%s (variant A: predictor "
+                        "input ← cerebellum)", cid, tid)
+        except Exception as e:
+            logger.warning("cerebellum hook %s: %s", cid, e)
+        self._cerebellum_hooked.add(cid)
+
+    # ── Шаг 2 — петля роста связей (in-life topology growth) ──────────────
+
+    def _brain_growth_step(self, cid: str) -> None:
+        """Один тик петли роста. idle→(плато intrinsic)→propose+dwell→измерить
+        Δloss_ema→keep/backoff. keep на ЗНАЧИМОМ сошедшемся улучшении; backoff
+        revert'ит ребро и защищает net/§3. Одна связь в полёте. Gated снаружи
+        (_growth_enabled + single_organism)."""
+        org = self.organisms.get(cid)
+        pred = self.predictor.get(cid)
+        if org is None or pred is None:
+            return
+        if self._cerebellum_tissue_id(cid, org) is None:
+            return  # нет cerebellum → расти некуда (драйвер не отзовётся)
+        st = self._growth_state.get(cid)
+        if st is None:
+            if self._growth_saturated:
+                return  # связи насыщены — петля на паузе (до фазы тканей §3.2)
+            # idle: ОТНОСИТЕЛЬНОЕ плато — intrinsic_ema у своего трейлинг-floor
+            # (min за окно) N тиков подряд = learning-progress застрял (весами
+            # учиться нечему → менять структуру). intrinsic выше floor (прогресс
+            # вернулся) → сброс. Self-referencing, drift-robust (Фрай 08.06).
+            intr = float(self.intrinsic_ema.get(cid, 0.0))
+            hist = self._growth_intr_hist.get(cid)
+            if hist is None:
+                hist = deque(maxlen=self._growth_intr_window)
+                self._growth_intr_hist[cid] = hist
+            hist.append(intr)
+            floor = min(hist)
+            near_floor = intr <= floor * (1.0 + self._growth_near_floor_margin)
+            if near_floor:
+                n = self._growth_stagnation_n.get(cid, 0) + 1
+                self._growth_stagnation_n[cid] = n
+                if n >= self._growth_plateau_ticks:
+                    self._propose_growth_edge(cid, org)
+            else:
+                self._growth_stagnation_n[cid] = 0  # intrinsic поднялся над floor → прогресс
+            return
+        # dwell: ждём пере-сходимости predictor'а с новым входом (Фрай: достаточно,
+        # чтобы не принять шум за сигнал).
+        st["ticks"] += 1
+        if st["ticks"] < self._growth_dwell_ticks:
+            return
+        # measure + keep/backoff
+        loss_before = float(st["loss_before"])
+        loss_after = float(self.loss_ema.get(cid, loss_before))
+        delta = loss_before - loss_after  # >0 = прогноз улучшился
+        signif = delta >= loss_before * self._growth_min_delta_frac
+        # net/§3-защита: §3 не ухудшился (par не вырос) И энергия не обвалилась.
+        net_ok = int(self._paralysis_window_n) <= int(st["par_before"])
+        bc = self.biochem.get(cid)
+        if bc is not None and st.get("energy_before") is not None:
+            net_ok = net_ok and (float(getattr(bc, "energy", 0.0))
+                                 >= float(st["energy_before"]) * 0.618)
+        keep = bool(signif and net_ok)
+        gene = st["gene"]
+        if keep:
+            self._growth_kept += 1
+            # KEEP = поиск ещё продуктивен → сбрасываем насыщение.
+            self._growth_fallback_streak = 0
+            self._growth_saturated = False
+            logger.info("brain-growth KEEP cid=%s edge=%s→cerebellum Δloss=%.5f "
+                        "(%.1f%%) kept=%d", cid, gene.source_role, delta,
+                        100.0 * delta / max(1e-9, loss_before), self._growth_kept)
+        else:
+            try:
+                gene.enabled = False
+                from core.tissue_topology import apply_topology_overlay_to_org
+                apply_topology_overlay_to_org(org)
+            except Exception as e:
+                logger.warning("brain-growth backoff %s: %s", cid, e)
+            # cooldown: отметить ребро отвергнутым (не ретраить ~cooldown проб).
+            self._growth_rejected.setdefault(cid, {})[gene.source_role] = (
+                self._growth_propose_count)
+            self._growth_reverted += 1
+            # SATURATION: backoff из fallback (свежих кандидатов не было) → копим
+            # streak. Порог → пауза петли + сигнал готовности к фазе тканей.
+            if st.get("from_fallback"):
+                self._growth_fallback_streak += 1
+                if (not self._growth_saturated and self._growth_fallback_streak
+                        >= self._growth_saturation_threshold):
+                    self._growth_saturated = True
+                    n_active = sum(1 for g in (
+                        getattr(org, "tissue_topology_genes", []) or [])
+                        if getattr(g, "enabled", False))
+                    logger.info("brain-growth SATURATED cid=%s: полезные связи "
+                                "исчерпаны (active=%d), петля связей НА ПАУЗЕ — "
+                                "готов к фазе тканей §3.2", cid, n_active)
+            else:
+                self._growth_fallback_streak = 0  # был свежий кандидат → не насыщение
+            logger.info("brain-growth BACKOFF cid=%s edge=%s→cerebellum Δloss=%.5f "
+                        "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
+                        delta, signif, net_ok, self._growth_reverted)
+        self._growth_state.pop(cid, None)
+        # После keep/backoff — заново копим стагнацию у floor до следующего propose.
+        self._growth_stagnation_n[cid] = 0
+
+    def _propose_growth_edge(self, cid: str, org) -> bool:
+        """Предложить ОДНУ связь {роль}→cerebellum (gene-формат + innovation
+        tracker как у Хьюберта, target=cerebellum чтобы двигать вход прогноза).
+        Записывает state для dwell. True если ребро добавлено."""
+        try:
+            from core.tissue_topology import (
+                TissueConnectionGene, apply_topology_overlay_to_org,
+                TissueInnovationTracker)
+            from core.connection import ConnectionType
+        except Exception as e:
+            logger.warning("brain-growth import %s: %s", cid, e)
+            return False
+        if self._growth_tracker is None:
+            self._growth_tracker = TissueInnovationTracker()
+        role_to_id: dict = {}
+        for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
+            role = getattr(tissue, "role", None)
+            if role is None:
+                spec = getattr(tissue, "spec", None)
+                role = getattr(spec, "role", None) if spec is not None else None
+            if role:
+                role_to_id[role] = _tid
+        if "cerebellum" not in role_to_id:
+            return False
+        genes = getattr(org, "tissue_topology_genes", None)
+        if genes is None:
+            genes = []
+            org.tissue_topology_genes = genes
+        taken = {g.source_role for g in genes
+                 if g.enabled and g.target_role == "cerebellum"}
+        all_cand = sorted(r for r in role_to_id
+                          if r != "cerebellum" and r not in taken)
+        if not all_cand:
+            return False
+        # COOLDOWN: предпочитаем рёбра, не отвергнутые за последние
+        # _growth_retry_cooldown проб. Если свежих нет (всё в cooldown) —
+        # fallback на all_cand (cooldown = предпочтение, не сталл).
+        rej = self._growth_rejected.get(cid, {})
+        cd = int(self._growth_retry_cooldown)
+        fresh = [r for r in all_cand
+                 if r not in rej or (self._growth_propose_count - rej[r]) >= cd]
+        used_fallback = not fresh   # свежих кандидатов нет → гоняем оставшиеся
+        candidates = fresh if fresh else all_cand
+        self._growth_propose_count += 1
+        src = self._growth_rng.choice(candidates)
+        gene = TissueConnectionGene(
+            innovation=self._growth_tracker.reserve(src, "cerebellum"),
+            source_role=src, target_role="cerebellum",
+            conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
+        genes.append(gene)
+        try:
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            logger.warning("brain-growth apply %s: %s", cid, e)
+            genes.remove(gene)
+            return False
+        bc = self.biochem.get(cid)
+        self._growth_state[cid] = {
+            "gene": gene,
+            "loss_before": float(self.loss_ema.get(cid, 0.0)),
+            "ticks": 0,
+            "par_before": int(self._paralysis_window_n),
+            "energy_before": (float(getattr(bc, "energy", 0.0))
+                              if bc is not None else None),
+            "from_fallback": used_fallback,
+        }
+        logger.info("brain-growth PROPOSE cid=%s edge=%s→cerebellum loss_before=%.5f",
+                    cid, src, self._growth_state[cid]["loss_before"])
+        return True
+
+    def reset_growth_saturation(self) -> None:
+        """Снять насыщение роста связей. Вызывать при добавлении ТКАНЕЙ (§3.2):
+        новые роли = новые {роль}→cerebellum кандидаты → петле снова есть что
+        пробовать. Идемпотентно."""
+        if self._growth_saturated or self._growth_fallback_streak:
+            logger.info("brain-growth saturation reset (новые ткани/роли — "
+                        "петля связей возобновлена)")
+        self._growth_saturated = False
+        self._growth_fallback_streak = 0
+
     def _predictor_train_step(self, cid: str, obs_tensor,
                               input_tensor=None) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
@@ -5244,6 +5688,51 @@ class LocalColonyCompute:
             float(self.trace_norm_ema.get(cid, 0.0)),
             float(self.reward_var_ema.get(cid, 0.0)),
             1.0 if par else 0.0,
+        ], dtype=np.float32)
+
+    def _build_client_intero(self, cid: str):
+        """§3.2: client-authoritative интероцепция [7] из self.biochem.
+
+        Зеркало server `_gather_interoception` (sidecars.py:48). Slots 0,1,3,4,5
+        (energy/hydration/cortisol/serotonin/infection) — ТОЧНЫЕ из биохимии
+        Адама. Slots 2 (age) и 6 (valence=comfort−discomfort) требуют member-
+        стейта P40 (нет birth_tick / comfort-EMA client-side) → carry последнего
+        P40-intero (или 0). Снимает P40-blind risk — insula не слепнет, если P40
+        перестанет слать `intero`. Возвращает np.ndarray[7] или None (нет биохимии
+        → insula пропустится штатно).
+
+        Нормировки совпадают с server ТОЧЬ-В-ТОЧЬ:
+          slot[1] = hydration / (100·camel)  — raw camel, как в _gather (НЕ
+          kleiber); даёт ту же squashed-шкалу, что insula видела от P40. Для
+          felt-DRIVE используется нативная [0,100] шкала (см. ws_client), НЕ
+          этот squashed slot — у них разные потребители.
+        """
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return None
+        energy = float(getattr(bc, "energy", 0.0) or 0.0)
+        hydration = float(getattr(bc, "hydration", 0.0) or 0.0)
+        camel = float((self.traits.get(cid, {}) or {}).get(
+            "camel", _CLIENT_DEFAULT_CAMEL) or _CLIENT_DEFAULT_CAMEL)
+        max_h = 100.0 * camel
+        cortisol = float(getattr(bc, "cortisol", 0.0) or 0.0)
+        serotonin = float(getattr(bc, "serotonin", 0.0) or 0.0)
+        infection = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+        # slots 2/6 — carry последнего P40-intero (member-стейт), пока нет
+        # client-side birth_tick/comfort-EMA. Полный паритет — отд. итерацией.
+        carry = self._last_p40_intero.get(cid)
+        age_norm = (float(carry[2]) if carry is not None
+                    and len(carry) > 2 else 0.0)
+        valence = (float(carry[6]) if carry is not None
+                   and len(carry) > 6 else 0.0)
+        return np.array([
+            energy / _CLIENT_MAX_ENERGY if _CLIENT_MAX_ENERGY > 0 else 0.0,
+            hydration / max_h if max_h > 0 else 0.0,
+            age_norm,
+            cortisol / 100.0,
+            serotonin / 100.0,
+            infection,
+            valence,
         ], dtype=np.float32)
 
     def _upgrade_tissue_input_dim(self, tissue, new_data_dim: int) -> bool:
@@ -6586,7 +7075,16 @@ class LocalColonyCompute:
             if delta_e != 0.0:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
                 if delta_e > 0.0:
-                    self._e_income_sum += delta_e  # ENERGY_CALIB
+                    self._e_income_sum += delta_e  # ENERGY_CALIB income
+                else:
+                    # §3.5-ПОЛНОТА (Фрай 07.06): ОТРИЦАТЕЛЬНЫЙ delta_energy =
+                    # серверная per-event цена (атаки/combat/действия) — списывал
+                    # energy, но в ledger НЕ попадал (только delta>0 шёл в income).
+                    # Это и есть «непосчитанная метаб-цена berserk/атак»: LEDGER_FULL
+                    # вскрыл residual≈−250/окно при attack=140-202, dmg=0. Теперь в
+                    # cost → net_comp = истинный метаб-баланс (net+ перестанет врать).
+                    self._e_cost_sum += -delta_e
+                    self._e_srv_cost_sum += -delta_e  # отдельный диаг-аккумулятор
             # Hydration income (31.05.2026): присутствие ключа delta_hydration
             # в event = P40 шлёт питьё → активируем hydration-ось отбора для
             # этого cid (thirst-декей + жажда-смерть включатся в
@@ -6843,6 +7341,7 @@ class LocalColonyCompute:
                     # Конец паралича → recovery-грант (ЭНЕРГИЯ, не время).
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
+                    self._paralysis_window_n += 1  # §3.5-ledger: грант искажает Δ
                     # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
                     # recovery = «передышка» → снимает не только паралич, но и
                     # стресс-залипание catatonic (cortisol застревает на 99.5 от
@@ -6863,6 +7362,16 @@ class LocalColonyCompute:
                         bc.glucose = max(
                             float(getattr(bc, "glucose", 0.0)),
                             float(getattr(bc, "baseline_glucose", 50.0)))
+                        # Infection-relief (Фрай 08.06, вариант b): recovery чистит
+                        # и infection_severity — иначе absorbing-петля (recovery
+                        # снимает energy+стресс+mb, но инфекция ре-дренит сразу →
+                        # mb=inflammation возвращается → §3-цикл вечно; water лечит
+                        # ТОЛЬКО при severity<0.5 + water-seek гатнут → у Адама
+                        # severity~1.0 вода бессильна, recovery-клир единственный
+                        # путь). Инфекция остаётся ЖИВОЙ механикой (заражение тикает),
+                        # recovery её снимает как стресс — §3=«полная передышка».
+                        bc.infection_severity = 0.0
+                        bc.infected = False
                         bc.mental_break = ""
                         bc.mental_break_ticks = 0
                     except Exception:
@@ -6932,6 +7441,28 @@ class LocalColonyCompute:
                         for c in self.organisms]
                 eff_mean = (sum(effs) / len(effs)) if effs else 0.0
                 _net = self._e_income_sum - self._e_cost_sum - self._e_infdrain_sum
+                # §3.5-ПОЛНОТА (Фрай 07.06): net_true = реальная Δenergy за окно
+                # (authoritative bc.energy, не врёт); residual = net_true − net_comp
+                # = непосчитанные расходы/гранты (berserk/атаки/дегидрация/§3-грант).
+                # Автотюн ДОЛЖЕН читать net_true, не компонентный net.
+                _e_now = -1.0
+                try:
+                    for _bcv in self.biochem.values():
+                        _e_now = float(getattr(_bcv, "energy", -1.0))
+                        break  # single-organism: один Адам
+                except Exception:
+                    pass
+                _net_true = (_e_now - self._e_window_e0
+                             if (self._e_window_e0 >= 0.0 and _e_now >= 0.0)
+                             else _net)
+                _residual = _net_true - _net
+                logger.info(
+                    "LEDGER_FULL net_comp=%.1f net_true=%.1f residual=%.1f "
+                    "srv_cost=%.1f paralysis=%d e0=%.1f e1=%.1f (srv_cost=серверная "
+                    "per-event цена delta_e<0, теперь в ledger; residual→0+гранты "
+                    "после фикса; paralysis>0 = §3-несустейнабельно)",
+                    _net, _net_true, _residual, self._e_srv_cost_sum,
+                    self._paralysis_window_n, self._e_window_e0, _e_now)
                 # INSTINCT_DIAG (Фрай): natural-роды vs bootstrap-омоложение +
                 # сколько особей сейчас в активном инстинкте. Критерий успеха:
                 # natural>0 (пошли роды) + eff_mean ползёт 5→10. Если держится
@@ -7051,6 +7582,15 @@ class LocalColonyCompute:
             self._e_income_sum = 0.0
             self._e_cost_sum = 0.0
             self._e_infdrain_sum = 0.0
+            # §3.5-ledger: новое окно стартует с текущей energy (net_true база).
+            try:
+                for _bcv in self.biochem.values():
+                    self._e_window_e0 = float(getattr(_bcv, "energy", -1.0))
+                    break
+            except Exception:
+                self._e_window_e0 = -1.0
+            self._paralysis_window_n = 0
+            self._e_srv_cost_sum = 0.0
             self._nav = {"ticks": 0, "onf": 0, "gather": 0, "gather_onf": 0,
                          "eat": 0, "flip": 0, "mnorm": 0.0, "p40_ate": 0,
                          "yield_fire": 0, "move": 0, "stay": 0, "cf_last": 0,
@@ -7129,7 +7669,19 @@ class LocalColonyCompute:
         # стресса держится, но ложный lock уходит. Recover existing catatonic
         # к ~40 за ~144 тика.
         try:
-            bc.cortisol = float(getattr(bc, "cortisol", 0.0)) * _CORTISOL_HOMEOSTASIS_DECAY
+            _cort_decay = _CORTISOL_HOMEOSTASIS_DECAY  # 0.995 базовый гомеостаз
+            # BERSERK cortisol-relief exit (Фрай 08.06, инвариант «нет залипших
+            # mental_break»): decay_step даёт relief ×0.98 ТОЛЬКО catatonic
+            # (biochemistry.py:474) → berserk был ABSORBING (cortisol не уходил →
+            # berserk вечен → форсил холостые ATTACK, srv_cost 300). Зеркалим
+            # catatonic-relief на берсерк client-side: при mb=berserk усиленный
+            # decay ×0.98 → cortisol спадает ниже berserk-порога → выходит, спам
+            # прекращается сам. Источник пина (ЖАЖДА: hydration~16 server-side,
+            # water-halo OFF Phase 2 — Хьюберт убирает параллельно) при выходимом
+            # берсерке даёт cortisol реально упасть. berserk НЕ-absorbing, как все mb.
+            if str(getattr(bc, "mental_break", "")) == "berserk":
+                _cort_decay = 0.98
+            bc.cortisol = float(getattr(bc, "cortisol", 0.0)) * _cort_decay
         except Exception as e:
             logger.debug("cortisol homeostasis cid=%s: %s", cid, e)
 
@@ -7773,6 +8325,11 @@ class LocalColonyCompute:
             "n_alive": n,
             "n_predictors": len(self.predictor),
             "n_prev_obs": len(self.prev_obs),
+            # Рост мозга при жизни (§6): принятых/откатанных связей + в полёте.
+            "tissue_topology_mutations_total": int(self._growth_kept),
+            "growth_kept": int(self._growth_kept),
+            "growth_reverted": int(self._growth_reverted),
+            "growth_in_flight": len(self._growth_state),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
             "intrinsic_reward_avg": (
@@ -7909,6 +8466,13 @@ class LocalColonyCompute:
                 "species_id": self.species_id.get(cid),
                 "gen": int(getattr(org, "generation", 0) or 0),
                 "topo": len(getattr(org, "tissue_topology_genes", []) or []),
+                # Рост мозга при жизни (§6 замер): topo_active = живые связи
+                # (enabled), tissue_topology_mutations_total = принятых ростом
+                # (kept). На флипе _growth_enabled это растёт с 0 — мозг меняется.
+                "topo_active": sum(
+                    1 for g in (getattr(org, "tissue_topology_genes", []) or [])
+                    if getattr(g, "enabled", False)),
+                "tissue_topology_mutations_total": int(self._growth_kept),
                 "age": _age,
                 "inst": _inst,
                 "food": _food,

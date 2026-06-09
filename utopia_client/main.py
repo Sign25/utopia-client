@@ -520,6 +520,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # (insula-стресс → temperature-модуляция). Через client_flags → мгновенный
     # on/off без деплоя: запуск по go Фрая, tripwire-откат при disruption.
     applied_insula_temp: bool | None = None
+    # §3.2 (Фрай 09.06.2026): felt-thirst gradual drive. Через client_flags →
+    # мгновенный on/off без рестарта; false = kill-switch (откат к бинарному
+    # 30% water-seek), backoff если выживание падает.
+    applied_felt_thirst_drive: bool | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -762,6 +766,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("insula_temp → %s", target_insula_temp)
                         except Exception as e:
                             logger.warning("set_insula_temp failed: %s", e)
+
+                    # §3.2: felt-thirst gradual drive. Мгновенный on/off без
+                    # деплоя (запуск по go Фрая; kill-switch=false → бинарный
+                    # 30%; backoff при падении выживания). edge-detect.
+                    target_felt_thirst = bool(flags.get("felt_thirst_drive", False))
+                    if target_felt_thirst != applied_felt_thirst_drive \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_felt_thirst_drive(target_felt_thirst)
+                            applied_felt_thirst_drive = target_felt_thirst
+                            logger.info("felt_thirst_drive → %s", target_felt_thirst)
+                        except Exception as e:
+                            logger.warning("set_felt_thirst_drive failed: %s", e)
 
                     # Ступень 2 (full-world): motor renorm growth-cap (числовой
                     # флаг). Мгновенная рекалибровка renorm-супрессора без рестарта.
