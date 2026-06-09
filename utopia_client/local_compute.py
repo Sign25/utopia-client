@@ -186,6 +186,16 @@ _GLUCOSE_FLOOR_ENERGY_THRESHOLD = 200.0
 _CORTISOL_HOMEOSTASIS_DECAY = 0.995
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
 _INSULA_DATA_DIM = 71
+# §3.2 (Фрай 09.06.2026): client-authoritative интероцепция. Строим 7-вектор
+# ЛОКАЛЬНО из self.biochem (energy/hydration/cortisol/serotonin/infection —
+# точно из биохимии Адама; age/valence — carry последнего P40-intero). Снимает
+# P40-blind risk: insula не слепнет, если P40 перестанет слать intero.
+# Зеркало server-side _gather_interoception (NeuroCore/server/tick/sidecars.py:48)
+# — нормировки совпадают ТОЧЬ-В-ТОЧЬ (incl. raw-camel quirk slot[1]), иначе insula
+# получит сдвиг распределения входа.
+_CLIENT_MAX_ENERGY = 1309.0      # mirror cfg.max_energy default (_gather_interoception)
+_CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
+_CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
 # Совпадает с _DEFAULT_MODE_FLOOR_MAX на P40 (routes_world.py).
 _DEFAULT_MODE_FLOOR_MAX = 0.01
@@ -691,6 +701,10 @@ class LocalColonyCompute:
         self._bias_last_update_tick: int = 0
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
+        # §3.2 (Фрай 09.06.2026): последний P40-intero[7] per-cid — для carry
+        # slots 2/6 (age/valence) в client-built intero + fallback, если
+        # биохимии нет. См. _build_client_intero.
+        self._last_p40_intero: dict = {}   # cid → np.ndarray[7]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
         # TD = β_local − EMA(β_local, α=0.01) per-cid, обновляется один раз за
         # тик в _compute_higher_tissues. effective_eta_reward = lr_reward ·
@@ -760,6 +774,13 @@ class LocalColonyCompute:
         self._it_baseline: dict = {}          # cid → бегущая средняя advantage (variance-reduction)
         self._it_last_tmod: dict = {}         # cid → последний T_mod (телеметрия обучения моста)
         self._insula_temp_enabled: bool = False
+        # §3.2 (Фрай 09.06.2026): felt-thirst gradual drive. False (дефолт) →
+        # текущий бинарный 30% water-seek (прод не меняется до go). True →
+        # градуальный felt-drive (intero[1]-афферент масштабирует приоритет
+        # рефлекса A, φ-onset 0.382). Мгновенный on/off через client_flags
+        # (felt_thirst_drive); kill-switch = false → откат к бинарному. См.
+        # ws_client._apply_water_seek.
+        self._felt_thirst_drive_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -1295,6 +1316,7 @@ class LocalColonyCompute:
         self.imagination.pop(cid, None)
         self.planner.pop(cid, None)
         self.insula.pop(cid, None)
+        self._last_p40_intero.pop(cid, None)   # §3.2 carry cleanup
         # 13.05.2026: S2.D default_mode.
         self.default_mode.pop(cid, None)
         self.last_beta_local.pop(cid, None)
@@ -2338,6 +2360,19 @@ class LocalColonyCompute:
                         "сохранены для ре-enable)")
         return self._insula_temp_enabled
 
+    def set_felt_thirst_drive(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл §3.2 felt-thirst gradual drive МГНОВЕННО
+        (без деплоя/рестарта). on=True: рефлекс A (water-seek) масштабирует
+        приоритет по градуальному felt-сигналу жажды (intero[1]-афферент,
+        φ-onset 0.382) вместо бинарного порога 30%. on=False (kill-switch):
+        откат к проверенному бинарному 30% (read-only флаг — поведение
+        water-seek читает его per-тик; ткани/состояние не трогаются). Реверс
+        мгновенный. backoff: VPS/кабинет ставит false, если выживание падает."""
+        self._felt_thirst_drive_enabled = bool(on)
+        logger.info("set_felt_thirst_drive: %s (%s)", on,
+                    "градуальный felt-drive" if on else "бинарный 30% (kill-switch)")
+        return self._felt_thirst_drive_enabled
+
     def set_motor_renorm_cap(self, cap: float) -> float:
         """Канал client_flags: рекалибровка motor renorm growth-cap (Ступень 2,
         Фрай). cap=1.0 → пин магнитуды к target (текущее); cap>1 → веса motor_policy
@@ -3291,16 +3326,29 @@ class LocalColonyCompute:
                     self._skill_window_tick[cid] = _sn
 
                 # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
+                # §3.2 (Фрай 09.06.2026): client-authoritative intero — строим
+                # ЛОКАЛЬНО из self.biochem (primary), P40-intero храним для carry
+                # slots 2/6 + fallback. Снимает P40-blind risk (insula не слепнет
+                # без P40-поля). См. _build_client_intero.
                 intero_tensor = None
                 if intero_per_cid is not None:
-                    intero_arr = intero_per_cid.get(cid)
-                    if intero_arr is not None:
+                    _p40_intero = intero_per_cid.get(cid)
+                    if _p40_intero is not None:
                         try:
-                            intero_tensor = torch.from_numpy(
-                                np.asarray(intero_arr, dtype=np.float32)
-                            ).to(self.device).unsqueeze(0)
+                            self._last_p40_intero[cid] = np.asarray(
+                                _p40_intero, dtype=np.float32).reshape(-1)
                         except Exception:
-                            intero_tensor = None
+                            pass
+                intero_arr = self._build_client_intero(cid)
+                if intero_arr is None:
+                    intero_arr = self._last_p40_intero.get(cid)  # fallback P40
+                if intero_arr is not None:
+                    try:
+                        intero_tensor = torch.from_numpy(
+                            np.asarray(intero_arr, dtype=np.float32).reshape(-1)
+                        ).to(self.device).unsqueeze(0)
+                    except Exception:
+                        intero_tensor = None
                 self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
 
                 # Z1 (16.05.2026, Зодчий) — apply-step 7 высших тканей
@@ -5640,6 +5688,51 @@ class LocalColonyCompute:
             float(self.trace_norm_ema.get(cid, 0.0)),
             float(self.reward_var_ema.get(cid, 0.0)),
             1.0 if par else 0.0,
+        ], dtype=np.float32)
+
+    def _build_client_intero(self, cid: str):
+        """§3.2: client-authoritative интероцепция [7] из self.biochem.
+
+        Зеркало server `_gather_interoception` (sidecars.py:48). Slots 0,1,3,4,5
+        (energy/hydration/cortisol/serotonin/infection) — ТОЧНЫЕ из биохимии
+        Адама. Slots 2 (age) и 6 (valence=comfort−discomfort) требуют member-
+        стейта P40 (нет birth_tick / comfort-EMA client-side) → carry последнего
+        P40-intero (или 0). Снимает P40-blind risk — insula не слепнет, если P40
+        перестанет слать `intero`. Возвращает np.ndarray[7] или None (нет биохимии
+        → insula пропустится штатно).
+
+        Нормировки совпадают с server ТОЧЬ-В-ТОЧЬ:
+          slot[1] = hydration / (100·camel)  — raw camel, как в _gather (НЕ
+          kleiber); даёт ту же squashed-шкалу, что insula видела от P40. Для
+          felt-DRIVE используется нативная [0,100] шкала (см. ws_client), НЕ
+          этот squashed slot — у них разные потребители.
+        """
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return None
+        energy = float(getattr(bc, "energy", 0.0) or 0.0)
+        hydration = float(getattr(bc, "hydration", 0.0) or 0.0)
+        camel = float((self.traits.get(cid, {}) or {}).get(
+            "camel", _CLIENT_DEFAULT_CAMEL) or _CLIENT_DEFAULT_CAMEL)
+        max_h = 100.0 * camel
+        cortisol = float(getattr(bc, "cortisol", 0.0) or 0.0)
+        serotonin = float(getattr(bc, "serotonin", 0.0) or 0.0)
+        infection = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+        # slots 2/6 — carry последнего P40-intero (member-стейт), пока нет
+        # client-side birth_tick/comfort-EMA. Полный паритет — отд. итерацией.
+        carry = self._last_p40_intero.get(cid)
+        age_norm = (float(carry[2]) if carry is not None
+                    and len(carry) > 2 else 0.0)
+        valence = (float(carry[6]) if carry is not None
+                   and len(carry) > 6 else 0.0)
+        return np.array([
+            energy / _CLIENT_MAX_ENERGY if _CLIENT_MAX_ENERGY > 0 else 0.0,
+            hydration / max_h if max_h > 0 else 0.0,
+            age_norm,
+            cortisol / 100.0,
+            serotonin / 100.0,
+            infection,
+            valence,
         ], dtype=np.float32)
 
     def _upgrade_tissue_input_dim(self, tissue, new_data_dim: int) -> bool:

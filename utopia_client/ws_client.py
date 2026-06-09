@@ -2159,7 +2159,13 @@ class ColonyWSClient:
 
     # Water-seek рефлекс (31.05.2026). Tile.WATER=1 (environment/world.py).
     _WATER_TILE = 1
-    _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду
+    _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду (бинарный режим)
+    # §3.2 (Фрай 09.06.2026): φ-onset градуального felt-drive. 0.382·100=38.2
+    # (нативная hydration-шкала [0,100], НЕ squashed insula slot[1]). hydration<
+    # onset → felt>0; felt=(onset−hyd)/onset∈[0,1] масштабирует приоритет
+    # рефлекса A (duty-cycle). Тюнится по выживанию. Заменяет бинарный 30% под
+    # флагом compute._felt_thirst_drive_enabled.
+    _THIRST_ONSET = 38.2
     _WATER_SEEK_RADIUS = 8         # тайлов вокруг — дальше random walk
     # Berry/fruit-seek (01.06.2026, Хьюберт audit): grass net −7.85/сек (НЕ
     # кормит), berry +18/сек. Голодные Зодчие должны идти к высокоценной флоре,
@@ -2428,13 +2434,30 @@ class ColonyWSClient:
             self._water_seek_pos = {}
         if not hasattr(self, "_water_seek_stuck"):
             self._water_seek_stuck = {}
+        # §3.2 felt-drive: duty-cycle аккумулятор приоритета рефлекса A per-cid.
+        if not hasattr(self, "_thirst_accum"):
+            self._thirst_accum = {}
+        _felt_on = (self.compute is not None
+                    and getattr(self.compute, "_felt_thirst_drive_enabled", False))
         for entry in creatures_out:
             cid = entry.get("cid")
             bc = biochem.get(cid) if cid else None
             if bc is None:
                 continue
-            if float(getattr(bc, "hydration", 100.0)) >= self._WATER_SEEK_HYDRATION:
-                continue
+            hyd = float(getattr(bc, "hydration", 100.0))
+            # felt ∈ [0,1] — сила «чувства жажды» (thirst-афферент). Бинарный
+            # режим: felt=1.0 при hydration<30 (детерминированная компульсия, как
+            # было). Градуальный (§3.2): onset φ=38.2, felt=(onset−hyd)/onset →
+            # жажднее ⇒ сильнее тяга. Не жаждет → пропуск (+ сброс аккумулятора).
+            if _felt_on:
+                if hyd >= self._THIRST_ONSET:
+                    self._thirst_accum.pop(cid, None)
+                    continue
+                felt = max(0.0, min(1.0, (self._THIRST_ONSET - hyd) / self._THIRST_ONSET))
+            else:
+                if hyd >= self._WATER_SEEK_HYDRATION:
+                    continue
+                felt = 1.0
             n_thirsty += 1
             rc = pos.get(cid)
             if rc is None or rc[0] is None:
@@ -2445,6 +2468,7 @@ class ColonyWSClient:
                 n_near += 1
                 self._water_seek_stuck[cid] = 0
                 self._water_seek_pos[cid] = rc
+                self._thirst_accum.pop(cid, None)   # §3.2 пьёт → сброс duty-cycle
                 continue
             # Не у воды + жажда → веди к воде. Стук-детект (зеркало arrival-escape):
             if self._water_seek_pos.get(cid) == rc:
@@ -2458,6 +2482,16 @@ class ColonyWSClient:
                 # воды нет в радиусе ИЛИ пинуется (недостижима) → ИССЛЕДУЙ:
                 # ротация 4 кардинальных (sn//5)%4 → любое открытое сменит pos.
                 wd = [0, 2, 1, 3][(_sn // 5) % 4]   # N, E, S, W
+            # §3.2 градуальный duty-cycle (детерминированный, без RNG): копим
+            # felt; шаг-к-воде только при накоплении ≥1 (rate=felt/тик). felt=1
+            # ⇒ каждый тик (бинарная компульсия). felt мал ⇒ редкий нудж — мозг
+            # большую часть тиков свободен. «Жажднее → сильнее тяга», ОДИН контур.
+            if felt < 1.0:
+                _acc = self._thirst_accum.get(cid, 0.0) + felt
+                if _acc < 1.0:
+                    self._thirst_accum[cid] = _acc
+                    continue   # этот тик felt не перебивает действие мозга
+                self._thirst_accum[cid] = _acc - 1.0
             entry["action"] = int(wd)
             n_seek += 1
         if n_seek:
