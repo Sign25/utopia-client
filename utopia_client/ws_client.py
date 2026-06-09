@@ -1708,9 +1708,28 @@ class ColonyWSClient:
                     obs_arr = None
             if obs_arr is None:
                 continue
-            # §10.9 ПОГОДА v0.1: temperature (Adam-only поле) → obs[35]. None → no-op.
-            obs_arr = self._apply_weather_to_obs(obs_arr, c.get("temperature"))
+            # §10.9 ПОГОДА v0.1: temperature → obs[35]. Хьюберт шлёт ВЛОЖЕННО
+            # c["weather"]["temperature"] (+ патчит server-obs[35]). Читаем оба
+            # места (nested + flat fallback). Идемпотентно: Адам на server-obs
+            # (temp@35 уже есть) → пишем то же; client-built → заполняем. None →
+            # no-op. WEATHER_DIAG ниже логирует obs[35] для валидации.
+            _wx = c.get("weather")
+            _temp = (_wx.get("temperature") if isinstance(_wx, dict) else None)
+            if _temp is None:
+                _temp = c.get("temperature")
+            obs_arr = self._apply_weather_to_obs(obs_arr, _temp)
             obs_per_cid[cid_s] = obs_arr
+            if _temp is not None:
+                self._weather_diag_n = getattr(self, "_weather_diag_n", 0) + 1
+                if self._weather_diag_n % 600 == 1:
+                    try:
+                        logger.info("WEATHER_DIAG cid=%s obs[35]=%.4f temp=%.4f "
+                                    "src=%s server_obs=%s", cid_s,
+                                    float(obs_arr[35]), float(_temp),
+                                    "weather" if isinstance(_wx, dict) else "flat",
+                                    c.get("obs") is not None)
+                    except Exception:
+                        pass
             # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
             # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
             events_per_cid[cid_s] = {
