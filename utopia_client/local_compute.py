@@ -1738,6 +1738,22 @@ class LocalColonyCompute:
                     getattr(self, target)[cid] = float(payload[key])
                 except Exception:
                     pass
+        # §6 рост мозга durable (Фрай 09.06): восстановить ПРОГРЕСС петли роста
+        # (kept/reverted KPI + трейлинг-floor deque + стагнация). predictor цел →
+        # floor-история валидна → PROPOSE возобновляется без re-warm. См. save_state.
+        _gl = payload.get("growth_loop")
+        if isinstance(_gl, dict):
+            try:
+                self._growth_kept = int(_gl.get("kept", self._growth_kept))
+                self._growth_reverted = int(_gl.get("reverted", self._growth_reverted))
+                _hist = _gl.get("intr_hist") or []
+                if _hist:
+                    self._growth_intr_hist[cid] = deque(
+                        (float(x) for x in _hist),
+                        maxlen=self._growth_intr_window)
+                self._growth_stagnation_n[cid] = int(_gl.get("stagnation_n", 0))
+            except Exception as e:
+                logger.debug("restore_persisted_state %s growth_loop: %s", cid, e)
         # Higher tissues (brain migration) — exact, без Y50
         for key, store in (
             ("dopamine", self.dopamine),
@@ -3618,6 +3634,23 @@ class LocalColonyCompute:
                 payload["intrinsic_ema"] = float(self.intrinsic_ema.get(cid, 0.0))
             except Exception as e:
                 logger.debug("save_state %s predictor: %s", cid, e)
+        # §6 рост мозга durable (Фрай 09.06): персистить ПРОГРЕСС петли роста.
+        # predictor цел (loss_ema непрерывен) → трейлинг-floor история ВАЛИДНА →
+        # PROPOSE возобновляется без ~233-тик re-warm после сбоя питания.
+        # growth_kept/reverted — KPI «закреплено» больше не врёт «0» после рестарта;
+        # intr_hist — трейлинг-floor deque; stagnation_n — счётчик «у floor».
+        # _growth_saturated НЕ персистим: на рестарте сброс в False → петля заново
+        # ищет (durable-инвариант роста, Фрай). См. restore_persisted_state.
+        try:
+            _gi_hist = self._growth_intr_hist.get(cid)
+            payload["growth_loop"] = {
+                "kept": int(self._growth_kept),
+                "reverted": int(self._growth_reverted),
+                "intr_hist": list(_gi_hist) if _gi_hist is not None else [],
+                "stagnation_n": int(self._growth_stagnation_n.get(cid, 0)),
+            }
+        except Exception as e:
+            logger.debug("save_state %s growth_loop: %s", cid, e)
         # Phase 6 — self-observable EMAs.
         if cid in self.entropy_ema:
             payload["entropy_ema"] = float(self.entropy_ema.get(cid, 0.0))
