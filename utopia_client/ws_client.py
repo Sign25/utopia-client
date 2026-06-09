@@ -2166,6 +2166,12 @@ class ColonyWSClient:
     # рефлекса A (duty-cycle). Тюнится по выживанию. Заменяет бинарный 30% под
     # флагом compute._felt_thirst_drive_enabled.
     _THIRST_ONSET = 38.2
+    # §3.2 concave felt-кривая (Фрай 09.06, первое окно): линейный felt в mid-зоне
+    # слаб (hyd~30: felt~0.15 → редкий override → коррекция поздно → провал до 0 +
+    # berserk). felt^φ⁻¹ (concave, степень 0.618) бустит mid (0.15→0.30), держит
+    # φ-onset (0 при onset, 1 при hyd=0), монотонна. Строгое улучшение в нужную
+    # сторону: ранняя коррекция жажды.
+    _THIRST_FELT_POWER = 0.6180339887498949   # φ⁻¹
     _WATER_SEEK_RADIUS = 8         # тайлов вокруг — дальше random walk
     # Berry/fruit-seek (01.06.2026, Хьюберт audit): grass net −7.85/сек (НЕ
     # кормит), berry +18/сек. Голодные Зодчие должны идти к высокоценной флоре,
@@ -2453,7 +2459,8 @@ class ColonyWSClient:
                 if hyd >= self._THIRST_ONSET:
                     self._thirst_accum.pop(cid, None)
                     continue
-                felt = max(0.0, min(1.0, (self._THIRST_ONSET - hyd) / self._THIRST_ONSET))
+                _lin = max(0.0, min(1.0, (self._THIRST_ONSET - hyd) / self._THIRST_ONSET))
+                felt = _lin ** self._THIRST_FELT_POWER   # concave φ⁻¹: бустит mid
             else:
                 if hyd >= self._WATER_SEEK_HYDRATION:
                     continue

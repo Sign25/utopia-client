@@ -158,17 +158,40 @@ def test_felt_drive_no_seek_above_onset():
     assert "c1" not in cli._thirst_accum
 
 
-def test_felt_drive_duty_cycle_half():
-    # Флаг ON, felt=0.5 (hydration=19.1) → шаг-к-воде каждый 2-й тик.
-    c = _compute_with(hydration=19.1)     # (38.2-19.1)/38.2 = 0.5
+def _override_fired(cli, cid="c1"):
+    # sentinel 9 (не направление 0-3) → override фаирит ⇔ action сменился.
+    # robust к stuck-ротации wd (направление меняется, факт override — нет).
+    creatures = [{"cid": cid, "row": 10, "col": 10}]
+    out = [{"cid": cid, "action": 9, "target_id": None}]
+    cli._apply_water_seek(creatures, out)
+    return out[0]["action"] != 9
+
+
+def test_felt_drive_duty_cycle_matches_felt():
+    # Флаг ON: rate override за окно ≈ felt (детерминированный duty-cycle).
+    # felt = concave((onset-hyd)/onset)^φ⁻¹ — формула-driven, robust к степени.
+    hyd = 19.1
+    onset = wsm.ColonyWSClient._THIRST_ONSET
+    power = wsm.ColonyWSClient._THIRST_FELT_POWER
+    felt = ((onset - hyd) / onset) ** power
+    c = _compute_with(hydration=hyd)
     c.set_felt_thirst_drive(True)
     cli = _client(_FakeWC(20, [(10, 16)]))
     cli.compute = c
-    a1 = _seek_once(cli)                   # acc 0.5 <1 → skip
-    a2 = _seek_once(cli)                   # acc 1.0 → override
-    a3 = _seek_once(cli)                   # acc 0.5 → skip
-    a4 = _seek_once(cli)                   # acc 1.0 → override
-    assert (a1, a2, a3, a4) == (1, 2, 1, 2)
+    N = 50
+    overrides = sum(1 for _ in range(N) if _override_fired(cli))
+    assert abs(overrides - round(N * felt)) <= 1   # duty-cycle rate = felt
+
+
+def test_felt_concave_boosts_mid():
+    # Concave: felt^φ⁻¹ > linear в mid-зоне (строгое усиление пула жажды).
+    onset = wsm.ColonyWSClient._THIRST_ONSET
+    power = wsm.ColonyWSClient._THIRST_FELT_POWER
+    hyd = 30.0                              # mid-зона
+    lin = (onset - hyd) / onset             # ~0.215
+    concave = lin ** power
+    assert concave > lin                    # бустит
+    assert 0.0 < power < 1.0                # φ⁻¹ concave
 
 
 def test_felt_drive_high_compulsion_every_tick():
