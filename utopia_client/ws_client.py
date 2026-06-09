@@ -1608,6 +1608,25 @@ class ColonyWSClient:
 
     # ── Phase F3.1.b/c: obs_batch → actions_batch ────────────────────────
 
+    @staticmethod
+    def _apply_weather_to_obs(obs_arr, temperature):
+        """§10.9 ПОГОДА v0.1 (контракт Хьюберт/Фрай 09.06): temperature ∈[-1,1] →
+        obs[35] (Adam-only слот, был steps_taken/5000 — не-сенсорный счётчик
+        возраста; steps_taken жив в payload-поле, инфа не теряется). obs Адама
+        строит КЛИЕНТ (owned skip_obs) → temp инжектится ЗДЕСЬ; server-патч
+        obs[35] owned не достигает. Поле Adam-only (Хьюберт шлёт только Адаму) →
+        presence = гейт. None → no-op (до деплоя weather.py). Predictor target
+        авто-включает temp@35 (obs[:64] фикс) → prediction-давление. v0.1
+        perception-only (без world-эффекта; respawn-возмущение — v0.2). Мутирует
+        obs_arr на месте, возвращает его."""
+        if temperature is None:
+            return obs_arr
+        try:
+            obs_arr[35] = float(temperature)
+        except (IndexError, TypeError, ValueError):
+            pass
+        return obs_arr
+
     def _collect_obs_batch(
         self, creatures: list
     ) -> tuple[dict, dict, dict]:
@@ -1689,6 +1708,8 @@ class ColonyWSClient:
                     obs_arr = None
             if obs_arr is None:
                 continue
+            # §10.9 ПОГОДА v0.1: temperature (Adam-only поле) → obs[35]. None → no-op.
+            obs_arr = self._apply_weather_to_obs(obs_arr, c.get("temperature"))
             obs_per_cid[cid_s] = obs_arr
             # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
             # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
