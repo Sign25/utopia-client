@@ -5908,6 +5908,26 @@ class LocalColonyCompute:
                 surprise_prev = self.loss_ema.get(cid, 0.0)
                 self.loss_ema[cid] = (1 - _EMA_ALPHA) * surprise_prev + _EMA_ALPHA * loss_f
                 self.pred_loss_history[cid].append(loss_f)
+                # §10.9 v0.2-валидация: per-region predictor-loss — ГДЕ давление.
+                # [35]=temperature (прямой сигнал), [44:55]=density bins (temp-
+                # зависимы в v0.2 через respawn-лаг → сюда сядет Path-B давление),
+                # rest=базлайн. v0.1: dens≈базлайн. v0.2: dens↑ И УСТОЙЧИВО (лаг/
+                # нелинейность не выучиваются persistence'ом, в отличие от гладкого
+                # temp@35) = реальное давление. Throttled, read-only (не трогает train).
+                self._pred_region_diag_n = getattr(self, "_pred_region_diag_n", 0) + 1
+                if self._pred_region_diag_n % 600 == 1:
+                    try:
+                        with torch.no_grad():
+                            _t = obs_tensor.detach()
+                            _lt = float(F.mse_loss(out[:, 35:36], _t[:, 35:36]).item())
+                            _ld = float(F.mse_loss(out[:, 44:56], _t[:, 44:56]).item())
+                            _rest_o = torch.cat([out[:, :35], out[:, 36:44], out[:, 56:]], dim=1)
+                            _rest_t = torch.cat([_t[:, :35], _t[:, 36:44], _t[:, 56:]], dim=1)
+                            _lr = float(F.mse_loss(_rest_o, _rest_t).item())
+                        logger.info("PRED_REGION_DIAG cid=%s loss=%.5f temp35=%.5f "
+                                    "dens44_55=%.5f rest=%.5f", cid, loss_f, _lt, _ld, _lr)
+                    except Exception:
+                        pass
                 delta = max(0.0, surprise_prev - loss_f)
                 intrinsic = _BETA_INTRINSIC * delta
                 self.intrinsic_last[cid] = intrinsic
