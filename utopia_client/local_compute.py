@@ -1749,6 +1749,50 @@ class LocalColonyCompute:
         # Из спека + load весов (payload["grown_weights"]). Durable через рестарт.
         _gl0 = payload.get("growth_loop")
         _gw = payload.get("grown_weights") or {}
+        # STAGE 2 PERSIST (Фрай go 10.06): graduated-узлы пересоздаём В ГРАФ
+        # (org.tissues + ген уже в tissue_topology_genes → overlay ниже проведёт
+        # ребро). ГАРД: без enabled-гена {role}→cerebellum узел НЕ вставляем
+        # (узел без исходящего ребра workbench счёл бы МОТОР-выходом — мусор в
+        # действия) → такой деградирует в сайдкар (Stage 1 семантика).
+        _graduated_roles: set = set()
+        if isinstance(_gl0, dict) and _gl0.get("graduated_tissues"):
+            _genes_raw = payload.get("tissue_topology_genes") or []
+            _has_gene = {
+                str(d.get("source_role")) for d in _genes_raw
+                if d.get("enabled") and d.get("target_role") == "cerebellum"}
+            for _sp in (_gl0.get("graduated_tissues") or []):
+                try:
+                    _role = str(_sp.get("role"))
+                    if _role not in _has_gene:
+                        logger.warning("restore graduated %s/%s: ген отсутствует "
+                                       "→ деградация в сайдкар", cid, _role)
+                        continue
+                    _t = self._make_higher_tissue(
+                        _role, data_dim=int(_sp.get("data_dim", 64)),
+                        n_embd=int(_sp.get("n_embd", 21)))
+                    if _t is None:
+                        continue
+                    if _role in _gw:
+                        try:
+                            _t.load_state_dict(_gw[_role])
+                        except Exception as e:
+                            logger.debug("restore graduated weights %s/%s: %s",
+                                         cid, _role, e)
+                    org.tissues[getattr(_t, "tissue_id")] = _t
+                    self._tissue_graduated.setdefault(cid, {})[_role] = _t
+                    _graduated_roles.add(_role)
+                    logger.info("restore graduated %s/%s → ГРАФ-узел (Stage 2 "
+                                "persist, ребро проведёт overlay)", cid, _role)
+                except Exception as e:
+                    logger.debug("restore graduated tissue %s: %s", cid, e)
+            try:
+                self._tissue_grad_done = max(self._tissue_grad_done,
+                                             int(_gl0.get("grad_done", 0)))
+                self._tissue_grad_reverted = max(
+                    self._tissue_grad_reverted,
+                    int(_gl0.get("grad_reverted", 0)))
+            except Exception:
+                pass
         if isinstance(_gl0, dict) and _gl0.get("grown_tissues"):
             _specs_ok = []
             for _sp in (_gl0.get("grown_tissues") or []):
@@ -1756,6 +1800,12 @@ class LocalColonyCompute:
                     _role = str(_sp.get("role"))
                     _dd = int(_sp.get("data_dim", 64))
                     _ne = int(_sp.get("n_embd", 21))
+                    if _role in _graduated_roles:
+                        # уже в графе (Stage 2) — сайдкар-двойник дал бы ДВОЙНОЙ
+                        # вклад (узел→cerebellum + сайдкар→predictor). Спек
+                        # оставляем (источник истины + деградация на старом коде).
+                        _specs_ok.append({"role": _role, "data_dim": _dd, "n_embd": _ne})
+                        continue
                     _t = self._make_higher_tissue(_role, data_dim=_dd, n_embd=_ne)
                     if _t is not None:
                         if _role in _gw:
@@ -3778,6 +3828,23 @@ class LocalColonyCompute:
                 "tissue_reverted": int(self._tissue_reverted),
                 "tissue_gc_pruned": int(self._tissue_gc_pruned),
                 "grown_tissues": list(self._tissue_grown_specs.get(cid, [])),
+                # STAGE 2 PERSIST (Фрай go 10.06): graduated-узлы помечаем
+                # ОТДЕЛЬНО — restore пересоздаёт их В ГРАФ (не сайдкаром).
+                # Роль ОСТАЁТСЯ и в grown_tissues (backward-compat: старый
+                # клиент без Stage 2 деградирует её в сайдкар — Stage 1
+                # семантика, безопасно). Спек берём из grown_specs (он там
+                # остаётся после graduation — источник истины по dims).
+                # MID-WATCH узел (in-flight _tissue_grad_state) НЕ помечаем:
+                # §3-окно не завершено → на restore консервативно сайдкаром,
+                # graduation пройдёт заново с чистым watch.
+                "graduated_tissues": [
+                    dict(s) for s in self._tissue_grown_specs.get(cid, [])
+                    if s.get("role") in (self._tissue_graduated.get(cid) or {})
+                    and s.get("role") != (self._tissue_grad_state.get(cid)
+                                          or {}).get("role")
+                ],
+                "grad_done": int(self._tissue_grad_done),
+                "grad_reverted": int(self._tissue_grad_reverted),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)

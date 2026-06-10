@@ -287,6 +287,131 @@ def test_save_keeps_graduated_weights_and_sidecar_spec():
     assert "grown1" in payload.get("grown_weights", {})
 
 
+# ── STAGE 2 PERSIST (Фрай go 10.06): graduated переживает рестарт В ГРАФЕ ──
+
+def _graduate_ok(c, org):
+    """Довести graduation до GRADUATE-OK (watch завершён чисто)."""
+    st = c._tissue_grad_state["a"]
+    st["ticks"] = c._tissue_growth_dwell_ticks - 1
+    c._tissue_graduation_watch("a", org, st)
+    assert c._tissue_grad_done >= 1
+
+
+def test_save_marks_graduated_separately():
+    c, org, t = _grad_setup()
+    org.generation = 0
+    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    c._graduate_tissue("a", org)
+    _graduate_ok(c, org)
+    payload = c.save_state("a")
+    gl = payload["growth_loop"]
+    assert gl["graduated_tissues"] == [
+        {"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    # backward-compat: роль ОСТАЁТСЯ в grown_tissues (старый клиент → сайдкар)
+    assert gl["grown_tissues"] == [
+        {"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    assert "grown1" in payload["grown_weights"]
+
+
+def _restore_target():
+    """Свежий компьют + орг-скелет с cerebellum (как после add_creature)."""
+    c = _c()
+    cb = c._make_higher_tissue("cerebellum", data_dim=64)
+    org = types.SimpleNamespace(
+        tissues={getattr(cb, "tissue_id", "cb"): cb}, connections=[],
+        tissue_topology_genes=[], generation=0)
+    c.organisms["a"] = org
+    return c, org
+
+
+def test_restore_recreates_graduated_in_graph():
+    src, org_s, t = _grad_setup()
+    org_s.generation = 0
+    src._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    src._graduate_tissue("a", org_s)
+    _graduate_ok(src, org_s)
+    payload = src.save_state("a")
+
+    dst, org_d = _restore_target()
+    dst.restore_persisted_state("a", payload)
+    # узел В ГРАФЕ (не сайдкаром), ребро проведено overlay'ем
+    roles = {getattr(tt, "role", None) for tt in org_d.tissues.values()}
+    assert "grown1" in roles
+    assert "grown1" in dst._tissue_graduated.get("a", {})
+    assert "grown1" not in (dst._grown_tissues.get("a") or {})   # НЕ двойник
+    tid = next(k for k, tt in org_d.tissues.items()
+               if getattr(tt, "role", None) == "grown1")
+    assert any(cn.source_tissue_id == tid for cn in org_d.connections)
+    # счётчик Stage-1 лимита восстановлен → новых graduations не будет
+    assert dst._tissue_grad_done == 1
+
+
+def test_restore_without_gene_degrades_to_sidecar():
+    # ГАРД: graduated-спек есть, а ген пропал → узел НЕ вставляем (orphan
+    # стал бы мотор-выходом) → деградация в сайдкар (Stage 1 семантика).
+    src, org_s, t = _grad_setup()
+    org_s.generation = 0
+    src._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    src._graduate_tissue("a", org_s)
+    _graduate_ok(src, org_s)
+    payload = src.save_state("a")
+    payload["tissue_topology_genes"] = []            # ген «пропал»
+
+    dst, org_d = _restore_target()
+    dst.restore_persisted_state("a", payload)
+    roles = {getattr(tt, "role", None) for tt in org_d.tissues.values()}
+    assert "grown1" not in roles                     # в графе НЕТ
+    assert "grown1" in (dst._grown_tissues.get("a") or {})   # сайдкар-fallback
+    assert not dst._tissue_graduated.get("a")
+
+
+def test_restore_old_payload_without_stage2_degrades():
+    # payload Stage 1 (без graduated_tissues) → как раньше: сайдкар.
+    src, org_s, t = _grad_setup()
+    org_s.generation = 0
+    src._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    src._graduate_tissue("a", org_s)
+    _graduate_ok(src, org_s)
+    payload = src.save_state("a")
+    payload["growth_loop"].pop("graduated_tissues", None)
+
+    dst, org_d = _restore_target()
+    dst.restore_persisted_state("a", payload)
+    assert "grown1" in (dst._grown_tissues.get("a") or {})
+    assert not dst._tissue_graduated.get("a")
+
+
+def test_restored_graduated_killswitch_reverts():
+    src, org_s, t = _grad_setup()
+    org_s.generation = 0
+    src._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    src._graduate_tissue("a", org_s)
+    _graduate_ok(src, org_s)
+    payload = src.save_state("a")
+
+    dst, org_d = _restore_target()
+    dst.restore_persisted_state("a", payload)
+    dst.set_tissue_graduation(False)                 # kill-switch после рестарта
+    roles = {getattr(tt, "role", None) for tt in org_d.tissues.values()}
+    assert "grown1" not in roles
+    assert "grown1" in (dst._grown_tissues.get("a") or {})    # обратно в сайдкар
+
+
+def test_midwatch_save_degrades_to_sidecar():
+    # сейв ПОСРЕДИ watch-окна: §3-клиренса ещё нет → консервативно НЕ
+    # помечаем graduated → restore даст сайдкар, graduation пройдёт заново.
+    src, org_s, t = _grad_setup()
+    org_s.generation = 0
+    src._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    src._graduate_tissue("a", org_s)                 # watch in-flight
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["graduated_tissues"] == []
+    dst, org_d = _restore_target()
+    dst.restore_persisted_state("a", payload)
+    assert "grown1" in (dst._grown_tissues.get("a") or {})
+    assert not dst._tissue_graduated.get("a")
+
+
 def test_graduation_metrics_for_ui():
     c = _c()
     c._tissue_graduated["a"] = {"grown1": object()}
