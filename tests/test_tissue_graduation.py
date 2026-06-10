@@ -191,6 +191,39 @@ def test_watch_energy_collapse_revert():
     assert c._grown_tissues["a"]["grown1"] is t
 
 
+def test_watch_slow_energy_bleed_reverts_at_window_end():
+    # Фрай 10.06: первый §3 был МЕДЛЕННЫЙ bleed (форейдж деградировал
+    # постепенно) — мгновенные детекторы (paralysis, <φ⁻¹) его прозевают.
+    # Кумулятивный тренд: avg(2-я половина) < avg(1-я)·(1−φ⁻⁵) → revert.
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    st = c._tissue_grad_state["a"]
+    dwell = c._tissue_growth_dwell_ticks
+    for i in range(dwell):
+        # линейный bleed 1000→800 (−20%): мгновенный порог 618 НЕ задет
+        c.biochem["a"].energy = 1000.0 - 200.0 * (i + 1) / dwell
+        c._tissue_graduation_watch("a", org, st)
+        if "a" not in c._tissue_grad_state:
+            break
+    assert c._tissue_grad_reverted == 1              # bleed пойман трендом
+    assert c._tissue_grad_done == 0
+    assert c._grown_tissues["a"]["grown1"] is t      # деградация в сайдкар
+
+
+def test_watch_healthy_oscillation_graduates():
+    # здоровая осцилляция energy (еда/трата) вокруг уровня — НЕ bleed, OK.
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    st = c._tissue_grad_state["a"]
+    dwell = c._tissue_growth_dwell_ticks
+    for i in range(dwell):
+        c.biochem["a"].energy = 950.0 + (50.0 if i % 2 else -50.0)
+        c._tissue_graduation_watch("a", org, st)
+    assert c._tissue_grad_done == 1                  # окно чисто
+    assert c._tissue_grad_reverted == 0
+    assert org.tissues.get(getattr(t, "tissue_id")) is t
+
+
 def test_watch_clean_window_graduates():
     c, org, t = _grad_setup()
     c._graduate_tissue("a", org)

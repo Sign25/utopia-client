@@ -6041,6 +6041,12 @@ class LocalColonyCompute:
             "par_before": int(self._paralysis_window_n),
             "energy_before": (float(getattr(bc, "energy", 0.0))
                               if bc is not None else None),
+            # КУМУЛЯТИВНЫЙ energy-тренд (Фрай 10.06): первый §3 был МЕДЛЕННЫЙ
+            # bleed (форейдж деградировал постепенно) — мгновенный детектор его
+            # прозевает. Копим средние по половинам окна: avg2<avg1 значимо
+            # (φ⁻⁵) в конце окна → revert, даже без мгновенного паралича.
+            "e_sum1": 0.0, "e_n1": 0,    # первая половина watch-окна
+            "e_sum2": 0.0, "e_n2": 0,    # вторая половина
         }
         logger.info("brain-growth TISSUE-GRADUATE-START cid=%s role=%s rise=%.5f "
                     "edge_w=%.3f (сайдкар → ГРАФ-узел, §3-watch %d тиков)",
@@ -6097,12 +6103,30 @@ class LocalColonyCompute:
             return
         bc = self.biochem.get(cid)
         if bc is not None and st.get("energy_before"):
-            if (float(getattr(bc, "energy", 0.0))
-                    < float(st["energy_before"]) * 0.618):
+            e_now = float(getattr(bc, "energy", 0.0))
+            if e_now < float(st["energy_before"]) * 0.618:
                 self._revert_graduation(cid, org, st, reason="energy-collapse")
                 return
+            # кумулятивный тренд (Фрай): сэмпл в половину окна
+            if st["ticks"] <= self._tissue_growth_dwell_ticks // 2:
+                st["e_sum1"] += e_now
+                st["e_n1"] += 1
+            else:
+                st["e_sum2"] += e_now
+                st["e_n2"] += 1
         if st["ticks"] < self._tissue_growth_dwell_ticks:
             return
+        # конец окна: МЕДЛЕННЫЙ bleed — средняя energy 2-й половины упала
+        # значимо (≥φ⁻⁵) против 1-й → форейдж деградирует → revert (Фрай 10.06).
+        if st["e_n1"] > 0 and st["e_n2"] > 0:
+            avg1 = st["e_sum1"] / st["e_n1"]
+            avg2 = st["e_sum2"] / st["e_n2"]
+            if avg2 < avg1 * (1.0 - self._growth_min_delta_frac):
+                logger.info("brain-growth TISSUE-GRADUATE energy-bleed cid=%s "
+                            "avg1=%.1f avg2=%.1f (кумулятивный тренд вниз)",
+                            cid, avg1, avg2)
+                self._revert_graduation(cid, org, st, reason="energy-bleed")
+                return
         loss_before = float(st["loss_before"])
         loss_after = float(self.loss_ema.get(cid, loss_before))
         self._tissue_grad_done += 1
