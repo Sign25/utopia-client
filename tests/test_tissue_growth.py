@@ -200,6 +200,31 @@ def test_gc_epoch_rest_lets_growth_resume():
     assert c._maybe_start_tissue_gc("a") is False         # отдых держит
 
 
+def test_tissue_growth_metrics_for_ui():
+    # UI-контракт: live-счёт + cumulative + in-flight флаги, отдельно от связей.
+    c = _c()
+    c._tissue_growth_enabled = True
+    c._grown_tissues["a"] = {"grown4": object(), "grown10": object()}
+    c._tissue_kept = 2
+    c._tissue_reverted = 5
+    c._tissue_gc_pruned = 3
+    c._tissue_propose_count = 12
+    m = c._tissue_growth_metrics("a")
+    assert m["tissue_grown_live"] == 2          # 2 живых сайдкара
+    assert m["tissue_kept"] == 2 and m["tissue_reverted"] == 5
+    assert m["tissue_gc_pruned"] == 3 and m["tissue_propose_total"] == 12
+    assert m["tissue_growing"] == 0 and m["tissue_gc_evaluating"] == 0
+    assert m["tissue_growth_enabled"] is True
+    # GC held-aside сайдкар всё ещё считается живым + флаг evaluating
+    c._tissue_gc_state["a"] = {"role": "grown4", "tissue": object(),
+                               "loss_before": 0.05, "ticks": 0}
+    m2 = c._tissue_growth_metrics("a")
+    assert m2["tissue_gc_evaluating"] == 1
+    assert m2["tissue_grown_live"] == 3          # 2 в dict + 1 held-aside
+    # агрегат (cid=None) по всем организмам
+    assert c._tissue_growth_metrics()["tissue_grown_live"] == 3
+
+
 def test_gc_pruned_counter_persists():
     src = _c()
     src.organisms["a"] = types.SimpleNamespace(generation=0)
