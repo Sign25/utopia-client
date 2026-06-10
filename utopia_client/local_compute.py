@@ -462,6 +462,24 @@ class LocalColonyCompute:
         self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
         self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
         self._behavioral_probe_role: str = ""  # §10.3 ablate-проба замера сигнала по измерениям
+        # АНТИ-CHURN GUARD выпуска (Фрай 10.06, после инцидента grown151):
+        # revert→re-graduate цикл долбил мотор быстрее восстановления (3 цикла
+        # за 90с, energy 1000→70, §3-churn ре-эмерджнул в ПОВТОРНОМ выпуске).
+        # (2) revert ставит РОЛЬ в graduation-cooldown (не долбить тот же узел);
+        # (3) лимит revert'ов ПОДРЯД → halt выпуска (до re-flip флага);
+        # (A) re-graduate гейт на СТАБИЛЬНОЕ recovery: energy ≥ 618 (φ⁻¹·max)
+        #     И стабильно 89 тиков (Fib) И paralysis=0 — транзиентный просвет
+        #     paralysis==0 НЕ открывает гейт; (опц.) energy-collapse детектор
+        #     window-based (rolling-mean 13) — погодный одиночный провал не
+        #     роняет watch в фазе восстановления.
+        self._grad_rejected: dict = {}        # cid → {role: tick} revert-cooldown роли
+        self._grad_revert_streak: int = 0     # revert'ов подряд (KEEP сбрасывает)
+        self._GRAD_REVERT_HALT: int = 3       # Fib-лимит → halt выпуска
+        self._grad_halted: bool = False       # стоп до re-flip tissue_graduation
+        self._grad_health_streak: dict = {}   # cid → тиков подряд здоров
+        self._GRAD_HEALTH_ENERGY: float = 618.0   # φ⁻¹·max_energy 1000
+        self._GRAD_HEALTH_TICKS: int = 89     # Fib — стабильность перед выпуском
+        self._GRAD_COLLAPSE_WIN: int = 13     # Fib — rolling-mean окно collapse-детектора
         # §10.3 STAGE 3 BEHAVIORAL-GC (Фрай go 10.06): парный interleaved
         # leave-one-out по самочувствию. ablate = soft edge-weight→0 (НЕ removal
         # → топология не дёргается → нет churn/§3); discard пост-toggle transient
@@ -1400,6 +1418,8 @@ class LocalColonyCompute:
         self._beh_income_cum.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_rejected_roles.pop(cid, None)
+        self._grad_rejected.pop(cid, None)         # анти-churn cleanup
+        self._grad_health_streak.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -6065,6 +6085,14 @@ class LocalColonyCompute:
         on=False (kill-switch) = revert всех graduated-узлов ОБРАТНО В САЙДКАРЫ
         (веса целы, изоляция от мотора восстановлена). Идемпотентно."""
         self._tissue_graduation_enabled = bool(on)
+        if on:
+            # re-flip = осознанный рестарт выпуска: снять HALT + streak (анти-
+            # churn (3)); health-гейт (A) всё равно потребует stable recovery.
+            if self._grad_halted or self._grad_revert_streak:
+                logger.info("set_tissue_graduation: HALT снят re-flip'ом "
+                            "(streak=%d)", self._grad_revert_streak)
+            self._grad_halted = False
+            self._grad_revert_streak = 0
         if not on:
             for cid in list(self.organisms.keys()):
                 st = self._tissue_grad_state.get(cid)
@@ -6124,6 +6152,9 @@ class LocalColonyCompute:
         хорошей ткани (grown133). Возвращает число снятых меток."""
         n = self.reset_behavior_rejected()
         self._beh_gc_rejected.clear()
+        self._grad_rejected.clear()
+        self._grad_halted = False
+        self._grad_revert_streak = 0
         self._tissue_grad_done = 0
         logger.info("behavioral_gc RETEST: метки/cooldown сняты, grad-лимит "
                     "сброшен — durable-сайдкары снова выпускаются")
@@ -6329,7 +6360,12 @@ class LocalColonyCompute:
         # анти-осцилляция (Фрай): behavior-rejected роли НЕ выпускаем повторно
         # (prediction-good, но поведенчески бесполезны — иначе вечный churn).
         rej = self._beh_rejected_roles.get(cid) or set()
-        cands = [(r, rises[r]) for r in d.keys() if r in rises and r not in rej]
+        # анти-churn (2): роль после revert в cooldown (не долбить тот же узел).
+        grej = self._grad_rejected.get(cid) or {}
+        cands = [(r, rises[r]) for r in d.keys()
+                 if r in rises and r not in rej
+                 and (self._last_world_tick - grej.get(r, -10**9))
+                 >= self._tissue_gc_epoch_interval]
         if not cands:
             return False        # durable-verified кандидатов нет — ждём GC-KEEP
         role = max(cands, key=lambda x: x[1])[0]
@@ -6436,10 +6472,24 @@ class LocalColonyCompute:
 
     def _revert_graduation(self, cid: str, org, st: dict, reason: str) -> None:
         """Revert in-flight graduation (watch-окно): немедленный откат при §3/
-        energy-сигнале или kill-switch."""
+        energy-сигнале или kill-switch. Анти-churn (Фрай, инцидент grown151):
+        (2) роль в cooldown — не долбить тот же узел; (3) revert'ы подряд ≥
+        лимита → HALT выпуска (до re-flip флага); health-streak сбрасывается
+        (re-attempt только после стабильного recovery)."""
         self._tissue_grad_reverted += 1
         self._tissue_grad_state.pop(cid, None)
         self._tissue_last_resolve[cid] = int(self._last_world_tick)  # rate-limit
+        if reason != "kill-switch":
+            self._grad_rejected.setdefault(cid, {})[st["role"]] = int(
+                self._last_world_tick)                       # (2) роль-cooldown
+            self._grad_revert_streak += 1
+            self._grad_health_streak[cid] = 0                # (A) recovery заново
+            if (not self._grad_halted
+                    and self._grad_revert_streak >= self._GRAD_REVERT_HALT):
+                self._grad_halted = True
+                logger.warning("brain-growth GRADUATE-HALT: %d revert'ов подряд "
+                               "— выпуск ОСТАНОВЛЕН до re-flip tissue_graduation "
+                               "(анти-churn, Фрай)", self._grad_revert_streak)
         self._degraduate_node(cid, org, st["role"], reason=reason)
 
     def _tissue_graduation_watch(self, cid: str, org, st: dict) -> None:
@@ -6454,7 +6504,16 @@ class LocalColonyCompute:
         bc = self.biochem.get(cid)
         if bc is not None and st.get("energy_before"):
             e_now = float(getattr(bc, "energy", 0.0))
-            if e_now < float(st["energy_before"]) * 0.618:
+            # window-based collapse (Фрай опц., инцидент grown151): rolling-mean
+            # последних 13 тиков < φ⁻¹·before — одиночный погодный провал НЕ
+            # роняет watch (мгновенный детектор ре-триггерился в фазе recovery).
+            ew = st.setdefault("e_win", [])
+            ew.append(e_now)
+            if len(ew) > self._GRAD_COLLAPSE_WIN:
+                ew.pop(0)
+            if (len(ew) >= self._GRAD_COLLAPSE_WIN
+                    and (sum(ew) / len(ew))
+                    < float(st["energy_before"]) * 0.618):
                 self._revert_graduation(cid, org, st, reason="energy-collapse")
                 return
             # кумулятивный тренд (Фрай): сэмпл в половину окна
@@ -6480,6 +6539,7 @@ class LocalColonyCompute:
         loss_before = float(st["loss_before"])
         loss_after = float(self.loss_ema.get(cid, loss_before))
         self._tissue_grad_done += 1
+        self._grad_revert_streak = 0          # успех рвёт revert-streak (3)
         self._tissue_grad_state.pop(cid, None)
         self._tissue_last_resolve[cid] = int(self._last_world_tick)
         logger.info("brain-growth TISSUE-GRADUATE-OK cid=%s role=%s — мотор цел "
@@ -6603,10 +6663,23 @@ class LocalColonyCompute:
             _last = self._tissue_last_resolve.get(cid)
             if _last is not None and (self._last_world_tick - _last) < self._tissue_growth_cooldown:
                 return
+            # (A) СТАБИЛЬНОЕ recovery (Фрай, инцидент grown151): транзиентный
+            # просвет paralysis==0 НЕ открывает выпуск — нужен health-streak:
+            # energy ≥ φ⁻¹·max И paralysis=0 СТАБИЛЬНО 89 тиков подряд.
+            _bc = self.biochem.get(cid)
+            _e = float(getattr(_bc, "energy", 0.0)) if _bc is not None else 0.0
+            if _e >= self._GRAD_HEALTH_ENERGY:
+                self._grad_health_streak[cid] = (
+                    self._grad_health_streak.get(cid, 0) + 1)
+            else:
+                self._grad_health_streak[cid] = 0
             # GRADUATION (Stage 1) — ПЕРЕД GC: появился durable-кандидат (GC-KEEP
             # этой сессии) и лимит не исчерпан → один сайдкар идёт в граф под
-            # §3-watch. Гейты выше уже гарантируют paralysis==0 + rate-limit.
+            # §3-watch. Гейты: paralysis==0 + rate-limit (выше) + НЕ halted (3)
+            # + стабильное recovery (A).
             if (self._tissue_graduation_enabled
+                    and not self._grad_halted
+                    and self._grad_health_streak.get(cid, 0) >= self._GRAD_HEALTH_TICKS
                     and self._tissue_grad_done < self._tissue_grad_max
                     and self._graduate_tissue(cid, org)):
                 return
