@@ -105,10 +105,13 @@ def test_stage1_limit_blocks_second_graduation(monkeypatch):
     monkeypatch.setattr(c, "_graduate_tissue",
                         lambda cid, o: calls.append(cid) or True)
     c._paralysis_window_n = 0
+    c.biochem["a"] = types.SimpleNamespace(energy=1000.0)
+    c._grad_health_streak["a"] = c._GRAD_HEALTH_TICKS    # health-гейт открыт
     c._tissue_grad_done = 1                          # лимит исчерпан
     c._tissue_growth_step("a")
     assert calls == []                               # graduation НЕ стартует
     c._tissue_grad_done = 0
+    c._grad_health_streak["a"] = c._GRAD_HEALTH_TICKS
     c._tissue_growth_step("a")
     assert calls == ["a"]                            # лимит свободен → стартует
 
@@ -186,7 +189,10 @@ def test_watch_energy_collapse_revert():
     c._graduate_tissue("a", org)
     st = c._tissue_grad_state["a"]
     c.biochem["a"].energy = 500.0                    # < 0.618 × 1000
-    c._tissue_graduation_watch("a", org, st)
+    for _ in range(c._GRAD_COLLAPSE_WIN):            # window-based (анти-churn)
+        if "a" not in c._tissue_grad_state:
+            break
+        c._tissue_graduation_watch("a", org, st)
     assert c._tissue_grad_reverted == 1
     assert c._grown_tissues["a"]["grown1"] is t
 
@@ -241,6 +247,7 @@ def test_regraduation_reuses_gene_no_duplicate():
     c, org, t = _grad_setup()
     c._graduate_tissue("a", org)
     c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="test")
+    c._last_world_tick += c._tissue_gc_epoch_interval   # cooldown (2) истёк
     c._graduate_tissue("a", org)                     # повторная попытка
     genes = [g for g in org.tissue_topology_genes
              if g.source_role == "grown1" and g.target_role == "cerebellum"]
@@ -426,3 +433,90 @@ def test_graduation_metrics_for_ui():
     assert m["tissue_grown_live"] == 0
     # агрегат
     assert c._tissue_growth_metrics()["tissue_graduated_live"] == 1
+
+
+# ── АНТИ-CHURN GUARD (Фрай 10.06, инцидент grown151) ────────────────────
+
+def test_revert_sets_role_cooldown_and_streak():
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    c._last_world_tick = 2000
+    c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="energy-collapse")
+    assert c._grad_rejected["a"]["grown1"] == 2000   # (2) роль в cooldown
+    assert c._grad_revert_streak == 1
+    assert c._grad_health_streak.get("a", 0) == 0    # (A) recovery заново
+    # cooldown: та же роль НЕ выпускается сразу
+    assert c._graduate_tissue("a", org) is False
+
+
+def test_revert_streak_halts_graduation():
+    c = _c()
+    org = types.SimpleNamespace(tissue_topology_genes=[], connections=[], tissues={})
+    c.organisms["a"] = org
+    c._degraduate_node = lambda *a, **k: None
+    for i in range(c._GRAD_REVERT_HALT):
+        c._tissue_grad_state["a"] = {"role": f"grown{i}"}
+        c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="x")
+    assert c._grad_halted is True                     # (3) HALT
+
+
+def test_reflip_clears_halt():
+    c = _c()
+    c._grad_halted = True
+    c._grad_revert_streak = 3
+    c.set_tissue_graduation(True)
+    assert c._grad_halted is False and c._grad_revert_streak == 0
+
+
+def test_killswitch_revert_no_streak():
+    # kill-switch не считается churn-revert'ом (не копит streak/cooldown)
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="kill-switch")
+    assert c._grad_revert_streak == 0
+    assert not c._grad_rejected.get("a")
+
+
+def test_collapse_detector_is_window_based():
+    # одиночный погодный провал НЕ роняет watch; устойчиво низкое окно — роняет
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    st = c._tissue_grad_state["a"]
+    c.biochem["a"].energy = 100.0                    # глубокий провал 1 тик
+    c._tissue_graduation_watch("a", org, st)
+    assert "a" in c._tissue_grad_state               # выжил (rolling-mean)
+    for _ in range(c._GRAD_COLLAPSE_WIN):
+        if "a" not in c._tissue_grad_state:
+            break
+        c._tissue_graduation_watch("a", org, st)     # 13 тиков низко
+    assert "a" not in c._tissue_grad_state           # collapse пойман
+    assert c._tissue_grad_reverted == 1
+
+
+def test_health_streak_gates_graduation(monkeypatch):
+    c = _c()
+    org = types.SimpleNamespace(tissues={"cb": object()}, connections=[],
+                                tissue_topology_genes=[])
+    c.organisms["a"] = org
+    c.predictor["a"] = object()
+    c._tissue_growth_enabled = True
+    c._tissue_graduation_enabled = True
+    monkeypatch.setattr(c, "_cerebellum_tissue_id", lambda cid, o: "cb")
+    monkeypatch.setattr(c, "_connections_saturated", lambda o: True)
+    monkeypatch.setattr(c, "_intrinsic_plateaued", lambda cid: False)
+    monkeypatch.setattr(c, "_maybe_start_tissue_gc", lambda cid: False)
+    calls = []
+    monkeypatch.setattr(c, "_graduate_tissue",
+                        lambda cid, o: calls.append(cid) or True)
+    c.biochem["a"] = types.SimpleNamespace(energy=1000.0)
+    c._paralysis_window_n = 0
+    # здоров, но streak ещё не набран → выпуска нет
+    for _ in range(c._GRAD_HEALTH_TICKS - 1):
+        c._tissue_growth_step("a")
+    assert calls == []
+    c._tissue_growth_step("a")                       # 89-й тик подряд
+    assert calls == ["a"]                            # гейт открылся
+    # провал энергии сбрасывает streak
+    c.biochem["a"].energy = 300.0
+    c._tissue_growth_step("a")
+    assert c._grad_health_streak["a"] == 0
