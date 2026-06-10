@@ -516,6 +516,16 @@ class LocalColonyCompute:
         # 13×2×233=6058т ≈ один климат-цикл (epoch 6388) — укладывается.
         self._BEH_GC_PAIRS: int = 13      # пар ablate/restore окон (paired-t N=13)
         self._BEH_GC_T_KEEP: float = 2.179  # t-крит paired N=13 (df=12, две-стор. 0.05)
+        # POWER-AWARE метка (Фрай (1) 10.06): permanent reject ТОЛЬКО при adequate
+        # power по ВСЕМ измерениям. Целевой эффект per-dim = известный размер из
+        # Step-1 ablation grown133 (cort Δ7) / типичная динамика. MDE≤target =
+        # powered. Underpowered измерение → prune остаётся SOFT (retry).
+        self._BEH_GC_MDE_TARGET = {
+            "neg_cortisol": 7.0,   # Step-1: grown133 ablation cort Δ7
+            "glucose": 5.0,        # метаболический сдвиг сопоставим
+            "hydration": 2.0,      # water-специалист
+            "income": 1.0,         # foraging-rate сдвиг
+        }
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -6309,61 +6319,84 @@ class LocalColonyCompute:
             if st["pairs_done"] >= self._BEH_GC_PAIRS:
                 self._resolve_behavioral_gc(cid, org, st)
 
+    @staticmethod
+    def _robust_paired(diffs: list):
+        """Robust paired-статистика (Фрай (в) 10.06): median + MAD вместо
+        mean+sd — давит жажда-спайки кортизола (выброс не тащит вердикт).
+        Возвращает (median, robust_sd=1.4826·MAD, t_robust). MDE считается
+        снаружи из robust_sd. n<2 → (md,0,0)."""
+        n = len(diffs)
+        if n < 2:
+            return (sum(diffs) / max(1, n), 0.0, 0.0)
+        sd = sorted(diffs)
+        med = (sd[n // 2] if n % 2 else (sd[n // 2 - 1] + sd[n // 2]) / 2.0)
+        absdev = sorted(abs(x - med) for x in diffs)
+        mad = (absdev[n // 2] if n % 2
+               else (absdev[n // 2 - 1] + absdev[n // 2]) / 2.0)
+        rsd = 1.4826 * mad
+        t = med / (rsd / (n ** 0.5)) if rsd >= 1e-9 else 0.0
+        return (med, rsd, t)
+
     def _resolve_behavioral_gc(self, cid: str, org, st: dict) -> None:
-        """Paired-t per-dim: ablate-окна vs restore-окна. Все измерения в семантике
-        «больше=лучше» → ablate НИЖЕ restore значимо = ткань ПОЛЕЗНА по измерению.
-        specialist-keep (любое измерение durable-полезно) + veto net-harm (сумма
-        вреда > пользы по z). keep→restore edge (узел живёт); prune→degraduate."""
-        import math
+        """Robust paired per-dim (median+MAD, Фрай (в)): ablate vs restore окна.
+        Все измерения «больше=лучше» → ablate НИЖЕ restore значимо = ткань ПОЛЕЗНА.
+        specialist-keep (любое durable-полезно) + veto net-harm. POWER-AWARE метка
+        (Фрай (1)): permanent beh_rejected ТОЛЬКО если ВСЕ live-измерения adequately
+        powered (MDE ≤ целевой эффект Step-1) И benefit'а нет; иначе SOFT cooldown
+        (inconclusive → retry; на 13 парах cortisol underpowered → permanent
+        невозможен). keep→edge restore; prune→degraduate."""
         role = st["role"]
         dims = ("neg_cortisol", "glucose", "hydration", "income")
-        benefit_z, harm_z, detail = 0.0, 0.0, []
+        benefit, harm, detail = 0.0, 0.0, []
+        all_powered = True       # все измерения adequately powered?
         for d in dims:
             a = st["samples"]["ablate"].get(d, [])
             r = st["samples"]["restore"].get(d, [])
             n = min(len(a), len(r))
             if n < 2:
+                all_powered = False
                 continue
             diffs = [a[i] - r[i] for i in range(n)]   # ablate − restore
-            md = sum(diffs) / n
-            sd = (sum((x - md) ** 2 for x in diffs) / (n - 1)) ** 0.5
-            # МОЩНОСТЬ (Фрай 10.06): логируем КАЖДОЕ измерение, не только
-            # пересёкшие порог — иначе keep/prune вслепую (нельзя отличить
-            # underpowered от no-effect).
-            t = md / (sd / math.sqrt(n)) if sd >= 1e-9 else 0.0
+            med, rsd, t = self._robust_paired(diffs)
+            mde = self._BEH_GC_T_KEEP * rsd / (n ** 0.5)   # min detectable effect
+            powered = mde <= self._BEH_GC_MDE_TARGET.get(d, 1e9)
+            all_powered = all_powered and powered
             logger.info("brain-growth BEH-GC-DIM cid=%s role=%s dim=%s n=%d "
-                        "md=%.3f sd=%.3f t=%.2f (t_keep=%.2f)", cid, role, d, n,
-                        md, sd, t, self._BEH_GC_T_KEEP)
-            if sd < 1e-9:
+                        "med=%.3f rsd=%.3f t=%.2f MDE=%.2f target=%.2f powered=%s",
+                        cid, role, d, n, med, rsd, t, mde,
+                        self._BEH_GC_MDE_TARGET.get(d, 0.0), powered)
+            if rsd < 1e-9:
                 continue
-            z = abs(md) / sd
             if t <= -self._BEH_GC_T_KEEP:              # ablate ниже = польза
-                benefit_z += z
+                benefit += abs(med) / rsd
                 detail.append(f"{d}:t={t:.1f}(польза)")
             elif t >= self._BEH_GC_T_KEEP:             # ablate выше = ткань ВРЕДИТ
-                harm_z += z
+                harm += abs(med) / rsd
                 detail.append(f"{d}:t={t:.1f}(вред)")
-        keep = benefit_z > 0.0 and benefit_z >= harm_z   # specialist + veto net-harm
+        keep = benefit > 0.0 and benefit >= harm       # specialist + veto net-harm
         self._beh_gc_state.pop(cid, None)
         self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        # окно завершилось в ablate-фазе → восстановить edge перед вердиктом
         self._beh_gc_set_edge_weight(org, role, self._TISSUE_GRAD_EDGE_WEIGHT)
         if keep:
             self._beh_gc_done += 1
-            logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit_z=%.2f "
-                        "harm_z=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
-                        cid, role, benefit_z, harm_z, ", ".join(detail) or "—")
-        else:
-            self._beh_gc_pruned += 1
-            self._beh_gc_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
-            # анти-осцилляция (Фрай): метка «behavior-rejected до изменения
-            # мира» — остаётся prediction-сайдкаром, re-graduate заблокирован.
+            logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
+                        "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
+                        cid, role, benefit, harm, ", ".join(detail) or "—")
+            return
+        # PRUNE: degraduate в сайдкар + cooldown ВСЕГДА; метка permanent —
+        # ТОЛЬКО при adequate power (no-benefit ДОКАЗАН). underpowered →
+        # SOFT (absence-of-evidence ≠ no-benefit, Фрай): остаётся кандидатом.
+        self._beh_gc_pruned += 1
+        self._beh_gc_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
+        self._degraduate_node(cid, org, role, reason="behavioral-prune")
+        if all_powered:
             self._beh_rejected_roles.setdefault(cid, set()).add(role)
-            self._degraduate_node(cid, org, role, reason="behavioral-prune")
-            logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit_z=%.2f "
-                        "harm_z=%.2f [%s] — поведенчески не полезен → degraduate "
-                        "в сайдкар (cooldown)", cid, role, benefit_z, harm_z,
-                        ", ".join(detail) or "—")
+            verdict = "PERMANENT (power adequate, no-benefit доказан)"
+        else:
+            verdict = "SOFT cooldown (underpowered → inconclusive, retry)"
+        logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit=%.2f harm=%.2f "
+                    "[%s] — degraduate в сайдкар; %s", cid, role, benefit, harm,
+                    ", ".join(detail) or "—", verdict)
 
     def _graduate_tissue(self, cid: str, org) -> bool:
         """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
