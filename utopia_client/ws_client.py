@@ -1793,11 +1793,19 @@ class ColonyWSClient:
             # on_flora-rate. Низкий sees_rate → «пустыни»/мало флоры; высокий
             # sees, низкий onf → видят, но не доходят (навигация). Аккумулируем.
             if not hasattr(self, "_nav_vis"):
-                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
+                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "eat": 0,
+                                 "batches": 0}
             _nv = self._nav_vis
             _nv["cids"] += 1
             if on_flora_per_cid[cid_s]:
                 _nv["onf"] += 1
+            # /stats Блок 4 active_eat_rate: доля тиков с эмитом EAT(14)/GATHER(13)
+            # (compute.last_action) — «учится ли активно добывать» (Track 2).
+            if self.compute is not None:
+                _la = self.compute._stat_last_action.get(cid_s, -1) \
+                    if hasattr(self.compute, "_stat_last_action") else -1
+                if _la in (13, 14):
+                    _nv["eat"] = _nv.get("eat", 0) + 1
             if _rc is not None:
                 _vr = int(float((self.compute.traits.get(cid_s) or {}).get(
                     "vision_radius", 7) or 7)) if self.compute else 7
@@ -1898,10 +1906,18 @@ class ColonyWSClient:
                 _cc = max(1, _nv["cids"])
                 logger.info(
                     "NAV_VIS batches=300 sees_flora_rate=%.3f onf_rate=%.3f "
-                    "flora_total=%d cid_samples=%d",
-                    _nv["sees"] / _cc, _nv["onf"] / _cc, len(flora_pos),
-                    _nv["cids"])
-                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "batches": 0}
+                    "active_eat_rate=%.3f flora_total=%d cid_samples=%d",
+                    _nv["sees"] / _cc, _nv["onf"] / _cc,
+                    _nv.get("eat", 0) / _cc, len(flora_pos), _nv["cids"])
+                # /stats Блок 4: стопка foraging-долей в compute → owner-diagnostics.
+                if self.compute is not None:
+                    self.compute._stat_foraging = {
+                        "onf_rate": round(_nv["onf"] / _cc, 3),
+                        "sees_flora_rate": round(_nv["sees"] / _cc, 3),
+                        "active_eat_rate": round(_nv.get("eat", 0) / _cc, 3),
+                    }
+                self._nav_vis = {"cids": 0, "sees": 0, "onf": 0, "eat": 0,
+                                 "batches": 0}
         return (obs_per_cid, events_per_cid, intero_per_cid, rates_per_cid,
                 on_flora_per_cid, carried_food_per_cid, nearest_flora_per_cid)
 

@@ -454,6 +454,9 @@ class LocalColonyCompute:
         self._stat_beh_verdicts: dict = {}  # role → {verdict, dims} (§10.3 Блок 7b)
         self._stat_growth_events = deque(maxlen=20)   # лента роста (Блок 7/9)
         self._stat_growth_history = deque(maxlen=288)  # ряд n_tissues/grown/grad
+        self._stat_ate_total: dict = {}     # cid → монотонный счётчик еды (lifetime)
+        self._stat_foraging: dict = {}      # foraging-доли (ws_client rollup → owner)
+        self._stat_last_action: dict = {}   # cid → последнее выбранное действие (active_eat)
         self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
@@ -1527,6 +1530,7 @@ class LocalColonyCompute:
         self._tile_yield_mem.pop(cid, None)       # «доедай» yield-память (Фрай 06.06)
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
+        self._stat_ate_total.pop(cid, None)
         self._skill_kill.pop(cid, None)
         self._skill_atk.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -1913,6 +1917,18 @@ class LocalColonyCompute:
             try:
                 self._beh_gc_keep_cd[cid] = {
                     str(k): int(v) for k, v in _gl0["beh_gc_keep_cd"].items()}
+            except Exception:
+                pass
+        # §6.2 одометр lifetime: restore монотонные счётчики (max — не регресс).
+        if isinstance(_gl0, dict):
+            try:
+                if _gl0.get("ate_total"):
+                    self._stat_ate_total[cid] = max(
+                        self._stat_ate_total.get(cid, 0), int(_gl0["ate_total"]))
+                self._stat_paralysis_count = max(
+                    self._stat_paralysis_count, int(_gl0.get("paralysis_count", 0)))
+                self._stat_recovery_count = max(
+                    self._stat_recovery_count, int(_gl0.get("recovery_count", 0)))
             except Exception:
                 pass
         # анти-осцилляция: behavior-rejected метки durable через рестарт.
@@ -3532,6 +3548,7 @@ class LocalColonyCompute:
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
                 out[cid] = {"action": action, "target_id": None}
+                self._stat_last_action[cid] = int(action)  # /stats active_eat_rate
                 # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
                 # за флагом park_test (контролируемое условие). По-тиковый лог,
                 # выровнен по world_tick для кросс-сверки со steps/tick сервера.
@@ -3982,6 +3999,10 @@ class LocalColonyCompute:
                 "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
                 "beh_soft_count": dict(self._beh_soft_count.get(cid) or {}),
                 "beh_gc_keep_cd": dict(self._beh_gc_keep_cd.get(cid) or {}),
+                # §6.2 одометр lifetime — durable (иначе рестарт обнулял бы).
+                "ate_total": int(self._stat_ate_total.get(cid, 0)),
+                "paralysis_count": int(self._stat_paralysis_count),
+                "recovery_count": int(self._stat_recovery_count),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -8368,6 +8389,7 @@ class LocalColonyCompute:
             # опыт фуражёра → efficiency растёт каждые 200 тиков.
             if event.get("ate") or delta_e > 0.0:
                 self._skill_eat[cid] = self._skill_eat.get(cid, 0) + 1
+                self._stat_ate_total[cid] = self._stat_ate_total.get(cid, 0) + 1  # /stats lifetime (монотонный)
             damage = float(event.get("damage_taken", 0.0) or 0.0)
             if damage > 0:
                 apply_pvp_hit(bc, kind="cross_clan_target")
@@ -9813,8 +9835,53 @@ class LocalColonyCompute:
                 {"role": r, **v} for r, v in self._stat_beh_verdicts.items()],
             # Блок 7/9 — лента событий роста
             "growth_events": list(self._stat_growth_events),
+            # Блок 7 — ступенчатый ряд роста (lifetime-история сложности)
+            "growth_history": self._stat_snapshot_growth_history(),
+            # Блок 4 — foraging «учится ли активно кормиться» (ws_client rollup)
+            "foraging": dict(self._stat_foraging),
+            # §6.2 — одометр жизни Адама (lifetime-накопители)
+            "lifetime": self._stat_lifetime(),
             # Блок 10 — железо клиента
             "hardware": self._stat_hardware(),
+        }
+
+    def _stat_snapshot_growth_history(self) -> list:
+        """/stats Блок 7: дописать текущую точку (t, n_tissues, n_params, grown,
+        graduated) в ring-288 и вернуть последние ~288 — lifetime-ступеньки роста.
+        Вызывается из owner-extra (каденс ≈ push 30с → ring ~2.4ч)."""
+        try:
+            org = next(iter(self.organisms.values()), None)
+            if org is not None:
+                tissues = getattr(org, "tissues", {}) or {}
+                n_params = 0
+                try:
+                    n_params = sum(p.numel() for t in tissues.values()
+                                   for c in t.cells.values()
+                                   for p in c.parameters())
+                except Exception:
+                    pass
+                grown = sum(len(d or {}) for d in self._grown_tissues.values())
+                grad = sum(len(d or {}) for d in self._tissue_graduated.values())
+                self._stat_growth_history.append({
+                    "t": int(self._last_world_tick),
+                    "n_tissues": len(tissues),
+                    "n_params": int(n_params),
+                    "grown": int(grown), "graduated": int(grad)})
+        except Exception as e:
+            logger.debug("growth_history snapshot: %s", e)
+        return list(self._stat_growth_history)
+
+    def _stat_lifetime(self) -> dict:
+        """§6.2 одометр: накопленное за жизнь Адама. ate_total монотонный;
+        ticks_lived = возраст; paralysis_survived = восстановлений."""
+        cid = next(iter(self.organisms.keys()), None)
+        _bt = self._birth_tick.get(cid) if cid else None
+        ticks_lived = (max(0, int(self._last_world_tick) - int(_bt))
+                       if _bt is not None else int(self._last_world_tick))
+        return {
+            "ate_total": int(sum(self._stat_ate_total.values())),
+            "ticks_lived": int(ticks_lived),
+            "paralysis_survived": int(self._stat_recovery_count),
         }
 
     def _stat_hardware(self) -> dict:
