@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import os
 import random
 import time
 import types
@@ -443,6 +444,17 @@ class LocalColonyCompute:
         self._tissue_gc_sweep_done: dict = {}         # cid → tick конца последнего sweep (отдых между эпохами)
         self._tissue_gc_epoch_interval: int = 6388    # тиков отдыха между sweep'ами (длинный климат-цикл)
         self._tissue_gc_pruned: int = 0               # сайдкаров отпущено GC (фазовый шум)
+        # /stats Фаза 2 (v1.3, 10.06): накопители для push в diagnostics —
+        # клиент знает эти сигналы, UI их ждёт (контракт stats_redesign v1.3).
+        self._stat_pred_region: dict = {}   # cid → {temp35,dens44_55,rest} (PRED_REGION)
+        # felt_thirst вычисляется inline из hydration; insula_t_mod = _it_last_tmod
+        self._stat_ledger: dict = {}        # {net_true,residual,srv_cost} (LEDGER_FULL)
+        self._stat_paralysis_count: int = 0    # §3 параличей за сессию
+        self._stat_recovery_count: int = 0     # §3 восстановлений
+        self._stat_beh_verdicts: dict = {}  # role → {verdict, dims} (§10.3 Блок 7b)
+        self._stat_growth_events = deque(maxlen=20)   # лента роста (Блок 7/9)
+        self._stat_growth_history = deque(maxlen=288)  # ряд n_tissues/grown/grad
+        self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
         # (cerebellum→motor). IN-MEMORY: спек ткани ОСТАЁТСЯ в grown_specs →
@@ -4046,7 +4058,9 @@ class LocalColonyCompute:
             if not payload:
                 continue
             try:
-                torch.save(payload, dir_path / f"{cid}.pt")
+                _path = dir_path / f"{cid}.pt"
+                torch.save(payload, _path)
+                self._last_pt_path[cid] = str(_path)   # /stats Блок 1b (size_disk)
                 n += 1
             except Exception as e:
                 logger.warning("save_state %s torch.save failed: %s", cid, e)
@@ -6365,6 +6379,12 @@ class LocalColonyCompute:
         t = med / (rsd / (n ** 0.5)) if rsd >= 1e-9 else 0.0
         return (med, rsd, t)
 
+    def _stat_event(self, kind: str, role: str, text: str) -> None:
+        """/stats Блок 7/9: записать событие роста в кольцевой буфер (ленту)."""
+        self._stat_growth_events.append({
+            "t": int(self._last_world_tick), "kind": kind,
+            "role": role, "text": text})
+
     def _resolve_behavioral_gc(self, cid: str, org, st: dict) -> None:
         """Robust paired per-dim (median+MAD, Фрай (в)): ablate vs restore окна.
         Все измерения «больше=лучше» → ablate НИЖЕ restore значимо = ткань ПОЛЕЗНА.
@@ -6378,6 +6398,7 @@ class LocalColonyCompute:
         dims = ("neg_cortisol", "glucose", "hydration", "income")
         benefit, harm, detail = 0.0, 0.0, []
         all_powered = True       # все измерения adequately powered?
+        dim_stats = {}           # /stats Блок 7b: per-dim t/med/mde/powered
         for d in dims:
             a = st["samples"]["ablate"].get(d, [])
             r = st["samples"]["restore"].get(d, [])
@@ -6390,6 +6411,8 @@ class LocalColonyCompute:
             mde = t_keep * rsd / (n ** 0.5)   # min detectable effect
             powered = mde <= self._BEH_GC_MDE_TARGET.get(d, 1e9)
             all_powered = all_powered and powered
+            dim_stats[d] = {"t": round(t, 2), "med": round(med, 2),
+                            "mde": round(mde, 2), "powered": bool(powered)}
             logger.info("brain-growth BEH-GC-DIM cid=%s role=%s dim=%s n=%d "
                         "med=%.3f rsd=%.3f t=%.2f MDE=%.2f target=%.2f powered=%s",
                         cid, role, d, n, med, rsd, t, mde,
@@ -6414,6 +6437,9 @@ class LocalColonyCompute:
             logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
                         "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
                         cid, role, benefit, harm, ", ".join(detail) or "—")
+            self._stat_beh_verdicts[role] = {"verdict": "KEEP", "dims": dim_stats}
+            self._stat_event("beh-keep", role,
+                             f"ткань {role} поведенчески полезна [{', '.join(detail) or '—'}]")
             return
         # PRUNE: degraduate в сайдкар + cooldown ВСЕГДА; метка permanent —
         # ТОЛЬКО при adequate power (no-benefit ДОКАЗАН). underpowered →
@@ -6438,6 +6464,11 @@ class LocalColonyCompute:
         logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit=%.2f harm=%.2f "
                     "[%s] — degraduate в сайдкар; %s", cid, role, benefit, harm,
                     ", ".join(detail) or "—", verdict)
+        _vlabel = ("PERMANENT" if all_powered
+                   else f"SOFT#{self._beh_soft_count.get(cid, {}).get(role, 1)}")
+        self._stat_beh_verdicts[role] = {"verdict": _vlabel, "dims": dim_stats}
+        self._stat_event("beh-prune", role,
+                         f"ткань {role}: {_vlabel} [{', '.join(detail) or '—'}]")
 
     def _graduate_tissue(self, cid: str, org) -> bool:
         """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
@@ -6649,6 +6680,8 @@ class LocalColonyCompute:
                     "(до %.5f → после %.5f, диагностика; критерий Stage 1 = §3)",
                     cid, st["role"], st["ticks"],
                     loss_before - loss_after, loss_before, loss_after)
+        self._stat_event("graduate-ok", st["role"],
+                         f"ткань {st['role']} выпущена в мозг (мотор цел)")
 
     def _maybe_start_tissue_gc(self, cid: str) -> bool:
         """§10.8 GC (Фрай 10.06): начать leave-one-out ре-оценку ОДНОГО живого
@@ -6886,6 +6919,9 @@ class LocalColonyCompute:
                             _lr = float(F.mse_loss(_rest_o, _rest_t).item())
                         logger.info("PRED_REGION_DIAG cid=%s loss=%.5f temp35=%.5f "
                                     "dens44_55=%.5f rest=%.5f", cid, loss_f, _lt, _ld, _lr)
+                        self._stat_pred_region[cid] = {  # /stats Блок 6
+                            "temp35": round(_lt, 5), "dens44_55": round(_ld, 5),
+                            "rest": round(_lr, 5)}
                     except Exception:
                         pass
                 delta = max(0.0, surprise_prev - loss_f)
@@ -7508,6 +7544,7 @@ class LocalColonyCompute:
         if cid in self._paralysis_until:
             return
         self._paralysis_until[cid] = time.monotonic() + _PARALYSIS_SEC
+        self._stat_paralysis_count += 1  # /stats Блок 3
         logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
                     cid, reason, _PARALYSIS_SEC)
 
@@ -8591,6 +8628,7 @@ class LocalColonyCompute:
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
                     self._paralysis_window_n += 1  # §3.5-ledger: грант искажает Δ
+                    self._stat_recovery_count += 1  # /stats Блок 3
                     # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
                     # recovery = «передышка» → снимает не только паралич, но и
                     # стресс-залипание catatonic (cortisol застревает на 99.5 от
@@ -8712,6 +8750,12 @@ class LocalColonyCompute:
                     "после фикса; paralysis>0 = §3-несустейнабельно)",
                     _net, _net_true, _residual, self._e_srv_cost_sum,
                     self._paralysis_window_n, self._e_window_e0, _e_now)
+                self._stat_ledger = {  # /stats Блок 4 (истинный баланс §3.5)
+                    "net_true": round(_net_true, 1),
+                    "net_comp": round(_net, 1),
+                    "residual": round(_residual, 1),
+                    "srv_cost": round(float(self._e_srv_cost_sum), 1),
+                    "paralysis_window": int(self._paralysis_window_n)}
                 # INSTINCT_DIAG (Фрай): natural-роды vs bootstrap-омоложение +
                 # сколько особей сейчас в активном инстинкте. Критерий успеха:
                 # natural>0 (пошли роды) + eff_mean ползёт 5→10. Если держится
@@ -9721,9 +9765,60 @@ class LocalColonyCompute:
             "s2_dopa_td_avg": s2_dopa_td_avg,
             "s2_action_dist_avg": s2_action_dist_avg,
             "s2_bias_max_avg": s2_bias_max_avg,
+            # /stats Фаза 2 (v1.3): owner-агрегат Блоков 3/4/7/7b/10.
+            **self._stat_owner_extra(),
             "creatures": self._per_creature_stats(
                 action_dists=action_dists, bias_max=bias_max),
         }
+
+    def _stat_owner_extra(self) -> dict:
+        """/stats v1.3 Фаза 2: owner-агрегат — §3.5-ledger, §3-счётчики,
+        поведенческие вердикты (Блок 7b), лента роста, железо клиента (Блок 10)."""
+        _par_total = self._stat_paralysis_count or 1
+        return {
+            # Блок 4 — истинный баланс (§3.5-ledger)
+            **{f"ledger_{k}": v for k, v in (self._stat_ledger or {}).items()},
+            # Блок 3 — §3 бессмертие
+            "paralysis_count": int(self._stat_paralysis_count),
+            "recovery_count": int(self._stat_recovery_count),
+            "paralyzed_fraction": round(
+                1.0 - self._stat_recovery_count / _par_total, 4)
+                if self._stat_paralysis_count else 0.0,
+            "recovery_energy": round(float(self._recovery_energy), 1),
+            "immortal": bool(self._single_organism),
+            # Блок 7b — поведенческие вердикты тканей
+            "beh_verdicts": [
+                {"role": r, **v} for r, v in self._stat_beh_verdicts.items()],
+            # Блок 7/9 — лента событий роста
+            "growth_events": list(self._stat_growth_events),
+            # Блок 10 — железо клиента
+            "hardware": self._stat_hardware(),
+        }
+
+    def _stat_hardware(self) -> dict:
+        """/stats Блок 10: железо клиента (статика + загрузка). psutil/platform
+        опциональны — без них отдаём что есть."""
+        from utopia_client import __version__ as _ver
+        import platform
+        hw = {"os_name": platform.platform(terse=True),
+              "client_version": _ver,
+              "device": str(self.device)}
+        try:
+            import psutil
+            hw["cpu_cores"] = psutil.cpu_count(logical=False)
+            hw["cpu_threads"] = psutil.cpu_count(logical=True)
+            hw["cpu_util_pct"] = round(psutil.cpu_percent(interval=None), 1)
+            _vm = psutil.virtual_memory()
+            hw["ram_total_gb"] = round(_vm.total / 1e9, 1)
+            hw["ram_used_gb"] = round(_vm.used / 1e9, 1)
+            hw["ram_util_pct"] = round(_vm.percent, 1)
+        except Exception:
+            pass
+        try:
+            hw["cpu_model"] = platform.processor() or "unknown"
+        except Exception:
+            pass
+        return hw
 
     def _per_creature_stats(
         self,
@@ -9865,5 +9960,55 @@ class LocalColonyCompute:
                 "client_episodic_recall_norm": (
                     round(float(self.last_episodic_recall[cid].norm().item()), 4)
                     if cid in self.last_episodic_recall else 0.0),
+                # /stats Фаза 2 (v1.3): §3 / самосознание / тех-паспорт / погода.
+                **self._stat_per_creature_extra(cid, org, tissues, n_params),
             })
         return out
+
+    def _stat_per_creature_extra(self, cid, org, tissues, n_params) -> dict:
+        """/stats v1.3 Фаза 2: per-creature поля Блоков 1b/2/3/6 — клиент знает,
+        UI ждёт. §3-статус, felt-thirst, insula-T, трейты, тех-паспорт, pred_region."""
+        bc = self.biochem.get(cid)
+        # §3 paralysis (Блок 3): статус из _paralysis_until (монотонные секунды).
+        par, ticks_rem = False, 0
+        _until = self._paralysis_until.get(cid)
+        if _until is not None:
+            _rem = _until - time.monotonic()
+            if _rem > 0:
+                par, ticks_rem = True, max(0, round(_rem * 30.0))
+        # felt-thirst (Блок 2): inline из hydration (§3.2 concave φ⁻¹).
+        felt = 0.0
+        if bc is not None:
+            _hyd = float(getattr(bc, "hydration", 100.0))
+            if _hyd < 38.2:
+                felt = round((max(0.0, (38.2 - _hyd) / 38.2)) ** 0.618, 3)
+        # тех-паспорт (Блок 1b): клиент знает суммы по тканям + .pt размер.
+        n_cells = n_syn = 0
+        try:
+            for t in (tissues or {}).values():
+                n_cells += len(getattr(t, "cells", {}) or {})
+            n_syn = int(n_params)  # обучаемые веса ≈ синапсы
+        except Exception:
+            pass
+        _disk = 0.0
+        _pt = self._last_pt_path.get(cid)
+        try:
+            if _pt and os.path.exists(_pt):
+                _disk = round(os.path.getsize(_pt) / 1e6, 2)
+        except Exception:
+            pass
+        return {
+            "paralyzed": bool(par),
+            "paralysis_ticks_remaining": int(ticks_rem),
+            "felt_thirst": felt,
+            "insula_t_mod": round(float(self._it_last_tmod.get(cid, 1.0)), 4),
+            "traits": {k: int((self.traits.get(cid) or {}).get(k, 0))
+                       for k in ("move_speed", "attack_power", "efficiency")},
+            "pred_region": self._stat_pred_region.get(cid, {}),
+            "n_cells": int(n_cells),
+            "n_synapses": int(n_syn),
+            "size_disk_mb": _disk,
+            "predictor_dim": int(getattr(self, "_predictor_data_dim", 64) or 64),
+            "device": str(self.device),
+            "dtype": "float32",
+        }
