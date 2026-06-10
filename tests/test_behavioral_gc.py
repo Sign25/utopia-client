@@ -161,15 +161,31 @@ def test_resolve_keep_when_ablate_worsens_cortisol():
     assert c._beh_gc_done == 1 and c._beh_gc_pruned == 0
 
 
-def test_resolve_prune_when_no_benefit():
-    # измерения не различаются ablate/restore → не полезен → PRUNE + degraduate
+def test_resolve_prune_soft_when_underpowered():
+    # тихие измерения, но n=5 малый → MDE может быть adequate если rsd крошечный.
+    # Здесь cortisol underpowered (нет данных) → SOFT (не permanent).
     c = _c()
-    abl = {"glucose": [80, 81, 79, 80, 80]}
+    abl = {"glucose": [80, 81, 79, 80, 80]}           # cortisol отсутствует
     res = {"glucose": [80, 80, 81, 79, 80]}
     _resolve_with(c, abl, res)
     assert c._beh_gc_pruned == 1 and c._beh_gc_done == 0
-    assert "grown1" in c._beh_gc_rejected["a"]       # cooldown поставлен
-    assert not c._tissue_graduated.get("a")          # degraduated
+    assert "grown1" in c._beh_gc_rejected["a"]        # cooldown ВСЕГДА
+    assert not c._tissue_graduated.get("a")           # degraduated
+    # cortisol n<2 → не powered → SOFT → НЕ permanent
+    assert "grown1" not in c._beh_rejected_roles.get("a", set())
+
+
+def test_prune_permanent_only_when_all_powered():
+    # все 4 измерения с малым rsd (adequate power) и без benefit → PERMANENT
+    c = _c()
+    base = lambda v: [v, v+0.2, v-0.2, v+0.1, v-0.1, v, v+0.15, v-0.15]
+    abl = {"neg_cortisol": base(-60), "glucose": base(80),
+           "hydration": base(95), "income": base(2.0)}
+    res = {"neg_cortisol": base(-60), "glucose": base(80),
+           "hydration": base(95), "income": base(2.0)}
+    _resolve_with(c, abl, res)
+    assert c._beh_gc_pruned == 1
+    assert "grown1" in c._beh_rejected_roles.get("a", set())   # PERMANENT
 
 
 def test_resolve_veto_net_harm():
@@ -185,11 +201,15 @@ def test_resolve_veto_net_harm():
 
 # ── анти-осцилляция (Фрай): prune → метка → re-graduate заблокирован ────
 
-def test_prune_marks_behavior_rejected():
+def test_prune_permanent_marks_behavior_rejected():
+    # ВСЕ измерения adequately powered + no-benefit → PERMANENT метка
     c = _c()
-    abl = {"glucose": [80, 81, 79, 80, 80]}
-    res = {"glucose": [80, 80, 81, 79, 80]}
-    _resolve_with(c, abl, res)                       # → prune
+    base = lambda v: [v, v+0.2, v-0.2, v+0.1, v-0.1, v, v+0.15, v-0.15]
+    abl = {"neg_cortisol": base(-60), "glucose": base(80),
+           "hydration": base(95), "income": base(2.0)}
+    res = {"neg_cortisol": base(-60), "glucose": base(80),
+           "hydration": base(95), "income": base(2.0)}
+    _resolve_with(c, abl, res)                       # → prune permanent
     assert "grown1" in c._beh_rejected_roles.get("a", set())
 
 
