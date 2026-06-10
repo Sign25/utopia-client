@@ -461,6 +461,7 @@ class LocalColonyCompute:
         self._tissue_grad_max: int = 1        # Stage 1: ровно одна ткань, потом стоп
         self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
         self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
+        self._behavioral_probe_role: str = ""  # §10.3 ablate-проба замера сигнала по измерениям
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -6034,6 +6035,34 @@ class LocalColonyCompute:
         logger.info("set_tissue_graduation: %s", on)
         return self._tissue_graduation_enabled
 
+    def set_behavioral_probe(self, role: str) -> str:
+        """§10.3 Step-1 (Фрай 10.06): behavioral leave-one-out ПРОБА для замера
+        СИГНАЛА graduated-узла по измерениям самочувствия. role!="" → ablate эту
+        ткань (workbench выход→нули, мотор-вклад исчезает); ""→снять абляцию.
+        BIOCHEM_DEBUG ловит сдвиг измерений (ablated vs baseline). Ребро/узел НЕ
+        трогаем — обратимо мгновенно (это и есть GC-ablation, переиспользуем
+        для Stage 3). Мотор-риска нет: ablation = МЕНЬШЕ сигнала в cerebellum,
+        не больше (графа не возмущаем)."""
+        role = str(role or "")
+        self._behavioral_probe_role = role
+        for _cid, org in self.organisms.items():
+            try:
+                abl = getattr(org, "_ablated_roles", None)
+                if abl is None:
+                    org._ablated_roles = abl = set()
+                # снять прошлую пробу (наши grownN-роли), оставить чужие абляции
+                for r in [x for x in abl if str(x).startswith("grown")]:
+                    abl.discard(r)
+                if role:
+                    abl.add(role)
+                if hasattr(org, "_cached_levels"):
+                    org._cached_levels = None
+            except Exception as e:
+                logger.warning("behavioral probe %s/%s: %s", _cid, role, e)
+        logger.info("set_behavioral_probe: role=%r (ablate для замера сигнала)",
+                    role)
+        return role
+
     def _graduate_tissue(self, cid: str, org) -> bool:
         """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
         ГРАФ-узел в cerebellum→motor контур. Кандидат = GC-KEEP-verified с max
@@ -6836,13 +6865,21 @@ class LocalColonyCompute:
                  round(float(getattr(bc, "cortisol", 0.0)), 1),
                  round(float(getattr(bc, "serotonin", 0.0)), 1),
                  round(float(getattr(bc, "glucose", 0.0)), 1),
-                 str(getattr(bc, "mental_break", "") or ""))
+                 str(getattr(bc, "mental_break", "") or ""),
+                 # §10.3 Step-1 (Фрай 10.06): кандидаты behavioral-composite —
+                 # замерить CV (шум-floor) на ~1 климат-цикл до включения в GC.
+                 round(float(getattr(bc, "hydration", 0.0)), 1),
+                 round(float(getattr(bc, "fatigue", 0.0)), 1),
+                 round(float(getattr(bc, "adrenaline", 0.0)), 1))
                 for cid, bc in biochem.items()
             ])
+            _probe = (f" PROBE_ABLATE={self._behavioral_probe_role}"
+                      if self._behavioral_probe_role else "")
             logger.info(
-                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb: %s",
-                "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb}"
-                          for cid, e, c, s, g, mb in per_cid_e))
+                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb_hyd_fat_adr:%s %s", _probe,
+                "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb},"
+                          f"hyd={hyd},fat={fat},adr={adr}"
+                          for cid, e, c, s, g, mb, hyd, fat, adr in per_cid_e))
         except Exception as _e:
             logger.debug("biochem debug log failed: %s", _e)
         # INSULA_TEMP_DEBUG (Track 2 (б)): сигнал ОБУЧЕНИЯ моста — отличить

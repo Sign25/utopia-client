@@ -528,6 +528,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # on/off; дефолт OFF (dormant). Растит узел после насыщения связей.
     applied_tissue_growth: bool | None = None
     applied_tissue_graduation: bool | None = None
+    applied_behavioral_probe: str | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -808,6 +809,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("tissue_graduation → %s", target_tissue_grad)
                         except Exception as e:
                             logger.warning("set_tissue_graduation failed: %s", e)
+
+                    # §10.3 Step-1 (Фрай 10.06): behavioral-probe — ablate
+                    # graduated-ткань (строковый флаг = роль, ""=снять) для
+                    # замера сигнала по измерениям. Мгновенно, обратимо. edge-detect.
+                    target_probe = str(flags.get("behavioral_probe", "") or "")
+                    if target_probe != applied_behavioral_probe \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_behavioral_probe(target_probe)
+                            applied_behavioral_probe = target_probe
+                            logger.info("behavioral_probe → %r", target_probe)
+                        except Exception as e:
+                            logger.warning("set_behavioral_probe failed: %s", e)
 
                     # Ступень 2 (full-world): motor renorm growth-cap (числовой
                     # флаг). Мгновенная рекалибровка renorm-супрессора без рестарта.
