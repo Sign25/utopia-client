@@ -474,7 +474,13 @@ class LocalColonyCompute:
         self._behavioral_gc_enabled: bool = False  # client_flag behavioral_gc (OFF dormant)
         self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
         self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
-        self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-graduate сразу)
+        self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
+        # АНТИ-ОСЦИЛЛЯЦИЯ (Фрай 10.06): behavior-pruned ткань возвращается в
+        # сайдкары, где она ВСЁ ЕЩЁ prediction-good → без метки вечный churn
+        # graduate↔prune. Метка «behavior-rejected до изменения мира»: остаётся
+        # prediction-сайдкаром, повторный выпуск ЗАБЛОКИРОВАН. Персистится.
+        # Сброс — reset_behavior_rejected() при изменении мира (новые аффордансы).
+        self._beh_rejected_roles: dict = {}  # cid → set(role) без повторного выпуска
         self._beh_gc_done: int = 0        # behavioral-keep'ов (метрика)
         self._beh_gc_pruned: int = 0      # behavioral-prune'ов
         self._BEH_GC_WINDOW: int = 233    # тиков на окно (= погодный sin-цикл)
@@ -1389,6 +1395,7 @@ class LocalColonyCompute:
         self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
         self._beh_income_cum.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
+        self._beh_rejected_roles.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1814,6 +1821,13 @@ class LocalColonyCompute:
                 self._tissue_grad_reverted = max(
                     self._tissue_grad_reverted,
                     int(_gl0.get("grad_reverted", 0)))
+            except Exception:
+                pass
+        # анти-осцилляция: behavior-rejected метки durable через рестарт.
+        if isinstance(_gl0, dict) and _gl0.get("beh_rejected"):
+            try:
+                self._beh_rejected_roles[cid] = {
+                    str(r) for r in _gl0["beh_rejected"]}
             except Exception:
                 pass
         if isinstance(_gl0, dict) and _gl0.get("grown_tissues"):
@@ -3868,6 +3882,9 @@ class LocalColonyCompute:
                 ],
                 "grad_done": int(self._tissue_grad_done),
                 "grad_reverted": int(self._tissue_grad_reverted),
+                # анти-осцилляция (Фрай 10.06): behavior-rejected — durable
+                # (иначе после рестарта churn graduate↔prune вернулся бы).
+                "beh_rejected": sorted(self._beh_rejected_roles.get(cid) or []),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -6085,6 +6102,17 @@ class LocalColonyCompute:
                     role)
         return role
 
+    def reset_behavior_rejected(self) -> int:
+        """Сброс анти-осцилляционных меток «behavior-rejected». Вызывать при
+        ИЗМЕНЕНИИ МИРА (новые аффордансы Хьюберта: хищник/нагрузка/...) — ткань,
+        бесполезная в старом мире, может стать специалистом в новом. Идемпотентно."""
+        n = sum(len(s) for s in self._beh_rejected_roles.values())
+        if n:
+            logger.info("behavior-rejected метки сброшены (%d ролей) — мир "
+                        "изменился, повторный выпуск разрешён", n)
+        self._beh_rejected_roles.clear()
+        return n
+
     def set_behavioral_gc(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл §10.3 Stage 3 behavioral-GC. on=False
         (kill-switch): прервать активный GC, ВОССТАНОВИТЬ edge-weight (узел
@@ -6250,6 +6278,9 @@ class LocalColonyCompute:
         else:
             self._beh_gc_pruned += 1
             self._beh_gc_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
+            # анти-осцилляция (Фрай): метка «behavior-rejected до изменения
+            # мира» — остаётся prediction-сайдкаром, re-graduate заблокирован.
+            self._beh_rejected_roles.setdefault(cid, set()).add(role)
             self._degraduate_node(cid, org, role, reason="behavioral-prune")
             logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit_z=%.2f "
                         "harm_z=%.2f [%s] — поведенчески не полезен → degraduate "
@@ -6268,7 +6299,10 @@ class LocalColonyCompute:
         True если graduation начата (watch-окно открыто)."""
         d = self._grown_tissues.get(cid) or {}
         rises = self._tissue_gc_keep_rise.get(cid) or {}
-        cands = [(r, rises[r]) for r in d.keys() if r in rises]
+        # анти-осцилляция (Фрай): behavior-rejected роли НЕ выпускаем повторно
+        # (prediction-good, но поведенчески бесполезны — иначе вечный churn).
+        rej = self._beh_rejected_roles.get(cid) or set()
+        cands = [(r, rises[r]) for r in d.keys() if r in rises and r not in rej]
         if not cands:
             return False        # durable-verified кандидатов нет — ждём GC-KEEP
         role = max(cands, key=lambda x: x[1])[0]

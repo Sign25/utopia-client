@@ -183,6 +183,46 @@ def test_resolve_veto_net_harm():
     assert c._beh_gc_pruned == 1                      # veto net-harm сработал
 
 
+# ── анти-осцилляция (Фрай): prune → метка → re-graduate заблокирован ────
+
+def test_prune_marks_behavior_rejected():
+    c = _c()
+    abl = {"glucose": [80, 81, 79, 80, 80]}
+    res = {"glucose": [80, 80, 81, 79, 80]}
+    _resolve_with(c, abl, res)                       # → prune
+    assert "grown1" in c._beh_rejected_roles.get("a", set())
+
+
+def test_graduate_skips_behavior_rejected():
+    c = _c()
+    org = types.SimpleNamespace(tissues={}, connections=[],
+                                tissue_topology_genes=[])
+    c.organisms["a"] = org
+    c._grown_tissues["a"] = {"grown1": object()}
+    c._tissue_gc_keep_rise["a"] = {"grown1": 0.05}   # prediction-good!
+    c._beh_rejected_roles["a"] = {"grown1"}          # но behavior-rejected
+    assert c._graduate_tissue("a", org) is False     # повторный выпуск блокирован
+
+
+def test_behavior_rejected_persists_restart():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._beh_rejected_roles["a"] = {"grown7", "grown9"}
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["beh_rejected"] == ["grown7", "grown9"]
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._beh_rejected_roles["a"] == {"grown7", "grown9"}
+
+
+def test_reset_behavior_rejected_on_world_change():
+    c = _c()
+    c._beh_rejected_roles["a"] = {"grown7"}
+    assert c.reset_behavior_rejected() == 1
+    assert not c._beh_rejected_roles
+
+
 def test_metrics_expose_beh_gc():
     c = _c()
     c._beh_gc_done = 2
