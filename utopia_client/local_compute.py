@@ -431,6 +431,18 @@ class LocalColonyCompute:
         self._grown_tissues: dict = {}                # cid → {role: Tissue} predictor-сайдкары
         self._tissue_growth_cooldown: int = 233       # Fib — тиков паузы между propose (rate-limit b)
         self._tissue_last_resolve: dict = {}          # cid → tick последнего keep/backoff
+        # §10.8 DURABILITY (Фрай 10.06): dwell 89<погодный день-цикл 233 → keep судил
+        # по ФРАГМЕНТУ цикла → сайдкар фитил фазовый погодный шум. keep-окно ≥1 цикл →
+        # Δloss судит durable кросс-цикл улучшение, не транзиент.
+        self._tissue_growth_dwell_ticks: int = 233    # Fib = период sin/233 (один погодный цикл)
+        # GC: ре-оценка ЖИВЫХ сайдкаров на полном цикле — фазовые отпустить (noise-fit).
+        # Leave-one-out абляция: убрать сайдкар → dwell цикл → если loss НЕ вырос значимо
+        # (вклад распался) → пруна навсегда; иначе вернуть (durable). Изолировано от мотора.
+        self._tissue_gc_state: dict = {}              # cid → {role,tissue,loss_before,ticks} (held-aside абляция)
+        self._tissue_gc_tested: dict = {}             # cid → set(role) проверенных в текущей эпохе
+        self._tissue_gc_sweep_done: dict = {}         # cid → tick конца последнего sweep (отдых между эпохами)
+        self._tissue_gc_epoch_interval: int = 6388    # тиков отдыха между sweep'ами (длинный климат-цикл)
+        self._tissue_gc_pruned: int = 0               # сайдкаров отпущено GC (фазовый шум)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1330,6 +1342,9 @@ class LocalColonyCompute:
         self._tissue_grown_specs.pop(cid, None)
         self._grown_tissues.pop(cid, None)         # §10.8 редизайн a: сайдкары
         self._tissue_last_resolve.pop(cid, None)
+        self._tissue_gc_state.pop(cid, None)       # §10.8 GC cleanup
+        self._tissue_gc_tested.pop(cid, None)
+        self._tissue_gc_sweep_done.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1818,6 +1833,8 @@ class LocalColonyCompute:
                 self._tissue_kept = int(_gl.get("tissue_kept", self._tissue_kept))
                 self._tissue_reverted = int(
                     _gl.get("tissue_reverted", self._tissue_reverted))
+                self._tissue_gc_pruned = int(
+                    _gl.get("tissue_gc_pruned", self._tissue_gc_pruned))
                 _hist = _gl.get("intr_hist") or []
                 if _hist:
                     self._growth_intr_hist[cid] = deque(
@@ -3738,13 +3755,20 @@ class LocalColonyCompute:
                 # т.к. они НЕ в org.tissues (редизайн a: изоляция от мотора).
                 "tissue_kept": int(self._tissue_kept),
                 "tissue_reverted": int(self._tissue_reverted),
+                "tissue_gc_pruned": int(self._tissue_gc_pruned),
                 "grown_tissues": list(self._tissue_grown_specs.get(cid, [])),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
         # §10.8 (редизайн a): веса выросших predictor-сайдкаров (НЕ в tissues_by_role).
         try:
-            _gd = self._grown_tissues.get(cid)
+            _gd = dict(self._grown_tissues.get(cid) or {})
+            # GC держит один сайдкар «в стороне» во время абляции-dwell — его спек
+            # ещё в grown_specs, значит на restore он пересоздастся: сохраним и его
+            # веса, иначе мид-GC сейв потеряет обучение этого сайдкара.
+            _gcs = self._tissue_gc_state.get(cid)
+            if _gcs and _gcs.get("role") and _gcs.get("tissue") is not None:
+                _gd.setdefault(_gcs["role"], _gcs["tissue"])
             if _gd:
                 payload["grown_weights"] = {r: t.state_dict() for r, t in _gd.items()}
         except Exception as e:
@@ -5801,6 +5825,9 @@ class LocalColonyCompute:
                 self._grown_tissues.pop(cid, None)
                 self._tissue_grown_specs.pop(cid, None)
                 self._tissue_growth_state.pop(cid, None)
+                self._tissue_gc_state.pop(cid, None)       # GC held-aside тоже убираем
+                self._tissue_gc_tested.pop(cid, None)
+                self._tissue_gc_sweep_done.pop(cid, None)
             if n_removed:
                 self._tissue_kept = 0
                 logger.info("set_tissue_growth OFF: РЕВЕРТ — убрано %d выросших "
@@ -5873,6 +5900,84 @@ class LocalColonyCompute:
         except Exception as e:
             logger.warning("tissue-growth remove %s role=%s: %s", cid, role, e)
 
+    def _prune_grown_spec(self, cid: str, role: str) -> None:
+        """GC: убрать спек сайдкара из grown_specs (чтобы restore его НЕ пересоздал).
+        Грон-объект уже отсутствует в _grown_tissues (был held GC). Навсегда."""
+        specs = self._tissue_grown_specs.get(cid)
+        if specs:
+            specs = [s for s in specs if s.get("role") != role]
+            if specs:
+                self._tissue_grown_specs[cid] = specs
+            else:
+                self._tissue_grown_specs.pop(cid, None)
+
+    def _maybe_start_tissue_gc(self, cid: str) -> bool:
+        """§10.8 GC (Фрай 10.06): начать leave-one-out ре-оценку ОДНОГО живого
+        сайдкара. Эпоха = sweep всех живых; между эпохами отдых (длинный климат-цикл),
+        чтобы рост новых durable тканей не голодал. Абляция: убрать сайдкар из
+        _grown_tissues (вклад исчезает из входа предиктора) → dwell цикл → resolve.
+        Мотор изолирован (сайдкары не в графе). True если GC начат."""
+        d = self._grown_tissues.get(cid)
+        if not d:
+            return False
+        tested = self._tissue_gc_tested.setdefault(cid, set())
+        untested = [r for r in d.keys() if r not in tested]
+        if not untested:
+            # sweep завершён — отметить конец эпохи (один раз) и отдыхать.
+            if tested:
+                self._tissue_gc_sweep_done[cid] = int(self._last_world_tick)
+                tested.clear()
+            return False
+        # отдых между эпохами: не начинаем новый sweep, пока не прошёл климат-цикл.
+        _done = self._tissue_gc_sweep_done.get(cid)
+        if _done is not None and (self._last_world_tick - _done) < self._tissue_gc_epoch_interval:
+            return False
+        role = untested[0]
+        tissue = d.pop(role, None)
+        if not d:
+            self._grown_tissues.pop(cid, None)
+        if tissue is None:
+            return False
+        self._tissue_gc_state[cid] = {
+            "role": role,
+            "tissue": tissue,                    # held-aside (вне входа предиктора)
+            "loss_before": float(self.loss_ema.get(cid, 0.0)),
+            "ticks": 0,
+        }
+        logger.info("brain-growth TISSUE-GC-START cid=%s role=%s loss_before=%.5f "
+                    "(leave-one-out, %d untested)", cid, role,
+                    self._tissue_gc_state[cid]["loss_before"], len(untested))
+        return True
+
+    def _resolve_tissue_gc(self, cid: str, gc: dict) -> None:
+        """§10.8 GC resolve: после dwell-цикла без сайдкара — если loss вырос значимо
+        (вклад durable, его удаление повредило прогноз) → ВЕРНУТЬ; иначе (вклад распался
+        на полном цикле = фазовый шум) → ОТПУСТИТЬ навсегда. Консервативно: погодный
+        дрейф loss вверх склоняет к KEEP (не over-прунит здоровые)."""
+        gc["ticks"] += 1
+        if gc["ticks"] < self._tissue_growth_dwell_ticks:
+            return
+        role = gc["role"]
+        loss_before = float(gc["loss_before"])
+        loss_after = float(self.loss_ema.get(cid, loss_before))
+        rise = loss_after - loss_before          # >0 = удаление сайдкара подняло loss
+        durable = rise >= loss_before * self._growth_min_delta_frac
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)
+        self._tissue_gc_tested.setdefault(cid, set()).add(role)
+        if durable:
+            self._grown_tissues.setdefault(cid, {})[role] = gc["tissue"]   # вернуть
+            logger.info("brain-growth TISSUE-GC-KEEP cid=%s role=%s rise=%.5f "
+                        "(%.1f%%) durable", cid, role, rise,
+                        100.0 * rise / max(1e-9, loss_before))
+        else:
+            self._prune_grown_spec(cid, role)    # грон уже вне _grown_tissues
+            self._tissue_kept = max(0, self._tissue_kept - 1)
+            self._tissue_gc_pruned += 1
+            logger.info("brain-growth TISSUE-GC-PRUNE cid=%s role=%s rise=%.5f "
+                        "(noise-fit отпущен) pruned=%d kept=%d", cid, role, rise,
+                        self._tissue_gc_pruned, self._tissue_kept)
+        self._tissue_gc_state.pop(cid, None)
+
     def _tissue_growth_step(self, cid: str) -> None:
         """§10.8: propose→dwell→Δloss_ema→keep/backoff для ТКАНЕЙ-узлов. Растит
         узел ТОЛЬКО когда связи насыщены (19/19) И intrinsic у floor (тот же
@@ -5885,6 +5990,12 @@ class LocalColonyCompute:
             return
         if self._cerebellum_tissue_id(cid, org) is None:
             return
+        # GC dwell (Фрай 10.06): абляция-ре-оценка живого сайдкара идёт первой —
+        # один сайдкар «в стороне», ждём полный цикл, решаем durable/прун.
+        gc = self._tissue_gc_state.get(cid)
+        if gc is not None:
+            self._resolve_tissue_gc(cid, gc)
+            return
         st = self._tissue_growth_state.get(cid)
         if st is None:
             # Узлы — ПОСЛЕ рёбер: пока ВСЕ роли→cerebellum не подключены, ткани ждут.
@@ -5895,17 +6006,21 @@ class LocalColonyCompute:
             # net_ok пропустил кумулятив → §3-кризис). Растём только когда Адам здоров.
             if int(self._paralysis_window_n) > 0:
                 return
-            # (b) RATE-LIMIT: пауза между propose (выживание/мотор восстанавливается).
+            # (b) RATE-LIMIT: пауза между propose/GC (выживание/мотор восстанавливается).
             _last = self._tissue_last_resolve.get(cid)
             if _last is not None and (self._last_world_tick - _last) < self._tissue_growth_cooldown:
+                return
+            # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
+            # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
+            if self._maybe_start_tissue_gc(cid):
                 return
             # noise-robust плато (доля near-floor ≥ φ⁻¹), устойчив к всплескам погоды.
             if self._intrinsic_plateaued(cid):
                 self._propose_growth_tissue(cid, org)
             return
-        # dwell — ждём пере-сходимости predictor'а с новым сайдкаром.
+        # dwell — ждём пере-сходимости predictor'а ≥ ПОЛНЫЙ погодный цикл (durable).
         st["ticks"] += 1
-        if st["ticks"] < self._growth_dwell_ticks:
+        if st["ticks"] < self._tissue_growth_dwell_ticks:
             return
         loss_before = float(st["loss_before"])
         loss_after = float(self.loss_ema.get(cid, loss_before))

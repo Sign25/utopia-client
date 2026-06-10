@@ -129,3 +129,84 @@ def test_grown_contribution_none_without_sidecars():
     c = _c()
     import torch
     assert c._grown_pred_contribution("a", torch.zeros(1, 64)) is None
+
+
+# ── durability GC (Фрай 10.06): dwell ≥ погодный цикл + leave-one-out ре-оценка ──
+
+def test_tissue_dwell_is_full_weather_cycle():
+    # dwell 89<цикл 233 судил по фрагменту → фазовый шум. Окно ≥ цикл → durable.
+    c = _c()
+    assert c._tissue_growth_dwell_ticks == 233          # = период sin/233
+
+
+def test_gc_start_ablates_one_sidecar():
+    c = _c()
+    c._grown_tissues["a"] = {"grown1": object(), "grown2": object()}
+    c.loss_ema["a"] = 0.05
+    c._last_world_tick = 1000
+    assert c._maybe_start_tissue_gc("a") is True
+    gc = c._tissue_gc_state["a"]
+    assert gc["role"] in ("grown1", "grown2")
+    assert gc["role"] not in c._grown_tissues.get("a", {})   # held-aside, вне входа
+    assert gc["loss_before"] == 0.05 and gc["ticks"] == 0
+
+
+def test_gc_prune_releases_noise_fit():
+    c = _c()
+    c._grown_tissues["a"] = {"grown1": object()}
+    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    c._tissue_kept = 1
+    c.loss_ema["a"] = 0.05
+    c._last_world_tick = 0
+    c._maybe_start_tissue_gc("a")
+    gc = c._tissue_gc_state["a"]
+    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
+    c.loss_ema["a"] = 0.05                               # удаление НЕ подняло loss
+    c._resolve_tissue_gc("a", gc)
+    assert "a" not in c._tissue_gc_state
+    assert c._tissue_gc_pruned == 1 and c._tissue_kept == 0
+    assert c._tissue_grown_specs.get("a") in (None, [])   # спек убран → restore не вернёт
+    assert "grown1" not in c._grown_tissues.get("a", {})
+
+
+def test_gc_keep_returns_durable():
+    c = _c()
+    t = object()
+    c._grown_tissues["a"] = {"grown1": t}
+    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    c._tissue_kept = 1
+    c.loss_ema["a"] = 0.05
+    c._last_world_tick = 0
+    c._maybe_start_tissue_gc("a")
+    gc = c._tissue_gc_state["a"]
+    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
+    c.loss_ema["a"] = 0.05 * (1 + c._growth_min_delta_frac + 0.01)  # удаление подняло loss
+    c._resolve_tissue_gc("a", gc)
+    assert "a" not in c._tissue_gc_state
+    assert c._grown_tissues["a"]["grown1"] is t          # вернули ТОТ ЖЕ объект (веса целы)
+    assert c._tissue_kept == 1 and c._tissue_gc_pruned == 0
+
+
+def test_gc_epoch_rest_lets_growth_resume():
+    # sweep завершён (все живые протестированы) → отдых: новый sweep не стартует,
+    # idle уходит в propose (рост новых durable между эпохами).
+    c = _c()
+    c._grown_tissues["a"] = {"grown1": object()}
+    c._tissue_gc_tested["a"] = {"grown1"}
+    c._last_world_tick = 5000
+    assert c._maybe_start_tissue_gc("a") is False
+    assert c._tissue_gc_sweep_done.get("a") == 5000
+    assert c._tissue_gc_tested["a"] == set()
+    assert c._maybe_start_tissue_gc("a") is False         # отдых держит
+
+
+def test_gc_pruned_counter_persists():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._tissue_gc_pruned = 7
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["tissue_gc_pruned"] == 7
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._tissue_gc_pruned == 7
