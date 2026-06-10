@@ -443,6 +443,24 @@ class LocalColonyCompute:
         self._tissue_gc_sweep_done: dict = {}         # cid → tick конца последнего sweep (отдых между эпохами)
         self._tissue_gc_epoch_interval: int = 6388    # тиков отдыха между sweep'ами (длинный климат-цикл)
         self._tissue_gc_pruned: int = 0               # сайдкаров отпущено GC (фазовый шум)
+        # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
+        # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
+        # (cerebellum→motor). IN-MEMORY: спек ткани ОСТАЁТСЯ в grown_specs →
+        # рестарт пересоздаёт её как САЙДКАР (авто-деградация в безопасное
+        # состояние; durability узла = Stage 2, seed/persist/P40 не трогаем).
+        # Кандидат = ТОЛЬКО GC-KEEP-verified durable (rise записывает GC этой
+        # сессии). Мягкая стыковка: вес ребра φ⁻² (НЕ 1.0 — кризис 09.06 был
+        # при полной связи). §3-гейт АБСОЛЮТНЫЙ: paralysis>0 в watch-окне →
+        # НЕМЕДЛЕННЫЙ revert (не ждём конца окна). Stage 1 де-риск: ровно ОДНА
+        # graduation за сессию (_tissue_grad_max=1).
+        self._tissue_graduation_enabled: bool = False  # client_flag tissue_graduation (OFF)
+        self._tissue_grad_state: dict = {}    # cid → {role,tid,gene,ticks,par_before,energy_before,loss_before} watch
+        self._tissue_graduated: dict = {}     # cid → {role: Tissue} живые граф-узлы (save/kill-switch/ревизия)
+        self._tissue_grad_done: int = 0       # успешных graduations за сессию
+        self._tissue_grad_reverted: int = 0   # revert'ов graduation (§3/energy)
+        self._tissue_grad_max: int = 1        # Stage 1: ровно одна ткань, потом стоп
+        self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
+        self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1345,6 +1363,9 @@ class LocalColonyCompute:
         self._tissue_gc_state.pop(cid, None)       # §10.8 GC cleanup
         self._tissue_gc_tested.pop(cid, None)
         self._tissue_gc_sweep_done.pop(cid, None)
+        self._tissue_grad_state.pop(cid, None)     # §10.8 graduation cleanup
+        self._tissue_graduated.pop(cid, None)
+        self._tissue_gc_keep_rise.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -3769,6 +3790,12 @@ class LocalColonyCompute:
             _gcs = self._tissue_gc_state.get(cid)
             if _gcs and _gcs.get("role") and _gcs.get("tissue") is not None:
                 _gd.setdefault(_gcs["role"], _gcs["tissue"])
+            # graduation (Stage 1, in-memory): graduated-узел живёт в org.tissues,
+            # НЕ в _grown_tissues, но спек остался сайдкарным → на restore он
+            # пересоздастся САЙДКАРОМ (деградация). Сохраняем его веса сюда,
+            # иначе рестарт мид-graduation потерял бы обучение ткани.
+            for _r, _t in (self._tissue_graduated.get(cid) or {}).items():
+                _gd.setdefault(_r, _t)
             if _gd:
                 payload["grown_weights"] = {r: t.state_dict() for r, t in _gd.items()}
         except Exception as e:
@@ -5820,6 +5847,15 @@ class LocalColonyCompute:
         if not on:
             n_removed = 0
             for cid in list(self.organisms.keys()):
+                # graduation (Stage 1): сперва вернуть граф-узлы в сайдкары
+                # (вытащить из cerebellum→motor), потом убрать как сайдкары.
+                st = self._tissue_grad_state.get(cid)
+                if st is not None:
+                    self._revert_graduation(cid, self.organisms.get(cid), st,
+                                            reason="tissue_growth kill-switch")
+                for role in list((self._tissue_graduated.get(cid) or {}).keys()):
+                    self._degraduate_node(cid, self.organisms.get(cid), role,
+                                          reason="tissue_growth kill-switch")
                 d = self._grown_tissues.get(cid) or {}
                 n_removed += len(d)
                 self._grown_tissues.pop(cid, None)
@@ -5828,6 +5864,7 @@ class LocalColonyCompute:
                 self._tissue_gc_state.pop(cid, None)       # GC held-aside тоже убираем
                 self._tissue_gc_tested.pop(cid, None)
                 self._tissue_gc_sweep_done.pop(cid, None)
+                self._tissue_gc_keep_rise.pop(cid, None)   # graduation-кандидаты
             if n_removed:
                 self._tissue_kept = 0
                 logger.info("set_tissue_growth OFF: РЕВЕРТ — убрано %d выросших "
@@ -5911,6 +5948,196 @@ class LocalColonyCompute:
             else:
                 self._tissue_grown_specs.pop(cid, None)
 
+    def set_tissue_graduation(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл Stage 1 GRADUATION (Фрай 10.06). on=True:
+        при появлении durable-кандидата (GC-KEEP) — graduation ОДНОЙ ткани в граф.
+        on=False (kill-switch) = revert всех graduated-узлов ОБРАТНО В САЙДКАРЫ
+        (веса целы, изоляция от мотора восстановлена). Идемпотентно."""
+        self._tissue_graduation_enabled = bool(on)
+        if not on:
+            for cid in list(self.organisms.keys()):
+                st = self._tissue_grad_state.get(cid)
+                if st is not None:
+                    self._revert_graduation(cid, self.organisms.get(cid), st,
+                                            reason="kill-switch")
+                # graduated без in-flight state (watch уже пройден) — тоже вернуть
+                for role in list((self._tissue_graduated.get(cid) or {}).keys()):
+                    self._degraduate_node(cid, self.organisms.get(cid), role,
+                                          reason="kill-switch")
+        logger.info("set_tissue_graduation: %s", on)
+        return self._tissue_graduation_enabled
+
+    def _graduate_tissue(self, cid: str, org) -> bool:
+        """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
+        ГРАФ-узел в cerebellum→motor контур. Кандидат = GC-KEEP-verified с max
+        rise (только durable этой сессии). Акт: ткань из _grown_tissues (выход
+        уходит из прямого входа предиктора) → org.tissues (входящих рёбер нет =
+        СЕНСОР, читает obs64 — та же семантика входа, что у сайдкара) + ген
+        {role}→cerebellum весом φ⁻² (мягкая стыковка) + overlay. Вклад теперь
+        течёт obs→узел→cerebellum→{motor, predictor-hook}. IN-MEMORY: спек
+        остаётся сайдкарным в grown_specs → рестарт = деградация в сайдкар.
+        True если graduation начата (watch-окно открыто)."""
+        d = self._grown_tissues.get(cid) or {}
+        rises = self._tissue_gc_keep_rise.get(cid) or {}
+        cands = [(r, rises[r]) for r in d.keys() if r in rises]
+        if not cands:
+            return False        # durable-verified кандидатов нет — ждём GC-KEEP
+        role = max(cands, key=lambda x: x[1])[0]
+        try:
+            from core.tissue_topology import (
+                TissueConnectionGene, apply_topology_overlay_to_org,
+                TissueInnovationTracker)
+            from core.connection import ConnectionType
+        except Exception as e:
+            logger.warning("tissue-graduation import %s: %s", cid, e)
+            return False
+        if self._growth_tracker is None:
+            self._growth_tracker = TissueInnovationTracker()
+        tissue = d.get(role)
+        tid = getattr(tissue, "tissue_id", None)
+        if tissue is None or tid is None:
+            return False
+        genes = getattr(org, "tissue_topology_genes", None)
+        if genes is None:
+            genes = []
+            org.tissue_topology_genes = genes
+        # ре-использовать существующий ген (re-graduation после revert/рестарта),
+        # НЕ дублировать — дубль удвоил бы сигнал в cerebellum.
+        gene = next((g for g in genes
+                     if getattr(g, "source_role", None) == role
+                     and getattr(g, "target_role", None) == "cerebellum"), None)
+        if gene is None:
+            gene = TissueConnectionGene(
+                innovation=self._growth_tracker.reserve(role, "cerebellum"),
+                source_role=role, target_role="cerebellum",
+                conn_type=ConnectionType.DIRECT,
+                weight=float(self._TISSUE_GRAD_EDGE_WEIGHT), enabled=True)
+            genes.append(gene)
+        else:
+            gene.enabled = True
+            gene.weight = float(self._TISSUE_GRAD_EDGE_WEIGHT)
+        # вставка узла ПЕРЕД overlay (резолв роли требует ткань в org.tissues)
+        d.pop(role, None)
+        if not d:
+            self._grown_tissues.pop(cid, None)
+        org.tissues[tid] = tissue
+        try:
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            # rollback: узел из графа, ген off, сайдкар назад — состояние «до»
+            logger.warning("tissue-graduation overlay %s/%s: %s", cid, role, e)
+            org.tissues.pop(tid, None)
+            gene.enabled = False
+            self._grown_tissues.setdefault(cid, {})[role] = tissue
+            return False
+        self._tissue_graduated.setdefault(cid, {})[role] = tissue
+        bc = self.biochem.get(cid)
+        self._tissue_grad_state[cid] = {
+            "role": role,
+            "tid": tid,
+            "gene": gene,
+            "ticks": 0,
+            "loss_before": float(self.loss_ema.get(cid, 0.0)),
+            "par_before": int(self._paralysis_window_n),
+            "energy_before": (float(getattr(bc, "energy", 0.0))
+                              if bc is not None else None),
+            # КУМУЛЯТИВНЫЙ energy-тренд (Фрай 10.06): первый §3 был МЕДЛЕННЫЙ
+            # bleed (форейдж деградировал постепенно) — мгновенный детектор его
+            # прозевает. Копим средние по половинам окна: avg2<avg1 значимо
+            # (φ⁻⁵) в конце окна → revert, даже без мгновенного паралича.
+            "e_sum1": 0.0, "e_n1": 0,    # первая половина watch-окна
+            "e_sum2": 0.0, "e_n2": 0,    # вторая половина
+        }
+        logger.info("brain-growth TISSUE-GRADUATE-START cid=%s role=%s rise=%.5f "
+                    "edge_w=%.3f (сайдкар → ГРАФ-узел, §3-watch %d тиков)",
+                    cid, role, rises.get(role, 0.0),
+                    self._TISSUE_GRAD_EDGE_WEIGHT,
+                    self._tissue_growth_dwell_ticks)
+        return True
+
+    def _degraduate_node(self, cid: str, org, role: str, reason: str = "") -> None:
+        """Убрать graduated-узел из графа ОБРАТНО В САЙДКАР (веса целы, тот же
+        объект). Ген off + overlay (рёбра уходят), узел из org.tissues, ткань в
+        _grown_tissues (вклад снова идёт напрямую в предиктор, мотор изолирован)."""
+        t = (self._tissue_graduated.get(cid) or {}).pop(role, None)
+        if not self._tissue_graduated.get(cid):
+            self._tissue_graduated.pop(cid, None)
+        if org is None or t is None:
+            return
+        try:
+            genes = getattr(org, "tissue_topology_genes", None) or []
+            for g in genes:
+                if (getattr(g, "source_role", None) == role
+                        and getattr(g, "target_role", None) == "cerebellum"):
+                    g.enabled = False
+            # overlay ДО удаления узла: disabled-ген матчит старое ребро только
+            # пока роль резолвится (узел ещё в org.tissues) — иначе ребро виснет.
+            from core.tissue_topology import apply_topology_overlay_to_org
+            apply_topology_overlay_to_org(org)
+            org.tissues.pop(getattr(t, "tissue_id", None), None)
+            if hasattr(org, "_cached_levels"):
+                org._cached_levels = None   # узел ушёл — топо-кеш невалиден
+        except Exception as e:
+            logger.warning("tissue-degraduate %s/%s: %s", cid, role, e)
+        self._grown_tissues.setdefault(cid, {})[role] = t
+        logger.info("brain-growth TISSUE-GRADUATE-REVERT cid=%s role=%s (%s) — "
+                    "узел из графа, сайдкар восстановлен (мотор изолирован)",
+                    cid, role, reason)
+
+    def _revert_graduation(self, cid: str, org, st: dict, reason: str) -> None:
+        """Revert in-flight graduation (watch-окно): немедленный откат при §3/
+        energy-сигнале или kill-switch."""
+        self._tissue_grad_reverted += 1
+        self._tissue_grad_state.pop(cid, None)
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)  # rate-limit
+        self._degraduate_node(cid, org, st["role"], reason=reason)
+
+    def _tissue_graduation_watch(self, cid: str, org, st: dict) -> None:
+        """Per-tick watch graduated-узла. §3-гейт АБСОЛЮТНЫЙ + НЕМЕДЛЕННЫЙ:
+        paralysis вырос → revert сразу (кризис 09.06 показал: ждать окно нельзя,
+        кумулятив копится). Energy-обвал (<φ⁻¹ от старта) → revert. Окно чисто
+        (полный погодный цикл 233) → GRADUATE-OK, узел остаётся в графе."""
+        st["ticks"] += 1
+        if int(self._paralysis_window_n) > int(st["par_before"]):
+            self._revert_graduation(cid, org, st, reason="§3 paralysis")
+            return
+        bc = self.biochem.get(cid)
+        if bc is not None and st.get("energy_before"):
+            e_now = float(getattr(bc, "energy", 0.0))
+            if e_now < float(st["energy_before"]) * 0.618:
+                self._revert_graduation(cid, org, st, reason="energy-collapse")
+                return
+            # кумулятивный тренд (Фрай): сэмпл в половину окна
+            if st["ticks"] <= self._tissue_growth_dwell_ticks // 2:
+                st["e_sum1"] += e_now
+                st["e_n1"] += 1
+            else:
+                st["e_sum2"] += e_now
+                st["e_n2"] += 1
+        if st["ticks"] < self._tissue_growth_dwell_ticks:
+            return
+        # конец окна: МЕДЛЕННЫЙ bleed — средняя energy 2-й половины упала
+        # значимо (≥φ⁻⁵) против 1-й → форейдж деградирует → revert (Фрай 10.06).
+        if st["e_n1"] > 0 and st["e_n2"] > 0:
+            avg1 = st["e_sum1"] / st["e_n1"]
+            avg2 = st["e_sum2"] / st["e_n2"]
+            if avg2 < avg1 * (1.0 - self._growth_min_delta_frac):
+                logger.info("brain-growth TISSUE-GRADUATE energy-bleed cid=%s "
+                            "avg1=%.1f avg2=%.1f (кумулятивный тренд вниз)",
+                            cid, avg1, avg2)
+                self._revert_graduation(cid, org, st, reason="energy-bleed")
+                return
+        loss_before = float(st["loss_before"])
+        loss_after = float(self.loss_ema.get(cid, loss_before))
+        self._tissue_grad_done += 1
+        self._tissue_grad_state.pop(cid, None)
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)
+        logger.info("brain-growth TISSUE-GRADUATE-OK cid=%s role=%s — мотор цел "
+                    "(paralysis=0 все %d тиков), узел ЖИВЁТ в графе. Δloss=%.5f "
+                    "(до %.5f → после %.5f, диагностика; критерий Stage 1 = §3)",
+                    cid, st["role"], st["ticks"],
+                    loss_before - loss_after, loss_before, loss_after)
+
     def _maybe_start_tissue_gc(self, cid: str) -> bool:
         """§10.8 GC (Фрай 10.06): начать leave-one-out ре-оценку ОДНОГО живого
         сайдкара. Эпоха = sweep всех живых; между эпохами отдых (длинный климат-цикл),
@@ -5966,6 +6193,9 @@ class LocalColonyCompute:
         self._tissue_gc_tested.setdefault(cid, set()).add(role)
         if durable:
             self._grown_tissues.setdefault(cid, {})[role] = gc["tissue"]   # вернуть
+            # graduation-кандидаты (Stage 1): durable-verified этой сессии + их rise
+            # (graduation берёт max-rise). Только GC-KEEP попадают в кандидаты.
+            self._tissue_gc_keep_rise.setdefault(cid, {})[role] = float(rise)
             logger.info("brain-growth TISSUE-GC-KEEP cid=%s role=%s rise=%.5f "
                         "(%.1f%%) durable", cid, role, rise,
                         100.0 * rise / max(1e-9, loss_before))
@@ -5973,6 +6203,7 @@ class LocalColonyCompute:
             self._prune_grown_spec(cid, role)    # грон уже вне _grown_tissues
             self._tissue_kept = max(0, self._tissue_kept - 1)
             self._tissue_gc_pruned += 1
+            (self._tissue_gc_keep_rise.get(cid) or {}).pop(role, None)
             logger.info("brain-growth TISSUE-GC-PRUNE cid=%s role=%s rise=%.5f "
                         "(noise-fit отпущен) pruned=%d kept=%d", cid, role, rise,
                         self._tissue_gc_pruned, self._tissue_kept)
@@ -5989,6 +6220,13 @@ class LocalColonyCompute:
         if org is None or pred is None:
             return
         if self._cerebellum_tissue_id(cid, org) is None:
+            return
+        # GRADUATION watch (Stage 1, Фрай 10.06) — ПЕРВЫМ: пока узел под §3-
+        # наблюдением, петля (propose/GC) на паузе → мотор-сигнал чистый, без
+        # интерференции других экспериментов.
+        gs = self._tissue_grad_state.get(cid)
+        if gs is not None:
+            self._tissue_graduation_watch(cid, org, gs)
             return
         # GC dwell (Фрай 10.06): абляция-ре-оценка живого сайдкара идёт первой —
         # один сайдкар «в стороне», ждём полный цикл, решаем durable/прун.
@@ -6009,6 +6247,13 @@ class LocalColonyCompute:
             # (b) RATE-LIMIT: пауза между propose/GC (выживание/мотор восстанавливается).
             _last = self._tissue_last_resolve.get(cid)
             if _last is not None and (self._last_world_tick - _last) < self._tissue_growth_cooldown:
+                return
+            # GRADUATION (Stage 1) — ПЕРЕД GC: появился durable-кандидат (GC-KEEP
+            # этой сессии) и лимит не исчерпан → один сайдкар идёт в граф под
+            # §3-watch. Гейты выше уже гарантируют paralysis==0 + rate-limit.
+            if (self._tissue_graduation_enabled
+                    and self._tissue_grad_done < self._tissue_grad_max
+                    and self._graduate_tissue(cid, org)):
                 return
             # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
             # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
@@ -8357,12 +8602,16 @@ class LocalColonyCompute:
             live += len(self._tissue_gc_state)        # held-aside в GC ещё живой
             growing = len(self._tissue_growth_state)
             evaluating = len(self._tissue_gc_state)
+            graduated = sum(len(d or {}) for d in self._tissue_graduated.values())
+            grad_watch = len(self._tissue_grad_state)
         else:
             live = len(self._grown_tissues.get(cid) or {})
             if cid in self._tissue_gc_state:
                 live += 1
             growing = 1 if cid in self._tissue_growth_state else 0
             evaluating = 1 if cid in self._tissue_gc_state else 0
+            graduated = len(self._tissue_graduated.get(cid) or {})
+            grad_watch = 1 if cid in self._tissue_grad_state else 0
         return {
             "tissue_grown_live": int(live),
             "tissue_kept": int(self._tissue_kept),
@@ -8372,6 +8621,12 @@ class LocalColonyCompute:
             "tissue_growing": int(growing),
             "tissue_gc_evaluating": int(evaluating),
             "tissue_growth_enabled": bool(self._tissue_growth_enabled),
+            # Stage 1 GRADUATION (узлы в графе ≠ сайдкары; live их НЕ включает)
+            "tissue_graduated_live": int(graduated),
+            "tissue_grad_watch": int(grad_watch),
+            "tissue_grad_done": int(self._tissue_grad_done),
+            "tissue_grad_reverted": int(self._tissue_grad_reverted),
+            "tissue_graduation_enabled": bool(self._tissue_graduation_enabled),
         }
 
     def diagnostics(self) -> dict:  # noqa: C901

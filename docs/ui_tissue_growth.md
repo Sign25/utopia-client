@@ -34,6 +34,25 @@ JSON диагностики (тот же, откуда UI берёт `topo_activ
 | `tissue_gc_evaluating` | 0/1 | сейчас GC-ре-оценка живой ткани (leave-one-out) | индикатор-точка «ревизия…» |
 | `tissue_growth_enabled` | bool | флаг роста ON/OFF | бейдж ON/OFF |
 
+### Stage 1 GRADUATION (клиент 0.13.53+): сайдкар → узел ГРАФА
+
+Третья ступень: durable-ткань (GC-KEEP) «выпускается» из инкубатора сайдкаров
+В ГРАФ организма (через cerebellum→motor, под §3-наблюдением). Это ДРУГОЕ
+состояние ткани — graduated-узел НЕ входит в `tissue_grown_live`.
+
+| Поле | Тип | Смысл | Как показать |
+|------|-----|-------|--------------|
+| `tissue_graduated_live` | int | узлов в ГРАФЕ (выпускники инкубатора) | «в графе: N» рядом с live |
+| `tissue_grad_watch` | 0/1 | сейчас §3-watch graduated-узла (петля на паузе) | индикатор «● graduation…» |
+| `tissue_grad_done` | int | успешных graduations за сессию | опц. |
+| `tissue_grad_reverted` | int | revert'ов graduation (§3/energy-сигнал) | мелким |
+| `tissue_graduation_enabled` | bool | флаг graduation ON/OFF | бейдж |
+
+Семантика: graduation НЕ меняет `topo_active`-смысл (это рёбра скелетных
+ролей); узел-выпускник добавляет СВОЁ ребро →cerebellum, но в UI он живёт
+строкой «в графе: N». При revert узел возвращается в сайдкары
+(`graduated_live`−1, `grown_live`+1) — это защита мотора, не регрессия.
+
 Контекст-драйвер (поля уже есть, показывать рядом — рост ведёт ПРОГНОЗ):
 - `loss_ema` / `prediction_loss_avg` — ошибка предсказания мира (драйвер);
 - `prediction_accuracy` — точность прогноза;

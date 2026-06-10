@@ -527,6 +527,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # §10.8 (Фрай 09.06.2026): рост ТКАНЕЙ (узлами). client_flags → мгновенный
     # on/off; дефолт OFF (dormant). Растит узел после насыщения связей.
     applied_tissue_growth: bool | None = None
+    applied_tissue_graduation: bool | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -794,6 +795,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("tissue_growth → %s", target_tissue_growth)
                         except Exception as e:
                             logger.warning("set_tissue_growth failed: %s", e)
+
+                    # Stage 1 GRADUATION (Фрай 10.06): durable-сайдкар → граф-узел
+                    # через §3-контур. Мгновенный on/off; OFF = revert узлов в
+                    # сайдкары. Дефолт OFF (dormant). edge-detect.
+                    target_tissue_grad = bool(flags.get("tissue_graduation", False))
+                    if target_tissue_grad != applied_tissue_graduation \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_tissue_graduation(target_tissue_grad)
+                            applied_tissue_graduation = target_tissue_grad
+                            logger.info("tissue_graduation → %s", target_tissue_grad)
+                        except Exception as e:
+                            logger.warning("set_tissue_graduation failed: %s", e)
 
                     # Ступень 2 (full-world): motor renorm growth-cap (числовой
                     # флаг). Мгновенная рекалибровка renorm-супрессора без рестарта.
