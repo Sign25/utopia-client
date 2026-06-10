@@ -128,3 +128,55 @@ def test_beh_verdict_recorded_on_resolve():
     c._resolve_behavioral_gc("a", org, st)
     assert "grown1" in c._stat_beh_verdicts
     assert c._stat_beh_verdicts["grown1"]["verdict"].startswith("SOFT")
+
+
+# ── открытый хвост §4.4: foraging / growth_history / lifetime ───────────
+
+def test_growth_history_snapshot_and_export():
+    c = _c()
+    org = types.SimpleNamespace(tissues={}, generation=0)
+    c.organisms["a"] = org
+    c._last_world_tick = 5000
+    hist = c._stat_snapshot_growth_history()
+    assert len(hist) == 1
+    assert hist[0]["t"] == 5000 and hist[0]["n_tissues"] == 0
+    assert "grown" in hist[0] and "graduated" in hist[0]
+    c._last_world_tick = 5100
+    hist2 = c._stat_snapshot_growth_history()
+    assert len(hist2) == 2 and hist2[-1]["t"] == 5100
+
+
+def test_lifetime_odometer():
+    c = _c()
+    org = types.SimpleNamespace(tissues={}, generation=0)
+    c.organisms["a"] = org
+    c._stat_ate_total["a"] = 1842
+    c._stat_recovery_count = 14
+    c._birth_tick["a"] = 1000
+    c._last_world_tick = 42280
+    lf = c._stat_lifetime()
+    assert lf["ate_total"] == 1842 and lf["paralysis_survived"] == 14
+    assert lf["ticks_lived"] == 41280
+
+
+def test_foraging_in_owner_extra():
+    c = _c()
+    c._stat_foraging = {"onf_rate": 0.12, "sees_flora_rate": 0.93, "active_eat_rate": 0.04}
+    ow = c._stat_owner_extra()
+    assert ow["foraging"]["onf_rate"] == 0.12
+    assert "growth_history" in ow and "lifetime" in ow
+
+
+def test_lifetime_counters_persist():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._stat_ate_total["a"] = 500
+    src._stat_recovery_count = 7
+    src._stat_paralysis_count = 7
+    payload = src.save_state("a")
+    gl = payload["growth_loop"]
+    assert gl["ate_total"] == 500 and gl["recovery_count"] == 7
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._stat_ate_total["a"] == 500 and dst._stat_recovery_count == 7
