@@ -520,3 +520,35 @@ def test_health_streak_gates_graduation(monkeypatch):
     c.biochem["a"].energy = 300.0
     c._tissue_growth_step("a")
     assert c._grad_health_streak["a"] == 0
+
+
+# ── эскалация cooldown (Фрай: 2×revert = проверенно-вредная) ────────────
+
+def test_cooldown_escalates_with_revert_count():
+    c, org, t = _grad_setup()
+    c._graduate_tissue("a", org)
+    c._last_world_tick = 10000
+    c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="x")
+    assert c._grad_revert_count["a"]["grown1"] == 1
+    # 1й revert: cooldown 1×epoch — после него снова кандидат
+    c._last_world_tick = 10000 + c._tissue_gc_epoch_interval
+    assert c._graduate_tissue("a", org) is True
+    c._revert_graduation("a", org, c._tissue_grad_state["a"], reason="x")
+    assert c._grad_revert_count["a"]["grown1"] == 2
+    # 2й revert: cooldown 2×epoch — 1×epoch уже НЕ хватает
+    c._last_world_tick += c._tissue_gc_epoch_interval
+    assert c._graduate_tissue("a", org) is False
+    c._last_world_tick += c._tissue_gc_epoch_interval      # итого 2×
+    assert c._graduate_tissue("a", org) is True
+
+
+def test_revert_count_persists():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._grad_revert_count["a"] = {"grown151": 2}
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["grad_revert_count"] == {"grown151": 2}
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._grad_revert_count["a"] == {"grown151": 2}

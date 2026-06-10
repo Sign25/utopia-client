@@ -473,6 +473,13 @@ class LocalColonyCompute:
         #     window-based (rolling-mean 13) — погодный одиночный провал не
         #     роняет watch в фазе восстановления.
         self._grad_rejected: dict = {}        # cid → {role: tick} revert-cooldown роли
+        # ЭСКАЛАЦИЯ cooldown (Фрай 10.06, grown151 2×revert): повторно
+        # ревертнутая ткань = проверенно-вредная в графе — cooldown растёт
+        # Fib-множителем с revert-count (1→1×, 2→2×, 3→5×, 4→13×, 5+→34×
+        # epoch_interval) → живёт prediction-сайдкаром, не тратит циклы
+        # выпуска. Counts персистятся (иначе рестарт обнулял бы эскалацию).
+        self._grad_revert_count: dict = {}    # cid → {role: n revert'ов роли}
+        self._GRAD_COOLDOWN_FIB = (1, 2, 5, 13, 34)  # множители epoch_interval
         self._grad_revert_streak: int = 0     # revert'ов подряд (KEEP сбрасывает)
         self._GRAD_REVERT_HALT: int = 3       # Fib-лимит → halt выпуска
         self._grad_halted: bool = False       # стоп до re-flip tissue_graduation
@@ -1419,6 +1426,7 @@ class LocalColonyCompute:
         self._beh_gc_rejected.pop(cid, None)
         self._beh_rejected_roles.pop(cid, None)
         self._grad_rejected.pop(cid, None)         # анти-churn cleanup
+        self._grad_revert_count.pop(cid, None)
         self._grad_health_streak.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
@@ -1845,6 +1853,14 @@ class LocalColonyCompute:
                 self._tissue_grad_reverted = max(
                     self._tissue_grad_reverted,
                     int(_gl0.get("grad_reverted", 0)))
+            except Exception:
+                pass
+        # эскалация cooldown: revert-counts durable.
+        if isinstance(_gl0, dict) and _gl0.get("grad_revert_count"):
+            try:
+                self._grad_revert_count[cid] = {
+                    str(k): int(v)
+                    for k, v in _gl0["grad_revert_count"].items()}
             except Exception:
                 pass
         # анти-осцилляция: behavior-rejected метки durable через рестарт.
@@ -3909,6 +3925,9 @@ class LocalColonyCompute:
                 # анти-осцилляция (Фрай 10.06): behavior-rejected — durable
                 # (иначе после рестарта churn graduate↔prune вернулся бы).
                 "beh_rejected": sorted(self._beh_rejected_roles.get(cid) or []),
+                # эскалация cooldown выпуска: revert-counts durable (иначе
+                # рестарт обнулял бы и вредная ткань вернулась бы в очередь).
+                "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -6153,6 +6172,7 @@ class LocalColonyCompute:
         n = self.reset_behavior_rejected()
         self._beh_gc_rejected.clear()
         self._grad_rejected.clear()
+        self._grad_revert_count.clear()
         self._grad_halted = False
         self._grad_revert_streak = 0
         self._tissue_grad_done = 0
@@ -6361,11 +6381,17 @@ class LocalColonyCompute:
         # (prediction-good, но поведенчески бесполезны — иначе вечный churn).
         rej = self._beh_rejected_roles.get(cid) or set()
         # анти-churn (2): роль после revert в cooldown (не долбить тот же узел).
+        # ЭСКАЛАЦИЯ (Фрай): cooldown × Fib(revert_count) — проверенно-вредная
+        # (2+ revert) ждёт кратно дольше, живёт prediction-сайдкаром.
         grej = self._grad_rejected.get(cid) or {}
+        gcnt = self._grad_revert_count.get(cid) or {}
+        def _cd(r):
+            n = int(gcnt.get(r, 1))
+            mult = self._GRAD_COOLDOWN_FIB[min(n - 1, len(self._GRAD_COOLDOWN_FIB) - 1)]
+            return self._tissue_gc_epoch_interval * mult
         cands = [(r, rises[r]) for r in d.keys()
                  if r in rises and r not in rej
-                 and (self._last_world_tick - grej.get(r, -10**9))
-                 >= self._tissue_gc_epoch_interval]
+                 and (self._last_world_tick - grej.get(r, -10**9)) >= _cd(r)]
         if not cands:
             return False        # durable-verified кандидатов нет — ждём GC-KEEP
         role = max(cands, key=lambda x: x[1])[0]
@@ -6482,6 +6508,8 @@ class LocalColonyCompute:
         if reason != "kill-switch":
             self._grad_rejected.setdefault(cid, {})[st["role"]] = int(
                 self._last_world_tick)                       # (2) роль-cooldown
+            _rc = self._grad_revert_count.setdefault(cid, {})
+            _rc[st["role"]] = _rc.get(st["role"], 0) + 1     # эскалация (Фрай)
             self._grad_revert_streak += 1
             self._grad_health_streak[cid] = 0                # (A) recovery заново
             if (not self._grad_halted
