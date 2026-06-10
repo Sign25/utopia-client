@@ -529,6 +529,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_tissue_growth: bool | None = None
     applied_tissue_graduation: bool | None = None
     applied_behavioral_probe: str | None = None
+    applied_behavioral_gc: bool | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -809,6 +810,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("tissue_graduation → %s", target_tissue_grad)
                         except Exception as e:
                             logger.warning("set_tissue_graduation failed: %s", e)
+
+                    # §10.3 Stage 3 (Фрай go 10.06): behavioral-GC — парная
+                    # ревизия graduated-узлов по самочувствию. Дефолт OFF
+                    # (dormant). Мгновенный on/off; OFF=abort+restore edge. edge-detect.
+                    target_beh_gc = bool(flags.get("behavioral_gc", False))
+                    if target_beh_gc != applied_behavioral_gc \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_behavioral_gc(target_beh_gc)
+                            applied_behavioral_gc = target_beh_gc
+                            logger.info("behavioral_gc → %s", target_beh_gc)
+                        except Exception as e:
+                            logger.warning("set_behavioral_gc failed: %s", e)
 
                     # §10.3 Step-1 (Фрай 10.06): behavioral-probe — ablate
                     # graduated-ткань (строковый флаг = роль, ""=снять) для

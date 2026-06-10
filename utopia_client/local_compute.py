@@ -462,6 +462,31 @@ class LocalColonyCompute:
         self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
         self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
         self._behavioral_probe_role: str = ""  # §10.3 ablate-проба замера сигнала по измерениям
+        # §10.3 STAGE 3 BEHAVIORAL-GC (Фрай go 10.06): парный interleaved
+        # leave-one-out по самочувствию. ablate = soft edge-weight→0 (НЕ removal
+        # → топология не дёргается → нет churn/§3); discard пост-toggle transient
+        # (мотор устаканивается); §3-монитор активен (abort при paralysis>0);
+        # порог = ПАРНАЯ значимость (paired-t по окнам, не сырой k·CV). Измерения:
+        # live-variance (cortisol↓/glucose↑/hydration↑/income-rate↑), мёртвые
+        # (serotonin/fatigue/adrenaline pinned в текущих условиях) НЕ берём —
+        # набор НЕ заморожен (вернутся с аффордансами хищник/нагрузка). specialist-
+        # keep (ablation бьёт ЛЮБОЕ измерение за порог) + veto net-harm.
+        self._behavioral_gc_enabled: bool = False  # client_flag behavioral_gc (OFF dormant)
+        self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
+        self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
+        self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
+        # АНТИ-ОСЦИЛЛЯЦИЯ (Фрай 10.06): behavior-pruned ткань возвращается в
+        # сайдкары, где она ВСЁ ЕЩЁ prediction-good → без метки вечный churn
+        # graduate↔prune. Метка «behavior-rejected до изменения мира»: остаётся
+        # prediction-сайдкаром, повторный выпуск ЗАБЛОКИРОВАН. Персистится.
+        # Сброс — reset_behavior_rejected() при изменении мира (новые аффордансы).
+        self._beh_rejected_roles: dict = {}  # cid → set(role) без повторного выпуска
+        self._beh_gc_done: int = 0        # behavioral-keep'ов (метрика)
+        self._beh_gc_pruned: int = 0      # behavioral-prune'ов
+        self._BEH_GC_WINDOW: int = 233    # тиков на окно (= погодный sin-цикл)
+        self._BEH_GC_TRANSIENT: int = 21  # discard тиков после toggle (Fib, мотор устаканивается)
+        self._BEH_GC_PAIRS: int = 5       # пар ablate/restore окон (paired-t N=5)
+        self._BEH_GC_T_KEEP: float = 2.776  # t-крит paired N=5 (df=4, две-стор. 0.05)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1367,6 +1392,10 @@ class LocalColonyCompute:
         self._tissue_grad_state.pop(cid, None)     # §10.8 graduation cleanup
         self._tissue_graduated.pop(cid, None)
         self._tissue_gc_keep_rise.pop(cid, None)
+        self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
+        self._beh_income_cum.pop(cid, None)
+        self._beh_gc_rejected.pop(cid, None)
+        self._beh_rejected_roles.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1792,6 +1821,13 @@ class LocalColonyCompute:
                 self._tissue_grad_reverted = max(
                     self._tissue_grad_reverted,
                     int(_gl0.get("grad_reverted", 0)))
+            except Exception:
+                pass
+        # анти-осцилляция: behavior-rejected метки durable через рестарт.
+        if isinstance(_gl0, dict) and _gl0.get("beh_rejected"):
+            try:
+                self._beh_rejected_roles[cid] = {
+                    str(r) for r in _gl0["beh_rejected"]}
             except Exception:
                 pass
         if isinstance(_gl0, dict) and _gl0.get("grown_tissues"):
@@ -3846,6 +3882,9 @@ class LocalColonyCompute:
                 ],
                 "grad_done": int(self._tissue_grad_done),
                 "grad_reverted": int(self._tissue_grad_reverted),
+                # анти-осцилляция (Фрай 10.06): behavior-rejected — durable
+                # (иначе после рестарта churn graduate↔prune вернулся бы).
+                "beh_rejected": sorted(self._beh_rejected_roles.get(cid) or []),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -6063,6 +6102,191 @@ class LocalColonyCompute:
                     role)
         return role
 
+    def reset_behavior_rejected(self) -> int:
+        """Сброс анти-осцилляционных меток «behavior-rejected». Вызывать при
+        ИЗМЕНЕНИИ МИРА (новые аффордансы Хьюберта: хищник/нагрузка/...) — ткань,
+        бесполезная в старом мире, может стать специалистом в новом. Идемпотентно."""
+        n = sum(len(s) for s in self._beh_rejected_roles.values())
+        if n:
+            logger.info("behavior-rejected метки сброшены (%d ролей) — мир "
+                        "изменился, повторный выпуск разрешён", n)
+        self._beh_rejected_roles.clear()
+        return n
+
+    def set_behavioral_gc(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл §10.3 Stage 3 behavioral-GC. on=False
+        (kill-switch): прервать активный GC, ВОССТАНОВИТЬ edge-weight (узел
+        обратно в полноценный graduated). Идемпотентно."""
+        self._behavioral_gc_enabled = bool(on)
+        if not on:
+            for cid in list(self._beh_gc_state.keys()):
+                self._abort_behavioral_gc(cid, self.organisms.get(cid),
+                                          reason="kill-switch")
+        logger.info("set_behavioral_gc: %s", on)
+        return self._behavioral_gc_enabled
+
+    def _beh_gc_set_edge_weight(self, org, role: str, w: float) -> None:
+        """Soft ablate/restore (Фрай 10.06): менять ВЕС ребра {role}→cerebellum,
+        НЕ удалять узел — топология стабильна → нет churn → нет §3-триггера.
+        overlay переписывает conn.weight из gene.weight."""
+        try:
+            genes = getattr(org, "tissue_topology_genes", None) or []
+            for g in genes:
+                if (getattr(g, "source_role", None) == role
+                        and getattr(g, "target_role", None) == "cerebellum"):
+                    g.weight = float(w)
+            from core.tissue_topology import apply_topology_overlay_to_org
+            apply_topology_overlay_to_org(org)
+        except Exception as e:
+            logger.warning("beh-gc edge-weight %s/%s→%.3f: %s", role, role, w, e)
+
+    def _beh_gc_sample(self, cid: str) -> dict:
+        """Снимок live-variance измерений самочувствия. income — RATE (дельта
+        монотонного аккумулятора, выставляется per-окно). cortisol инвертируем
+        (↓=благо) → все измерения в семантике «больше=лучше»."""
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return {}
+        return {
+            "neg_cortisol": -float(getattr(bc, "cortisol", 0.0)),
+            "glucose": float(getattr(bc, "glucose", 0.0)),
+            "hydration": float(getattr(bc, "hydration", 0.0)),
+            "income_cum": float(self._beh_income_cum.get(cid, 0.0)),
+        }
+
+    def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
+        """Запустить парный GC на graduated-узле (durable, не в cooldown). Стартуем
+        в ablate-фазе (edge-weight→0). True если начат."""
+        grad = self._tissue_graduated.get(cid) or {}
+        rej = self._beh_gc_rejected.get(cid) or {}
+        cand = [r for r in grad
+                if (self._last_world_tick - rej.get(r, -10**9))
+                >= self._tissue_gc_epoch_interval]
+        if not cand:
+            return False
+        role = cand[0]
+        self._beh_gc_set_edge_weight(org, role, 0.0)   # старт: ablate
+        self._beh_gc_state[cid] = {
+            "role": role,
+            "phase": "ablate",
+            "pairs_done": 0,
+            "win_ticks": 0,
+            "win0_income": float(self._beh_income_cum.get(cid, 0.0)),
+            "acc": {}, "acc_n": 0,
+            "samples": {"ablate": {}, "restore": {}},
+            "par_before": int(self._paralysis_window_n),
+        }
+        logger.info("brain-growth BEH-GC-START cid=%s role=%s (парный interleaved, "
+                    "soft-ablate edge→0, %d пар × %d тиков)", cid, role,
+                    self._BEH_GC_PAIRS, self._BEH_GC_WINDOW)
+        return True
+
+    def _abort_behavioral_gc(self, cid: str, org, reason: str) -> None:
+        """Прервать GC: восстановить edge-weight (узел снова полноценный graduated)."""
+        st = self._beh_gc_state.pop(cid, None)
+        if st is None:
+            return
+        if org is not None:
+            self._beh_gc_set_edge_weight(org, st["role"],
+                                         self._TISSUE_GRAD_EDGE_WEIGHT)
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)
+        logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge-weight "
+                    "восстановлен", cid, st["role"], reason)
+
+    def _behavioral_gc_step(self, cid: str, org) -> None:
+        """Один тик парной машины. §3-abort → discard transient → накопить окно →
+        на закрытии окна toggle фазы (edge-weight) → собрать BEH_GC_PAIRS пар →
+        resolve (paired-t per-dim, specialist-keep + veto net-harm)."""
+        st = self._beh_gc_state.get(cid)
+        if st is None:
+            return
+        # §3-монитор (Фрай): дестабилизировал → немедленный abort + restore.
+        if int(self._paralysis_window_n) > int(st["par_before"]):
+            self._abort_behavioral_gc(cid, org, reason="§3 paralysis")
+            return
+        st["win_ticks"] += 1
+        # discard пост-toggle transient (мотор устаканивается перед замером)
+        if st["win_ticks"] <= self._BEH_GC_TRANSIENT:
+            return
+        s = self._beh_gc_sample(cid)
+        for k, v in s.items():
+            if k != "income_cum":
+                st["acc"][k] = st["acc"].get(k, 0.0) + v
+        st["acc_n"] += 1
+        if st["win_ticks"] < self._BEH_GC_WINDOW:
+            return
+        # закрыть окно: средние измерений + income-RATE за окно
+        phase = st["phase"]
+        win = {k: st["acc"][k] / max(1, st["acc_n"]) for k in st["acc"]}
+        inc_now = float(self._beh_income_cum.get(cid, 0.0))
+        win["income"] = (inc_now - st["win0_income"]) / max(1, st["win_ticks"])
+        for k, v in win.items():
+            st["samples"][phase].setdefault(k, []).append(v)
+        # toggle фазы (soft edge-weight) + сброс окна
+        new_phase = "restore" if phase == "ablate" else "ablate"
+        self._beh_gc_set_edge_weight(
+            org, st["role"],
+            0.0 if new_phase == "ablate" else self._TISSUE_GRAD_EDGE_WEIGHT)
+        st["phase"] = new_phase
+        st["win_ticks"] = 0
+        st["acc"] = {}
+        st["acc_n"] = 0
+        st["win0_income"] = inc_now
+        if new_phase == "ablate":        # завершилась полная пара (restore→ablate)
+            st["pairs_done"] += 1
+            if st["pairs_done"] >= self._BEH_GC_PAIRS:
+                self._resolve_behavioral_gc(cid, org, st)
+
+    def _resolve_behavioral_gc(self, cid: str, org, st: dict) -> None:
+        """Paired-t per-dim: ablate-окна vs restore-окна. Все измерения в семантике
+        «больше=лучше» → ablate НИЖЕ restore значимо = ткань ПОЛЕЗНА по измерению.
+        specialist-keep (любое измерение durable-полезно) + veto net-harm (сумма
+        вреда > пользы по z). keep→restore edge (узел живёт); prune→degraduate."""
+        import math
+        role = st["role"]
+        dims = ("neg_cortisol", "glucose", "hydration", "income")
+        benefit_z, harm_z, detail = 0.0, 0.0, []
+        for d in dims:
+            a = st["samples"]["ablate"].get(d, [])
+            r = st["samples"]["restore"].get(d, [])
+            n = min(len(a), len(r))
+            if n < 2:
+                continue
+            diffs = [a[i] - r[i] for i in range(n)]   # ablate − restore
+            md = sum(diffs) / n
+            sd = (sum((x - md) ** 2 for x in diffs) / (n - 1)) ** 0.5
+            if sd < 1e-9:
+                continue
+            t = md / (sd / math.sqrt(n))               # paired-t
+            z = abs(md) / sd
+            if t <= -self._BEH_GC_T_KEEP:              # ablate ниже = польза
+                benefit_z += z
+                detail.append(f"{d}:t={t:.1f}(польза)")
+            elif t >= self._BEH_GC_T_KEEP:             # ablate выше = ткань ВРЕДИТ
+                harm_z += z
+                detail.append(f"{d}:t={t:.1f}(вред)")
+        keep = benefit_z > 0.0 and benefit_z >= harm_z   # specialist + veto net-harm
+        self._beh_gc_state.pop(cid, None)
+        self._tissue_last_resolve[cid] = int(self._last_world_tick)
+        # окно завершилось в ablate-фазе → восстановить edge перед вердиктом
+        self._beh_gc_set_edge_weight(org, role, self._TISSUE_GRAD_EDGE_WEIGHT)
+        if keep:
+            self._beh_gc_done += 1
+            logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit_z=%.2f "
+                        "harm_z=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
+                        cid, role, benefit_z, harm_z, ", ".join(detail) or "—")
+        else:
+            self._beh_gc_pruned += 1
+            self._beh_gc_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
+            # анти-осцилляция (Фрай): метка «behavior-rejected до изменения
+            # мира» — остаётся prediction-сайдкаром, re-graduate заблокирован.
+            self._beh_rejected_roles.setdefault(cid, set()).add(role)
+            self._degraduate_node(cid, org, role, reason="behavioral-prune")
+            logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit_z=%.2f "
+                        "harm_z=%.2f [%s] — поведенчески не полезен → degraduate "
+                        "в сайдкар (cooldown)", cid, role, benefit_z, harm_z,
+                        ", ".join(detail) or "—")
+
     def _graduate_tissue(self, cid: str, org) -> bool:
         """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
         ГРАФ-узел в cerebellum→motor контур. Кандидат = GC-KEEP-verified с max
@@ -6075,7 +6299,10 @@ class LocalColonyCompute:
         True если graduation начата (watch-окно открыто)."""
         d = self._grown_tissues.get(cid) or {}
         rises = self._tissue_gc_keep_rise.get(cid) or {}
-        cands = [(r, rises[r]) for r in d.keys() if r in rises]
+        # анти-осцилляция (Фрай): behavior-rejected роли НЕ выпускаем повторно
+        # (prediction-good, но поведенчески бесполезны — иначе вечный churn).
+        rej = self._beh_rejected_roles.get(cid) or set()
+        cands = [(r, rises[r]) for r in d.keys() if r in rises and r not in rej]
         if not cands:
             return False        # durable-verified кандидатов нет — ждём GC-KEEP
         role = max(cands, key=lambda x: x[1])[0]
@@ -6317,6 +6544,11 @@ class LocalColonyCompute:
             return
         if self._cerebellum_tissue_id(cid, org) is None:
             return
+        # BEHAVIORAL-GC (Stage 3, Фрай 10.06) — если активен парный замер,
+        # ведём его и НИЧЕГО больше (изолированный мотор-сигнал, как graduation).
+        if cid in self._beh_gc_state:
+            self._behavioral_gc_step(cid, org)
+            return
         # GRADUATION watch (Stage 1, Фрай 10.06) — ПЕРВЫМ: пока узел под §3-
         # наблюдением, петля (propose/GC) на паузе → мотор-сигнал чистый, без
         # интерференции других экспериментов.
@@ -6350,6 +6582,13 @@ class LocalColonyCompute:
             if (self._tissue_graduation_enabled
                     and self._tissue_grad_done < self._tissue_grad_max
                     and self._graduate_tissue(cid, org)):
+                return
+            # BEHAVIORAL-GC (Stage 3, Фрай 10.06): ревизия ВЫПУСКНИКОВ (graduated)
+            # по самочувствию — раньше роста новых сайдкаров. Парный interleaved
+            # на одном durable-узле; гейты выше дали paralysis==0 + rate-limit.
+            if (self._behavioral_gc_enabled
+                    and self._tissue_graduated.get(cid)
+                    and self._maybe_start_behavioral_gc(cid, org)):
                 return
             # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
             # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
@@ -7879,6 +8118,11 @@ class LocalColonyCompute:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
                 if delta_e > 0.0:
                     self._e_income_sum += delta_e  # ENERGY_CALIB income
+                    # §10.3: монотонный income-аккумулятор (НЕ сбрасывается на
+                    # 300-ledger-окне) → behavioral-GC меряет income-rate
+                    # (unsaturated energy-измерение) дельтой между сэмплами.
+                    self._beh_income_cum[cid] = (
+                        self._beh_income_cum.get(cid, 0.0) + delta_e)
                 else:
                     # §3.5-ПОЛНОТА (Фрай 07.06): ОТРИЦАТЕЛЬНЫЙ delta_energy =
                     # серверная per-event цена (атаки/combat/действия) — списывал
@@ -8731,6 +8975,12 @@ class LocalColonyCompute:
             "tissue_grad_done": int(self._tissue_grad_done),
             "tissue_grad_reverted": int(self._tissue_grad_reverted),
             "tissue_graduation_enabled": bool(self._tissue_graduation_enabled),
+            # Stage 3 BEHAVIORAL-GC (парная ревизия выпускников по самочувствию)
+            "beh_gc_active": int(1 if cid in self._beh_gc_state else (
+                len(self._beh_gc_state) if cid is None else 0)),
+            "beh_gc_kept": int(self._beh_gc_done),
+            "beh_gc_pruned": int(self._beh_gc_pruned),
+            "behavioral_gc_enabled": bool(self._behavioral_gc_enabled),
         }
 
     def diagnostics(self) -> dict:  # noqa: C901
