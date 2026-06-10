@@ -526,6 +526,16 @@ class LocalColonyCompute:
             "hydration": 2.0,      # water-специалист
             "income": 1.0,         # foraging-rate сдвиг
         }
+        # ПЕТЛЯ №1 (Фрай ок 10.06): SOFT-prune НЕ ставил graduation-cooldown →
+        # вечная осцилляция graduate↔soft-prune (hard insert/remove ~1.5-2ч).
+        # Фикс: SOFT инкрементит _grad_revert_count (re-graduate откладывается
+        # Fib-эскалацией), + repeat-soft роль АВТО-роутится в 34-ПАР ДОСВЕТКУ
+        # (один длинный powered-тест вместо многих коротких → keep/permanent
+        # окончательно, петля рвётся; graduation-churn меньше).
+        self._beh_soft_count: dict = {}       # cid → {role: n SOFT-prune'ов} (персист)
+        self._BEH_GC_DEEP_AFTER_SOFTS: int = 2   # Fib — softs до досветки
+        self._BEH_GC_PAIRS_DEEP: int = 34     # Fib — пар в досветке (MDE cort ≈ ±7)
+        self._BEH_GC_T_KEEP_DEEP: float = 2.035  # t-крит df=33 (две-стор. 0.05)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -1437,6 +1447,7 @@ class LocalColonyCompute:
         self._beh_rejected_roles.pop(cid, None)
         self._grad_rejected.pop(cid, None)         # анти-churn cleanup
         self._grad_revert_count.pop(cid, None)
+        self._beh_soft_count.pop(cid, None)
         self._grad_health_streak.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
@@ -1871,6 +1882,12 @@ class LocalColonyCompute:
                 self._grad_revert_count[cid] = {
                     str(k): int(v)
                     for k, v in _gl0["grad_revert_count"].items()}
+            except Exception:
+                pass
+        if isinstance(_gl0, dict) and _gl0.get("beh_soft_count"):
+            try:
+                self._beh_soft_count[cid] = {
+                    str(k): int(v) for k, v in _gl0["beh_soft_count"].items()}
             except Exception:
                 pass
         # анти-осцилляция: behavior-rejected метки durable через рестарт.
@@ -3938,6 +3955,7 @@ class LocalColonyCompute:
                 # эскалация cooldown выпуска: revert-counts durable (иначе
                 # рестарт обнулял бы и вредная ткань вернулась бы в очередь).
                 "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
+                "beh_soft_count": dict(self._beh_soft_count.get(cid) or {}),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -6183,6 +6201,7 @@ class LocalColonyCompute:
         self._beh_gc_rejected.clear()
         self._grad_rejected.clear()
         self._grad_revert_count.clear()
+        self._beh_soft_count.clear()
         self._grad_halted = False
         self._grad_revert_streak = 0
         self._tissue_grad_done = 0
@@ -6242,11 +6261,19 @@ class LocalColonyCompute:
         if not cand:
             return False
         role = cand[0]
+        # ДОСВЕТКА (Фрай 10.06): repeat-soft роль → 34 пары (powered-тест,
+        # keep/permanent окончательно) вместо очередного 13-пар цикла.
+        deep = (self._beh_soft_count.get(cid, {}).get(role, 0)
+                >= self._BEH_GC_DEEP_AFTER_SOFTS)
+        pairs = self._BEH_GC_PAIRS_DEEP if deep else self._BEH_GC_PAIRS
+        t_keep = self._BEH_GC_T_KEEP_DEEP if deep else self._BEH_GC_T_KEEP
         self._beh_gc_set_edge_weight(org, role, 0.0)   # старт: ablate
         self._beh_gc_state[cid] = {
             "role": role,
             "phase": "ablate",
             "pairs_done": 0,
+            "pairs_target": pairs,
+            "t_keep": t_keep,
             "win_ticks": 0,
             "win0_income": float(self._beh_income_cum.get(cid, 0.0)),
             "acc": {}, "acc_n": 0,
@@ -6254,8 +6281,9 @@ class LocalColonyCompute:
             "par_before": int(self._paralysis_window_n),
         }
         logger.info("brain-growth BEH-GC-START cid=%s role=%s (парный interleaved, "
-                    "soft-ablate edge→0, %d пар × %d тиков)", cid, role,
-                    self._BEH_GC_PAIRS, self._BEH_GC_WINDOW)
+                    "soft-ablate edge→0, %d пар × %d тиков%s)", cid, role,
+                    pairs, self._BEH_GC_WINDOW,
+                    ", ДОСВЕТКА repeat-soft" if deep else "")
         return True
 
     def _abort_behavioral_gc(self, cid: str, org, reason: str) -> None:
@@ -6316,7 +6344,7 @@ class LocalColonyCompute:
         st["win0_income"] = inc_now
         if new_phase == "ablate":        # завершилась полная пара (restore→ablate)
             st["pairs_done"] += 1
-            if st["pairs_done"] >= self._BEH_GC_PAIRS:
+            if st["pairs_done"] >= st.get("pairs_target", self._BEH_GC_PAIRS):
                 self._resolve_behavioral_gc(cid, org, st)
 
     @staticmethod
@@ -6346,6 +6374,7 @@ class LocalColonyCompute:
         (inconclusive → retry; на 13 парах cortisol underpowered → permanent
         невозможен). keep→edge restore; prune→degraduate."""
         role = st["role"]
+        t_keep = float(st.get("t_keep", self._BEH_GC_T_KEEP))
         dims = ("neg_cortisol", "glucose", "hydration", "income")
         benefit, harm, detail = 0.0, 0.0, []
         all_powered = True       # все измерения adequately powered?
@@ -6358,7 +6387,7 @@ class LocalColonyCompute:
                 continue
             diffs = [a[i] - r[i] for i in range(n)]   # ablate − restore
             med, rsd, t = self._robust_paired(diffs)
-            mde = self._BEH_GC_T_KEEP * rsd / (n ** 0.5)   # min detectable effect
+            mde = t_keep * rsd / (n ** 0.5)   # min detectable effect
             powered = mde <= self._BEH_GC_MDE_TARGET.get(d, 1e9)
             all_powered = all_powered and powered
             logger.info("brain-growth BEH-GC-DIM cid=%s role=%s dim=%s n=%d "
@@ -6367,10 +6396,10 @@ class LocalColonyCompute:
                         self._BEH_GC_MDE_TARGET.get(d, 0.0), powered)
             if rsd < 1e-9:
                 continue
-            if t <= -self._BEH_GC_T_KEEP:              # ablate ниже = польза
+            if t <= -t_keep:                           # ablate ниже = польза
                 benefit += abs(med) / rsd
                 detail.append(f"{d}:t={t:.1f}(польза)")
-            elif t >= self._BEH_GC_T_KEEP:             # ablate выше = ткань ВРЕДИТ
+            elif t >= t_keep:                          # ablate выше = ткань ВРЕДИТ
                 harm += abs(med) / rsd
                 detail.append(f"{d}:t={t:.1f}(вред)")
         keep = benefit > 0.0 and benefit >= harm       # specialist + veto net-harm
@@ -6379,6 +6408,9 @@ class LocalColonyCompute:
         self._beh_gc_set_edge_weight(org, role, self._TISSUE_GRAD_EDGE_WEIGHT)
         if keep:
             self._beh_gc_done += 1
+            # решено powered-KEEP'ом → роль чиста (петля №1 закрыта)
+            (self._beh_soft_count.get(cid) or {}).pop(role, None)
+            (self._grad_revert_count.get(cid) or {}).pop(role, None)
             logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
                         "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
                         cid, role, benefit, harm, ", ".join(detail) or "—")
@@ -6391,9 +6423,18 @@ class LocalColonyCompute:
         self._degraduate_node(cid, org, role, reason="behavioral-prune")
         if all_powered:
             self._beh_rejected_roles.setdefault(cid, set()).add(role)
+            (self._beh_soft_count.get(cid) or {}).pop(role, None)
             verdict = "PERMANENT (power adequate, no-benefit доказан)"
         else:
-            verdict = "SOFT cooldown (underpowered → inconclusive, retry)"
+            # ПЕТЛЯ №1 (Фрай): SOFT тоже эскалирует graduation-cooldown
+            # (re-graduate разрежается ×Fib) + копит soft_count → досветка.
+            _rc = self._grad_revert_count.setdefault(cid, {})
+            _rc[role] = _rc.get(role, 0) + 1
+            self._grad_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
+            _sc = self._beh_soft_count.setdefault(cid, {})
+            _sc[role] = _sc.get(role, 0) + 1
+            verdict = (f"SOFT cooldown #{_sc[role]} (underpowered → retry; "
+                       f"досветка 34-пар после {self._BEH_GC_DEEP_AFTER_SOFTS})")
         logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit=%.2f harm=%.2f "
                     "[%s] — degraduate в сайдкар; %s", cid, role, benefit, harm,
                     ", ".join(detail) or "—", verdict)

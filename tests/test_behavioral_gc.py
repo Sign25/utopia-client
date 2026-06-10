@@ -263,3 +263,56 @@ def test_retest_clears_rejection_and_limit():
     assert not c._beh_rejected_roles
     assert not c._beh_gc_rejected
     assert c._tissue_grad_done == 0          # лимит сброшен → re-graduate
+
+
+# ── ПЕТЛЯ №1 (Фрай): SOFT → эскалация cooldown + досветка 34-пар ────────
+
+def test_soft_prune_escalates_graduation_cooldown():
+    c = _c()
+    abl = {"glucose": [80, 81, 79, 80, 80]}          # cortisol нет → underpowered
+    res = {"glucose": [80, 80, 81, 79, 80]}
+    _resolve_with(c, abl, res)                       # SOFT
+    assert c._grad_revert_count["a"]["grown1"] == 1  # re-graduate разрежен
+    assert "grown1" in c._grad_rejected["a"]
+    assert c._beh_soft_count["a"]["grown1"] == 1
+    assert "grown1" not in c._beh_rejected_roles.get("a", set())   # НЕ permanent
+
+
+def test_repeat_soft_routes_to_deep_retest():
+    pytest.importorskip("core.tissue")
+    c, org, t, gene = _graduated_setup()
+    c._last_world_tick = 10**6
+    c._beh_soft_count["a"] = {"grown1": 2}           # repeat-soft
+    assert c._maybe_start_behavioral_gc("a", org) is True
+    st = c._beh_gc_state["a"]
+    assert st["pairs_target"] == 34                  # досветка
+    assert abs(st["t_keep"] - 2.035) < 1e-9
+    # обычная роль → 13 пар
+    c._beh_gc_state.clear()
+    c._beh_soft_count["a"] = {"grown1": 1}
+    c._maybe_start_behavioral_gc("a", org)
+    assert c._beh_gc_state["a"]["pairs_target"] == 13
+
+
+def test_powered_keep_clears_counters():
+    c = _c()
+    c._beh_soft_count["a"] = {"grown1": 2}
+    c._grad_revert_count["a"] = {"grown1": 2}
+    abl = {"income": [1.2, 1.25, 1.15, 1.3, 1.1, 1.2, 1.22, 1.18]}   # ниже = польза
+    res = {"income": [2.0, 1.95, 2.1, 1.9, 2.05, 2.0, 1.98, 2.02]}   # rsd>0, t<<−2
+    _resolve_with(c, abl, res)
+    assert c._beh_gc_done == 1                       # KEEP
+    assert "grown1" not in c._beh_soft_count.get("a", {})
+    assert "grown1" not in c._grad_revert_count.get("a", {})
+
+
+def test_soft_count_persists():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._beh_soft_count["a"] = {"grown156": 1}
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["beh_soft_count"] == {"grown156": 1}
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._beh_soft_count["a"] == {"grown156": 1}
