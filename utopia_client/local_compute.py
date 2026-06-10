@@ -8339,6 +8339,41 @@ class LocalColonyCompute:
                     reverted += 1
         return kept, reverted
 
+    def _tissue_growth_metrics(self, cid: str = None) -> dict:
+        """§10.8 рост ТКАНЕЙ (predictor-сайдкары, ВНЕ графа) для UI/диагностики —
+        ОТДЕЛЬНО от роста СВЯЗЕЙ (topo_active = рёбра→cerebellum). Сайдкары читают
+        obs64, их выход добавляется во вход предиктора (улучшает прогноз), мотор
+        изолирован. cid=None → агрегат по всем организмам.
+          tissue_grown_live   — ЖИВЫХ выросших тканей сейчас (вкл. 1 в GC-абляции)
+          tissue_kept         — закреплено durable (= live; обнуляемо GC-пруном)
+          tissue_reverted     — отвергнуто при рождении (backoff: Δloss не значим)
+          tissue_gc_pruned    — отпущено GC (noise-fit: вклад распался на цикле)
+          tissue_propose_total— всего предложено за жизнь (монотонный)
+          tissue_growing      — 1 если сейчас растит/dwell новую (in-flight)
+          tissue_gc_evaluating— 1 если сейчас GC-ре-оценка (leave-one-out dwell)
+          tissue_growth_enabled — флаг роста ON/OFF."""
+        if cid is None:
+            live = sum(len(d or {}) for d in self._grown_tissues.values())
+            live += len(self._tissue_gc_state)        # held-aside в GC ещё живой
+            growing = len(self._tissue_growth_state)
+            evaluating = len(self._tissue_gc_state)
+        else:
+            live = len(self._grown_tissues.get(cid) or {})
+            if cid in self._tissue_gc_state:
+                live += 1
+            growing = 1 if cid in self._tissue_growth_state else 0
+            evaluating = 1 if cid in self._tissue_gc_state else 0
+        return {
+            "tissue_grown_live": int(live),
+            "tissue_kept": int(self._tissue_kept),
+            "tissue_reverted": int(self._tissue_reverted),
+            "tissue_gc_pruned": int(self._tissue_gc_pruned),
+            "tissue_propose_total": int(self._tissue_propose_count),
+            "tissue_growing": int(growing),
+            "tissue_gc_evaluating": int(evaluating),
+            "tissue_growth_enabled": bool(self._tissue_growth_enabled),
+        }
+
     def diagnostics(self) -> dict:  # noqa: C901
         """Снимок метрик обучения для /api/diagnostics/training.
 
@@ -8806,6 +8841,8 @@ class LocalColonyCompute:
             "growth_kept": _gk,
             "growth_reverted": _gr,
             "growth_in_flight": len(self._growth_state),
+            # §10.8 рост ТКАНЕЙ (сайдкары, вне графа) — отдельно от роста СВЯЗЕЙ выше.
+            **self._tissue_growth_metrics(),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
             "intrinsic_reward_avg": (
@@ -8953,6 +8990,8 @@ class LocalColonyCompute:
                 "growth_kept": _topo_enabled,
                 "growth_reverted": _topo_reverted,
                 "tissue_topology_mutations_total": _topo_total,
+                # §10.8 рост ТКАНЕЙ (сайдкары) — per-creature, отдельно от связей.
+                **self._tissue_growth_metrics(cid),
                 "age": _age,
                 "inst": _inst,
                 "food": _food,
