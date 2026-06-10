@@ -530,6 +530,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_tissue_graduation: bool | None = None
     applied_behavioral_probe: str | None = None
     applied_behavioral_gc: bool | None = None
+    applied_behavioral_gc_retest: bool | None = None
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -823,6 +824,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_gc → %s", target_beh_gc)
                         except Exception as e:
                             logger.warning("set_behavioral_gc failed: %s", e)
+
+                    # §10.3 power-калибровка (Фрай 10.06): behavioral_gc_retest
+                    # — снять rejected-метки + grad-лимит, durable-сайдкары
+                    # снова выпускаются (для пере-прогона grown133). edge true→retest.
+                    target_retest = bool(flags.get("behavioral_gc_retest", False))
+                    if target_retest != applied_behavioral_gc_retest \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            if target_retest:
+                                ws.compute.behavioral_gc_retest()
+                            applied_behavioral_gc_retest = target_retest
+                            logger.info("behavioral_gc_retest → %s", target_retest)
+                        except Exception as e:
+                            logger.warning("behavioral_gc_retest failed: %s", e)
 
                     # §10.3 Step-1 (Фрай 10.06): behavioral-probe — ablate
                     # graduated-ткань (строковый флаг = роль, ""=снять) для

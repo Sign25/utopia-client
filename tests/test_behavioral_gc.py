@@ -29,7 +29,7 @@ def _c():
 def test_beh_gc_default_off():
     c = _c()
     assert c._behavioral_gc_enabled is False
-    assert c._BEH_GC_PAIRS == 5 and c._BEH_GC_WINDOW == 233
+    assert c._BEH_GC_PAIRS == 13 and c._BEH_GC_WINDOW == 233
 
 
 def test_set_beh_gc_toggle():
@@ -232,3 +232,14 @@ def test_metrics_expose_beh_gc():
     assert m["beh_gc_active"] == 1
     assert m["beh_gc_kept"] == 2 and m["beh_gc_pruned"] == 1
     assert m["behavioral_gc_enabled"] is False
+
+
+def test_retest_clears_rejection_and_limit():
+    c = _c()
+    c._beh_rejected_roles["a"] = {"grown133"}
+    c._beh_gc_rejected["a"] = {"grown133": 100}
+    c._tissue_grad_done = 1
+    assert c.behavioral_gc_retest() == 1
+    assert not c._beh_rejected_roles
+    assert not c._beh_gc_rejected
+    assert c._tissue_grad_done == 0          # лимит сброшен → re-graduate
