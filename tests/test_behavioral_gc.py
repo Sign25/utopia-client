@@ -316,3 +316,35 @@ def test_soft_count_persists():
     dst.organisms["a"] = types.SimpleNamespace(generation=0)
     dst.restore_persisted_state("a", payload)
     assert dst._beh_soft_count["a"] == {"grown156": 1}
+
+
+# ── KEEP-cooldown (Фрай: подтверждённый узел не ре-ревизуется по кругу) ──
+
+def test_keep_sets_long_cooldown():
+    pytest.importorskip("core.tissue")
+    c, org, t, gene = _graduated_setup()
+    c._last_world_tick = 10**6
+    # KEEP-резолв (cortisol польза)
+    st = {"role": "grown1", "samples": {
+        "ablate": {"neg_cortisol": [-70, -72, -68, -71, -69]},
+        "restore": {"neg_cortisol": [-60, -59, -61, -60, -60]}}}
+    c._resolve_behavioral_gc("a", org, st)
+    assert c._beh_gc_done == 1
+    assert "grown1" in c._beh_gc_keep_cd["a"]              # cooldown поставлен
+    # сразу — НЕ ре-стартует (в keep-cooldown)
+    assert c._maybe_start_behavioral_gc("a", org) is False
+    # после длинной паузы — ре-валидация разрешена
+    c._last_world_tick += c._BEH_GC_KEEP_COOLDOWN
+    assert c._maybe_start_behavioral_gc("a", org) is True
+
+
+def test_keep_cooldown_persists():
+    src = _c()
+    src.organisms["a"] = types.SimpleNamespace(generation=0)
+    src._beh_gc_keep_cd["a"] = {"grown4": 12345}
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["beh_gc_keep_cd"] == {"grown4": 12345}
+    dst = _c()
+    dst.organisms["a"] = types.SimpleNamespace(generation=0)
+    dst.restore_persisted_state("a", payload)
+    assert dst._beh_gc_keep_cd["a"] == {"grown4": 12345}
