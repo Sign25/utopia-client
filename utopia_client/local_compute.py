@@ -512,6 +512,12 @@ class LocalColonyCompute:
         self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
         self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
+        # KEEP-cooldown (Фрай 10.06): подтверждённый узел НЕ ре-ревизуется по
+        # кругу — длинная пауза (epoch-rest ×13), периодич. ре-валидация ловит
+        # деградацию/world-change. Замыкает третью verdict-петлю (KEEP→long-cd,
+        # SOFT→escalating→34, PERMANENT→терминал). Персистится.
+        self._beh_gc_keep_cd: dict = {}   # cid → {role: tick} KEEP-cooldown
+        self._BEH_GC_KEEP_COOLDOWN: int = 6388 * 13  # epoch_interval × Fib(13)
         # АНТИ-ОСЦИЛЛЯЦИЯ (Фрай 10.06): behavior-pruned ткань возвращается в
         # сайдкары, где она ВСЁ ЕЩЁ prediction-good → без метки вечный churn
         # graduate↔prune. Метка «behavior-rejected до изменения мира»: остаётся
@@ -1456,6 +1462,7 @@ class LocalColonyCompute:
         self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
         self._beh_income_cum.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
+        self._beh_gc_keep_cd.pop(cid, None)
         self._beh_rejected_roles.pop(cid, None)
         self._grad_rejected.pop(cid, None)         # анти-churn cleanup
         self._grad_revert_count.pop(cid, None)
@@ -1900,6 +1907,12 @@ class LocalColonyCompute:
             try:
                 self._beh_soft_count[cid] = {
                     str(k): int(v) for k, v in _gl0["beh_soft_count"].items()}
+            except Exception:
+                pass
+        if isinstance(_gl0, dict) and _gl0.get("beh_gc_keep_cd"):
+            try:
+                self._beh_gc_keep_cd[cid] = {
+                    str(k): int(v) for k, v in _gl0["beh_gc_keep_cd"].items()}
             except Exception:
                 pass
         # анти-осцилляция: behavior-rejected метки durable через рестарт.
@@ -3968,6 +3981,7 @@ class LocalColonyCompute:
                 # рестарт обнулял бы и вредная ткань вернулась бы в очередь).
                 "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
                 "beh_soft_count": dict(self._beh_soft_count.get(cid) or {}),
+                "beh_gc_keep_cd": dict(self._beh_gc_keep_cd.get(cid) or {}),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
@@ -6213,6 +6227,7 @@ class LocalColonyCompute:
         хорошей ткани (grown133). Возвращает число снятых меток."""
         n = self.reset_behavior_rejected()
         self._beh_gc_rejected.clear()
+        self._beh_gc_keep_cd.clear()
         self._grad_rejected.clear()
         self._grad_revert_count.clear()
         self._beh_soft_count.clear()
@@ -6269,9 +6284,14 @@ class LocalColonyCompute:
         в ablate-фазе (edge-weight→0). True если начат."""
         grad = self._tissue_graduated.get(cid) or {}
         rej = self._beh_gc_rejected.get(cid) or {}
+        kcd = self._beh_gc_keep_cd.get(cid) or {}
         cand = [r for r in grad
                 if (self._last_world_tick - rej.get(r, -10**9))
-                >= self._tissue_gc_epoch_interval]
+                >= self._tissue_gc_epoch_interval
+                # KEEP-cooldown: подтверждённый узел ждёт длинную паузу до
+                # ре-валидации (не ревизуется по кругу сразу после KEEP).
+                and (self._last_world_tick - kcd.get(r, -10**9))
+                >= self._BEH_GC_KEEP_COOLDOWN]
         if not cand:
             return False
         role = cand[0]
@@ -6434,6 +6454,8 @@ class LocalColonyCompute:
             # решено powered-KEEP'ом → роль чиста (петля №1 закрыта)
             (self._beh_soft_count.get(cid) or {}).pop(role, None)
             (self._grad_revert_count.get(cid) or {}).pop(role, None)
+            # KEEP-cooldown (Фрай): длинная пауза до ре-валидации (не по кругу).
+            self._beh_gc_keep_cd.setdefault(cid, {})[role] = int(self._last_world_tick)
             logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
                         "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
                         cid, role, benefit, harm, ", ".join(detail) or "—")
