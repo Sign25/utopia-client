@@ -485,8 +485,12 @@ class LocalColonyCompute:
         self._beh_gc_pruned: int = 0      # behavioral-prune'ов
         self._BEH_GC_WINDOW: int = 233    # тиков на окно (= погодный sin-цикл)
         self._BEH_GC_TRANSIENT: int = 21  # discard тиков после toggle (Fib, мотор устаканивается)
-        self._BEH_GC_PAIRS: int = 5       # пар ablate/restore окон (paired-t N=5)
-        self._BEH_GC_T_KEEP: float = 2.776  # t-крит paired N=5 (df=4, две-стор. 0.05)
+        # Мощность (Фрай 10.06): 5 пар underpowered — window-усреднение теряет
+        # внутри-окно N, погодный дрейф между парными окнами раздувает paired-sd.
+        # 13 пар (Fib, df=12, t_keep 2.18) + STEP-1 эффект cort Δ7/sd~6 → t~4 >2.18.
+        # 13×2×233=6058т ≈ один климат-цикл (epoch 6388) — укладывается.
+        self._BEH_GC_PAIRS: int = 13      # пар ablate/restore окон (paired-t N=13)
+        self._BEH_GC_T_KEEP: float = 2.179  # t-крит paired N=13 (df=12, две-стор. 0.05)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -6113,6 +6117,18 @@ class LocalColonyCompute:
         self._beh_rejected_roles.clear()
         return n
 
+    def behavioral_gc_retest(self) -> int:
+        """Power-калибровка/пере-прогон (Фрай 10.06): снять behavior-rejected
+        метки + cooldown + сбросить Stage-1 grad-лимит → durable-сайдкары снова
+        выпускаются и проходят behavioral-GC. Для замера мощности на известно-
+        хорошей ткани (grown133). Возвращает число снятых меток."""
+        n = self.reset_behavior_rejected()
+        self._beh_gc_rejected.clear()
+        self._tissue_grad_done = 0
+        logger.info("behavioral_gc RETEST: метки/cooldown сняты, grad-лимит "
+                    "сброшен — durable-сайдкары снова выпускаются")
+        return n
+
     def set_behavioral_gc(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл §10.3 Stage 3 behavioral-GC. on=False
         (kill-switch): прервать активный GC, ВОССТАНОВИТЬ edge-weight (узел
@@ -6222,6 +6238,11 @@ class LocalColonyCompute:
         win["income"] = (inc_now - st["win0_income"]) / max(1, st["win_ticks"])
         for k, v in win.items():
             st["samples"][phase].setdefault(k, []).append(v)
+        logger.info("brain-growth BEH-GC-WINDOW cid=%s role=%s phase=%s pair=%d "
+                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f", cid, st["role"],
+                    phase, st["pairs_done"], win.get("neg_cortisol", 0.0),
+                    win.get("glucose", 0.0), win.get("hydration", 0.0),
+                    win.get("income", 0.0))
         # toggle фазы (soft edge-weight) + сброс окна
         new_phase = "restore" if phase == "ablate" else "ablate"
         self._beh_gc_set_edge_weight(
@@ -6255,9 +6276,15 @@ class LocalColonyCompute:
             diffs = [a[i] - r[i] for i in range(n)]   # ablate − restore
             md = sum(diffs) / n
             sd = (sum((x - md) ** 2 for x in diffs) / (n - 1)) ** 0.5
+            # МОЩНОСТЬ (Фрай 10.06): логируем КАЖДОЕ измерение, не только
+            # пересёкшие порог — иначе keep/prune вслепую (нельзя отличить
+            # underpowered от no-effect).
+            t = md / (sd / math.sqrt(n)) if sd >= 1e-9 else 0.0
+            logger.info("brain-growth BEH-GC-DIM cid=%s role=%s dim=%s n=%d "
+                        "md=%.3f sd=%.3f t=%.2f (t_keep=%.2f)", cid, role, d, n,
+                        md, sd, t, self._BEH_GC_T_KEEP)
             if sd < 1e-9:
                 continue
-            t = md / (sd / math.sqrt(n))               # paired-t
             z = abs(md) / sd
             if t <= -self._BEH_GC_T_KEEP:              # ablate ниже = польза
                 benefit_z += z
