@@ -473,9 +473,24 @@ class LocalColonyCompute:
         self._tissue_graduated: dict = {}     # cid → {role: Tissue} живые граф-узлы (save/kill-switch/ревизия)
         self._tissue_grad_done: int = 0       # успешных graduations за сессию
         self._tissue_grad_reverted: int = 0   # revert'ов graduation (§3/energy)
-        self._tissue_grad_max: int = 1        # Stage 1: ровно одна ткань, потом стоп
+        # Stage 2 (Фрай/Шеф 11.06): тесный лимит снят — система самоограничивается
+        # (per-add §3-watch откатывает вредное, GC кулит бесполезное/редундантное,
+        # kill-switch + cumulative-monitor страхуют). Реальный потолок = число
+        # живых wellbeing-осей (сейчас 2 → natural equilibrium KEEP'ов мал), не
+        # grad_max. Fib 89 = высокий backstop против runaway (безопаснее uncapped).
+        self._tissue_grad_max: int = 89       # Fib — backstop, не constraint
         self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
         self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
+        # CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): per-add watch проверяет ТОЛЬКО
+        # на add-time (233-окно). При many-concurrent медленный collective-drift
+        # (N выпускников СОВОКУПНО проседают мотор) он пропускает. Непрерывный
+        # collective-health (energy EWMA + §3-paralysis): просел → ПАУЗА graduation
+        # + SHED lowest-value graduated (revert наименее ценного) до recovery.
+        self._grad_collective_paused: bool = False  # пауза выпуска от collective-drift
+        self._grad_health_ewma: dict = {}     # cid → EWMA energy (collective baseline)
+        self._grad_value: dict = {}           # cid → {role: value} для shed-ранжирования
+        self._GRAD_SHED_ENERGY: float = 382.0     # energy EWMA < φ⁻¹·max·0.618 → drift
+        self._GRAD_HEALTH_RECOVER: int = 89   # тиков здоровья подряд → снять паузу
         self._behavioral_probe_role: str = ""  # §10.3 ablate-проба замера сигнала по измерениям
         # АНТИ-CHURN GUARD выпуска (Фрай 10.06, после инцидента grown151):
         # revert→re-graduate цикл долбил мотор быстрее восстановления (3 цикла
@@ -1466,6 +1481,8 @@ class LocalColonyCompute:
         self._beh_income_cum.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
+        self._grad_value.pop(cid, None)         # cumulative-monitor cleanup
+        self._grad_health_ewma.pop(cid, None)
         self._beh_rejected_roles.pop(cid, None)
         self._grad_rejected.pop(cid, None)         # анти-churn cleanup
         self._grad_revert_count.pop(cid, None)
@@ -6477,6 +6494,9 @@ class LocalColonyCompute:
             (self._grad_revert_count.get(cid) or {}).pop(role, None)
             # KEEP-cooldown (Фрай): длинная пауза до ре-валидации (не по кругу).
             self._beh_gc_keep_cd.setdefault(cid, {})[role] = int(self._last_world_tick)
+            # value↑ для shed-ранжирования: поведенчески-durable = высокая
+            # ценность (+10 над prediction-rise) → shed'ится последним.
+            self._grad_value.setdefault(cid, {})[role] = 10.0 + benefit
             logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
                         "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
                         cid, role, benefit, harm, ", ".join(detail) or "—")
@@ -6591,6 +6611,9 @@ class LocalColonyCompute:
             self._grown_tissues.setdefault(cid, {})[role] = tissue
             return False
         self._tissue_graduated.setdefault(cid, {})[role] = tissue
+        # value для shed-ранжирования (cumulative-monitor): стартовая = GC-KEEP
+        # rise (prediction-durability); behavioral-KEEP позже поднимет (поведение).
+        self._grad_value.setdefault(cid, {})[role] = float(rises.get(role, 0.0))
         bc = self.biochem.get(cid)
         self._tissue_grad_state[cid] = {
             "role": role,
@@ -6620,6 +6643,7 @@ class LocalColonyCompute:
         объект). Ген off + overlay (рёбра уходят), узел из org.tissues, ткань в
         _grown_tissues (вклад снова идёт напрямую в предиктор, мотор изолирован)."""
         t = (self._tissue_graduated.get(cid) or {}).pop(role, None)
+        (self._grad_value.get(cid) or {}).pop(role, None)   # cumulative-monitor
         if not self._tissue_graduated.get(cid):
             self._tissue_graduated.pop(cid, None)
         if org is None or t is None:
@@ -6797,6 +6821,43 @@ class LocalColonyCompute:
                         self._tissue_gc_pruned, self._tissue_kept)
         self._tissue_gc_state.pop(cid, None)
 
+    def _cumulative_grad_health(self, cid: str, org) -> None:
+        """CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): непрерывный collective-health
+        выпущенных узлов. Per-add §3-watch проверяет на add-time (233-окно);
+        медленный collective-drift (N узлов СОВОКУПНО проседают мотор) он
+        пропускает. Здесь: energy EWMA + §3-paralysis по всем graduated. Просел →
+        ПАУЗА graduation + SHED наименее-ценного (revert lowest _grad_value) до
+        recovery. Активен только при ≥2 graduated (1 покрыт per-add watch)."""
+        grad = self._tissue_graduated.get(cid) or {}
+        if len(grad) < 2:
+            self._grad_collective_paused = False   # нечему дрейфовать
+            return
+        bc = self.biochem.get(cid)
+        e_now = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
+        prev = self._grad_health_ewma.get(cid)
+        ewma = e_now if prev is None else (0.9 * prev + 0.1 * e_now)  # сглаж.
+        self._grad_health_ewma[cid] = ewma
+        par = int(self._paralysis_window_n)
+        drift = (par > 0) or (ewma < self._GRAD_SHED_ENERGY)
+        if drift and not self._grad_collective_paused:
+            # SHED: revert НАИМЕНЕЕ ценного graduated (lowest _grad_value).
+            vals = self._grad_value.get(cid) or {}
+            shed = min(grad.keys(), key=lambda r: vals.get(r, 0.0))
+            self._grad_collective_paused = True
+            self._tissue_grad_reverted += 1
+            (self._grad_value.get(cid) or {}).pop(shed, None)
+            self._degraduate_node(cid, org, shed, reason="collective-drift shed")
+            logger.warning("brain-growth GRAD-SHED cid=%s role=%s (collective-"
+                           "drift: par=%d energy_ewma=%.0f, %d graduated) — "
+                           "выпуск НА ПАУЗУ, revert наименее-ценного до recovery",
+                           cid, shed, par, ewma, len(grad))
+        elif self._grad_collective_paused and par == 0 \
+                and ewma >= self._GRAD_HEALTH_ENERGY:
+            self._grad_collective_paused = False
+            logger.info("brain-growth GRAD-RESUME cid=%s — collective-health "
+                        "восстановлен (energy_ewma=%.0f, par=0), выпуск возобновлён",
+                        cid, ewma)
+
     def _tissue_growth_step(self, cid: str) -> None:
         """§10.8: propose→dwell→Δloss_ema→keep/backoff для ТКАНЕЙ-узлов. Растит
         узел ТОЛЬКО когда связи насыщены (19/19) И intrinsic у floor (тот же
@@ -6809,6 +6870,9 @@ class LocalColonyCompute:
             return
         if self._cerebellum_tissue_id(cid, org) is None:
             return
+        # CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): непрерывно (каждый тик) — ловит
+        # collective-drift многих выпускников, паузит/shed'ит. До всех веток.
+        self._cumulative_grad_health(cid, org)
         # BEHAVIORAL-GC (Stage 3, Фрай 10.06) — если активен парный замер,
         # ведём его и НИЧЕГО больше (изолированный мотор-сигнал, как graduation).
         if cid in self._beh_gc_state:
@@ -6857,6 +6921,7 @@ class LocalColonyCompute:
             # + стабильное recovery (A).
             if (self._tissue_graduation_enabled
                     and not self._grad_halted
+                    and not self._grad_collective_paused  # cumulative-monitor пауза
                     and self._grad_health_streak.get(cid, 0) >= self._GRAD_HEALTH_TICKS
                     and self._tissue_grad_done < self._tissue_grad_max
                     and self._graduate_tissue(cid, org)):
@@ -9271,6 +9336,7 @@ class LocalColonyCompute:
             "beh_gc_kept": int(self._beh_gc_done),
             "beh_gc_pruned": int(self._beh_gc_pruned),
             "behavioral_gc_enabled": bool(self._behavioral_gc_enabled),
+            "grad_collective_paused": bool(self._grad_collective_paused),
         }
 
     def diagnostics(self) -> dict:  # noqa: C901
