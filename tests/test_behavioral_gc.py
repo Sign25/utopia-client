@@ -73,8 +73,8 @@ def _graduated_setup():
     c.organisms["a"] = org
     c._tissue_graduated["a"] = {"grown1": t}
     c.biochem["a"] = types.SimpleNamespace(cortisol=60.0, glucose=80.0,
-                                           hydration=90.0)
-    return c, org, t, gene
+                                           hydration=90.0, energy=700.0)
+    return c, org, t, gene  # energy≥618 → проходит энерго-гейт старта GC (11.06)
 
 
 def test_soft_ablate_changes_weight_not_topology():
@@ -348,3 +348,57 @@ def test_keep_cooldown_persists():
     dst.organisms["a"] = types.SimpleNamespace(generation=0)
     dst.restore_persisted_state("a", payload)
     assert dst._beh_gc_keep_cd["a"] == {"grown4": 12345}
+
+
+# ── анти-спираль 11.06 (инцидент 52%-паралич): abort-cooldown + энерго-гейт ──
+
+def _grad_compute():
+    c = _c()
+    org = types.SimpleNamespace()
+    c.organisms["a"] = org
+    c._beh_gc_set_edge_weight = lambda o, r, w: None   # stub: без графа
+    c._tissue_graduated["a"] = {"g1": object()}
+    c.biochem["a"] = types.SimpleNamespace(energy=700.0)  # healthy (≥618)
+    c._last_world_tick = 10**6                            # нет недавнего §3
+    return c, org
+
+
+def test_abort_sets_escalating_fib_cooldown():
+    c, org = _grad_compute()
+    ei = c._tissue_gc_epoch_interval
+    for i, mult in enumerate((1, 2, 5), start=1):
+        c._beh_gc_state["a"] = {"role": "g1"}
+        c._abort_behavioral_gc("a", org, reason="§3 paralysis")
+        assert c._beh_gc_abort_count["a"]["g1"] == i
+        assert c._beh_gc_abort_cd["a"]["g1"] == c._last_world_tick + mult * ei
+
+
+def test_kill_switch_abort_no_escalation():
+    c, org = _grad_compute()
+    c._beh_gc_state["a"] = {"role": "g1"}
+    c._abort_behavioral_gc("a", org, reason="kill-switch")
+    assert "a" not in c._beh_gc_abort_count    # не копит на ручной kill-switch
+
+
+def test_gc_starts_when_healthy():
+    c, org = _grad_compute()
+    assert c._maybe_start_behavioral_gc("a", org) is True
+    assert c._beh_gc_state["a"]["role"] == "g1"
+
+
+def test_energy_gate_blocks_low_energy():
+    c, org = _grad_compute()
+    c.biochem["a"].energy = 100.0              # < 618 → не стартуем
+    assert c._maybe_start_behavioral_gc("a", org) is False
+
+
+def test_energy_gate_blocks_recent_paralysis():
+    c, org = _grad_compute()
+    c._last_paralysis_tick["a"] = c._last_world_tick - 10   # §3 10 тиков назад (<89)
+    assert c._maybe_start_behavioral_gc("a", org) is False
+
+
+def test_abort_cooldown_blocks_restart():
+    c, org = _grad_compute()
+    c._beh_gc_abort_cd["a"] = {"g1": c._last_world_tick + 5000}  # ещё в cooldown
+    assert c._maybe_start_behavioral_gc("a", org) is False

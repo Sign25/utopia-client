@@ -562,15 +562,32 @@ def test_grad_max_lifted():
     assert c._tissue_grad_max == 89          # Fib backstop, не тесный 1
 
 
-def test_cumulative_monitor_inactive_below_two():
+def test_cumulative_monitor_inactive_at_zero():
     c = _c()
     org = types.SimpleNamespace()
     c.organisms["a"] = org
-    c._tissue_graduated["a"] = {"grown1": object()}   # только 1 → per-add watch
+    c._tissue_graduated["a"] = {}              # 0 graduated → нечему дрейфовать
     c.biochem["a"] = types.SimpleNamespace(energy=100.0)
     c._grad_collective_paused = True
     c._cumulative_grad_health("a", org)
-    assert c._grad_collective_paused is False  # <2 → нечему дрейфовать
+    assert c._grad_collective_paused is False  # 0 → монитор неактивен
+
+
+def test_cumulative_monitor_active_at_one(monkeypatch):
+    # Фрай 11.06: монитор теперь активен при ≥1 (инцидент 52%-паралич — одиночный
+    # узел дренил без страховки). 1 graduated + дрейф → SHED (auto-защита).
+    c = _c()
+    org = types.SimpleNamespace()
+    c.organisms["a"] = org
+    shed = []
+    c._degraduate_node = lambda cid, o, role, reason="": shed.append(role)
+    c._tissue_graduated["a"] = {"grown1": object()}   # ОДИН узел
+    c._grad_value["a"] = {"grown1": 0.05}
+    c.biochem["a"] = types.SimpleNamespace(energy=50.0)   # < _GRAD_SHED_ENERGY → drift
+    c._paralysis_window_n = 1
+    c._cumulative_grad_health("a", org)
+    assert c._grad_collective_paused is True   # активен при N=1 → пауза
+    assert shed == ["grown1"]                  # одиночка shed'ится (recoverable)
 
 
 def test_cumulative_monitor_sheds_lowest_value_on_drift():

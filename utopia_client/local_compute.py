@@ -540,6 +540,17 @@ class LocalColonyCompute:
         self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
         self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
+        # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
+        # §3-abort НЕ ставил cooldown → дестабилизировавший узел сразу ре-eligible
+        # → ablate → §3 → abort по кругу (ускорялся 29→1мин). Fix: §3-abort ставит
+        # эскалирующий cooldown ×Fib(abort_count) — повторно-дестабилизирующий узел
+        # отдыхает дольше. Counts/cd персистятся (иначе рестарт обнулял бы эскалацию).
+        self._beh_gc_abort_count: dict = {}  # cid → {role: n §3-abort'ов}
+        self._beh_gc_abort_cd: dict = {}     # cid → {role: until_tick} (Fib-эскал.)
+        # энерго-гейт старта GC (Фрай 11.06): не аблейтить пока Адам не здоров —
+        # GC стартовал в paralysis==0 окне МЕЖДУ §3-провалами и сам дренил в §3.
+        self._last_paralysis_tick: dict = {}  # cid → world_tick последнего §3
+        self._BEH_GC_NO_PAR_TICKS: int = 89   # Fib — нет §3 за N тиков перед стартом GC
         # KEEP-cooldown (Фрай 10.06): подтверждённый узел НЕ ре-ревизуется по
         # кругу — длинная пауза (epoch-rest ×13), периодич. ре-валидация ловит
         # деградацию/world-change. Замыкает третью verdict-петлю (KEEP→long-cd,
@@ -1491,6 +1502,9 @@ class LocalColonyCompute:
         self._beh_income_cum.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
+        self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
+        self._beh_gc_abort_cd.pop(cid, None)
+        self._last_paralysis_tick.pop(cid, None)
         self._grad_value.pop(cid, None)         # cumulative-monitor cleanup
         self._grad_health_ewma.pop(cid, None)
         self._beh_rejected_roles.pop(cid, None)
@@ -1945,6 +1959,21 @@ class LocalColonyCompute:
             try:
                 self._beh_gc_keep_cd[cid] = {
                     str(k): int(v) for k, v in _gl0["beh_gc_keep_cd"].items()}
+            except Exception:
+                pass
+        # §3-abort escalating cooldown durable (иначе рестарт обнулял бы эскалацию
+        # и дестабилизирующий узел вернулся бы в очередь GC сразу).
+        if isinstance(_gl0, dict) and _gl0.get("beh_gc_abort_count"):
+            try:
+                self._beh_gc_abort_count[cid] = {
+                    str(k): int(v)
+                    for k, v in _gl0["beh_gc_abort_count"].items()}
+            except Exception:
+                pass
+        if isinstance(_gl0, dict) and _gl0.get("beh_gc_abort_cd"):
+            try:
+                self._beh_gc_abort_cd[cid] = {
+                    str(k): int(v) for k, v in _gl0["beh_gc_abort_cd"].items()}
             except Exception:
                 pass
         # §6.2 одометр lifetime: restore монотонные счётчики (max — не регресс).
@@ -4039,6 +4068,8 @@ class LocalColonyCompute:
                 "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
                 "beh_soft_count": dict(self._beh_soft_count.get(cid) or {}),
                 "beh_gc_keep_cd": dict(self._beh_gc_keep_cd.get(cid) or {}),
+                "beh_gc_abort_count": dict(self._beh_gc_abort_count.get(cid) or {}),
+                "beh_gc_abort_cd": dict(self._beh_gc_abort_cd.get(cid) or {}),
                 # §6.2 одометр lifetime — durable (иначе рестарт обнулял бы).
                 "ate_total": int(self._stat_ate_total.get(cid, 0)),
                 "paralysis_count": int(self._stat_paralysis_count),
@@ -6291,6 +6322,8 @@ class LocalColonyCompute:
         n = self.reset_behavior_rejected()
         self._beh_gc_rejected.clear()
         self._beh_gc_keep_cd.clear()
+        self._beh_gc_abort_count.clear()   # §3-abort escalating cooldown reset
+        self._beh_gc_abort_cd.clear()
         self._grad_rejected.clear()
         self._grad_revert_count.clear()
         self._beh_soft_count.clear()
@@ -6345,16 +6378,29 @@ class LocalColonyCompute:
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
         """Запустить парный GC на graduated-узле (durable, не в cooldown). Стартуем
         в ablate-фазе (edge-weight→0). True если начат."""
+        # ЭНЕРГО-ГЕЙТ (Фрай 11.06, инцидент 52%-паралич): GC стартовал в окне
+        # paralysis==0 МЕЖДУ §3-провалами и сам аблейтил в §3 → спираль. Не
+        # начинаем ablate пока Адам не здоров (energy≥φ⁻¹·max) И нет недавнего §3.
+        bc = self.biochem.get(cid)
+        e_now = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
+        if e_now < self._GRAD_HEALTH_ENERGY:
+            return False
+        if (self._last_world_tick - self._last_paralysis_tick.get(cid, -10**9)) \
+                < self._BEH_GC_NO_PAR_TICKS:
+            return False   # недавний §3 → ждём стабильности перед ablate
         grad = self._tissue_graduated.get(cid) or {}
         rej = self._beh_gc_rejected.get(cid) or {}
         kcd = self._beh_gc_keep_cd.get(cid) or {}
+        acd = self._beh_gc_abort_cd.get(cid) or {}   # §3-abort escalating cooldown
         cand = [r for r in grad
                 if (self._last_world_tick - rej.get(r, -10**9))
                 >= self._tissue_gc_epoch_interval
                 # KEEP-cooldown: подтверждённый узел ждёт длинную паузу до
                 # ре-валидации (не ревизуется по кругу сразу после KEEP).
                 and (self._last_world_tick - kcd.get(r, -10**9))
-                >= self._BEH_GC_KEEP_COOLDOWN]
+                >= self._BEH_GC_KEEP_COOLDOWN
+                # ABORT-cooldown: §3-дестабилизировавший узел отдыхает Fib-эскал.
+                and self._last_world_tick >= acd.get(r, 0)]
         if not cand:
             return False
         role = cand[0]
@@ -6392,8 +6438,24 @@ class LocalColonyCompute:
             self._beh_gc_set_edge_weight(org, st["role"],
                                          self._TISSUE_GRAD_EDGE_WEIGHT)
         self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge-weight "
-                    "восстановлен", cid, st["role"], reason)
+        role = st["role"]
+        # ABORT-COOLDOWN escalating Fib (Фрай 11.06): §3-abort → роль отдыхает
+        # ×Fib(abort_count) epoch_interval'ов перед ре-попыткой. Рвёт спираль
+        # (узел, дестабилизирующий §3, не долбит мотор по кругу). Только на §3-
+        # abort (не kill-switch — там вся GC off, cooldown бессмыслен).
+        if reason.startswith("§3"):
+            ac = self._beh_gc_abort_count.setdefault(cid, {})
+            ac[role] = ac.get(role, 0) + 1
+            mult = self._GRAD_COOLDOWN_FIB[
+                min(ac[role] - 1, len(self._GRAD_COOLDOWN_FIB) - 1)]
+            until = int(self._last_world_tick) + mult * self._tissue_gc_epoch_interval
+            self._beh_gc_abort_cd.setdefault(cid, {})[role] = until
+            logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge "
+                        "восстановлен, abort#%d → cooldown ×%d (до тика %d)",
+                        cid, role, reason, ac[role], mult, until)
+        else:
+            logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge-weight "
+                        "восстановлен", cid, role, reason)
 
     def _behavioral_gc_step(self, cid: str, org) -> None:
         """Один тик парной машины. §3-abort → discard transient → накопить окно →
@@ -6517,6 +6579,8 @@ class LocalColonyCompute:
             # решено powered-KEEP'ом → роль чиста (петля №1 закрыта)
             (self._beh_soft_count.get(cid) or {}).pop(role, None)
             (self._grad_revert_count.get(cid) or {}).pop(role, None)
+            (self._beh_gc_abort_count.get(cid) or {}).pop(role, None)  # §3-abort reset
+            (self._beh_gc_abort_cd.get(cid) or {}).pop(role, None)
             # KEEP-cooldown (Фрай): длинная пауза до ре-валидации (не по кругу).
             self._beh_gc_keep_cd.setdefault(cid, {})[role] = int(self._last_world_tick)
             # value↑ для shed-ранжирования: поведенчески-durable = высокая
@@ -6852,9 +6916,12 @@ class LocalColonyCompute:
         медленный collective-drift (N узлов СОВОКУПНО проседают мотор) он
         пропускает. Здесь: energy EWMA + §3-paralysis по всем graduated. Просел →
         ПАУЗА graduation + SHED наименее-ценного (revert lowest _grad_value) до
-        recovery. Активен только при ≥2 graduated (1 покрыт per-add watch)."""
+        recovery. Активен при ≥1 graduated (Фрай 11.06: инцидент ДОКАЗАЛ gap при
+        N=1 — одиночный узел дренил без страховки до 52%-паралича, понадобился
+        manual kill-switch; монитор при ≥1 ловит drain РАНЬШЕ и АВТО-шедит.
+        φ-гистерезис не флапнет; shed одиночки recoverable — узел назад в сайдкар)."""
         grad = self._tissue_graduated.get(cid) or {}
-        if len(grad) < 2:
+        if len(grad) < 1:
             self._grad_collective_paused = False   # нечему дрейфовать
             return
         bc = self.biochem.get(cid)
@@ -7678,6 +7745,7 @@ class LocalColonyCompute:
             return
         self._paralysis_until[cid] = time.monotonic() + _PARALYSIS_SEC
         self._stat_paralysis_count += 1  # /stats Блок 3
+        self._last_paralysis_tick[cid] = int(self._last_world_tick)  # энерго-гейт GC
         logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
                     cid, reason, _PARALYSIS_SEC)
 

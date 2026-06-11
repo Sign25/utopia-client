@@ -100,3 +100,22 @@ def test_beh_verdicts_round_trip():
     owner = dst._stat_owner_extra()
     roles = {v["role"] for v in owner["beh_verdicts"]}
     assert "grown4" in roles and "grown92" in roles
+
+
+def test_beh_gc_abort_cooldown_round_trip():
+    """§3-abort escalating cooldown durable — иначе рестарт обнулял бы эскалацию
+    и дестабилизирующий узел сразу вернулся бы в очередь GC (спираль 11.06)."""
+    src = _compute()
+    src._beh_gc_abort_count["a"] = {"grown93": 3}
+    src._beh_gc_abort_cd["a"] = {"grown93": 123456}
+
+    payload = src.save_state("a")
+    gl = payload["growth_loop"]
+    assert gl["beh_gc_abort_count"]["grown93"] == 3
+    assert gl["beh_gc_abort_cd"]["grown93"] == 123456
+
+    dst = _compute()
+    assert "a" not in dst._beh_gc_abort_cd
+    dst.restore_persisted_state("a", payload)
+    assert dst._beh_gc_abort_count["a"]["grown93"] == 3
+    assert dst._beh_gc_abort_cd["a"]["grown93"] == 123456
