@@ -77,3 +77,26 @@ def test_growth_loop_empty_hist_not_written():
     dst = _compute()
     dst.restore_persisted_state("a", payload)
     assert "a" not in dst._growth_intr_hist
+
+
+def test_beh_verdicts_round_trip():
+    """Блок 7b: поведенческие вердикты переживают рестарт — секция
+    «Поведенческая ценность тканей» не пустеет на self-update/сбое питания
+    (Шеф 11.06: «ткань появляется, через время исчезает»)."""
+    src = _compute()
+    src._stat_beh_verdicts["grown4"] = {"verdict": "KEEP", "dims": {"cortisol": -2.4}}
+    src._stat_beh_verdicts["grown92"] = {"verdict": "SOFT#1", "dims": {}}
+
+    payload = src.save_state("a")
+    assert payload["growth_loop"]["beh_verdicts"]["grown4"]["verdict"] == "KEEP"
+
+    dst = _compute()                      # рестарт: секция пуста
+    assert dst._stat_beh_verdicts == {}
+    dst.restore_persisted_state("a", payload)
+
+    assert dst._stat_beh_verdicts["grown4"]["verdict"] == "KEEP"
+    assert dst._stat_beh_verdicts["grown92"]["verdict"] == "SOFT#1"
+    # экспорт в diagnostics не пуст после рестарта
+    owner = dst._stat_owner_extra()
+    roles = {v["role"] for v in owner["beh_verdicts"]}
+    assert "grown4" in roles and "grown92" in roles

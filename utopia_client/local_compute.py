@@ -1957,6 +1957,14 @@ class LocalColonyCompute:
                     self._stat_paralysis_count, int(_gl0.get("paralysis_count", 0)))
                 self._stat_recovery_count = max(
                     self._stat_recovery_count, int(_gl0.get("recovery_count", 0)))
+                # Блок 7b: поведенческие вердикты durable через рестарт — иначе
+                # self-update/сбой питания обнуляет _stat_beh_verdicts → секция
+                # «Поведенческая ценность тканей» пустеет и набирается заново
+                # (Шеф 11.06: «ткань появляется, через время исчезает»).
+                _bv = _gl0.get("beh_verdicts")
+                if isinstance(_bv, dict):
+                    for _r, _v in _bv.items():
+                        self._stat_beh_verdicts.setdefault(str(_r), _v)
             except Exception:
                 pass
         # анти-осцилляция: behavior-rejected метки durable через рестарт.
@@ -4035,6 +4043,8 @@ class LocalColonyCompute:
                 "ate_total": int(self._stat_ate_total.get(cid, 0)),
                 "paralysis_count": int(self._stat_paralysis_count),
                 "recovery_count": int(self._stat_recovery_count),
+                # Блок 7b — поведенческие вердикты durable (стабильная секция UI).
+                "beh_verdicts": dict(self._stat_beh_verdicts),
             }
         except Exception as e:
             logger.debug("save_state %s growth_loop: %s", cid, e)
