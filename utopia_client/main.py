@@ -531,6 +531,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_behavioral_probe: str | None = None
     applied_behavioral_gc: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
+    applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
     # (числовой) → мгновенная рекалибровка renorm-супрессора без рестарта.
     applied_motor_renorm_cap: float | None = None
@@ -824,6 +825,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_gc → %s", target_beh_gc)
                         except Exception as e:
                             logger.warning("set_behavioral_gc failed: %s", e)
+
+                    # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
+                    # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +
+                    # meat-дима GC. Дефолт OFF (травоядный=текущее). Edge-detect.
+                    target_hunting = bool(flags.get("hunting", False))
+                    if target_hunting != applied_hunting \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_hunting(target_hunting)
+                            applied_hunting = target_hunting
+                            logger.info("hunting → %s", target_hunting)
+                        except Exception as e:
+                            logger.warning("set_hunting failed: %s", e)
 
                     # §10.3 power-калибровка (Фрай 10.06): behavioral_gc_retest
                     # — снять rejected-метки + grad-лимит, durable-сайдкары
