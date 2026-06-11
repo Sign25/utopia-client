@@ -2472,6 +2472,26 @@ class ColonyWSClient:
             return base * (1.0 - diet) * kleiber * vbonus  # одна flora/тик
         return 0.0
 
+    def _flee_speed_boost(self, cid) -> int:
+        """Predator v0.1 Часть 2 (Фрай/Хьюберт 11.06): доп. flee-шаги ∝ adrenaline.
+        Калибровка GROWTH-ZONE — побег ДОСТИЖИМ но вознаграждает реакцию:
+          adr <40  → 1 (= predator_speed−1, хищник догоняет — слабая реакция)
+          adr 40-70→ 2 (= predator_speed, паритет)
+          adr ≥70  → 3 (> predator, отрыв — сильная vigilance/близкий хищник)
+        Max 3 (start soft, не 4-чит). Тюн по escape-rate. adr оживляет Часть 1."""
+        compute = self.compute
+        if compute is None:
+            return 0
+        bc = getattr(compute, "biochem", {}).get(cid)
+        if bc is None:
+            return 0
+        adr = float(getattr(bc, "adrenaline", 0.0))
+        if adr >= 70.0:
+            return 3
+        if adr >= 40.0:
+            return 2
+        return 1
+
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
         не учатся искать воду (obs без water-градиента) → дегидратация. Рефлекс:
@@ -2613,6 +2633,11 @@ class ColonyWSClient:
             # water-seek-флаг навешивается позже в _apply_water_seek (по hydration).
             if int(a["action"]) == self._ACTION_FLEE:
                 entry["life_critical"] = True
+                # speed_boost (Фрай/Хьюберт 11.06 predator v0.1 Часть 2): доп.
+                # шаги flee ∝ adrenaline. Калибровка Фрая: побег при СИЛЬНОЙ
+                # реакции (adr высок=хищник близко=хорошая vigilance), паритет
+                # при слабой → evasion-ткани имеют смысл расти. start soft (max 3).
+                entry["speed_boost"] = self._flee_speed_boost(cid)
             try:
                 emas = self.compute.get_phase_emas(cid)
             except Exception:
