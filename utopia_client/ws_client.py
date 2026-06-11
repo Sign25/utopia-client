@@ -2223,6 +2223,11 @@ class ColonyWSClient:
     _HYDRATION_CRITICAL = 15.0     # ≤ → water-move life-critical (bypass §3-STAY)
     _ACTION_FLEE = 10              # FLEE — survival-escape от угрозы (тоже bypass)
     _FLEE_BOOST_ADR = 55.0         # Fib порог adrenaline для flee-boost=1 (band-ручка Фрая)
+    _MOVE_ACTIONS = frozenset({0, 1, 2, 3, 10})  # локомоция (MOVE кардинальные + FLEE)
+    #                              → persist=true (Хьюберт c8c2af8): сервер дед-реконит
+    #                              последний MOVE каждый world-тик пока клиент молчит
+    #                              (мой client-tick медленнее world → без persist P40
+    #                              force-STAY'ит через 30т=2с → Адам застывает/прыгает).
     # §3.2 (Фрай 09.06.2026): φ-onset градуального felt-drive. 0.382·100=38.2
     # (нативная hydration-шкала [0,100], НЕ squashed insula slot[1]). hydration<
     # onset → felt>0; felt=(onset−hyd)/onset∈[0,1] масштабирует приоритет
@@ -2628,17 +2633,28 @@ class ColonyWSClient:
             nearest_flora_per_cid=nearest_flora_per_cid)
         if not actions:
             return None
+        # persist-opt-in scope (Хьюберт c8c2af8): только Адам (single-organism).
+        # Его мозг-клиент тикает медленнее world-loop → между эмитами P40 без
+        # persist force-STAY'ит (30т) → заморозка. persist на локомоции → дед-
+        # реконинг → feed плотный как у фауны (мелкие collision-aware шаги).
+        _single = (bool(getattr(self.compute, "_single_organism", False))
+                   if self.compute is not None else False)
         creatures_out: list = []
         for cid, a in actions.items():
+            act = int(a["action"])
             entry: dict = {
                 "cid": cid,
-                "action": int(a["action"]),
+                "action": act,
                 "target_id": a.get("target_id"),
             }
+            # persist=true на локомоции Адама → сервер продолжает MOVE/FLEE каждый
+            # world-тик пока следующий client-tick не передумает (75т=5с safety-STAY).
+            if _single and act in self._MOVE_ACTIONS:
+                entry["persist"] = True
             # life_critical (Фрай/Хьюберт 11.06): FLEE = survival-escape от угрозы
             # → P40 обходит §3-force-STAY (бежать от хищника даже в параличе).
             # water-seek-флаг навешивается позже в _apply_water_seek (по hydration).
-            if int(a["action"]) == self._ACTION_FLEE:
+            if act == self._ACTION_FLEE:
                 entry["life_critical"] = True
                 # speed_boost (Фрай/Хьюберт 11.06 predator v0.1 Часть 2): доп.
                 # шаги flee ∝ adrenaline. Калибровка Фрая: побег при СИЛЬНОЙ
