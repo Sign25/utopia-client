@@ -2216,6 +2216,12 @@ class ColonyWSClient:
     # Water-seek рефлекс (31.05.2026). Tile.WATER=1 (environment/world.py).
     _WATER_TILE = 1
     _WATER_SEEK_HYDRATION = 30.0   # < 30/100 max → искать воду (бинарный режим)
+    # life_critical bypass (Фрай/Хьюберт 11.06): hydration ≤ crit → water-seek
+    # move помечается life_critical=true → P40 ОБХОДИТ §3-force-STAY (узко,
+    # scope is_adam, default false). Размыкает дедлок: бессмертный Адам ползёт
+    # к воде даже в §3-параличе (energy≤0 от хищник-дрейна) → recovery hyd→energy.
+    _HYDRATION_CRITICAL = 15.0     # ≤ → water-move life-critical (bypass §3-STAY)
+    _ACTION_FLEE = 10              # FLEE — survival-escape от угрозы (тоже bypass)
     # §3.2 (Фрай 09.06.2026): φ-onset градуального felt-drive. 0.382·100=38.2
     # (нативная hydration-шкала [0,100], НЕ squashed insula slot[1]). hydration<
     # onset → felt>0; felt=(onset−hyd)/onset∈[0,1] масштабирует приоритет
@@ -2556,6 +2562,10 @@ class ColonyWSClient:
                     continue   # этот тик felt не перебивает действие мозга
                 self._thirst_accum[cid] = _acc - 1.0
             entry["action"] = int(wd)
+            # life_critical (Фрай/Хьюберт 11.06): при критичной гидратации
+            # water-move помечается → P40 обходит §3-force-STAY → Адам ползёт к
+            # воде в параличе → recovery. Явно перезаписываем (мог быть FLEE-флаг).
+            entry["life_critical"] = bool(hyd <= self._HYDRATION_CRITICAL)
             n_seek += 1
         if n_seek:
             self._water_seek_overrides = getattr(
@@ -2598,6 +2608,11 @@ class ColonyWSClient:
                 "action": int(a["action"]),
                 "target_id": a.get("target_id"),
             }
+            # life_critical (Фрай/Хьюберт 11.06): FLEE = survival-escape от угрозы
+            # → P40 обходит §3-force-STAY (бежать от хищника даже в параличе).
+            # water-seek-флаг навешивается позже в _apply_water_seek (по hydration).
+            if int(a["action"]) == self._ACTION_FLEE:
+                entry["life_critical"] = True
             try:
                 emas = self.compute.get_phase_emas(cid)
             except Exception:
