@@ -70,8 +70,10 @@ def test_nearest_water_chosen():
     assert cli._water_seek_action(10, 10) == 2  # EAST (ближе)
 
 
-def test_no_water_in_radius():
-    cli = _client(_FakeWC(40, [(39, 39)]))  # вода далеко (>radius 8)
+def test_no_water_anywhere():
+    # progressive-scan (0.13.34) расширяется до ВСЕЙ карты → None только если
+    # воды нет НИГДЕ (раньше тест ждал None при воде>radius — устарел).
+    cli = _client(_FakeWC(40, []))  # воды нет вообще
     assert cli._water_seek_action(5, 5) is None
 
 
@@ -270,3 +272,41 @@ def test_apply_water_seek_skips_hydrated():
     creatures_out = [{"cid": "c1", "action": 1, "target_id": None}]
     cli._apply_water_seek(creatures, creatures_out)
     assert creatures_out[0]["action"] == 1  # НЕ тронут (не жаждущий)
+
+
+# ── life_critical bypass §3-force-STAY (Фрай/Хьюберт 11.06) ──────────────
+
+def test_water_seek_life_critical_when_hydration_critical():
+    pytest.importorskip("torch")
+    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.biochemistry import make_default
+    import types
+    c = LocalColonyCompute(device="cpu")
+    bc = make_default(); bc.hydration = 5.0  # ≤15 критично
+    c.biochem["c1"] = bc
+    c.organisms["c1"] = types.SimpleNamespace(generation=0)
+    cli = _client(_FakeWC(20, [(10, 16)]))
+    cli.compute = c
+    creatures = [{"cid": "c1", "row": 10, "col": 10}]
+    creatures_out = [{"cid": "c1", "action": 1, "target_id": None}]
+    cli._apply_water_seek(creatures, creatures_out)
+    assert creatures_out[0]["action"] == 2          # к воде
+    assert creatures_out[0]["life_critical"] is True  # bypass §3
+
+
+def test_water_seek_not_life_critical_when_moderate_thirst():
+    pytest.importorskip("torch")
+    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.biochemistry import make_default
+    import types
+    c = LocalColonyCompute(device="cpu")
+    bc = make_default(); bc.hydration = 25.0  # жаждущий, но >15 (не критично)
+    c.biochem["c1"] = bc
+    c.organisms["c1"] = types.SimpleNamespace(generation=0)
+    cli = _client(_FakeWC(20, [(10, 16)]))
+    cli.compute = c
+    creatures = [{"cid": "c1", "row": 10, "col": 10}]
+    creatures_out = [{"cid": "c1", "action": 1, "target_id": None}]
+    cli._apply_water_seek(creatures, creatures_out)
+    assert creatures_out[0]["action"] == 2          # ведёт к воде
+    assert creatures_out[0]["life_critical"] is False  # не критично → нет bypass
