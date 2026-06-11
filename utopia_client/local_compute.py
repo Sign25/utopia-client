@@ -476,6 +476,17 @@ class LocalColonyCompute:
         # learnable ось (ткань-anticipation рвёт раньше → меньше drain → GC отбирает).
         self._camp_hit_streak: dict = {}    # cid → consecutive just_hit (camp-длительность)
         self._CAMP_BREAK_TICKS: int = 5     # Fib-дебаунс: после N futile контратак → рви
+        # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
+        # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
+        # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
+        # хватало: (1) diet_gene>0 → server даёт kill-energy (energy+=φ⁷×diet); (2)
+        # DS-ATTACK на контакте (BS-prey-ATTACK инертна у single-Adam); (3) hunt-
+        # outcome-дима в GC (meat-energy, изолированно от plant-income). Kill-switch
+        # client_flag hunting (дефолт OFF=травоядный=текущее поведение).
+        self._hunting_enabled: bool = False      # client_flag hunting (OFF dormant)
+        self._OMNIVORE_DIET: float = 0.618        # φ⁻¹ — всеядный (Adam-specific при hunting ON)
+        self._PREY_KILL_ENERGY: float = 1.618 ** 7  # φ⁷≈29 (server prey_kill_energy, для meat-димы)
+        self._beh_meat_cum: dict = {}       # cid → монотонный Σ meat-energy (hunt-outcome дима GC)
         self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
@@ -599,6 +610,9 @@ class LocalColonyCompute:
             "glucose": 5.0,        # метаболический сдвиг сопоставим
             "hydration": 2.0,      # water-специалист
             "income": 1.0,         # foraging-rate сдвиг
+            "meat": 0.5,           # hunt-ось PLACEHOLDER — нет prior данных (охота dormant
+            #                        до флипа hunting); BEH-GC-WINDOW meat-лог даст Фраю
+            #                        калибровать от живых kill-окон (как neg_damage 0.5→0.3).
             "neg_damage": 0.3,     # fear-ось (Фрай 11.06, калибр. от живых negDmg):
             #                        ≈φ⁻²·baseline (0.382·0.86 урон/окно ≈ 0.33) =
             #                        принципиальная «значимая доля»; чуть ниже 13-пар
@@ -1524,6 +1538,7 @@ class LocalColonyCompute:
         self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
         self._beh_income_cum.pop(cid, None)
         self._beh_damage_cum.pop(cid, None)   # fear-ось cost-of-encounter cleanup
+        self._beh_meat_cum.pop(cid, None)     # hunt-ось meat-outcome cleanup
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -5270,6 +5285,16 @@ class LocalColonyCompute:
                     logits[5] += 1.5 * BS        # добыча достижима
                     if diet > 0.7:
                         logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
+                # DS-HUNT (Фрай hunting.md): BS-prey-ATTACK (выше) инертна у
+                # single-Adam (BS=0) → DS-версия. Всеядный Адам атакует достижимую
+                # добычу, перебивая §4-ATTACK-suppress (−φ·DS при not just_hit).
+                # ТОЛЬКО если рядом НЕТ хищника (d_prox<0.3): выживание > охота
+                # (хищник → §4 FLEE/defend приоритетнее).
+                if p_prox > 0.3 and d_prox < 0.3:
+                    logits[5] += (1.5 + 2.0 * min(p_prox, 1.0)) * DS  # > φ·DS suppress
+                    logits[10] -= 0.3 * DS       # не беги от добычи (не угроза)
+                elif p_prox <= 0.1:
+                    logits[5] -= 0.5 * DS        # добычи нет → ATTACK впустую
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
@@ -6395,6 +6420,37 @@ class LocalColonyCompute:
         logger.info("set_behavioral_gc: %s", on)
         return self._behavioral_gc_enabled
 
+    def set_hunting(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
+        on=True: Адам→ВСЕЯДНЫЙ (diet_gene→φ⁻¹=0.618) → (а) server даёт kill-energy
+        (energy+=φ⁷×diet), (б) DS-hunt-ATTACK активен (gate diet>0.5), (в) meat-
+        дима GC накапливается. off: травоядный (diet→0.0) = текущее поведение.
+        Меняет diet в traits → re-announce (_skill_changed_cids → P40 mirror).
+        ТОЛЬКО single-organism (Адам); другим owned диету не трогаем. Идемпотентно."""
+        self._hunting_enabled = bool(on)
+        if not self._single_organism:
+            logger.info("set_hunting: %s (НЕ single-organism → diet не трогаю)", on)
+            return self._hunting_enabled
+        target = self._OMNIVORE_DIET if on else 0.0
+        n = 0
+        for cid in list(self.organisms.keys()):
+            cur = self.traits.get(cid)
+            if not isinstance(cur, dict):
+                cur = {}
+                self.traits[cid] = cur
+            cur["diet_gene"] = target
+            org = self.organisms.get(cid)
+            if org is not None:
+                try:
+                    setattr(org, "diet_gene", target)
+                except Exception:
+                    pass
+            self._skill_changed_cids.add(cid)   # re-announce → P40 kill_energy×diet
+            n += 1
+        logger.info("set_hunting: %s (diet_gene→%.3f, %d owned re-announce)",
+                    on, target, n)
+        return self._hunting_enabled
+
     def _beh_gc_set_edge_weight(self, org, role: str, w: float) -> None:
         """Soft ablate/restore (Фрай 10.06): менять ВЕС ребра {role}→cerebellum,
         НЕ удалять узел — топология стабильна → нет churn → нет §3-триггера.
@@ -6423,6 +6479,7 @@ class LocalColonyCompute:
             "hydration": float(getattr(bc, "hydration", 0.0)),
             "income_cum": float(self._beh_income_cum.get(cid, 0.0)),
             "damage_cum": float(self._beh_damage_cum.get(cid, 0.0)),  # fear-ось (rate, neg)
+            "meat_cum": float(self._beh_meat_cum.get(cid, 0.0)),      # hunt-ось (rate, pos)
         }
 
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
@@ -6470,6 +6527,7 @@ class LocalColonyCompute:
             "win_ticks": 0,
             "win0_income": float(self._beh_income_cum.get(cid, 0.0)),
             "win0_damage": float(self._beh_damage_cum.get(cid, 0.0)),
+            "win0_meat": float(self._beh_meat_cum.get(cid, 0.0)),
             "acc": {}, "acc_n": 0,
             "samples": {"ablate": {}, "restore": {}},
             "par_before": int(self._paralysis_window_n),
@@ -6525,7 +6583,7 @@ class LocalColonyCompute:
             return
         s = self._beh_gc_sample(cid)
         for k, v in s.items():
-            if k not in ("income_cum", "damage_cum"):   # cum'ы → RATE, не mean
+            if k not in ("income_cum", "damage_cum", "meat_cum"):  # cum'ы → RATE, не mean
                 st["acc"][k] = st["acc"].get(k, 0.0) + v
         st["acc_n"] += 1
         if st["win_ticks"] < self._BEH_GC_WINDOW:
@@ -6538,13 +6596,16 @@ class LocalColonyCompute:
         dmg_now = float(self._beh_damage_cum.get(cid, 0.0))
         # neg_damage_rate: МЕНЬШЕ урона = ЛУЧШЕ (семантика «больше=лучше», как все дим).
         win["neg_damage"] = -(dmg_now - st["win0_damage"]) / max(1, st["win_ticks"])
+        meat_now = float(self._beh_meat_cum.get(cid, 0.0))
+        # meat_rate: БОЛЬШЕ мяса = ЛУЧШЕ (hunt-outcome). Чистый hunt-сигнал.
+        win["meat"] = (meat_now - st["win0_meat"]) / max(1, st["win_ticks"])
         for k, v in win.items():
             st["samples"][phase].setdefault(k, []).append(v)
         logger.info("brain-growth BEH-GC-WINDOW cid=%s role=%s phase=%s pair=%d "
-                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f negDmg=%.3f", cid,
+                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f negDmg=%.3f meat=%.3f", cid,
                     st["role"], phase, st["pairs_done"], win.get("neg_cortisol", 0.0),
                     win.get("glucose", 0.0), win.get("hydration", 0.0),
-                    win.get("income", 0.0), win.get("neg_damage", 0.0))
+                    win.get("income", 0.0), win.get("neg_damage", 0.0), win.get("meat", 0.0))
         # toggle фазы (soft edge-weight) + сброс окна
         new_phase = "restore" if phase == "ablate" else "ablate"
         self._beh_gc_set_edge_weight(
@@ -6556,6 +6617,7 @@ class LocalColonyCompute:
         st["acc_n"] = 0
         st["win0_income"] = inc_now
         st["win0_damage"] = dmg_now
+        st["win0_meat"] = meat_now
         if new_phase == "ablate":        # завершилась полная пара (restore→ablate)
             st["pairs_done"] += 1
             if st["pairs_done"] >= st.get("pairs_target", self._BEH_GC_PAIRS):
@@ -8596,8 +8658,15 @@ class LocalColonyCompute:
                 # без явного ate всё равно восполняем glucose (apply_feed).
                 apply_feed(bc)
             if event.get("killed"):
-                apply_kill_prey(bc)
+                apply_kill_prey(bc)                 # dopamine-спайк (награда, ось оживает)
                 self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1  # F5
+                # HUNT-ось (Фрай hunting.md): монотонный meat-energy (φ⁷×diet за
+                # kill) — ЧИСТЫЙ hunt-сигнал для GC-димы, изолирован от plant-income
+                # (income_cum смешан, meat_cum — только мясо). Hunting-ткань ablate
+                # → меньше kills → меньше meat-gain → specialist-keep.
+                _diet_g = float((self.traits.get(cid) or {}).get("diet_gene", 0.0) or 0.0)
+                self._beh_meat_cum[cid] = (self._beh_meat_cum.get(cid, 0.0)
+                                           + self._PREY_KILL_ENERGY * _diet_g)
             # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
             # опыт фуражёра → efficiency растёт каждые 200 тиков.
             if event.get("ate") or delta_e > 0.0:
