@@ -8660,13 +8660,14 @@ class LocalColonyCompute:
             if event.get("killed"):
                 apply_kill_prey(bc)                 # dopamine-спайк (награда, ось оживает)
                 self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1  # F5
-                # HUNT-ось (Фрай hunting.md): монотонный meat-energy (φ⁷×diet за
-                # kill) — ЧИСТЫЙ hunt-сигнал для GC-димы, изолирован от plant-income
-                # (income_cum смешан, meat_cum — только мясо). Hunting-ткань ablate
-                # → меньше kills → меньше meat-gain → specialist-keep.
-                _diet_g = float((self.traits.get(cid) or {}).get("diet_gene", 0.0) or 0.0)
-                self._beh_meat_cum[cid] = (self._beh_meat_cum.get(cid, 0.0)
-                                           + self._PREY_KILL_ENERGY * _diet_g)
+                # HUNT-ось (Фрай hunting.md): meat-energy = РЕАЛЬНЫЙ delta_energy
+                # этого kill-тика (Хьюберт: killed=True → чистый meat, grass=killed
+                # False/ate=True; delta_energy отражает YIELD_FACTOR-кноб + server-
+                # grant, точнее моего φ⁷×diet). Изолирован от plant-income → чистый
+                # hunt-сигнал для GC. Hunting-ткань ablate → меньше kills → меньше
+                # meat-gain → specialist-keep.
+                if delta_e > 0.0:
+                    self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + delta_e
             # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
             # опыт фуражёра → efficiency растёт каждые 200 тиков.
             if event.get("ate") or delta_e > 0.0:
