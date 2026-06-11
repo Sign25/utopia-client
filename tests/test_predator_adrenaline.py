@@ -25,7 +25,19 @@ def test_pred_prox_spikes_adrenaline():
     c.biochem["a"].adrenaline = 0.0       # мёртвая ось
     c._last_pred_prox["a"] = 1.0          # хищник вплотную
     c._apply_biochem_decay("a")
-    assert c.biochem["a"].adrenaline >= 50.0   # ожила (pred_prox·80, после decay)
+    # onset-латентность: за 1 тик растёт на ~_ADRENALINE_ONSET (не мгновенно)
+    assert c.biochem["a"].adrenaline > 0.0     # ожила (начала нарастать)
+    assert c.biochem["a"].adrenaline <= c._ADRENALINE_ONSET + 0.01  # лаг, не пик
+
+
+def test_adrenaline_onset_latency_ramps_to_peak():
+    # ключевое (Фрай): нарастает за НЕСКОЛЬКО тиков → learnable band.
+    c = _c()
+    c.biochem["a"].adrenaline = 0.0
+    c._last_pred_prox["a"] = 1.0          # target = 80
+    for _ in range(6):                    # ~4 тика до пика
+        c._apply_biochem_decay("a")
+    assert c.biochem["a"].adrenaline >= 75.0   # дошёл до ~target после ramp
 
 
 def test_no_spike_below_gate():
@@ -44,13 +56,14 @@ def test_adrenaline_transient_decays_when_predator_gone():
     assert c.biochem["a"].adrenaline < 80.0    # decay гасит (транзиент)
 
 
-def test_spike_scales_with_proximity():
+def test_spike_caps_at_proximity_target():
+    # target = pred_prox·80; ramp не превышает target (0.3·80=24).
     c = _c()
     c.biochem["a"].adrenaline = 0.0
-    c._last_pred_prox["a"] = 0.5          # средняя угроза
-    c._apply_biochem_decay("a")
-    a_mid = c.biochem["a"].adrenaline
-    assert 20.0 <= a_mid <= 45.0          # ~0.5·80 (после decay) — слабее чем вплотную
+    c._last_pred_prox["a"] = 0.3          # слабая угроза → target 24
+    for _ in range(6):
+        c._apply_biochem_decay("a")
+    assert c.biochem["a"].adrenaline <= 24.0 + 0.01   # не выше target
 
 
 # ── Часть 2: adrenaline → flee speed_boost (контракт Хьюберта) ──────────

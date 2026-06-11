@@ -463,6 +463,10 @@ class LocalColonyCompute:
         self._last_pred_prox: dict = {}     # cid → obs[61] predator-близость
         self._ADRENALINE_PRED_SCALE: float = 80.0  # pred_prox·scale → adrenaline (тюн по escape-rate)
         self._ADRENALINE_PRED_GATE: float = 0.15   # ниже → шум, не спайкаем
+        # ONSET-латентность (Фрай 11.06): adrenaline растёт ≤ этого/тик к target →
+        # innate ответ несовершенен (лаг) → escape<100% (learnable band) → ткань-
+        # anticipation отбирается. ~3-4 тика 0→80. Тюн к INTERMEDIATE escape-rate.
+        self._ADRENALINE_ONSET: float = 25.0   # max прирост adrenaline/тик (латентность)
         self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
@@ -9062,8 +9066,17 @@ class LocalColonyCompute:
             _pp = float(self._last_pred_prox.get(cid, 0.0))
             if _pp >= self._ADRENALINE_PRED_GATE:
                 _target = min(100.0, _pp * self._ADRENALINE_PRED_SCALE)
-                if _target > float(getattr(bc, "adrenaline", 0.0)):
-                    bc.adrenaline = _target   # спайк к воспринятой угрозе
+                _cur = float(getattr(bc, "adrenaline", 0.0))
+                if _target > _cur:
+                    # ONSET-ЛАТЕНТНОСТЬ (Фрай 11.06, ключевое): adrenaline
+                    # нарастает НЕ мгновенно (rate-limit _ADRENALINE_ONSET/тик) к
+                    # target → innate ответ ДОСТАТОЧЕН-НО-НЕСОВЕРШЕНЕН: при
+                    # внезапном близком хищнике boost растёт с лагом → иногда
+                    # ловят до пика → escape <100% = LEARNABLE BAND. Ткань,
+                    # реагирующая РАНЬШЕ/резче (anticipation/timing), поднимает
+                    # escape-rate → behavioral-GC её ОТБИРАЕТ (selection-градиент,
+                    # не просто живая ось). Тюн onset к INTERMEDIATE escape-rate.
+                    bc.adrenaline = min(_target, _cur + self._ADRENALINE_ONSET)
         except Exception as e:
             logger.debug("adrenaline pred-spike %s: %s", cid, e)
         # Phase 4 fix 0.11.6 (29.05): glucose floor energy-coupled (вариант 1,
