@@ -51,3 +51,28 @@ def test_spike_scales_with_proximity():
     c._apply_biochem_decay("a")
     a_mid = c.biochem["a"].adrenaline
     assert 20.0 <= a_mid <= 45.0          # ~0.5·80 (после decay) — слабее чем вплотную
+
+
+# ── Часть 2: adrenaline → flee speed_boost (контракт Хьюберта) ──────────
+
+def _ws(adr=None):
+    import utopia_client.ws_client as wsm
+    ws = wsm.ColonyWSClient(server="https://e.com", token="t",
+                            colony_name="cheef", client_version="0.0.0",
+                            estimated_population=0)
+    if adr is not None:
+        c = _c(); c.biochem["a"].adrenaline = adr
+        ws.compute = c
+    return ws
+
+
+def test_flee_boost_scales_with_adrenaline():
+    assert _ws(80.0)._flee_speed_boost("a") == 3   # сильная реакция → отрыв
+    assert _ws(50.0)._flee_speed_boost("a") == 2   # средняя → паритет
+    assert _ws(20.0)._flee_speed_boost("a") == 1   # слабая → хищник догоняет
+
+
+def test_flee_boost_no_compute():
+    ws = _ws()
+    ws.compute = None
+    assert ws._flee_speed_boost("a") == 0
