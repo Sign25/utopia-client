@@ -2223,6 +2223,7 @@ class ColonyWSClient:
     _HYDRATION_CRITICAL = 15.0     # ≤ → water-move life-critical (bypass §3-STAY)
     _ACTION_FLEE = 10              # FLEE — survival-escape от угрозы (тоже bypass)
     _FLEE_BOOST_ADR = 55.0         # Fib порог adrenaline для flee-boost=1 (band-ручка Фрая)
+    _FLEE_BURST_ADR = 75.0         # прямой контакт (camp, adr~80) → burst +2 (Шеф-гибрид camp-break)
     _MOVE_ACTIONS = frozenset({0, 1, 2, 3, 10})  # локомоция (MOVE кардинальные + FLEE)
     #                              → persist=true (Хьюберт c8c2af8): сервер дед-реконит
     #                              последний MOVE каждый world-тик пока клиент молчит
@@ -2487,12 +2488,15 @@ class ColonyWSClient:
         4 vs хищник 3, минимальный отрыв):
           adr ≥_FLEE_BOOST_ADR (Fib 55) → 1 (минимальный отрыв, хищник близко)
           иначе                          → 0 (паритет — бежит вровень с хищником)
-        Порог = калибровка LEARNABLE-BAND (зона Фрая): predator-спайк адреналина
-        капится pred_prox·80=80, onset +25/тик → 55 достигается на ~3-м тике (2 тика
-        паритета = лаг onset) и только при pred_prox≥0.69 (близкий хищник). Escape
-        промежуточный (быстро-реагирующая ткань отрывается, медленную ловят) →
-        selection-градиент. magnitude-кап 1 = жёсткое требование Шефа; порог/onset —
-        ручки Фрая под INTERMEDIATE escape-rate."""
+        CAMP-BREAK burst (Шеф-гибрид 11.06): при ПРЯМОМ контакте (хищник camp'ит
+        вплотную, pred_prox~1.0 → adr~80 ≥ _FLEE_BURST_ADR=75) разрешаем КОРОТКИЙ
+        рывок +2 (=5 клеток vs хищник 3) — разорвать camp. БРИФ: adrenaline спадает
+        когда хищник отстал → boost→1→0 → назад к паритету (honor Шеф «незначительно»:
+        burst = камп-брейкер, не sustained-преимущество; gap открыт, паритет держит).
+          adr ≥75 (прямой контакт/camp) → 2 (рывок разорвать)
+          adr ≥55 (близкий хищник)       → 1 (минимальный отрыв)
+          иначе                           → 0 (паритет)
+        Порог/onset/magnitude — band-ручки Фрая (switch-timing = learnable ось)."""
         compute = self.compute
         if compute is None:
             return 0
@@ -2500,6 +2504,8 @@ class ColonyWSClient:
         if bc is None:
             return 0
         adr = float(getattr(bc, "adrenaline", 0.0))
+        if adr >= self._FLEE_BURST_ADR:
+            return 2     # прямой контакт → burst разорвать camp
         if adr >= self._FLEE_BOOST_ADR:
             return 1
         return 0

@@ -467,6 +467,15 @@ class LocalColonyCompute:
         # innate ответ несовершенен (лаг) → escape<100% (learnable band) → ткань-
         # anticipation отбирается. ~3-4 тика 0→80. Тюн к INTERMEDIATE escape-rate.
         self._ADRENALINE_ONSET: float = 25.0   # max прирост adrenaline/тик (латентность)
+        # CAMP-BREAK (Фрай/Хьюберт/Шеф 11.06, живой инцидент 64%-паралич): хищник
+        # camp'ит ВПЛОТНУЮ → §4 контратакует (just_hit→ATTACK), но ATTACK не
+        # life_critical → P40 force-STAY'ит в §3 → Адам застывает → дренит. Fix:
+        # контратака N=5 тиков futile (хищник всё ещё бьёт = не убит) → SWITCH на
+        # FLEE-burst (life_critical → исполняется в §3, +2 рывок Шефа) → разорвать
+        # camp → назад к parity (burst брифовый, держит gap). Switch-timing —
+        # learnable ось (ткань-anticipation рвёт раньше → меньше drain → GC отбирает).
+        self._camp_hit_streak: dict = {}    # cid → consecutive just_hit (camp-длительность)
+        self._CAMP_BREAK_TICKS: int = 5     # Fib-дебаунс: после N futile контратак → рви
         self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
@@ -1573,6 +1582,7 @@ class LocalColonyCompute:
         self._skill_eat.pop(cid, None)
         self._stat_ate_total.pop(cid, None)
         self._last_pred_prox.pop(cid, None)   # predator-аффорданс cleanup
+        self._camp_hit_streak.pop(cid, None)  # camp-break cleanup
         self._skill_kill.pop(cid, None)
         self._skill_atk.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -3453,6 +3463,14 @@ class LocalColonyCompute:
                     # сигнал контакта (лучше obs[61], который лагает/не пикует). →
                     # сильный ATTACK-bias «бей в ответ, пока он рядом».
                     _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
+                    # CAMP-BREAK streak: consecutive just_hit = хищник camp'ит и бьёт.
+                    # N тиков подряд = контратака futile (не убили) → пора рвать FLEE.
+                    if _just_hit:
+                        self._camp_hit_streak[cid] = self._camp_hit_streak.get(cid, 0) + 1
+                    else:
+                        self._camp_hit_streak[cid] = 0
+                    _camp_break = (self._camp_hit_streak.get(cid, 0)
+                                   >= self._CAMP_BREAK_TICKS)
                     # ARRIVAL STUCK-DETECTION (Фрай 07.06 go): вектор (dr,dc,dist)
                     # к nearest_flora НЕ меняется N=13 тиков (φ-Fib) при dist>0 (не
                     # на флоре) → цель недостижима (P40 блокит ход через воду) →
@@ -3498,6 +3516,7 @@ class LocalColonyCompute:
                                               recent_yield=_staying,
                                               on_flora=_onf,
                                               just_hit=_just_hit,
+                                              camp_break=_camp_break,
                                               flora_abandon_dir=_abandon_dir)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
@@ -5041,6 +5060,7 @@ class LocalColonyCompute:
                              recent_yield: bool = False,
                              on_flora: bool = False,
                              just_hit: bool = False,
+                             camp_break: bool = False,
                              flora_abandon_dir: "Optional[int]" = None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
@@ -5185,9 +5205,18 @@ class LocalColonyCompute:
             # И возвращал berserk-on-presence при climb pressure. Теперь: реально
             # ударили → контратака; контакт БЕЗ урона (пассив/транзиент) → НЕ бей,
             # пасись/настороже; приближается (не контакт) → уйди до удара.
-            if just_hit:
+            if just_hit and camp_break:
+                # CAMP-BREAK (Фрай N=5/Хьюберт/Шеф 11.06): контратака N тиков НЕ
+                # убила хищника (всё ещё бьёт) = futile стенд, только дренит → РВИ
+                # camp: сильный FLEE (action 10 = life_critical → исполнится в §3,
+                # +2 burst Шефа в _flee_speed_boost разорвёт gap), гаси ATTACK.
+                # Хищник camp'ил т.к. ATTACK не life_critical → P40 force-STAY'ил.
+                logits[10] += 2.0 * PHI * DS     # сильный FLEE — разорвать camp
+                logits[5] -= PHI * DS            # хватит контратаковать (futile)
+            elif just_hit:
                 # damage_taken>0 = хищник ТОЧНО ударил ЭТОТ тик → бей в ответ СИЛЬНО,
-                # гаси бегство + move-прочь (стой в radius=1, добей).
+                # гаси бегство + move-прочь (стой в radius=1, добей). Первые N тиков:
+                # дай контратаке шанс убить; не убил за N → camp_break рвёт (выше).
                 logits[5] += 2.0 * PHI * DS      # сильный ATTACK
                 logits[10] -= PHI * DS           # НЕ беги — контратакуй
                 logits[0] *= 0.5; logits[1] *= 0.5
