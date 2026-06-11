@@ -79,10 +79,13 @@ def _ws(adr=None):
     return ws
 
 
-def test_flee_boost_scales_with_adrenaline():
-    assert _ws(80.0)._flee_speed_boost("a") == 3   # сильная реакция → отрыв
-    assert _ws(50.0)._flee_speed_boost("a") == 2   # средняя → паритет
-    assert _ws(20.0)._flee_speed_boost("a") == 1   # слабая → хищник догоняет
+def test_flee_boost_stopgap_floor():
+    # STOPGAP 11.06 (анти-супермен): boost у пола пока P40 на multiply-модели.
+    # base move_speed уже = скорость хищника; boost только короткий рывок при смерти.
+    assert _ws(90.0)._flee_speed_boost("a") == 1   # adr>=85 (близкая смерть) → ×2 рывок
+    assert _ws(80.0)._flee_speed_boost("a") == 0   # обычный побег → база (=хищник)
+    assert _ws(50.0)._flee_speed_boost("a") == 0
+    assert _ws(20.0)._flee_speed_boost("a") == 0
 
 
 def test_flee_boost_no_compute():
