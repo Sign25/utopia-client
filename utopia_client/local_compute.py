@@ -599,9 +599,12 @@ class LocalColonyCompute:
             "glucose": 5.0,        # метаболический сдвиг сопоставим
             "hydration": 2.0,      # water-специалист
             "income": 1.0,         # foraging-rate сдвиг
-            "neg_damage": 0.5,     # fear-ось PLACEHOLDER — нет prior данных по урону;
-            #                        BEH-GC-WINDOW negDmg-лог даёт Фраю калибровать
-            #                        от живых значений (как cort Δ7 из Step-1).
+            "neg_damage": 0.3,     # fear-ось (Фрай 11.06, калибр. от живых negDmg):
+            #                        ≈φ⁻²·baseline (0.382·0.86 урон/окно ≈ 0.33) =
+            #                        принципиальная «значимая доля»; чуть ниже 13-пар
+            #                        MDE 0.308 → borderline fear-ткань форсится на
+            #                        34-пар досветку → первый fear-KEEP с сильным
+            #                        евиденсом. Re-tune если baseline уползёт с данными.
         }
         # ПЕТЛЯ №1 (Фрай ок 10.06): SOFT-prune НЕ ставил graduation-cooldown →
         # вечная осцилляция graduate↔soft-prune (hard insert/remove ~1.5-2ч).
