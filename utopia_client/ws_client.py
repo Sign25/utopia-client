@@ -2474,11 +2474,14 @@ class ColonyWSClient:
 
     def _flee_speed_boost(self, cid) -> int:
         """Predator v0.1 Часть 2 (Фрай/Хьюберт 11.06): доп. flee-шаги ∝ adrenaline.
-        Калибровка GROWTH-ZONE — побег ДОСТИЖИМ но вознаграждает реакцию:
-          adr <40  → 1 (= predator_speed−1, хищник догоняет — слабая реакция)
-          adr 40-70→ 2 (= predator_speed, паритет)
-          adr ≥70  → 3 (> predator, отрыв — сильная vigilance/близкий хищник)
-        Max 3 (start soft, не 4-чит). Тюн по escape-rate. adr оживляет Часть 1."""
+        STOPGAP 11.06 (жалоба Шефа «режим супермена»): база move_speed=10 уже даёт
+        3 клетки/тик (= хищник), а boost у P40 УМНОЖАЕТ — (1+boost)×3 → телепорт на
+        6-12 клеток («прыгает не проходя путь»). Пока Хьюберт не сделает additive-
+        модель (base=хищник, boost=+1 короткий), держим boost у пола:
+          adr ≥85  → 1 (только при близкой смерти — короткий минимальный рывок ×2)
+          иначе    → 0 (бежит на базовой скорости = скорость хищника, паритет)
+        Это убирает супермен-прыжки в обычном побеге. Вернём градацию когда P40
+        переедет с multiply на additive (см. запрос Хьюберту)."""
         compute = self.compute
         if compute is None:
             return 0
@@ -2486,11 +2489,9 @@ class ColonyWSClient:
         if bc is None:
             return 0
         adr = float(getattr(bc, "adrenaline", 0.0))
-        if adr >= 70.0:
-            return 3
-        if adr >= 40.0:
-            return 2
-        return 1
+        if adr >= 85.0:
+            return 1
+        return 0
 
     def _apply_water_seek(self, creatures, creatures_out) -> None:
         """Override action на move-к-воде для жаждущих (hydration<30%). zodchiy
