@@ -2222,6 +2222,7 @@ class ColonyWSClient:
     # к воде даже в §3-параличе (energy≤0 от хищник-дрейна) → recovery hyd→energy.
     _HYDRATION_CRITICAL = 15.0     # ≤ → water-move life-critical (bypass §3-STAY)
     _ACTION_FLEE = 10              # FLEE — survival-escape от угрозы (тоже bypass)
+    _FLEE_BOOST_ADR = 55.0         # Fib порог adrenaline для flee-boost=1 (band-ручка Фрая)
     # §3.2 (Фрай 09.06.2026): φ-onset градуального felt-drive. 0.382·100=38.2
     # (нативная hydration-шкала [0,100], НЕ squashed insula slot[1]). hydration<
     # onset → felt>0; felt=(onset−hyd)/onset∈[0,1] масштабирует приоритет
@@ -2474,14 +2475,19 @@ class ColonyWSClient:
 
     def _flee_speed_boost(self, cid) -> int:
         """Predator v0.1 Часть 2 (Фрай/Хьюберт 11.06): доп. flee-шаги ∝ adrenaline.
-        STOPGAP 11.06 (жалоба Шефа «режим супермена»): база move_speed=10 уже даёт
-        3 клетки/тик (= хищник), а boost у P40 УМНОЖАЕТ — (1+boost)×3 → телепорт на
-        6-12 клеток («прыгает не проходя путь»). Пока Хьюберт не сделает additive-
-        модель (base=хищник, boost=+1 короткий), держим boost у пола:
-          adr ≥85  → 1 (только при близкой смерти — короткий минимальный рывок ×2)
-          иначе    → 0 (бежит на базовой скорости = скорость хищника, паритет)
-        Это убирает супермен-прыжки в обычном побеге. Вернём градацию когда P40
-        переедет с multiply на additive (см. запрос Хьюберту)."""
+        ADDITIVE-модель P40 (Хьюберт 9f92495): FLEE base = flee_distance=3 (= хищник,
+        паритет), extra_steps = boost (+0..2 клетки, collision-aware). Жалоба Шефа
+        «режим супермена» снята additive-моделью (boost больше НЕ множит → телепорта
+        нет). Шеф: «ускорение лишь незначительное» → magnitude КАП на 1 (+1 клетка =
+        4 vs хищник 3, минимальный отрыв):
+          adr ≥_FLEE_BOOST_ADR (Fib 55) → 1 (минимальный отрыв, хищник близко)
+          иначе                          → 0 (паритет — бежит вровень с хищником)
+        Порог = калибровка LEARNABLE-BAND (зона Фрая): predator-спайк адреналина
+        капится pred_prox·80=80, onset +25/тик → 55 достигается на ~3-м тике (2 тика
+        паритета = лаг onset) и только при pred_prox≥0.69 (близкий хищник). Escape
+        промежуточный (быстро-реагирующая ткань отрывается, медленную ловят) →
+        selection-градиент. magnitude-кап 1 = жёсткое требование Шефа; порог/onset —
+        ручки Фрая под INTERMEDIATE escape-rate."""
         compute = self.compute
         if compute is None:
             return 0
@@ -2489,7 +2495,7 @@ class ColonyWSClient:
         if bc is None:
             return 0
         adr = float(getattr(bc, "adrenaline", 0.0))
-        if adr >= 85.0:
+        if adr >= self._FLEE_BOOST_ADR:
             return 1
         return 0
 
