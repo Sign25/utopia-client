@@ -49,6 +49,16 @@ def test_sample_income_is_cumulative():
     assert s["income_cum"] == 12.5
 
 
+def test_sample_includes_fear_damage_cum():
+    # FEAR-ось (Фрай 11.06): cost-of-encounter дима = монотонный damage_cum.
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(cortisol=60, glucose=80, hydration=90)
+    c._beh_damage_cum["a"] = 7.0
+    s = c._beh_gc_sample("a")
+    assert s["damage_cum"] == 7.0            # сырьё для neg_damage_rate
+    assert "neg_damage" in c._BEH_GC_MDE_TARGET   # power-target есть
+
+
 # ── soft edge-weight (НЕ removal, neurocore-gated) ──────────────────────
 
 def _graduated_setup():

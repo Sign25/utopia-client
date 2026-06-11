@@ -548,6 +548,14 @@ class LocalColonyCompute:
         self._behavioral_gc_enabled: bool = False  # client_flag behavioral_gc (OFF dormant)
         self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
         self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
+        # FEAR-ОСЬ cost-of-encounter (Фрай 11.06, predator v0.1 validated): 3-я
+        # живая ось (adrenaline). Дима GC = neg_damage_rate (damage_taken только
+        # от хищника = ЧИСТЫЙ fear-сигнал, не разбавлен как cortisol голодом/жаждой;
+        # continuous > binary escape-rate; reuse income-паттерн). Fear/evasion-ткань
+        # ablate → больше урона принято → specialist-keep. Sparse (0 между встречами)
+        # → robust median+MAD + power-aware + SOFT→досветка держат. ШАБЛОН: каждый
+        # новый аффорданс = wired-ось + её outcome-метрика в GC-сэмпл (Фрай).
+        self._beh_damage_cum: dict = {}   # cid → монотонный Σ damage_taken (cost-of-encounter)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
         # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
         # §3-abort НЕ ставил cooldown → дестабилизировавший узел сразу ре-eligible
@@ -591,6 +599,9 @@ class LocalColonyCompute:
             "glucose": 5.0,        # метаболический сдвиг сопоставим
             "hydration": 2.0,      # water-специалист
             "income": 1.0,         # foraging-rate сдвиг
+            "neg_damage": 0.5,     # fear-ось PLACEHOLDER — нет prior данных по урону;
+            #                        BEH-GC-WINDOW negDmg-лог даёт Фраю калибровать
+            #                        от живых значений (как cort Δ7 из Step-1).
         }
         # ПЕТЛЯ №1 (Фрай ок 10.06): SOFT-prune НЕ ставил graduation-cooldown →
         # вечная осцилляция graduate↔soft-prune (hard insert/remove ~1.5-2ч).
@@ -1509,6 +1520,7 @@ class LocalColonyCompute:
         self._tissue_gc_keep_rise.pop(cid, None)
         self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
         self._beh_income_cum.pop(cid, None)
+        self._beh_damage_cum.pop(cid, None)   # fear-ось cost-of-encounter cleanup
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -3462,7 +3474,12 @@ class LocalColonyCompute:
                     # (damage_taken>0) = хищник ТОЧНО был в radius=1 → надёжнейший
                     # сигнал контакта (лучше obs[61], который лагает/не пикует). →
                     # сильный ATTACK-bias «бей в ответ, пока он рядом».
-                    _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
+                    _dmg_taken = float(_ev_cid.get("damage_taken", 0.0) or 0.0)
+                    _just_hit = _dmg_taken > 0.0
+                    # FEAR-ось: монотонный Σ damage_taken (cost-of-encounter дима GC).
+                    if _dmg_taken > 0.0:
+                        self._beh_damage_cum[cid] = (
+                            self._beh_damage_cum.get(cid, 0.0) + _dmg_taken)
                     # CAMP-BREAK streak: consecutive just_hit = хищник camp'ит и бьёт.
                     # N тиков подряд = контратака futile (не убили) → пора рвать FLEE.
                     if _just_hit:
@@ -6402,6 +6419,7 @@ class LocalColonyCompute:
             "glucose": float(getattr(bc, "glucose", 0.0)),
             "hydration": float(getattr(bc, "hydration", 0.0)),
             "income_cum": float(self._beh_income_cum.get(cid, 0.0)),
+            "damage_cum": float(self._beh_damage_cum.get(cid, 0.0)),  # fear-ось (rate, neg)
         }
 
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
@@ -6448,6 +6466,7 @@ class LocalColonyCompute:
             "t_keep": t_keep,
             "win_ticks": 0,
             "win0_income": float(self._beh_income_cum.get(cid, 0.0)),
+            "win0_damage": float(self._beh_damage_cum.get(cid, 0.0)),
             "acc": {}, "acc_n": 0,
             "samples": {"ablate": {}, "restore": {}},
             "par_before": int(self._paralysis_window_n),
@@ -6503,23 +6522,26 @@ class LocalColonyCompute:
             return
         s = self._beh_gc_sample(cid)
         for k, v in s.items():
-            if k != "income_cum":
+            if k not in ("income_cum", "damage_cum"):   # cum'ы → RATE, не mean
                 st["acc"][k] = st["acc"].get(k, 0.0) + v
         st["acc_n"] += 1
         if st["win_ticks"] < self._BEH_GC_WINDOW:
             return
-        # закрыть окно: средние измерений + income-RATE за окно
+        # закрыть окно: средние измерений + income/neg_damage-RATE за окно
         phase = st["phase"]
         win = {k: st["acc"][k] / max(1, st["acc_n"]) for k in st["acc"]}
         inc_now = float(self._beh_income_cum.get(cid, 0.0))
         win["income"] = (inc_now - st["win0_income"]) / max(1, st["win_ticks"])
+        dmg_now = float(self._beh_damage_cum.get(cid, 0.0))
+        # neg_damage_rate: МЕНЬШЕ урона = ЛУЧШЕ (семантика «больше=лучше», как все дим).
+        win["neg_damage"] = -(dmg_now - st["win0_damage"]) / max(1, st["win_ticks"])
         for k, v in win.items():
             st["samples"][phase].setdefault(k, []).append(v)
         logger.info("brain-growth BEH-GC-WINDOW cid=%s role=%s phase=%s pair=%d "
-                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f", cid, st["role"],
-                    phase, st["pairs_done"], win.get("neg_cortisol", 0.0),
+                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f negDmg=%.3f", cid,
+                    st["role"], phase, st["pairs_done"], win.get("neg_cortisol", 0.0),
                     win.get("glucose", 0.0), win.get("hydration", 0.0),
-                    win.get("income", 0.0))
+                    win.get("income", 0.0), win.get("neg_damage", 0.0))
         # toggle фазы (soft edge-weight) + сброс окна
         new_phase = "restore" if phase == "ablate" else "ablate"
         self._beh_gc_set_edge_weight(
@@ -6530,6 +6552,7 @@ class LocalColonyCompute:
         st["acc"] = {}
         st["acc_n"] = 0
         st["win0_income"] = inc_now
+        st["win0_damage"] = dmg_now
         if new_phase == "ablate":        # завершилась полная пара (restore→ablate)
             st["pairs_done"] += 1
             if st["pairs_done"] >= st.get("pairs_target", self._BEH_GC_PAIRS):
