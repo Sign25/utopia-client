@@ -33,7 +33,7 @@ def _c():
 def test_graduation_default_off():
     c = _c()
     assert c._tissue_graduation_enabled is False     # dormant дефолт
-    assert c._tissue_grad_max == 1                   # Stage 1: ровно одна ткань
+    assert c._tissue_grad_max == 89                  # Stage 2: лимит снят (Fib backstop)
     assert abs(c._TISSUE_GRAD_EDGE_WEIGHT - 0.382) < 1e-9   # φ⁻² мягкая стыковка
 
 
@@ -104,10 +104,11 @@ def test_stage1_limit_blocks_second_graduation(monkeypatch):
     calls = []
     monkeypatch.setattr(c, "_graduate_tissue",
                         lambda cid, o: calls.append(cid) or True)
+    monkeypatch.setattr(c, "_cumulative_grad_health", lambda cid, o: None)
     c._paralysis_window_n = 0
     c.biochem["a"] = types.SimpleNamespace(energy=1000.0)
     c._grad_health_streak["a"] = c._GRAD_HEALTH_TICKS    # health-гейт открыт
-    c._tissue_grad_done = 1                          # лимит исчерпан
+    c._tissue_grad_done = c._tissue_grad_max         # backstop исчерпан (89)
     c._tissue_growth_step("a")
     assert calls == []                               # graduation НЕ стартует
     c._tissue_grad_done = 0
@@ -552,3 +553,73 @@ def test_revert_count_persists():
     dst.organisms["a"] = types.SimpleNamespace(generation=0)
     dst.restore_persisted_state("a", payload)
     assert dst._grad_revert_count["a"] == {"grown151": 2}
+
+
+# ── grad_max снят + CUMULATIVE-HEALTH-MONITOR (Фрай 11.06) ───────────────
+
+def test_grad_max_lifted():
+    c = _c()
+    assert c._tissue_grad_max == 89          # Fib backstop, не тесный 1
+
+
+def test_cumulative_monitor_inactive_below_two():
+    c = _c()
+    org = types.SimpleNamespace()
+    c.organisms["a"] = org
+    c._tissue_graduated["a"] = {"grown1": object()}   # только 1 → per-add watch
+    c.biochem["a"] = types.SimpleNamespace(energy=100.0)
+    c._grad_collective_paused = True
+    c._cumulative_grad_health("a", org)
+    assert c._grad_collective_paused is False  # <2 → нечему дрейфовать
+
+
+def test_cumulative_monitor_sheds_lowest_value_on_drift():
+    c = _c()
+    org = types.SimpleNamespace(tissue_topology_genes=[], connections=[], tissues={})
+    c.organisms["a"] = org
+    c._degraduate_node = lambda cid, o, role, reason="": c._tissue_graduated["a"].pop(role, None)
+    c._tissue_graduated["a"] = {"grown1": object(), "grown2": object(), "grown3": object()}
+    c._grad_value["a"] = {"grown1": 0.05, "grown2": 10.5, "grown3": 0.01}  # grown3 ниже
+    c.biochem["a"] = types.SimpleNamespace(energy=50.0)   # просадка
+    c._paralysis_window_n = 3                             # §3-дрейф
+    c._cumulative_grad_health("a", org)
+    assert c._grad_collective_paused is True              # пауза
+    assert "grown3" not in c._tissue_graduated["a"]       # shed наименее-ценного
+    assert "grown2" in c._tissue_graduated["a"]           # ценный (beh-KEEP) жив
+
+
+def test_cumulative_monitor_resumes_on_recovery():
+    c = _c()
+    org = types.SimpleNamespace()
+    c.organisms["a"] = org
+    c._tissue_graduated["a"] = {"grown1": object(), "grown2": object()}
+    c._grad_collective_paused = True
+    c.biochem["a"] = types.SimpleNamespace(energy=1000.0)  # здоров
+    c._paralysis_window_n = 0
+    # EWMA должна подняться к recovery-порогу — несколько тиков
+    for _ in range(60):
+        c._cumulative_grad_health("a", org)
+    assert c._grad_collective_paused is False             # возобновлён
+
+
+def test_graduation_gated_by_collective_pause(monkeypatch):
+    c = _c()
+    org = types.SimpleNamespace(tissues={"cb": object()}, connections=[],
+                                tissue_topology_genes=[])
+    c.organisms["a"] = org
+    c.predictor["a"] = object()
+    c._tissue_growth_enabled = True
+    c._tissue_graduation_enabled = True
+    monkeypatch.setattr(c, "_cerebellum_tissue_id", lambda cid, o: "cb")
+    monkeypatch.setattr(c, "_connections_saturated", lambda o: True)
+    monkeypatch.setattr(c, "_cumulative_grad_health", lambda cid, o: None)
+    monkeypatch.setattr(c, "_intrinsic_plateaued", lambda cid: False)
+    monkeypatch.setattr(c, "_maybe_start_tissue_gc", lambda cid: False)
+    calls = []
+    monkeypatch.setattr(c, "_graduate_tissue", lambda cid, o: calls.append(cid) or True)
+    c.biochem["a"] = types.SimpleNamespace(energy=1000.0)
+    c._paralysis_window_n = 0
+    c._grad_health_streak["a"] = c._GRAD_HEALTH_TICKS
+    c._grad_collective_paused = True          # пауза от collective-drift
+    c._tissue_growth_step("a")
+    assert calls == []                         # graduation НЕ стартует под паузой
