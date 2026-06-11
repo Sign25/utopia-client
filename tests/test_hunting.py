@@ -90,3 +90,42 @@ def test_hunt_suppressed_near_predator():
     obs2 = [0.0] * 64; obs2[58] = 0.9
     c._shape_action_logits(logits_safe, obs2, diet=0.618, energy_ratio=1.0)
     assert float(logits_hunt[5]) < float(logits_safe[5])   # хищник подавил охоту
+
+
+# ── hunt-when-starving = life_critical (Фрай, ДО grass-cut) ──────────────
+
+def _hunt_entry(action, energy, prey_prox, hunting=True, single=True):
+    import utopia_client.ws_client as wsm
+    ws = wsm.ColonyWSClient(server="https://e.com", token="t", colony_name="cheef",
+                            client_version="0.0.0", estimated_population=0)
+    comp = types.SimpleNamespace()
+    comp._single_organism = single
+    comp._hunting_enabled = hunting
+    comp.biochem = {"a": types.SimpleNamespace(energy=energy)}
+    comp.handle_tick = lambda *a, **k: {"a": {"action": action}}
+    comp.get_phase_emas = lambda cid: None
+    ws.compute = comp
+    obs = [0.0] * 64
+    obs[58] = prey_prox
+    out = ws._run_tick_and_build({"a": obs}, {}, {}, world_tick=0)
+    return {e["cid"]: e for e in (out or [])}["a"]
+
+
+def test_hunt_starving_is_life_critical():
+    e = _hunt_entry(action=5, energy=50, prey_prox=0.9)
+    assert e.get("life_critical") is True
+
+
+def test_hunt_fed_not_life_critical():
+    e = _hunt_entry(action=5, energy=500, prey_prox=0.9)
+    assert "life_critical" not in e
+
+
+def test_hunt_no_prey_not_life_critical():
+    e = _hunt_entry(action=5, energy=50, prey_prox=0.0)
+    assert "life_critical" not in e
+
+
+def test_hunt_starving_off_when_hunting_disabled():
+    e = _hunt_entry(action=5, energy=50, prey_prox=0.9, hunting=False)
+    assert "life_critical" not in e

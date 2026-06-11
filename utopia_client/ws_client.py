@@ -2225,6 +2225,8 @@ class ColonyWSClient:
     _FLEE_BOOST_ADR = 55.0         # Fib порог adrenaline для flee-boost=1 (band-ручка Фрая)
     _FLEE_BURST_ADR = 75.0         # прямой контакт (camp, adr~80) → burst +2 (Шеф-гибрид camp-break)
     _MOVE_ACTIONS = frozenset({0, 1, 2, 3, 10})  # локомоция (MOVE кардинальные + FLEE)
+    _HUNT_ACTIONS = frozenset({0, 1, 2, 3, 5})    # hunt-move: MOVE к добыче + ATTACK
+    _ENERGY_CRITICAL = 89.0       # ≤ → hunt life_critical (голод-bypass §3, зеркало hyd≤15)
     #                              → persist=true (Хьюберт c8c2af8): сервер дед-реконит
     #                              последний MOVE каждый world-тик пока клиент молчит
     #                              (мой client-tick медленнее world → без persist P40
@@ -2667,6 +2669,23 @@ class ColonyWSClient:
                 # реакции (adr высок=хищник близко=хорошая vigilance), паритет
                 # при слабой → evasion-ткани имеют смысл расти. start soft (max 3).
                 entry["speed_boost"] = self._flee_speed_boost(cid)
+            # HUNT-WHEN-STARVING = life_critical (Фрай hunting.md, ДО grass-cut):
+            # зеркало water-when-thirsty (hyd≤15). Голод критичен (energy≤89) +
+            # добыча достижима (obs[58]>0.15) + hunt-action (MOVE/ATTACK) → обходит
+            # §3-force-STAY. Иначе −трава→голод→§3→в параличе НЕ охотится→голод-
+            # капкан (тот же класс, что вода/хищник). Только Адам с hunting ON.
+            elif (_single and act in self._HUNT_ACTIONS
+                  and getattr(self.compute, "_hunting_enabled", False)):
+                _bc = (getattr(self.compute, "biochem", {}) or {}).get(cid)
+                _e = float(getattr(_bc, "energy", 999.0)) if _bc is not None else 999.0
+                if _e <= self._ENERGY_CRITICAL:
+                    _obs = (obs_per_cid or {}).get(cid)
+                    try:
+                        _pp = float(_obs[58]) if (_obs is not None and len(_obs) > 58) else 0.0
+                    except Exception:
+                        _pp = 0.0
+                    if _pp > 0.15:               # добыча достижима
+                        entry["life_critical"] = True
             try:
                 emas = self.compute.get_phase_emas(cid)
             except Exception:
