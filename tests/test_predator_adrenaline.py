@@ -79,13 +79,15 @@ def _ws(adr=None):
     return ws
 
 
-def test_flee_boost_additive_minor():
+def test_flee_boost_additive_with_camp_burst():
     # ADDITIVE-модель P40 (Хьюберт 9f92495): boost=+клетки, не множитель.
-    # magnitude КАП на 1 (Шеф «незначительное» = +1 клетка, 4 vs хищник 3).
-    # порог Fib 55 = band-ручка Фрая (predator-спайк капится 80, onset +25/тик).
-    assert _ws(75.0)._flee_speed_boost("a") == 1   # adr>=55 (близкий хищник) → +1 отрыв
-    assert _ws(55.0)._flee_speed_boost("a") == 1   # ровно порог
-    assert _ws(50.0)._flee_speed_boost("a") == 0   # ниже порога → паритет (лаг onset)
+    # Шеф-гибрид (11.06): прямой контакт (camp, adr>=75) → burst +2 разорвать;
+    # близкий хищник (adr>=55) → +1; иначе паритет. Burst брифовый (adr спадает).
+    assert _ws(80.0)._flee_speed_boost("a") == 2   # camp (adr~80) → burst +2
+    assert _ws(75.0)._flee_speed_boost("a") == 2   # ровно burst-порог
+    assert _ws(60.0)._flee_speed_boost("a") == 1   # близкий → +1
+    assert _ws(55.0)._flee_speed_boost("a") == 1   # ровно boost-порог
+    assert _ws(50.0)._flee_speed_boost("a") == 0   # ниже → паритет (лаг onset)
     assert _ws(20.0)._flee_speed_boost("a") == 0   # слабая реакция → паритет
 
 

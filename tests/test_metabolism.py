@@ -190,6 +190,29 @@ def test_shape_logits_flee_near_predator():
     assert float(logits[10]) > 0   # FLEE буст у хищника
 
 
+def test_shape_logits_just_hit_counterattacks():
+    # just_hit (первые тики, не camp_break) → контратака (ATTACK↑, FLEE↓).
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    logits = torch.zeros(16)
+    obs = [0.0] * 64; obs[61] = 0.9                # контакт
+    c._shape_action_logits(logits, obs, diet=0.5, energy_ratio=1.0,
+                           just_hit=True, camp_break=False)
+    assert float(logits[5]) > float(logits[10])   # ATTACK доминирует над FLEE (контратака)
+
+
+def test_shape_logits_camp_break_flees():
+    # Фрай/Шеф 11.06: контратака N тиков futile → camp_break → РВИ FLEE (life_
+    # critical → §3-исполнение + burst), гаси ATTACK. Разрывает predator-camp.
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    logits = torch.zeros(16)
+    obs = [0.0] * 64; obs[61] = 0.9                # хищник camp'ит вплотную
+    c._shape_action_logits(logits, obs, diet=0.5, energy_ratio=1.0,
+                           just_hit=True, camp_break=True)
+    assert float(logits[10]) > 0 and float(logits[5]) < 0   # рви camp, не контратакуй
+
+
 def test_skill_growth_efficiency_movespeed():
     """F5 (Фрай): eat>10 → efficiency+1, move>100 → move_speed+1, reset+changed."""
     c, org, bc = _compute_with_org()
