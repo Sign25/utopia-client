@@ -457,6 +457,12 @@ class LocalColonyCompute:
         self._stat_ate_total: dict = {}     # cid → монотонный счётчик еды (lifetime)
         self._stat_foraging: dict = {}      # foraging-доли (ws_client rollup → owner)
         self._stat_last_action: dict = {}   # cid → последнее выбранное действие (active_eat)
+        # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox (obs[61]) → adrenaline
+        # спайк → оживляет мёртвую ось adrenaline. ТРАНЗИЕНТ: decay_step −2/тик
+        # гасит после побега (safeguard Фрая). pred_prox=1 → adrenaline ~80.
+        self._last_pred_prox: dict = {}     # cid → obs[61] predator-близость
+        self._ADRENALINE_PRED_SCALE: float = 80.0  # pred_prox·scale → adrenaline (тюн по escape-rate)
+        self._ADRENALINE_PRED_GATE: float = 0.15   # ниже → шум, не спайкаем
         self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
         # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
         # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
@@ -1548,6 +1554,7 @@ class LocalColonyCompute:
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
         self._stat_ate_total.pop(cid, None)
+        self._last_pred_prox.pop(cid, None)   # predator-аффорданс cleanup
         self._skill_kill.pop(cid, None)
         self._skill_atk.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -3507,6 +3514,10 @@ class LocalColonyCompute:
                         float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)  # predator-близость
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
+                    # predator-аффорданс v0.1: стэш pred_prox (obs[61]) → спайк
+                    # adrenaline в _apply_biochem_decay (оживляет ось).
+                    self._last_pred_prox[cid] = (
+                        float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)
                     # Policy-gradient контекст (Фрай 04.06): сохранить СЭМПЛИРОВАННОЕ
                     # действие + π=softmax(action_slice) для PG-апдейта output_proj
                     # (∇log π·advantage к выбранному действию) на следующем тике —
@@ -9043,6 +9054,18 @@ class LocalColonyCompute:
             decay_step(bc, _FakeWorld())
         except Exception as e:
             logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
+        # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox → adrenaline спайк ПОСЛЕ
+        # decay (decay −2/тик уже отработал → спайк держит уровень, пока хищник
+        # воспринимается; уйдёт хищник → pred_prox→0 → не спайкаем → decay гасит =
+        # ТРАНЗИЕНТ, safeguard Фрая). Оживляет мёртвую ось adrenaline.
+        try:
+            _pp = float(self._last_pred_prox.get(cid, 0.0))
+            if _pp >= self._ADRENALINE_PRED_GATE:
+                _target = min(100.0, _pp * self._ADRENALINE_PRED_SCALE)
+                if _target > float(getattr(bc, "adrenaline", 0.0)):
+                    bc.adrenaline = _target   # спайк к воспринятой угрозе
+        except Exception as e:
+            logger.debug("adrenaline pred-spike %s: %s", cid, e)
         # Phase 4 fix 0.11.6 (29.05): glucose floor energy-coupled (вариант 1,
         # одобрен Фраем). Физиология: глюкоза поддерживается из энергозапасов
         # (гомеостаз). Если organism сыт (energy высокая, P40 держит ~500),
