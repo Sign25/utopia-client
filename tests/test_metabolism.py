@@ -471,6 +471,49 @@ def test_no_rates_noop():
     assert "c1" not in c._dead_cids
 
 
+def test_bmr_basal_drains_per_sec():
+    # BMR (Шеф 12.06, Phase 2.5h): basal-drain применяется ВСЕГДА, даже при
+    # step_cost=0 (не движется). per_sec режим — ×dt.
+    c, org, bc = _compute_with_org(energy=500.0)
+    _apply(c, "c1", {"step_cost_per_sec": 0.0, "basal_drain_per_sec": 4.0,
+                     "_per_sec": True, "telomere_decay_per_sec": 0.0,
+                     "thirst_per_sec": 0.0}, dt=2.0)
+    assert bc.energy == 492.0                  # 4/сек × 2с = 8, хотя step_cost=0
+
+
+def test_bmr_basal_applies_when_stationary_tick_mode():
+    # tick-режим Адама (single_organism): STAY → step_cost_per_tick=0 (не движется),
+    # НО basal всё равно дренит — «покой не бесплатен».
+    c, org, bc = _compute_with_org(energy=500.0)
+    c._single_organism = True
+    c._apply_metabolism("c1", {"step_cost_per_tick": 0.0,
+                               "basal_drain_per_tick": 0.056,
+                               "thirst_per_tick": 0.0,
+                               "telomere_decay_per_tick": 0.0})
+    assert round(bc.energy, 3) == 499.944       # 500 − 0.056 (basal при STAY)
+
+
+def test_bmr_basal_plus_step_when_moving():
+    # Движение: step_cost + basal оба (total drain).
+    c, org, bc = _compute_with_org(energy=500.0)
+    c._single_organism = True
+    c._apply_metabolism("c1", {"step_cost_per_tick": 0.146,
+                               "basal_drain_per_tick": 0.056,
+                               "thirst_per_tick": 0.0,
+                               "telomere_decay_per_tick": 0.0})
+    assert round(bc.energy, 3) == 499.798       # 500 − 0.146 − 0.056 = 0.202
+
+
+def test_bmr_absent_no_drain():
+    # Обратная совместимость: нет basal-поля → 0 (колонии/legacy без BMR).
+    c, org, bc = _compute_with_org(energy=500.0)
+    c._single_organism = True
+    c._apply_metabolism("c1", {"step_cost_per_tick": 0.0,
+                               "thirst_per_tick": 0.0,
+                               "telomere_decay_per_tick": 0.0})
+    assert bc.energy == 500.0
+
+
 def test_clamp_energy_nonnegative():
     c, org, bc = _compute_with_org(energy=10.0)
     _apply(c, "c1", {"step_cost_per_sec": 999.0,  # 999×1 ≫ energy → 0

@@ -931,6 +931,7 @@ class LocalColonyCompute:
         self._metab_applies: int = 0          # для METAB_DIAG
         self._metab_dt_sum: float = 0.0       # Σ dt_seconds — средний интервал
         self._metab_sc_sum: float = 0.0       # Σ step_cost_now (per-sec rate)
+        self._metab_basal_sum: float = 0.0    # Σ BMR basal-drain (Phase 2.5h, METAB_DIAG)
         # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
         # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
         # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
@@ -8977,6 +8978,7 @@ class LocalColonyCompute:
                 # §3.5: per-client-tick rate, применяется один раз за apply (БЕЗ
                 # wall-dt). Та же шкала, что income → per-tick net = серверный.
                 step_cost = float(rates.get("step_cost_per_tick", 0.0) or 0.0)
+                basal = float(rates.get("basal_drain_per_tick", 0.0) or 0.0)  # BMR — всегда
                 thirst = float(rates.get("thirst_per_tick", 0.0) or 0.0)
                 tel_decay = float(rates.get("telomere_decay_per_tick", 0.0) or 0.0)
                 self._metab_sc_sum += step_cost     # METAB_DIAG (теперь per-tick)
@@ -8997,6 +8999,7 @@ class LocalColonyCompute:
                 _sc_rate = float(rates.get("step_cost_per_sec", 0.0) or 0.0)
                 self._metab_sc_sum += _sc_rate      # per-sec rate (METAB_DIAG)
                 step_cost = _sc_rate * dt           # energy/сек × сек (wall-dt)
+                basal = float(rates.get("basal_drain_per_sec", 0.0) or 0.0) * dt  # BMR
                 thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
                 tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
                 _dmg = 0.0                           # damage только per-tick (Адам)
@@ -9006,6 +9009,14 @@ class LocalColonyCompute:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
                 self._e_cost_sum += step_cost  # ENERGY_CALIB
+            # BMR (Шеф 12.06, Phase 2.5h): базовый метаболизм — ВСЕГДА, независимо
+            # от движения/action (step_cost выше — только при движении). «Покой не
+            # бесплатен»: чинит ягода-кемп эксплойт (стоял/ленивый роуминг = вечная
+            # сытость). Идёт в _e_cost_sum → ENERGY_CALIB net учитывает BMR.
+            if basal > 0.0:
+                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - basal)
+                self._e_cost_sum += basal
+                self._metab_basal_sum = getattr(self, "_metab_basal_sum", 0.0) + basal
             # DAMAGE-канал: применяем predator-урон к авторитетной energy
             # (per-client-tick, §3.5). Идёт в _e_cost_sum → ENERGY_CALIB net
             # учитывает урон. §3 ловит energy≤0 → паралич, не смерть.
@@ -9294,11 +9305,11 @@ class LocalColonyCompute:
                 _tick_n = getattr(self, "_metab_tick_n", 0)
                 logger.info(
                     "METAB_DIAG applies=%d mean_rate=%.4f mean_dt=%.2f "
-                    "mean_drain_per_apply=%.4f tick_mode=%d/%d",
+                    "mean_drain_per_apply=%.4f basal_sum=%.1f tick_mode=%d/%d",
                     self._metab_applies, self._metab_sc_sum / _ma,
                     self._metab_dt_sum / _ma,
                     (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma),
-                    _tick_n, self._metab_applies)
+                    self._metab_basal_sum, _tick_n, self._metab_applies)
                 # DAMAGE_DIAG (Фрай 07.06): predator-давление + применённый урон.
                 # dmg_applied=Σ урона к energy за окно; pred_ticks=тиков под атакой;
                 # mean_rate=средний raw damage_per_tick; factor=калибровка.
@@ -9318,6 +9329,7 @@ class LocalColonyCompute:
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
+                self._metab_basal_sum = 0.0
                 self._metab_tick_n = 0
                 self._dmg_sum = 0.0
                 self._dmg_rate_sum = 0.0

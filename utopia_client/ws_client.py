@@ -1914,6 +1914,14 @@ class ColonyWSClient:
                     # energy per-client-tick (§3.5). 0 когда хищник не бьёт.
                     rates_per_cid[cid_s]["damage_per_tick"] = float(
                         c.get("damage_per_tick", 0.0) or 0.0)
+                    # BMR (Шеф 12.06, Phase 2.5h): базовый метаболизм — energy
+                    # тратится ВСЕГДА (STAY/EAT/GATHER тоже), не только при движении.
+                    # = step_cost × φ⁻² (Хьюберт 96c5c8f). Применяется безусловно в
+                    # _apply_metabolism (отдельно от move-gated step_cost).
+                    rates_per_cid[cid_s]["basal_drain_per_tick"] = float(
+                        c.get("basal_drain_per_tick", 0.0) or 0.0)
+                rates_per_cid[cid_s]["basal_drain_per_sec"] = float(
+                    c.get("basal_drain_per_sec", 0.0) or 0.0)
         # NAV_VIS периодический лог (раз в ~300 батчей ≈ 60с при 5Гц).
         if hasattr(self, "_nav_vis"):
             self._nav_vis["batches"] += 1
