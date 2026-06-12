@@ -887,6 +887,7 @@ class LocalColonyCompute:
         # Внутрижизненная эволюция тела → наследуется через crossover.
         self._skill_eat: dict = {}          # cid → eat count (окно 200т)
         self._skill_kill: dict = {}         # cid → kill count
+        self._skill_kill_medium: dict = {}  # cid → kill count средней дичи (Phase 2 verify, delta_e≥34)
         self._skill_atk: dict = {}          # cid → melee-ATTACK count (§6 atk-growth)
         self._skill_move: dict = {}         # cid → move count
         self._skill_window_tick: dict = {}  # cid → world_tick последнего окна
@@ -3484,6 +3485,21 @@ class LocalColonyCompute:
                             self._hunt_pounce.pop(cid, None)
                     else:
                         self._hunt_pounce.pop(cid, None)
+                    # PHASE 2 verify-диаг (Фрай satiation-тест): дип голода →
+                    # погоня → pounce. Видеть цепочку acceptance live (rate 1/50).
+                    if self._hunting_enabled and _mp_cid is not None:
+                        self._md_diag_n = getattr(self, "_md_diag_n", 0) + 1
+                        if self._md_diag_n % 50 == 0:
+                            try:
+                                logger.info(
+                                    "MEDIUM_DIAG cid=%s mdist=%s er=%.3f hungry=%d "
+                                    "capable=%d pounce=%d d_prox=%.2f", cid,
+                                    _mp_cid.get("dist"), _er,
+                                    int(_hungry_for_med), int(_capable),
+                                    int(bool(self._hunt_pounce.get(cid))),
+                                    float(obs_arr[61]) if len(obs_arr) > 61 else -1.0)
+                            except Exception:
+                                pass
                     if isinstance(_nf_cid, dict) and _nf_cid.get("edible") is not None:
                         _nf_cid = _nf_cid["edible"]
                     # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
@@ -8771,6 +8787,16 @@ class LocalColonyCompute:
                 # meat-gain → specialist-keep.
                 if delta_e > 0.0:
                     self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + delta_e
+                # PHASE 2 verify (acceptance kill-rate × 55): крупный delta_e
+                # (≥34 = Fib-порог между мелкой 21 и средней 55) → kill средней.
+                # Отдельный счётчик + лог: kill-rate, energy hold после прыжка.
+                if delta_e >= 34.0:
+                    self._skill_kill_medium[cid] = (
+                        self._skill_kill_medium.get(cid, 0) + 1)
+                    logger.info(
+                        "MEDIUM_KILL cid=%s delta_e=%.1f total_med=%d energy=%.0f",
+                        cid, delta_e, self._skill_kill_medium[cid],
+                        float(getattr(bc, "energy", 0.0)))
             # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
             # опыт фуражёра → efficiency растёт каждые 200 тиков.
             if event.get("ate") or delta_e > 0.0:
