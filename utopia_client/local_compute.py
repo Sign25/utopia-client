@@ -5215,9 +5215,30 @@ class LocalColonyCompute:
             p_ew = float(obs_arr[57]) if n > 58 else 0.0
             p_prox = float(obs_arr[58]) if n > 58 else 0.0
             p_ns, p_ew = _unit(p_ns, p_ew)
-            pw = (2.0 + 4.0 * diet) * DS * min(p_prox + 0.1, 1.0)
+            # HUNT-SEEK калибровка (Фрай 12.06, live reach=0 фикс): УБРАЛ ∝p_prox
+            # attenuation (она убивала far-seek — Адам не доходил до добычи) +
+            # ГОЛОД-модуляция. base_prey без ослабления; prey_weight = base·hunger:
+            #   сытый (energy_ratio≥φ⁻¹=0.62) → φ⁻²=0.382 → prey≈1.7·DS < grass 2.76
+            #     → форажит траву; голодный (≤φ⁻²=0.38) → 1.0 → prey≈4.47·DS≈φ×grass
+            #     → активно охотится; линейно между, clamp. = лестница дефицит→голод→hunt.
+            base_prey = (2.0 + 4.0 * diet) * DS
+            _pinv, _pinv2 = 1.0 / PHI, 1.0 / (PHI * PHI)   # 0.618 / 0.382
+            if energy_ratio >= _pinv:
+                _hf = _pinv2
+            elif energy_ratio <= _pinv2:
+                _hf = 1.0
+            else:
+                _hf = _pinv2 + (_pinv - energy_ratio) / (_pinv - _pinv2) * (1.0 - _pinv2)
+            pw = base_prey * _hf
             logits[0] -= pw * p_ns; logits[1] += pw * p_ns
             logits[2] += pw * p_ew; logits[3] -= pw * p_ew
+            # BASELINE-ОПОРТУНИЗМ (Фрай): близкая добыча (≤~5 тайлов, p_prox≥0.2)
+            # → малый фикс pull НЕзависимо от голода → adjacent prey берётся даже
+            # сытым (baseline kills для verify; contact-commit добивает на контакте).
+            if p_prox >= 0.2:
+                _opp = 1.5 * DS
+                logits[0] -= _opp * p_ns; logits[1] += _opp * p_ns
+                logits[2] += _opp * p_ew; logits[3] -= _opp * p_ew
             # Predator-градиент (беги ПРОТИВ градиента).
             d_ns = float(obs_arr[59]) if n > 61 else 0.0
             d_ew = float(obs_arr[60]) if n > 61 else 0.0
