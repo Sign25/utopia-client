@@ -483,6 +483,7 @@ class LocalColonyCompute:
         # среднюю (55, бо́льший обед). Настойчивая погоня: коммит ОДНУ цель.
         self._POUNCE_DIST: int = 3          # ≤ тайла (упор) → прыжок +1 (Manhattan)
         self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
+        self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
         # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
@@ -3486,6 +3487,19 @@ class LocalColonyCompute:
                             self._hunt_pounce.pop(cid, None)
                     else:
                         self._hunt_pounce.pop(cid, None)
+                    # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
+                    # dist≤1 ИЛИ small-prey prox≥0.5) + голод + hunting → флаг для
+                    # _maybe_force_stay: ATTACK проходит сквозь §3-force-STAY. Еда у
+                    # рта берётся даже парализованным = выход из голод-капкана.
+                    _mp_contact = (isinstance(_mp_cid, dict)
+                                   and _mp_cid.get("dist") is not None
+                                   and float(_mp_cid.get("dist", 99.0)) <= 1.0)
+                    _sp_contact = (len(obs_arr) > 58 and float(obs_arr[58]) >= 0.5)
+                    if (self._hunting_enabled and _hungry_for_med
+                            and (_mp_contact or _sp_contact)):
+                        self._hunt_contact[cid] = 1
+                    else:
+                        self._hunt_contact.pop(cid, None)
                     # PHASE 2 verify-диаг (Фрай satiation-тест): дип голода →
                     # погоня → pounce. Видеть цепочку acceptance live (rate 1/50).
                     if self._hunting_enabled and _mp_cid is not None:
@@ -5389,20 +5403,23 @@ class LocalColonyCompute:
                 # d_prox<0.3 (как DS-hunt): хищник рядом → НЕ лезь на среднюю. На
                 # контакте (dist≤1) — доминантный ATTACK + гаси move (бей, не обходи).
                 # Pounce (+1 рывок на entry) ставится в obs-loop по dist≤_POUNCE_DIST.
+                # Гейт: ГОЛОД (er<φ⁻¹) + хищника рядом нет. CONTACT-ATTACK (dist≤1)
+                # фичрит при ЛЮБОМ голоде — еда у рта берётся даже при er=0 (§3-выход
+                # из голод-капкана). ПОГОНЯ (dist>1) — только если СПОСОБЕН (er>φ⁻⁵):
+                # не гнаться умирая, но добить вплотную — всегда (Шеф 12.06).
                 if (self._hunting_enabled and medium_prey is not None
                         and d_prox < 0.3
-                        and energy_ratio < _pinv
-                        and energy_ratio > _pinv ** 5):
+                        and energy_ratio < _pinv):
                     try:
                         _mdr = float(medium_prey.get("dr", 0.0))
                         _mdc = float(medium_prey.get("dc", 0.0))
                         _mds_raw = medium_prey.get("dist")
                         _mds = float(_mds_raw) if _mds_raw is not None else 99.0
                         if _mds <= 1.0:
-                            logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (контакт)
+                            logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (контакт, даже er=0)
                             logits[0] *= 0.4; logits[1] *= 0.4
                             logits[2] *= 0.4; logits[3] *= 0.4
-                        else:
+                        elif energy_ratio > _pinv ** 5:   # погоня только если способен
                             _wm = (2.0 + 4.0 * diet) * DS * PHI  # ровная φ-погоня
                             if _mdr < 0:
                                 logits[0] += _wm          # NORTH
@@ -8706,7 +8723,14 @@ class LocalColonyCompute:
         # paralysis независим от биохимического force_stay.
         if cid in self._paralysis_until:
             if time.monotonic() < self._paralysis_until[cid]:
-                out[cid] = {"action": STAY, "target_id": None}
+                # §3-CONTACT-HUNT bypass (Шеф/Хьюберт 12.06): голодающий с дичью
+                # ВПЛОТНУЮ может ударить (выбить еду = выход из §3-капкана), как
+                # life_critical FLEE обходит §3 для побега. Узко: только ATTACK(5),
+                # только при hunting + adjacent-target-флаг. Иначе — STAY как раньше.
+                _act = (out.get(cid) or {}).get("action")
+                if not (self._hunting_enabled and _act == 5
+                        and self._hunt_contact.get(cid)):
+                    out[cid] = {"action": STAY, "target_id": None}
                 return
         try:
             from environment.biochemistry import should_force_stay  # type: ignore

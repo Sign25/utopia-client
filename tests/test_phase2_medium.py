@@ -103,6 +103,20 @@ def test_medium_contact_attack():
     assert int(l.argmax()) == 5                # доминирует argmax
 
 
+def test_medium_contact_attack_when_starving():
+    # §3-выход (Шеф 12.06): дичь ВПЛОТНУЮ → ATTACK даже при er=0 (не capable).
+    # Еда у рта берётся даже умирающим — выход из голод-капкана.
+    l = _med_nav(energy_ratio=0.0, dr=0, dc=0, dist=1.0)
+    assert float(l[5]) > 0
+    assert int(l.argmax()) == 5
+
+
+def test_medium_chase_still_gated_when_starving():
+    # погоня (dist>1) НЕ фичрит при er<φ⁻⁵ — не гнаться умирая (только контакт).
+    l = _med_nav(energy_ratio=0.05, dr=-1, dc=0, dist=5.0)
+    assert float(l[0]) == 0.0                  # нет nav-pull к далёкой дичи
+
+
 # ── pounce-флаг (obs-loop) → entry speed_boost ──────────────────────────
 
 def _ws():
@@ -142,6 +156,41 @@ def test_pounce_entry_speed_boost():
     e = {x["cid"]: x for x in (out or [])}["a"]
     assert e.get("speed_boost") == 1
     assert e.get("persist") is True
+
+
+def test_paralysis_allows_contact_hunt_attack():
+    # §3-bypass: парализован (energy=0) + дичь вплотную (флаг) + ATTACK → проходит
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._hunt_contact["a"] = 1
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 5, "target_id": None}}     # network выбрал ATTACK
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 5                     # ATTACK прошёл (не STAY)
+
+
+def test_paralysis_forces_stay_non_attack():
+    # MOVE в параличе → всё ещё STAY (bypass только для ATTACK)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._hunt_contact["a"] = 1
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 1, "target_id": None}}
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 4                     # STAY
+
+
+def test_paralysis_forces_stay_attack_no_contact():
+    # ATTACK в параличе БЕЗ contact-флага → STAY (узкий bypass)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 5, "target_id": None}}
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 4                     # STAY (нет флага)
 
 
 def test_no_pounce_boost_without_flag():

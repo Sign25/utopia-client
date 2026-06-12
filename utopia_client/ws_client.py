@@ -2717,7 +2717,10 @@ class ColonyWSClient:
                         _pp = float(_obs[58]) if (_obs is not None and len(_obs) > 58) else 0.0
                     except Exception:
                         _pp = 0.0
-                    if _pp > 0.15:               # добыча достижима
+                    # мелкая (obs[58]) ИЛИ §3-contact-флаг (средняя dist≤1, не в
+                    # obs[58]) → life_critical: сервер пропустит ATTACK сквозь §3.
+                    _contact = bool(getattr(self.compute, "_hunt_contact", {}).get(cid))
+                    if _pp > 0.15 or _contact:    # добыча достижима / вплотную
                         entry["life_critical"] = True
             try:
                 emas = self.compute.get_phase_emas(cid)
