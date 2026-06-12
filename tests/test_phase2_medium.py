@@ -193,6 +193,64 @@ def test_paralysis_forces_stay_attack_no_contact():
     assert out["a"]["action"] == 4                     # STAY (нет флага)
 
 
+def _stub_biochem():
+    # environment.biochemistry не в venv → handler early-return'ит. Стаб no-op
+    # apply_* (+ should_force_stay) → handler исполняет kill-аккумулятор-логику.
+    import sys, types as _t
+    mod = _t.ModuleType("environment.biochemistry")
+    mod.apply_feed = lambda bc: None
+    mod.apply_kill_prey = lambda bc: None
+    mod.apply_pvp_hit = lambda bc, kind=None: None
+    mod.should_force_stay = lambda bc: False
+    pkg = sys.modules.get("environment") or _t.ModuleType("environment")
+    sys.modules["environment"] = pkg
+    sys.modules["environment.biochemistry"] = mod
+
+
+def test_kill_accumulator_feeds_meat_gc():
+    # PHASE 2.5m: kill_energy_acc → meat-GC ось + точный счёт (не теряется throttle)
+    _stub_biochem()
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=500.0)
+    c._apply_biochem_events("a", {"kill_energy_acc": 275.0, "kill_count_acc": 5,
+                                  "killed": True, "delta_energy": 0.0})
+    assert c._beh_meat_cum["a"] == 275.0           # ВСЁ мясо (5×55)
+    assert c._skill_kill["a"] == 5                  # точный счёт
+    assert c._skill_kill_medium["a"] == 5           # avg=55≥34 → medium-тир
+
+
+def test_kill_accumulator_prey_not_medium():
+    _stub_biochem()
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=500.0)
+    c._apply_biochem_events("a", {"kill_energy_acc": 42.0, "kill_count_acc": 2})
+    assert c._beh_meat_cum["a"] == 42.0            # мясо в ось (мелкая тоже)
+    assert c._skill_kill["a"] == 2
+    assert c._skill_kill_medium.get("a", 0) == 0   # avg=21<34 → НЕ medium
+
+
+def test_kill_accumulator_no_double_with_killed():
+    # аккумулятор present → per-tick killed НЕ дублирует
+    _stub_biochem()
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=500.0)
+    c._apply_biochem_events("a", {"kill_energy_acc": 55.0, "kill_count_acc": 1,
+                                  "killed": True, "delta_energy": 55.0})
+    assert c._beh_meat_cum["a"] == 55.0            # НЕ 110
+    assert c._skill_kill["a"] == 1                  # НЕ 2
+
+
+def test_kill_backcompat_killed_path():
+    # нет аккумулятора → per-tick killed (бэккомпат колоний/old P40)
+    _stub_biochem()
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=500.0)
+    c._apply_biochem_events("a", {"killed": True, "delta_energy": 55.0,
+                                  "kill_energy_acc": 0.0, "kill_count_acc": 0})
+    assert c._beh_meat_cum["a"] == 55.0
+    assert c._skill_kill_medium["a"] == 1          # delta_e≥34
+
+
 def test_no_pounce_boost_without_flag():
     ws = _ws()
     comp = types.SimpleNamespace()

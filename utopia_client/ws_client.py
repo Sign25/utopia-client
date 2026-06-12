@@ -1737,6 +1737,13 @@ class ColonyWSClient:
                 "killed": bool(c.get("killed", False)),
                 "damage_taken": float(c.get("damage_taken", 0.0) or 0.0),
                 "delta_energy": float(c.get("delta_energy", 0.0) or 0.0),
+                # PHASE 2.5m (Хьюберт 9f6e9e7): kill-аккумуляторы (read-and-reset,
+                # паттерн damage_acc 0.13.15) — НЕ теряются при throttle 3-5 Hz, в
+                # отличие от per-tick killed/delta_energy. kill_energy_acc=Σ энергии
+                # убийств (55 medium / 21 prey), kill_count_acc=число. Энергия УЖЕ
+                # применена через delta_energy — здесь ТОЛЬКО meat-GC ось + счётчик.
+                "kill_energy_acc": float(c.get("kill_energy_acc", 0.0) or 0.0),
+                "kill_count_acc": int(c.get("kill_count_acc", 0) or 0),
             }
             # Infection contact (01.06.2026, Фрай): P40 детектит контакт
             # больной↔здоровый (физика пространства) → events.infection_contact.

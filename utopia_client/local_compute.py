@@ -8801,20 +8801,37 @@ class LocalColonyCompute:
                 # Питание = и energy И glucose: при положительном delta_energy
                 # без явного ate всё равно восполняем glucose (apply_feed).
                 apply_feed(bc)
-            if event.get("killed"):
-                apply_kill_prey(bc)                 # dopamine-спайк (награда, ось оживает)
-                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1  # F5
-                # HUNT-ось (Фрай hunting.md): meat-energy = РЕАЛЬНЫЙ delta_energy
-                # этого kill-тика (Хьюберт: killed=True → чистый meat, grass=killed
-                # False/ate=True; delta_energy отражает YIELD_FACTOR-кноб + server-
-                # grant, точнее моего φ⁷×diet). Изолирован от plant-income → чистый
-                # hunt-сигнал для GC. Hunting-ткань ablate → меньше kills → меньше
-                # meat-gain → specialist-keep.
+            # PHASE 2.5m (Хьюберт 9f6e9e7): kill-АККУМУЛЯТОР — надёжный путь. per-tick
+            # killed/delta_energy ТЕРЯЛИСЬ при obs-throttle (3-5 Hz): _owned_last_events
+            # перезатирался каждый server-тик, клиент читал реже → 4 из 5 kills дропались.
+            # kill_energy_acc/kill_count_acc (read-and-reset, паттерн damage_acc) — Σ с
+            # прошлого чтения, НЕ теряются. Энергия УЖЕ применена через delta_energy
+            # (выше) — здесь ТОЛЬКО dopamine + meat-GC ось + счётчики (НЕ double-add energy).
+            _ke_acc = float(event.get("kill_energy_acc", 0.0) or 0.0)
+            _kc_acc = int(event.get("kill_count_acc", 0) or 0)
+            if _kc_acc > 0:
+                for _ in range(_kc_acc):
+                    apply_kill_prey(bc)             # dopamine per kill (награда, ось оживает)
+                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + _kc_acc
+                # meat-GC ось (Фрай hunting.md): ВСЁ мясо (prey 21 + medium 55) →
+                # hunt-сигнал, изолирован от plant-income. Надёжный Σ из аккумулятора.
+                self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + _ke_acc
+                # medium-тир: avg energy/kill ≥34 (Fib-порог 21<x<55) → средняя дичь.
+                _avg_ke = _ke_acc / _kc_acc
+                if _avg_ke >= 34.0:
+                    self._skill_kill_medium[cid] = (
+                        self._skill_kill_medium.get(cid, 0) + _kc_acc)
+                    logger.info(
+                        "MEDIUM_KILL cid=%s ke_acc=%.1f count=%d avg=%.1f "
+                        "total_med=%d energy=%.0f", cid, _ke_acc, _kc_acc,
+                        _avg_ke, self._skill_kill_medium[cid],
+                        float(getattr(bc, "energy", 0.0)))
+            elif event.get("killed"):
+                # БЭККОМПАТ (old P40 / колонии без аккумулятора): per-tick killed.
+                apply_kill_prey(bc)
+                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1
                 if delta_e > 0.0:
                     self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + delta_e
-                # PHASE 2 verify (acceptance kill-rate × 55): крупный delta_e
-                # (≥34 = Fib-порог между мелкой 21 и средней 55) → kill средней.
-                # Отдельный счётчик + лог: kill-rate, energy hold после прыжка.
                 if delta_e >= 34.0:
                     self._skill_kill_medium[cid] = (
                         self._skill_kill_medium.get(cid, 0) + 1)
