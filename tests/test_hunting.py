@@ -132,3 +132,33 @@ def test_hunt_no_prey_not_life_critical():
 def test_hunt_starving_off_when_hunting_disabled():
     e = _hunt_entry(action=5, energy=50, prey_prox=0.9, hunting=False)
     assert "life_critical" not in e
+
+
+# ── hunt-seek: голод-модуляция + baseline-опортунизм (Фрай 12.06) ────────
+
+def _prey_nav(energy_ratio, p_prox, diet=0.618):
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    obs = [0.0] * 64
+    obs[56] = 1.0           # prey-направление
+    obs[58] = p_prox
+    c._shape_action_logits(l, obs, diet=diet, energy_ratio=energy_ratio)
+    return float(l[1])      # prey-nav move-компонента
+
+
+def test_huntseek_hungry_stronger_than_fed():
+    # голод-модуляция: голодный активно охотится, сытый форажит траву
+    far_fed = _prey_nav(0.8, 0.1)       # сытый, далёкая добыча
+    far_hungry = _prey_nav(0.2, 0.1)    # голодный, далёкая добыча
+    assert far_hungry > far_fed
+    assert far_hungry > 4.0             # ≈4.47·DS (активная охота)
+    assert far_fed < 2.76               # < grass-нав (форажит траву)
+
+
+def test_huntseek_opportunism_close_prey():
+    # baseline-опортунизм: близкая добыча берётся даже сытым (контакт-commit добьёт)
+    far_fed = _prey_nav(0.8, 0.1)       # сытый, далеко → нет опортунизма
+    close_fed = _prey_nav(0.8, 0.5)     # сытый, близко (p_prox≥0.2) → опортунизм
+    assert close_fed > far_fed
+    assert close_fed > 2.76             # > grass-нав → сворачивает к близкой добыче
