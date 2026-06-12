@@ -3448,6 +3448,14 @@ class LocalColonyCompute:
                                 obs_tensor[0, 63] = _o63
                         except Exception:
                             pass
+                    # Phase 1 feeding-ladder (Фрай go / Хьюберт d972ea7): НАВИГАЦИЯ
+                    # к nearest-EDIBLE (мимо обесцененной травы). obs[62-63] ВЫШЕ
+                    # остались на legacy nearest_flora (discrimination, Фрай-инвариант
+                    # «не прячем траву»). Переключаем _nf_cid на edible-цель ТОЛЬКО
+                    # для нав-кода ниже (arrival-commit + stuck). Нет edible (колония
+                    # / нет съедобного рядом) → fallback legacy (нав к чему есть).
+                    if isinstance(_nf_cid, dict) and _nf_cid.get("edible") is not None:
+                        _nf_cid = _nf_cid["edible"]
                     # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
                     # dist-тренд (arrival-прокси) + obs[62/63]. Rate-limit 1/50.
                     if _nf_cid is not None:

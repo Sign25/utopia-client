@@ -1781,6 +1781,14 @@ class ColonyWSClient:
             # (Elder argmin). Прайор: dist==0→GATHER, dist>0→точный шаг, None→smell.
             _p40_nf = c.get("nearest_flora")
             if _p40_nf is not None:
+                # Phase 1 feeding-ladder (Хьюберт d972ea7, Adam-only): nearest_EDIBLE
+                # для НАВИГАЦИИ (мимо обесцененной травы); legacy nearest_flora +
+                # obs[63] kind остаются для discrimination (Фрай-инвариант). Кладём
+                # edible-цель в ["edible"] — obs[62-63] читают legacy, нав читает edible.
+                _p40_ne = c.get("nearest_edible_flora")
+                if _p40_ne is not None:
+                    _p40_nf = dict(_p40_nf)
+                    _p40_nf["edible"] = _p40_ne
                 nearest_flora_per_cid[cid_s] = _p40_nf
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")
