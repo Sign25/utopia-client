@@ -60,10 +60,13 @@ def test_hunt_attack_when_omnivore_prey_reachable():
     c = _c()
     logits = torch.zeros(16)
     obs = [0.0] * 64
-    obs[58] = 0.9                                 # добыча достижима (p_prox)
+    obs[56] = 0.8                                 # prey-направление (nav тянет move)
+    obs[58] = 0.9                                 # добыча НА КОНТАКТЕ (p_prox)
     # diet>0.5 (всеядный), хищника нет (obs[61]=0)
     c._shape_action_logits(logits, obs, diet=0.618, energy_ratio=1.0)
-    assert float(logits[5]) > 0                   # ATTACK по добыче (перебил §4-suppress)
+    assert float(logits[5]) > 0                   # ATTACK по добыче
+    # КОНТАКТ-COMMIT: ATTACK ПОБЕЖДАЕТ argmax (не «наезжает» move'ом на добычу)
+    assert int(logits.argmax()) == 5
 
 
 def test_herbivore_no_hunt_attack():

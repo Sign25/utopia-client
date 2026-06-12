@@ -5293,6 +5293,14 @@ class LocalColonyCompute:
                 if p_prox > 0.3 and d_prox < 0.3:
                     logits[5] += (1.5 + 2.0 * min(p_prox, 1.0)) * DS  # > φ·DS suppress
                     logits[10] -= 0.3 * DS       # не беги от добычи (не угроза)
+                    # КОНТАКТ-COMMIT (fix 12.06, live: Адам на prey_prox=1.0 ВЫБИРАЛ
+                    # MOVE не ATTACK — prey-НАВИГАЦИЯ (pw, выше) тянет move даже на
+                    # контакте → «наезжает» и обходит, не бьёт). Зеркало §4 just_hit:
+                    # на контакте ГАСИМ move + доминантный ATTACK → бей, не обходи.
+                    if p_prox > 0.5:
+                        logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (как §4)
+                        logits[0] *= 0.4; logits[1] *= 0.4
+                        logits[2] *= 0.4; logits[3] *= 0.4
                 elif p_prox <= 0.1:
                     logits[5] -= 0.5 * DS        # добычи нет → ATTACK впустую
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
