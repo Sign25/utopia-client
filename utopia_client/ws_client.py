@@ -1780,16 +1780,24 @@ class ColonyWSClient:
             # nearest_flora точный нав-сигнал (Хьюберт 05.06): {dr,dc,dist,kind}|None
             # (Elder argmin). Прайор: dist==0→GATHER, dist>0→точный шаг, None→smell.
             _p40_nf = c.get("nearest_flora")
-            if _p40_nf is not None:
+            # PHASE 2 (Хьюберт 39ba52b): nearest_medium_prey — отдельный нав-сигнал
+            # на среднюю дичь (55, труднее мелкой). Может прийти БЕЗ флоры рядом →
+            # держим контейнер даже при nearest_flora=None (kind=None → discrimination
+            # не путаем; нав читает ["medium_prey"] по паттерну ["edible"]).
+            _p40_mp = c.get("nearest_medium_prey")
+            if _p40_nf is not None or _p40_mp is not None:
+                _ent = dict(_p40_nf) if _p40_nf is not None else {
+                    "dr": 0, "dc": 0, "dist": None, "kind": None}
                 # Phase 1 feeding-ladder (Хьюберт d972ea7, Adam-only): nearest_EDIBLE
                 # для НАВИГАЦИИ (мимо обесцененной травы); legacy nearest_flora +
                 # obs[63] kind остаются для discrimination (Фрай-инвариант). Кладём
                 # edible-цель в ["edible"] — obs[62-63] читают legacy, нав читает edible.
                 _p40_ne = c.get("nearest_edible_flora")
                 if _p40_ne is not None:
-                    _p40_nf = dict(_p40_nf)
-                    _p40_nf["edible"] = _p40_ne
-                nearest_flora_per_cid[cid_s] = _p40_nf
+                    _ent["edible"] = _p40_ne
+                if _p40_mp is not None:
+                    _ent["medium_prey"] = _p40_mp
+                nearest_flora_per_cid[cid_s] = _ent
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")
             if _p40_cf is not None:
@@ -2668,6 +2676,14 @@ class ColonyWSClient:
             # world-тик пока следующий client-tick не передумает (75т=5с safety-STAY).
             if _single and act in self._MOVE_ACTIONS:
                 entry["persist"] = True
+            # PHASE 2 POUNCE (Фрай 12.06): в упор к средней дичи (dist≤_POUNCE_DIST,
+            # голоден+способен — флаг ставит obs-loop) → +1 рывок на кардинальном
+            # MOVE = короткий burst, нагоняет добычу до контакта (НЕ непрерывный
+            # буст: Адам база=добыча база, нагон за счёт усталости + этого прыжка).
+            # FLEE (10) свой speed_boost ниже — pounce только на 0-3.
+            if (_single and act in (0, 1, 2, 3)
+                    and getattr(self.compute, "_hunt_pounce", {}).get(cid)):
+                entry["speed_boost"] = 1
             # life_critical (Фрай/Хьюберт 11.06): FLEE = survival-escape от угрозы
             # → P40 обходит §3-force-STAY (бежать от хищника даже в параличе).
             # water-seek-флаг навешивается позже в _apply_water_seek (по hydration).

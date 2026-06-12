@@ -476,6 +476,13 @@ class LocalColonyCompute:
         # learnable ось (ткань-anticipation рвёт раньше → меньше drain → GC отбирает).
         self._camp_hit_streak: dict = {}    # cid → consecutive just_hit (camp-длительность)
         self._CAMP_BREAK_TICKS: int = 5     # Fib-дебаунс: после N futile контратак → рви
+        # PHASE 2 feeding-ladder — POUNCE-модель (Фрай 12.06): средняя дичь speed=2
+        # = Адам база 2 (паритет) БЕЗ непрерывного буста. Адам гонит на базе →
+        # добыча УСТАЁТ (Хьюберт tiring) → Адам нагоняет до упора → ПРЫЖОК +1 (короткий
+        # extra_step burst) → контакт → 2 удара. Арбитраж: голод И способен → гнать
+        # среднюю (55, бо́льший обед). Настойчивая погоня: коммит ОДНУ цель.
+        self._POUNCE_DIST: int = 3          # ≤ тайла (упор) → прыжок +1 (Manhattan)
+        self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
         # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
@@ -3435,7 +3442,8 @@ class LocalColonyCompute:
                     # server-side → инжектим сами (само-содержащееся). obs[62]=dist-
                     # сигнал 1/(1+dist) (1=на флоре, →0 далеко), obs[63]=kind/3. Мотор
                     # читает → медленный канал учит «GATHER↔высокий obs62» = контекст.
-                    if _nf_cid is not None and len(obs_arr) > 63:
+                    if (_nf_cid is not None and len(obs_arr) > 63
+                            and _nf_cid.get("dist") is not None):
                         try:
                             _d = float(_nf_cid.get("dist", 0.0) or 0.0)
                             _k = float(_nf_cid.get("kind", 0) or 0)
@@ -3454,6 +3462,28 @@ class LocalColonyCompute:
                     # «не прячем траву»). Переключаем _nf_cid на edible-цель ТОЛЬКО
                     # для нав-кода ниже (arrival-commit + stuck). Нет edible (колония
                     # / нет съедобного рядом) → fallback legacy (нав к чему есть).
+                    # PHASE 2 (Фрай 12.06, pounce-модель): средняя дичь = отдельная
+                    # цель. Извлекаем ДО edible-reassign (тот перезатирает _nf_cid).
+                    # _mp_cid = {dr,dc,dist,...}|None. Pounce-флаг: голоден (надо
+                    # лезть на 55) И способен (не критично-истощён) И дичь в упоре
+                    # (dist ≤ _POUNCE_DIST) → +1 рывок на entry (короткий burst).
+                    _mp_cid = (_nf_cid.get("medium_prey")
+                               if isinstance(_nf_cid, dict) else None)
+                    _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
+                    _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
+                    if (self._hunting_enabled and _mp_cid is not None
+                            and _hungry_for_med and _capable):
+                        try:
+                            _mpd = _mp_cid.get("dist")
+                            if (_mpd is not None
+                                    and float(_mpd) <= self._POUNCE_DIST):
+                                self._hunt_pounce[cid] = 1
+                            else:
+                                self._hunt_pounce.pop(cid, None)
+                        except (TypeError, ValueError):
+                            self._hunt_pounce.pop(cid, None)
+                    else:
+                        self._hunt_pounce.pop(cid, None)
                     if isinstance(_nf_cid, dict) and _nf_cid.get("edible") is not None:
                         _nf_cid = _nf_cid["edible"]
                     # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
@@ -3560,7 +3590,8 @@ class LocalColonyCompute:
                                               on_flora=_onf,
                                               just_hit=_just_hit,
                                               camp_break=_camp_break,
-                                              flora_abandon_dir=_abandon_dir)
+                                              flora_abandon_dir=_abandon_dir,
+                                              medium_prey=_mp_cid)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -5104,7 +5135,8 @@ class LocalColonyCompute:
                              on_flora: bool = False,
                              just_hit: bool = False,
                              camp_break: bool = False,
-                             flora_abandon_dir: "Optional[int]" = None) -> None:
+                             flora_abandon_dir: "Optional[int]" = None,
+                             medium_prey=None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -5332,6 +5364,40 @@ class LocalColonyCompute:
                         logits[2] *= 0.4; logits[3] *= 0.4
                 elif p_prox <= 0.1:
                     logits[5] -= 0.5 * DS        # добычи нет → ATTACK впустую
+                # PHASE 2 MEDIUM-SEEK (Фрай 12.06 pounce): арбитраж — голоден И
+                # способен → коммит ОДНУ среднюю дичь (55 = больший обед, тянет
+                # СИЛЬНЕЕ мелкой 21). Настойчивая погоня: ровный direction-only pull
+                # по dr/dc (НЕ ∝1/dist — иначе бросит далёкую, как был reach=0 фикс
+                # для мелкой). φ-доминантна над мелкой-prey nav. Survival-гейт
+                # d_prox<0.3 (как DS-hunt): хищник рядом → НЕ лезь на среднюю. На
+                # контакте (dist≤1) — доминантный ATTACK + гаси move (бей, не обходи).
+                # Pounce (+1 рывок на entry) ставится в obs-loop по dist≤_POUNCE_DIST.
+                if (self._hunting_enabled and medium_prey is not None
+                        and d_prox < 0.3
+                        and energy_ratio < _pinv
+                        and energy_ratio > _pinv ** 5):
+                    try:
+                        _mdr = float(medium_prey.get("dr", 0.0))
+                        _mdc = float(medium_prey.get("dc", 0.0))
+                        _mds_raw = medium_prey.get("dist")
+                        _mds = float(_mds_raw) if _mds_raw is not None else 99.0
+                        if _mds <= 1.0:
+                            logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (контакт)
+                            logits[0] *= 0.4; logits[1] *= 0.4
+                            logits[2] *= 0.4; logits[3] *= 0.4
+                        else:
+                            _wm = (2.0 + 4.0 * diet) * DS * PHI  # ровная φ-погоня
+                            if _mdr < 0:
+                                logits[0] += _wm          # NORTH
+                            elif _mdr > 0:
+                                logits[1] += _wm          # SOUTH
+                            if _mdc > 0:
+                                logits[2] += _wm          # EAST
+                            elif _mdc < 0:
+                                logits[3] += _wm          # WEST
+                            logits[10] -= 0.3 * DS        # не беги от добычи
+                    except (TypeError, ValueError):
+                        pass
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
