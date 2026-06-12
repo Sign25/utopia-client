@@ -2506,8 +2506,9 @@ class ColonyWSClient:
         if bc is None:
             return 0
         adr = float(getattr(bc, "adrenaline", 0.0))
-        if adr >= self._FLEE_BURST_ADR:
-            return 2     # прямой контакт → burst разорвать camp
+        # Шеф 12.06: рывок КАП на +1 (убрал +2 burst). С новой базой Адама=2
+        # (Хьюберт server-side) boost+1 → 3 клетки > хищник 2.24 → отрыв/camp-break;
+        # база 2 < хищник → нужен boost для побега. Добыча <2 → Адам ловит + рывком.
         if adr >= self._FLEE_BOOST_ADR:
             return 1
         return 0

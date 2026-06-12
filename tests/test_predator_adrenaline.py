@@ -79,12 +79,10 @@ def _ws(adr=None):
     return ws
 
 
-def test_flee_boost_additive_with_camp_burst():
-    # ADDITIVE-модель P40 (Хьюберт 9f92495): boost=+клетки, не множитель.
-    # Шеф-гибрид (11.06): прямой контакт (camp, adr>=75) → burst +2 разорвать;
-    # близкий хищник (adr>=55) → +1; иначе паритет. Burst брифовый (adr спадает).
-    assert _ws(80.0)._flee_speed_boost("a") == 2   # camp (adr~80) → burst +2
-    assert _ws(75.0)._flee_speed_boost("a") == 2   # ровно burst-порог
+def test_flee_boost_capped_at_one():
+    # Шеф 12.06: рывок КАП на +1 (убрал +2 burst). База Адама=2 (Хьюберт),
+    # boost+1 → 3 > хищник 2.24 → отрыв/camp-break + охота рывком.
+    assert _ws(80.0)._flee_speed_boost("a") == 1   # высокий adr → +1 (не +2)
     assert _ws(60.0)._flee_speed_boost("a") == 1   # близкий → +1
     assert _ws(55.0)._flee_speed_boost("a") == 1   # ровно boost-порог
     assert _ws(50.0)._flee_speed_boost("a") == 0   # ниже → паритет (лаг onset)
