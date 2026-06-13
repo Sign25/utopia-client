@@ -484,6 +484,7 @@ class LocalColonyCompute:
         self._POUNCE_DIST: int = 3          # ≤ тайла (упор) → прыжок +1 (Manhattan)
         self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
         self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
+        self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
         # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
@@ -3500,6 +3501,13 @@ class LocalColonyCompute:
                         self._hunt_contact[cid] = 1
                     else:
                         self._hunt_contact.pop(cid, None)
+                    # §3-EAT bypass (eating.md): на флора-тайле + голоден → EAT
+                    # проходит сквозь §3-force-STAY (выедание из §3 через еду, как
+                    # hunt-out-of-§3). Под passive-gate §3-Адам ДОЛЖЕН EAT, иначе капкан.
+                    if _onf and _hungry_for_med:
+                        self._on_food[cid] = 1
+                    else:
+                        self._on_food.pop(cid, None)
                     # PHASE 2 verify-диаг (Фрай satiation-тест): дип голода →
                     # погоня → pounce. Видеть цепочку acceptance live (rate 1/50).
                     if self._hunting_enabled and _mp_cid is not None:
@@ -5243,11 +5251,13 @@ class LocalColonyCompute:
                         # перебьёт, EAT-коммит НЕ эмитим). Сыт → слабый прайор (как было).
                         _dpx_eat = float(obs_arr[61]) if n > 61 else 0.0
                         if energy_ratio < (1.0 / PHI) and _dpx_eat < 0.15:
-                            logits[14] += 2.0 * PHI * DS   # доминантный EAT (×2φ, как arrival-commit)
+                            # РЕШИТЕЛЬНЫЙ EAT (мотор-биас на move из вакуум-эры
+                            # перебивал — гасим move жёстче ×0.2, EAT ×2.5φ).
+                            logits[14] += 2.5 * PHI * DS   # доминантный EAT
                             logits[13] += PHI * DS         # GATHER (на месте)
                             logits[4] += (1.0 / PHI) * DS  # STAY-поддержка
-                            logits[0] *= 0.4; logits[1] *= 0.4   # гаси move (не уходи с еды)
-                            logits[2] *= 0.4; logits[3] *= 0.4
+                            logits[0] *= 0.2; logits[1] *= 0.2   # жёстко гаси move (не уходи с еды)
+                            logits[2] *= 0.2; logits[3] *= 0.2
                         else:
                             logits[13] += 2.0 * DS    # GATHER (сыт/хищник — слабый прайор)
                             logits[14] += 1.0 * DS    # EAT
@@ -5263,7 +5273,11 @@ class LocalColonyCompute:
                         # специфично (nearest_flora 62/63). С §4 predator (по obs[61],
                         # ниже) НЕ конфликтует — хищник вплотную перебьёт (×0.5 move +
                         # ATTACK/FLEE). Встанет НА тайл → след.тик dist=0 → GATHER/EAT.
-                        _cw = 2.0 * PHI * DS          # commit-сила шага
+                        # ARRIVAL-to-LAND: голоден → сильнее коммит ПОСАДКИ (×3φ),
+                        # чтобы реально встать на еду (onf-bottleneck: Адам не лендил,
+                        # мотор тащил мимо). Сыт → обычный 2φ.
+                        _hungry_land = energy_ratio < (1.0 / PHI)
+                        _cw = (3.0 if _hungry_land else 2.0) * PHI * DS  # commit-сила шага
                         _af = PHI * DS                # анти-флип обратного напр.
                         if _dr < 0:
                             logits[0] += _cw; logits[1] -= _af   # NORTH, гаси SOUTH
@@ -8738,13 +8752,15 @@ class LocalColonyCompute:
         # paralysis независим от биохимического force_stay.
         if cid in self._paralysis_until:
             if time.monotonic() < self._paralysis_until[cid]:
-                # §3-CONTACT-HUNT bypass (Шеф/Хьюберт 12.06): голодающий с дичью
-                # ВПЛОТНУЮ может ударить (выбить еду = выход из §3-капкана), как
-                # life_critical FLEE обходит §3 для побега. Узко: только ATTACK(5),
-                # только при hunting + adjacent-target-флаг. Иначе — STAY как раньше.
+                # §3-bypass (Шеф/Хьюберт 12-13.06): голодающий выедает себя из §3 —
+                # ATTACK(5) по дичи ВПЛОТНУЮ (hunt-out) ИЛИ EAT(14) на флора-тайле
+                # (eat-out, под passive-gate). Как life_critical FLEE обходит §3.
+                # Узко: только эти действия + соответствующий флаг. Иначе — STAY.
                 _act = (out.get(cid) or {}).get("action")
-                if not (self._hunting_enabled and _act == 5
-                        and self._hunt_contact.get(cid)):
+                _hunt_ok = (self._hunting_enabled and _act == 5
+                            and self._hunt_contact.get(cid))
+                _eat_ok = (_act == 14 and self._on_food.get(cid))
+                if not (_hunt_ok or _eat_ok):
                     out[cid] = {"action": STAY, "target_id": None}
                 return
         try:

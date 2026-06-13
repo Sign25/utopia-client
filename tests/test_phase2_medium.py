@@ -182,6 +182,29 @@ def test_paralysis_forces_stay_non_attack():
     assert out["a"]["action"] == 4                     # STAY
 
 
+def test_paralysis_allows_eat_on_food():
+    # §3-EAT bypass (eating.md): парализован + на еде + EAT → проходит (выедание из §3)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._on_food["a"] = 1
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 14, "target_id": None}}    # EAT
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 14                    # EAT прошёл (не STAY)
+
+
+def test_paralysis_forces_stay_eat_no_food():
+    # EAT в параличе БЕЗ on_food-флага → STAY (узкий bypass)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 14, "target_id": None}}
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 4                     # STAY (нет флага)
+
+
 def test_paralysis_forces_stay_attack_no_contact():
     # ATTACK в параличе БЕЗ contact-флага → STAY (узкий bypass)
     import time as _t
