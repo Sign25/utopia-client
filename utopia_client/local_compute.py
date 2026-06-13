@@ -3508,6 +3508,12 @@ class LocalColonyCompute:
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
+                    # EAT_REFLEX триангуляция (rate 1/100): почему рефлекс не фичрит.
+                    self._eatdiag_n = getattr(self, "_eatdiag_n", 0) + 1
+                    if self._eatdiag_n % 100 == 0:
+                        logger.info("EAT_DIAG cid=%s onf=%d hungry=%d on_food=%d er=%.3f",
+                                    cid, int(_onf), int(_hungry_for_med),
+                                    int(bool(self._on_food.get(cid))), _er)
                     # PHASE 2 verify-диаг (Фрай satiation-тест): дип голода →
                     # погоня → pounce. Видеть цепочку acceptance live (rate 1/50).
                     if self._hunting_enabled and _mp_cid is not None:
