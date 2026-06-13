@@ -4073,6 +4073,12 @@ class LocalColonyCompute:
                 self._apply_biochem_mental_break(cid, world_tick)
                 self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
+                # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
+                # force-STAY). Раньше _stat_last_action писался при селекторе (выбор
+                # мотора) → рефлекс-EAT не отражался (телеметрия слепа к override).
+                _fa = (out.get(cid) or {}).get("action")
+                if _fa is not None:
+                    self._stat_last_action[cid] = int(_fa)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
@@ -8760,6 +8766,10 @@ class LocalColonyCompute:
         if _dpx >= 0.15:                      # хищник близко → FLEE приоритет, не ест
             return
         out[cid] = {"action": 14, "target_id": None}   # EAT — детерминированно
+        self._eat_reflex_n = getattr(self, "_eat_reflex_n", 0) + 1
+        if self._eat_reflex_n % 20 == 0:     # прямое подтверждение срабатывания
+            logger.info("EAT_REFLEX cid=%s fired #%d (on_food, d_prox=%.2f) → EAT override",
+                        cid, self._eat_reflex_n, _dpx)
 
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
