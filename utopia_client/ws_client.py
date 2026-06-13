@@ -1744,7 +1744,24 @@ class ColonyWSClient:
                 # применена через delta_energy — здесь ТОЛЬКО meat-GC ось + счётчик.
                 "kill_energy_acc": float(c.get("kill_energy_acc", 0.0) or 0.0),
                 "kill_count_acc": int(c.get("kill_count_acc", 0) or 0),
+                # PHASE B eating (#6, eating.md): прогресс многотикового поедания —
+                # eating_progress(0..1)/target_kind/remaining/total. Рефлекс-floor
+                # (Phase A) уже держит «ест→продолжать»; B потребляет progress для
+                # awareness + near-complete-commit (не бросать ради upgrade).
+                "eating_progress": float(c.get("eating_progress", 0.0) or 0.0),
+                "eating_target_kind": c.get("eating_target_kind"),
+                "eating_remaining_ticks": int(c.get("eating_remaining_ticks", 0) or 0),
+                "eating_total_ticks": int(c.get("eating_total_ticks", 0) or 0),
             }
+            # PHASE B confirm: подтвердить эмит obs #6 Хьюбертом (1/50, rate-limited).
+            if "eating_progress" in c:
+                self._eatprog_n = getattr(self, "_eatprog_n", 0) + 1
+                if self._eatprog_n % 50 == 0:
+                    logger.info("EAT_PROGRESS cid=%s progress=%.2f kind=%s remain=%s/%s",
+                                cid_s, float(c.get("eating_progress", 0.0) or 0.0),
+                                c.get("eating_target_kind"),
+                                c.get("eating_remaining_ticks"),
+                                c.get("eating_total_ticks"))
             # Infection contact (01.06.2026, Фрай): P40 детектит контакт
             # больной↔здоровый (физика пространства) → events.infection_contact.
             # Прокидываем в event → _apply_biochem_events бутстрапит infection

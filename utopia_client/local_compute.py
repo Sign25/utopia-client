@@ -485,6 +485,7 @@ class LocalColonyCompute:
         self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
         self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
         self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
+        self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
         # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
@@ -3504,7 +3505,14 @@ class LocalColonyCompute:
                     # §3-EAT bypass (eating.md): на флора-тайле + голоден → EAT
                     # проходит сквозь §3-force-STAY (выедание из §3 через еду, как
                     # hunt-out-of-§3). Под passive-gate §3-Адам ДОЛЖЕН EAT, иначе капкан.
-                    if _onf and _hungry_for_med:
+                    # PHASE B (#6): доедать НАЧАТЫЙ укус, даже если на миг сыт (0<progress<1)
+                    # — «не бросать near-complete ради upgrade» (commit реален). Под timer
+                    # energy@completion Адам обычно голоден всё поедание; это страховка.
+                    _evp = (events_per_cid.get(cid) or {}) if events_per_cid else {}
+                    _eprog = float(_evp.get("eating_progress", 0.0) or 0.0)
+                    self._eating_progress[cid] = _eprog
+                    _mid_eat = 0.0 < _eprog < 1.0
+                    if _onf and (_hungry_for_med or _mid_eat):
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
