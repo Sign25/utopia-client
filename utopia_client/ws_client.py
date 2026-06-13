@@ -1752,6 +1752,9 @@ class ColonyWSClient:
                 "eating_target_kind": c.get("eating_target_kind"),
                 "eating_remaining_ticks": int(c.get("eating_remaining_ticks", 0) or 0),
                 "eating_total_ticks": int(c.get("eating_total_ticks", 0) or 0),
+                # PHASE C (eating.md): труп от kill. on_corpse — Адам НА тайле трупа
+                # → corpse-EAT рефлекс (тот же детерм. floor, что on_flora).
+                "on_corpse": bool(c.get("on_corpse", False)),
             }
             # PHASE B confirm: подтвердить эмит obs #6 Хьюбертом (1/50, rate-limited).
             if "eating_progress" in c:
@@ -1809,7 +1812,11 @@ class ColonyWSClient:
             # держим контейнер даже при nearest_flora=None (kind=None → discrimination
             # не путаем; нав читает ["medium_prey"] по паттерну ["edible"]).
             _p40_mp = c.get("nearest_medium_prey")
-            if _p40_nf is not None or _p40_mp is not None:
+            # PHASE C: nearest_corpse {dr,dc,dist,energy_remaining} — нав к трупу (как
+            # medium_prey). Держим контейнер даже при nearest_flora=None.
+            _p40_corpse = c.get("nearest_corpse")
+            if (_p40_nf is not None or _p40_mp is not None
+                    or _p40_corpse is not None):
                 _ent = dict(_p40_nf) if _p40_nf is not None else {
                     "dr": 0, "dc": 0, "dist": None, "kind": None}
                 # Phase 1 feeding-ladder (Хьюберт d972ea7, Adam-only): nearest_EDIBLE
@@ -1821,6 +1828,8 @@ class ColonyWSClient:
                     _ent["edible"] = _p40_ne
                 if _p40_mp is not None:
                     _ent["medium_prey"] = _p40_mp
+                if _p40_corpse is not None:
+                    _ent["corpse"] = _p40_corpse
                 nearest_flora_per_cid[cid_s] = _ent
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")

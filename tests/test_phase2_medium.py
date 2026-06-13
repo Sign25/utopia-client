@@ -253,6 +253,37 @@ def test_eat_no_commit_near_predator():
     assert int(l.argmax()) != 14               # не EAT (хищник перебил коммит)
 
 
+def test_corpse_nav_hungry():
+    # Phase C: голоден + труп (мясо) + нет хищника → nav к трупу (dr<0 → NORTH)
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    c._shape_action_logits(l, [0.0] * 64, diet=0.5, energy_ratio=0.4,
+                           corpse={"dr": -1, "dc": 0, "dist": 5.0})
+    assert float(l[0]) > 0                     # NORTH к трупу
+    assert float(l[0]) > float(l[1])
+
+
+def test_corpse_nav_off_when_sated():
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    c._shape_action_logits(l, [0.0] * 64, diet=0.5, energy_ratio=0.9,
+                           corpse={"dr": -1, "dc": 0, "dist": 5.0})
+    assert float(l[0]) == 0.0                   # сыт → нет corpse-nav
+
+
+def test_corpse_nav_blocked_by_predator():
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    obs = [0.0] * 64
+    obs[61] = 0.5                              # хищник
+    c._shape_action_logits(l, obs, diet=0.5, energy_ratio=0.4,
+                           corpse={"dr": -1, "dc": 0, "dist": 5.0})
+    assert float(l[0]) == 0.0                   # хищник → FLEE приоритет, не к трупу
+
+
 def test_eat_reflex_hungry_on_food():
     # ДЕТЕРМИНИРОВАННЫЙ EAT-рефлекс (Фрай 13.06): голоден + на еде + нет хищника →
     # action=EAT в обход мотора (мотор выбрал MOVE).

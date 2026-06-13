@@ -3474,6 +3474,9 @@ class LocalColonyCompute:
                     # (dist ≤ _POUNCE_DIST) → +1 рывок на entry (короткий burst).
                     _mp_cid = (_nf_cid.get("medium_prey")
                                if isinstance(_nf_cid, dict) else None)
+                    # PHASE C: nearest_corpse для corpse-nav (труп ценнее травы — мясо)
+                    _corpse_cid = (_nf_cid.get("corpse")
+                                   if isinstance(_nf_cid, dict) else None)
                     _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
                     _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
                     if (self._hunting_enabled and _mp_cid is not None
@@ -3512,7 +3515,10 @@ class LocalColonyCompute:
                     _eprog = float(_evp.get("eating_progress", 0.0) or 0.0)
                     self._eating_progress[cid] = _eprog
                     _mid_eat = 0.0 < _eprog < 1.0
-                    if _onf and (_hungry_for_med or _mid_eat):
+                    # PHASE C: труп = тот же EAT-floor что флора. on_corpse → рефлекс
+                    # фичрит (детерм. EAT). post-kill commit: доедать тушу, не уходить.
+                    _on_corpse = bool(_evp.get("on_corpse"))
+                    if (_onf or _on_corpse) and (_hungry_for_med or _mid_eat):
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
@@ -3644,7 +3650,8 @@ class LocalColonyCompute:
                                               just_hit=_just_hit,
                                               camp_break=_camp_break,
                                               flora_abandon_dir=_abandon_dir,
-                                              medium_prey=_mp_cid)
+                                              medium_prey=_mp_cid,
+                                              corpse=_corpse_cid)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -5196,7 +5203,7 @@ class LocalColonyCompute:
                              just_hit: bool = False,
                              camp_break: bool = False,
                              flora_abandon_dir: "Optional[int]" = None,
-                             medium_prey=None) -> None:
+                             medium_prey=None, corpse=None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -5405,6 +5412,28 @@ class LocalColonyCompute:
             # бой на присутствие/в воздух) — единственный буст ATTACK = just_hit выше.
             if not just_hit:
                 logits[5] -= PHI * DS
+            # PHASE C corpse-nav (eating.md): голоден + труп (мясо, ценнее травы) + не
+            # на нём (dist>1) + нет хищника → nav к трупу (direction-only, как medium-
+            # seek). На трупе (dist≤1) corpse-EAT рефлекс (on_corpse) добьёт. Иерархия:
+            # predator-FLEE > corpse (d_prox<0.3).
+            if corpse is not None and energy_ratio < (1.0 / PHI) and d_prox < 0.3:
+                try:
+                    _cds_raw = corpse.get("dist")
+                    _cds = float(_cds_raw) if _cds_raw is not None else 99.0
+                    if _cds > 1.0:
+                        _cdr = float(corpse.get("dr", 0.0))
+                        _cdc = float(corpse.get("dc", 0.0))
+                        _wc = 3.0 * DS   # сильный pull к мясу (ценнее травы)
+                        if _cdr < 0:
+                            logits[0] += _wc
+                        elif _cdr > 0:
+                            logits[1] += _wc
+                        if _cdc > 0:
+                            logits[2] += _wc
+                        elif _cdc < 0:
+                            logits[3] += _wc
+                except (TypeError, ValueError):
+                    pass
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
             logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
