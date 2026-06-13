@@ -5234,8 +5234,23 @@ class LocalColonyCompute:
                         logits[13] += PHI * DS           # GATHER (доедай на месте)
                         logits[14] += (1.0 / PHI) * DS   # EAT
                     elif _dist <= 0.0:
-                        logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
-                        logits[14] += 1.0 * DS    # EAT
+                        # EAT-КОММИТ (Фрай Phase A 13.06, eating.md): без passive-
+                        # вакуума Адам ДОЛЖЕН осознанно EAT, иначе server-gate=голод
+                        # (active_eat был 2-3%). Голоден на еде + НЕТ хищника →
+                        # ДОМИНАНТНЫЙ EAT + гаси move (стой и ешь, не пылесось на ходу).
+                        # Поднимаем recent_yield-прайор в основной путь. Иерархия
+                        # predator>eat: гейт d_prox<0.15 (хищник близко → §4 FLEE ниже
+                        # перебьёт, EAT-коммит НЕ эмитим). Сыт → слабый прайор (как было).
+                        _dpx_eat = float(obs_arr[61]) if n > 61 else 0.0
+                        if energy_ratio < (1.0 / PHI) and _dpx_eat < 0.15:
+                            logits[14] += 2.0 * PHI * DS   # доминантный EAT (×2φ, как arrival-commit)
+                            logits[13] += PHI * DS         # GATHER (на месте)
+                            logits[4] += (1.0 / PHI) * DS  # STAY-поддержка
+                            logits[0] *= 0.4; logits[1] *= 0.4   # гаси move (не уходи с еды)
+                            logits[2] *= 0.4; logits[3] *= 0.4
+                        else:
+                            logits[13] += 2.0 * DS    # GATHER (сыт/хищник — слабый прайор)
+                            logits[14] += 1.0 * DS    # EAT
                     elif _dist <= 1.0:
                         # ARRIVAL COMMIT (Фрай 07.06, predator_defense-зеркало):
                         # флора ВПЛОТНУЮ (dist≈1, cardinal-смежная) → ДОМИНАНТНЫЙ

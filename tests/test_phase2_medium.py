@@ -193,6 +193,43 @@ def test_paralysis_forces_stay_attack_no_contact():
     assert out["a"]["action"] == 4                     # STAY (нет флага)
 
 
+def test_eat_commit_hungry_on_flora():
+    # Phase A (Фрай 13.06, eating.md): голоден + НА еде + нет хищника → доминантный
+    # EAT + гаси move (осознанный приём пищи, не вакуум на ходу).
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    obs = [0.0] * 64
+    c._shape_action_logits(l, obs, diet=0.0, energy_ratio=0.4,
+                           nearest_flora={"dr": 0, "dc": 0, "dist": 0.0})
+    assert float(l[14]) > 0                    # EAT
+    assert int(l.argmax()) == 14               # EAT доминирует (коммит)
+
+
+def test_eat_no_commit_when_sated():
+    # сыт (er≥φ⁻¹) → слабый прайор, НЕ коммит (GATHER>EAT, move не гасим)
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    obs = [0.0] * 64
+    c._shape_action_logits(l, obs, diet=0.0, energy_ratio=0.9,
+                           nearest_flora={"dr": 0, "dc": 0, "dist": 0.0})
+    assert int(l.argmax()) != 14               # EAT НЕ доминирует (нет коммита)
+
+
+def test_eat_no_commit_near_predator():
+    # голоден + на еде, НО хищник близко (d_prox≥0.15) → EAT-коммит ОТКЛ (иерархия
+    # predator>eat), §4 FLEE перебивает.
+    import torch
+    c = _c()
+    l = torch.zeros(16)
+    obs = [0.0] * 64
+    obs[61] = 0.5                              # хищник близко
+    c._shape_action_logits(l, obs, diet=0.0, energy_ratio=0.4,
+                           nearest_flora={"dr": 0, "dc": 0, "dist": 0.0})
+    assert int(l.argmax()) != 14               # не EAT (хищник перебил коммит)
+
+
 def _stub_biochem():
     # environment.biochemistry не в venv → handler early-return'ит. Стаб no-op
     # apply_* (+ should_force_stay) → handler исполняет kill-аккумулятор-логику.
