@@ -253,6 +253,35 @@ def test_eat_no_commit_near_predator():
     assert int(l.argmax()) != 14               # не EAT (хищник перебил коммит)
 
 
+def test_eat_reflex_hungry_on_food():
+    # ДЕТЕРМИНИРОВАННЫЙ EAT-рефлекс (Фрай 13.06): голоден + на еде + нет хищника →
+    # action=EAT в обход мотора (мотор выбрал MOVE).
+    c = _c()
+    c._on_food["a"] = 1
+    out = {"a": {"action": 1, "target_id": None}}     # мотор: MOVE
+    c._apply_eat_reflex("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 14                    # рефлекс override → EAT
+
+
+def test_eat_reflex_no_food_noop():
+    # не на еде → рефлекс НЕ трогает (нав к лучшему остаётся)
+    c = _c()
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_eat_reflex("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 1                     # без override
+
+
+def test_eat_reflex_blocked_by_predator():
+    # на еде + голоден, НО хищник (d_prox≥0.15) → НЕ ест (FLEE приоритет, иерархия)
+    c = _c()
+    c._on_food["a"] = 1
+    obs = [0.0] * 64
+    obs[61] = 0.5
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_eat_reflex("a", out, obs)
+    assert out["a"]["action"] == 1                     # хищник перебил рефлекс
+
+
 def _stub_biochem():
     # environment.biochemistry не в venv → handler early-return'ит. Стаб no-op
     # apply_* (+ should_force_stay) → handler исполняет kill-аккумулятор-логику.

@@ -4071,6 +4071,7 @@ class LocalColonyCompute:
                 # cortisol/serotonin/...), потом recompute mental_break,
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
+                self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
@@ -8728,6 +8729,37 @@ class LocalColonyCompute:
                     MENTAL_BREAK_DURATIONS.get(new_state, 0))
         except Exception as e:
             logger.debug("biochem mental_break update cid=%s: %s", cid, e)
+
+    def _apply_eat_reflex(self, cid: str, out: dict, obs) -> None:
+        """ДЕТЕРМИНИРОВАННЫЙ EAT-рефлекс-floor (Фрай/Шеф 13.06, eating.md).
+
+        Поедание = рефлекс «класть в рот и пробовать», НЕ shaping (телеметрия
+        доказала: shaping-EAT мотор не пробивает, own=1.0 драйвит → argmax=MOVE
+        даже на еде). Поэтому ДЕТЕРМИНИРОВАННЫЙ override (как §3-force-STAY): голоден
+        + на ЛЮБОЙ съедобной флоре под ногами (_on_food = _onf+голод, set в obs-loop)
+        + нет хищника → action=EAT(14), в обход мотора.
+
+        Развязка от nearest_edible-нав: трава под ногами = maintenance-floor (ешь тут);
+        nearest_edible-нав (мимо травы к ягоде) ОСТАЁТСЯ для случая _onf=0 (под ногами
+        пусто → upgrade к лучшему). Рефлекс = floor «есть ли вообще»; мозг = ВЫБОР
+        (что/куда/когда прервать/охота) — рост-давление на уровне выбора, не floor.
+
+        Иерархия LOCKED: predator-FLEE > EAT (d_prox-гейт — под угрозой не ест);
+        water-seek > EAT (ws_client._apply_water_seek позже перебьёт при жажде).
+        §3-синергия: _maybe_force_stay (ниже) пропускает EAT(14) сквозь §3-force-STAY
+        (флаг _on_food) → §3-Адам на еде выедает себя.
+        """
+        if cid not in out or not self._single_organism:
+            return
+        if not self._on_food.get(cid):       # голоден + на съедобной флоре (obs-loop)
+            return
+        try:
+            _dpx = float(obs[61]) if (obs is not None and len(obs) > 61) else 0.0
+        except (TypeError, ValueError, IndexError):
+            _dpx = 0.0
+        if _dpx >= 0.15:                      # хищник близко → FLEE приоритет, не ест
+            return
+        out[cid] = {"action": 14, "target_id": None}   # EAT — детерминированно
 
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
