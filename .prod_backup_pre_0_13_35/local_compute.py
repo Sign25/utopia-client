@@ -16,7 +16,6 @@ from __future__ import annotations
 import copy
 import logging
 import math
-import os
 import random
 import time
 import types
@@ -187,16 +186,6 @@ _GLUCOSE_FLOOR_ENERGY_THRESHOLD = 200.0
 _CORTISOL_HOMEOSTASIS_DECAY = 0.995
 # Phase S2.F insula: 64 obs + 7 интероцепции = 71.
 _INSULA_DATA_DIM = 71
-# §3.2 (Фрай 09.06.2026): client-authoritative интероцепция. Строим 7-вектор
-# ЛОКАЛЬНО из self.biochem (energy/hydration/cortisol/serotonin/infection —
-# точно из биохимии Адама; age/valence — carry последнего P40-intero). Снимает
-# P40-blind risk: insula не слепнет, если P40 перестанет слать intero.
-# Зеркало server-side _gather_interoception (NeuroCore/server/tick/sidecars.py:48)
-# — нормировки совпадают ТОЧЬ-В-ТОЧЬ (incl. raw-camel quirk slot[1]), иначе insula
-# получит сдвиг распределения входа.
-_CLIENT_MAX_ENERGY = 1309.0      # mirror cfg.max_energy default (_gather_interoception)
-_CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
-_CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
 # Совпадает с _DEFAULT_MODE_FLOOR_MAX на P40 (routes_world.py).
 _DEFAULT_MODE_FLOOR_MAX = 0.01
@@ -350,296 +339,6 @@ class LocalColonyCompute:
         self.reward_history: dict = {}       # cid → deque[float] maxlen=10
         # Метрики счётчиков (для diagnostics endpoint).
         self.predictor_steps: int = 0
-        # Вариант A (08.06.2026, Фрай/Хьюберт): рост мозга при жизни. Predictor —
-        # узел графа ЧЕРЕЗ cerebellum (бит 18, TISSUE_ROLES_ZODCHIY). forward-hook
-        # ловит выход cerebellum-ткани → он становится входом обученного
-        # predictor'а. Связи {ткань}→cerebellum двигают вход прогноза → Δloss_ema
-        # реагирует напрямую = драйвер для propose/keep петли роста. Только
-        # single-Adam; граф client-local, в P40 не уходит (Хьюберт verified).
-        # _predictor_from_cerebellum — kill-switch (False → predictor на raw obs).
-        self._predictor_from_cerebellum: bool = True
-        self._cerebellum_tid: dict = {}      # cid → tissue_id | None (cache)
-        self._cerebellum_out: dict = {}      # cid → torch.Tensor [1,64] выход/тик
-        self._cerebellum_hooked: set = set() # cid с зарегистрированным hook
-        # Шаг 2 — петля роста связей (08.06, Фрай go): propose→dwell→Δloss_ema→
-        # keep/backoff, ОДНА связь {роль}→cerebellum за раз. Триггер — плато
-        # intrinsic (мозгу нечему учиться весами → менять структуру). keep на
-        # ЗНАЧИМОМ сошедшемся Δloss_ema (Фрай: не любой Δ>0); backoff revert'ит
-        # ребро (enabled=False) + защищает net/§3. Gated OFF (ship dormant) —
-        # включить после live-проверки встраивания (cerebellum_out≠0, loss не взлетел).
-        self._growth_enabled: bool = True             # kill-switch (флип 08.06: рост ВКЛ для Адама)
-        self._growth_tracker = None                   # client-local innovation tracker (lazy)
-        self._growth_rng = random.Random(0)           # детерминируемый выбор src-роли
-        self._growth_state: dict = {}                 # cid → {gene, loss_before, ticks, par_before, energy_before}
-        # ОТНОСИТЕЛЬНЫЙ триггер (Фрай 08.06): embodied intrinsic floor не ноль и
-        # дрейфует (0.005-0.009) → абсолютный порог хрупок. Плато = intrinsic у
-        # СВОЕГО трейлинг-floor (min за окно) + стагнация N тиков (перестал падать).
-        # Self-referencing, drift-robust. Floor — референс, не абсолютный уровень.
-        self._growth_intr_hist: dict = {}             # cid → deque[float] intrinsic_ema (трейлинг-floor)
-        self._growth_stagnation_n: dict = {}          # cid → тиков «у floor» подряд
-        self._growth_intr_window: int = 233           # Fib — окно трейлинг-floor
-        self._growth_near_floor_margin: float = _PHI_CONST ** -3  # φ⁻³≈0.236 «у floor»
-        self._growth_plateau_ticks: int = 55          # Fib — мин. окно истории до оценки плато
-        # §10.8 (Фрай 09.06): noise-robust плато — ДОЛЯ near-floor сэмплов ≥ порога
-        # ВМЕСТО 55-подряд (хрупкого к всплескам intrinsic от погодной осцилляции:
-        # 75.5% near-floor, но 25% всплесков сбивали consecutive-счётчик → плато не
-        # объявлялось). φ⁻¹≈0.618: срабатывает при СХОДИМОСТИ (~75% near-floor), НЕ
-        # при активном обучении (низкая доля). Калибр: ниже converged-rate 0.755.
-        self._growth_plateau_frac: float = _PHI_CONST ** -1  # φ⁻¹≈0.618
-        self._growth_dwell_ticks: int = 89            # Fib — окно пере-сходимости predictor'а
-        self._growth_min_delta_frac: float = _PHI_CONST ** -5  # φ⁻⁵≈0.09 относит. улучшение
-        self._growth_kept: int = 0                    # принятых связей (метрика)
-        self._growth_reverted: int = 0                # откатов (метрика)
-        # tried-set с COOLDOWN (Фрай/Шеф 08.06): не ретраить отвергнутое ребро
-        # _growth_retry_cooldown проб подряд (поиск покрывает новые рёбра). НЕ
-        # permanent (эпистаз: ребро, бесполезное сейчас, может помочь после смены
-        # графа) → через cooldown снова eligible. Часы — счётчик проб (монотонный).
-        self._growth_propose_count: int = 0           # монотонные часы проб
-        self._growth_rejected: dict = {}              # cid → {source_role: propose_count при отказе}
-        self._growth_retry_cooldown: int = 13         # Fib — проб до повторной попытки отвергнутого
-        # SATURATION-guard (Шеф 08.06): когда полезные {роль}→cerebellum рёбра
-        # исчерпаны (все свежие кандидаты в cooldown → fallback гоняет оставшиеся
-        # бесполезные по кругу) — встать на ПАУЗУ, не churn'ить. Сигнал «связи
-        # насыщены → готов к фазе тканей §3.2». Снимается reset_growth_saturation()
-        # (вызвать при добавлении тканей — новые роли = новые кандидаты) или KEEP.
-        self._growth_fallback_streak: int = 0         # подряд fallback-backoff'ов
-        self._growth_saturated: bool = False          # пауза петли связей
-        self._growth_saturation_threshold: int = 5    # fallback-backoff'ов до насыщения
-        # §10.8 РОСТ ТКАНЕЙ (Фрай 09.06): рост УЗЛАМИ (не рёбрами). После
-        # насыщения связей (19/19→cerebellum) петля растит НОВУЮ ТКАНЬ кандидатом:
-        # минт (_make_higher_tissue) + вставка в org.tissues + проводка {роль}→
-        # cerebellum → dwell → Δloss_ema → keep/backoff (как рёбра). Узел без
-        # входящего ребра = СЕНСОР (читает obs напрямую, workbench.forward:97-126).
-        # Драйвер prediction: keep-путь СПИТ, пока мир (погода/аффордансы Хьюберта,
-        # §10.9) не вернёт prediction-давление (loss 0.046 = пол на статичном мире).
-        # Дисциплина та же: одна за раз, dwell, keep/backoff, durable-персист,
-        # kill-switch. Client-local. Спек гибкий (читает obs, расширяемо под новый
-        # obs-канал погоды — координация с Хьюбертом).
-        self._tissue_growth_enabled: bool = False     # kill-switch (дефолт OFF, dormant)
-        self._tissue_growth_state: dict = {}          # cid → in-flight {role,tid,loss_before,ticks,...}
-        self._tissue_kept: int = 0                    # принятых тканей (метрика)
-        self._tissue_reverted: int = 0                # откатанных тканей
-        self._tissue_propose_count: int = 0           # монотонный счётчик (имена ролей grownN)
-        self._tissue_grown_specs: dict = {}           # cid → [{role,data_dim,n_embd}] KEEP'нутых (персист+recreate)
-        self._TISSUE_GROWTH_DATA_DIM: int = 64        # читает obs64 (сенсор); под погоду расширяемо
-        self._TISSUE_GROWTH_N_EMBD: int = 21          # sidecar 21/3/1 (как высшие)
-        # §10.8 РЕДИЗАЙН (Фрай 09.06, после live-кризиса §3): (a) РАЗВЯЗКА ОТ МОТОРА.
-        # Выросшие ткани = PREDICTOR-САЙДКАРЫ: читают obs64, выход ДОБАВЛЯЕТСЯ во
-        # вход предиктора (изолированно). НЕ в графе → cerebellum/motor НЕ трогаются
-        # → поведение не возмущается → нет §3. Драйвер Δloss сохраняется (грон даёт
-        # предиктору новую фичу). (c) АБСОЛЮТНЫЙ §3-гейт: paralysis>0 → стоп propose.
-        # (b) rate-limit: пауза между propose (мотор/выживание восстанавливается).
-        self._grown_tissues: dict = {}                # cid → {role: Tissue} predictor-сайдкары
-        self._tissue_growth_cooldown: int = 233       # Fib — тиков паузы между propose (rate-limit b)
-        self._tissue_last_resolve: dict = {}          # cid → tick последнего keep/backoff
-        # §10.8 DURABILITY (Фрай 10.06): dwell 89<погодный день-цикл 233 → keep судил
-        # по ФРАГМЕНТУ цикла → сайдкар фитил фазовый погодный шум. keep-окно ≥1 цикл →
-        # Δloss судит durable кросс-цикл улучшение, не транзиент.
-        self._tissue_growth_dwell_ticks: int = 233    # Fib = период sin/233 (один погодный цикл)
-        # GC: ре-оценка ЖИВЫХ сайдкаров на полном цикле — фазовые отпустить (noise-fit).
-        # Leave-one-out абляция: убрать сайдкар → dwell цикл → если loss НЕ вырос значимо
-        # (вклад распался) → пруна навсегда; иначе вернуть (durable). Изолировано от мотора.
-        self._tissue_gc_state: dict = {}              # cid → {role,tissue,loss_before,ticks} (held-aside абляция)
-        self._tissue_gc_tested: dict = {}             # cid → set(role) проверенных в текущей эпохе
-        self._tissue_gc_sweep_done: dict = {}         # cid → tick конца последнего sweep (отдых между эпохами)
-        self._tissue_gc_epoch_interval: int = 6388    # тиков отдыха между sweep'ами (длинный климат-цикл)
-        self._tissue_gc_pruned: int = 0               # сайдкаров отпущено GC (фазовый шум)
-        # /stats Фаза 2 (v1.3, 10.06): накопители для push в diagnostics —
-        # клиент знает эти сигналы, UI их ждёт (контракт stats_redesign v1.3).
-        self._stat_pred_region: dict = {}   # cid → {temp35,dens44_55,rest} (PRED_REGION)
-        # felt_thirst вычисляется inline из hydration; insula_t_mod = _it_last_tmod
-        self._stat_ledger: dict = {}        # {net_true,residual,srv_cost} (LEDGER_FULL)
-        self._stat_paralysis_count: int = 0    # §3 параличей за сессию
-        self._stat_recovery_count: int = 0     # §3 восстановлений
-        self._stat_beh_verdicts: dict = {}  # role → {verdict, dims} (§10.3 Блок 7b)
-        self._stat_growth_events = deque(maxlen=20)   # лента роста (Блок 7/9)
-        self._stat_growth_history = deque(maxlen=288)  # ряд n_tissues/grown/grad
-        self._stat_ate_total: dict = {}     # cid → монотонный счётчик еды (lifetime)
-        self._stat_foraging: dict = {}      # foraging-доли (ws_client rollup → owner)
-        self._stat_last_action: dict = {}   # cid → последнее выбранное действие (active_eat)
-        # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox (obs[61]) → adrenaline
-        # спайк → оживляет мёртвую ось adrenaline. ТРАНЗИЕНТ: decay_step −2/тик
-        # гасит после побега (safeguard Фрая). pred_prox=1 → adrenaline ~80.
-        self._last_pred_prox: dict = {}     # cid → obs[61] predator-близость
-        self._ADRENALINE_PRED_SCALE: float = 80.0  # pred_prox·scale → adrenaline (тюн по escape-rate)
-        self._ADRENALINE_PRED_GATE: float = 0.15   # ниже → шум, не спайкаем
-        # ONSET-латентность (Фрай 11.06): adrenaline растёт ≤ этого/тик к target →
-        # innate ответ несовершенен (лаг) → escape<100% (learnable band) → ткань-
-        # anticipation отбирается. ~3-4 тика 0→80. Тюн к INTERMEDIATE escape-rate.
-        self._ADRENALINE_ONSET: float = 25.0   # max прирост adrenaline/тик (латентность)
-        # CAMP-BREAK (Фрай/Хьюберт/Шеф 11.06, живой инцидент 64%-паралич): хищник
-        # camp'ит ВПЛОТНУЮ → §4 контратакует (just_hit→ATTACK), но ATTACK не
-        # life_critical → P40 force-STAY'ит в §3 → Адам застывает → дренит. Fix:
-        # контратака N=5 тиков futile (хищник всё ещё бьёт = не убит) → SWITCH на
-        # FLEE-burst (life_critical → исполняется в §3, +2 рывок Шефа) → разорвать
-        # camp → назад к parity (burst брифовый, держит gap). Switch-timing —
-        # learnable ось (ткань-anticipation рвёт раньше → меньше drain → GC отбирает).
-        self._camp_hit_streak: dict = {}    # cid → consecutive just_hit (camp-длительность)
-        self._CAMP_BREAK_TICKS: int = 5     # Fib-дебаунс: после N futile контратак → рви
-        # PHASE 2 feeding-ladder — POUNCE-модель (Фрай 12.06): средняя дичь speed=2
-        # = Адам база 2 (паритет) БЕЗ непрерывного буста. Адам гонит на базе →
-        # добыча УСТАЁТ (Хьюберт tiring) → Адам нагоняет до упора → ПРЫЖОК +1 (короткий
-        # extra_step burst) → контакт → 2 удара. Арбитраж: голод И способен → гнать
-        # среднюю (55, бо́льший обед). Настойчивая погоня: коммит ОДНУ цель.
-        self._POUNCE_DIST: int = 3          # ≤ тайла (упор) → прыжок +1 (Manhattan)
-        self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
-        self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
-        self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
-        self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
-        # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
-        # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
-        # obs[56-58], выше), УЖЕ есть kill→dopamine (apply_kill_prey, Хьюберт). Не
-        # хватало: (1) diet_gene>0 → server даёт kill-energy (energy+=φ⁷×diet); (2)
-        # DS-ATTACK на контакте (BS-prey-ATTACK инертна у single-Adam); (3) hunt-
-        # outcome-дима в GC (meat-energy, изолированно от plant-income). Kill-switch
-        # client_flag hunting (дефолт OFF=травоядный=текущее поведение).
-        self._hunting_enabled: bool = False      # client_flag hunting (OFF dormant)
-        self._OMNIVORE_DIET: float = 0.618        # φ⁻¹ — всеядный (Adam-specific при hunting ON)
-        self._PREY_KILL_ENERGY: float = 1.618 ** 7  # φ⁷≈29 (server prey_kill_energy, для meat-димы)
-        self._beh_meat_cum: dict = {}       # cid → монотонный Σ meat-energy (hunt-outcome дима GC)
-        self._last_pt_path: dict = {}       # cid → последний .pt путь (size_disk)
-        # §10.8 STAGE 1 GRADUATION (Фрай 10.06, направление B Шефа): банк-инкубатор
-        # сайдкаров → graduation durable-ткани в ГРАФ-узел через §3-контур
-        # (cerebellum→motor). IN-MEMORY: спек ткани ОСТАЁТСЯ в grown_specs →
-        # рестарт пересоздаёт её как САЙДКАР (авто-деградация в безопасное
-        # состояние; durability узла = Stage 2, seed/persist/P40 не трогаем).
-        # Кандидат = ТОЛЬКО GC-KEEP-verified durable (rise записывает GC этой
-        # сессии). Мягкая стыковка: вес ребра φ⁻² (НЕ 1.0 — кризис 09.06 был
-        # при полной связи). §3-гейт АБСОЛЮТНЫЙ: paralysis>0 в watch-окне →
-        # НЕМЕДЛЕННЫЙ revert (не ждём конца окна). Stage 1 де-риск: ровно ОДНА
-        # graduation за сессию (_tissue_grad_max=1).
-        self._tissue_graduation_enabled: bool = False  # client_flag tissue_graduation (OFF)
-        self._tissue_grad_state: dict = {}    # cid → {role,tid,gene,ticks,par_before,energy_before,loss_before} watch
-        self._tissue_graduated: dict = {}     # cid → {role: Tissue} живые граф-узлы (save/kill-switch/ревизия)
-        self._tissue_grad_done: int = 0       # успешных graduations за сессию
-        self._tissue_grad_reverted: int = 0   # revert'ов graduation (§3/energy)
-        # Stage 2 (Фрай/Шеф 11.06): тесный лимит снят — система самоограничивается
-        # (per-add §3-watch откатывает вредное, GC кулит бесполезное/редундантное,
-        # kill-switch + cumulative-monitor страхуют). Реальный потолок = число
-        # живых wellbeing-осей (сейчас 2 → natural equilibrium KEEP'ов мал), не
-        # grad_max. Fib 89 = высокий backstop против runaway (безопаснее uncapped).
-        self._tissue_grad_max: int = 89       # Fib — backstop, не constraint
-        self._tissue_gc_keep_rise: dict = {}  # cid → {role: rise} durable-кандидаты (GC-KEEP сессии)
-        self._TISSUE_GRAD_EDGE_WEIGHT: float = 0.382  # φ⁻² — мягкий вход в cerebellum→motor
-        # CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): per-add watch проверяет ТОЛЬКО
-        # на add-time (233-окно). При many-concurrent медленный collective-drift
-        # (N выпускников СОВОКУПНО проседают мотор) он пропускает. Непрерывный
-        # collective-health (energy EWMA + §3-paralysis): просел → ПАУЗА graduation
-        # + SHED lowest-value graduated (revert наименее ценного) до recovery.
-        self._grad_collective_paused: bool = False  # пауза выпуска от collective-drift
-        self._grad_health_ewma: dict = {}     # cid → EWMA energy (collective baseline)
-        self._grad_value: dict = {}           # cid → {role: value} для shed-ранжирования
-        self._GRAD_SHED_ENERGY: float = 382.0     # energy EWMA < φ⁻¹·max·0.618 → drift
-        self._GRAD_HEALTH_RECOVER: int = 89   # тиков здоровья подряд → снять паузу
-        self._behavioral_probe_role: str = ""  # §10.3 ablate-проба замера сигнала по измерениям
-        # АНТИ-CHURN GUARD выпуска (Фрай 10.06, после инцидента grown151):
-        # revert→re-graduate цикл долбил мотор быстрее восстановления (3 цикла
-        # за 90с, energy 1000→70, §3-churn ре-эмерджнул в ПОВТОРНОМ выпуске).
-        # (2) revert ставит РОЛЬ в graduation-cooldown (не долбить тот же узел);
-        # (3) лимит revert'ов ПОДРЯД → halt выпуска (до re-flip флага);
-        # (A) re-graduate гейт на СТАБИЛЬНОЕ recovery: energy ≥ 618 (φ⁻¹·max)
-        #     И стабильно 89 тиков (Fib) И paralysis=0 — транзиентный просвет
-        #     paralysis==0 НЕ открывает гейт; (опц.) energy-collapse детектор
-        #     window-based (rolling-mean 13) — погодный одиночный провал не
-        #     роняет watch в фазе восстановления.
-        self._grad_rejected: dict = {}        # cid → {role: tick} revert-cooldown роли
-        # ЭСКАЛАЦИЯ cooldown (Фрай 10.06, grown151 2×revert): повторно
-        # ревертнутая ткань = проверенно-вредная в графе — cooldown растёт
-        # Fib-множителем с revert-count (1→1×, 2→2×, 3→5×, 4→13×, 5+→34×
-        # epoch_interval) → живёт prediction-сайдкаром, не тратит циклы
-        # выпуска. Counts персистятся (иначе рестарт обнулял бы эскалацию).
-        self._grad_revert_count: dict = {}    # cid → {role: n revert'ов роли}
-        self._GRAD_COOLDOWN_FIB = (1, 2, 5, 13, 34)  # множители epoch_interval
-        self._grad_revert_streak: int = 0     # revert'ов подряд (KEEP сбрасывает)
-        self._GRAD_REVERT_HALT: int = 3       # Fib-лимит → halt выпуска
-        self._grad_halted: bool = False       # стоп до re-flip tissue_graduation
-        self._grad_health_streak: dict = {}   # cid → тиков подряд здоров
-        self._GRAD_HEALTH_ENERGY: float = 618.0   # φ⁻¹·max_energy 1000
-        self._GRAD_HEALTH_TICKS: int = 89     # Fib — стабильность перед выпуском
-        self._GRAD_COLLAPSE_WIN: int = 13     # Fib — rolling-mean окно collapse-детектора
-        # §10.3 STAGE 3 BEHAVIORAL-GC (Фрай go 10.06): парный interleaved
-        # leave-one-out по самочувствию. ablate = soft edge-weight→0 (НЕ removal
-        # → топология не дёргается → нет churn/§3); discard пост-toggle transient
-        # (мотор устаканивается); §3-монитор активен (abort при paralysis>0);
-        # порог = ПАРНАЯ значимость (paired-t по окнам, не сырой k·CV). Измерения:
-        # live-variance (cortisol↓/glucose↑/hydration↑/income-rate↑), мёртвые
-        # (serotonin/fatigue/adrenaline pinned в текущих условиях) НЕ берём —
-        # набор НЕ заморожен (вернутся с аффордансами хищник/нагрузка). specialist-
-        # keep (ablation бьёт ЛЮБОЕ измерение за порог) + veto net-harm.
-        self._behavioral_gc_enabled: bool = False  # client_flag behavioral_gc (OFF dormant)
-        self._beh_gc_state: dict = {}     # cid → парная машина (фаза/окна/сэмплы)
-        self._beh_income_cum: dict = {}   # cid → монотонный income (income-rate-замер)
-        # FEAR-ОСЬ cost-of-encounter (Фрай 11.06, predator v0.1 validated): 3-я
-        # живая ось (adrenaline). Дима GC = neg_damage_rate (damage_taken только
-        # от хищника = ЧИСТЫЙ fear-сигнал, не разбавлен как cortisol голодом/жаждой;
-        # continuous > binary escape-rate; reuse income-паттерн). Fear/evasion-ткань
-        # ablate → больше урона принято → specialist-keep. Sparse (0 между встречами)
-        # → robust median+MAD + power-aware + SOFT→досветка держат. ШАБЛОН: каждый
-        # новый аффорданс = wired-ось + её outcome-метрика в GC-сэмпл (Фрай).
-        self._beh_damage_cum: dict = {}   # cid → монотонный Σ damage_taken (cost-of-encounter)
-        self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
-        # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
-        # §3-abort НЕ ставил cooldown → дестабилизировавший узел сразу ре-eligible
-        # → ablate → §3 → abort по кругу (ускорялся 29→1мин). Fix: §3-abort ставит
-        # эскалирующий cooldown ×Fib(abort_count) — повторно-дестабилизирующий узел
-        # отдыхает дольше. Counts/cd персистятся (иначе рестарт обнулял бы эскалацию).
-        self._beh_gc_abort_count: dict = {}  # cid → {role: n §3-abort'ов}
-        self._beh_gc_abort_cd: dict = {}     # cid → {role: until_tick} (Fib-эскал.)
-        # энерго-гейт старта GC (Фрай 11.06): не аблейтить пока Адам не здоров —
-        # GC стартовал в paralysis==0 окне МЕЖДУ §3-провалами и сам дренил в §3.
-        self._last_paralysis_tick: dict = {}  # cid → world_tick последнего §3
-        self._BEH_GC_NO_PAR_TICKS: int = 89   # Fib — нет §3 за N тиков перед стартом GC
-        # KEEP-cooldown (Фрай 10.06): подтверждённый узел НЕ ре-ревизуется по
-        # кругу — длинная пауза (epoch-rest ×13), периодич. ре-валидация ловит
-        # деградацию/world-change. Замыкает третью verdict-петлю (KEEP→long-cd,
-        # SOFT→escalating→34, PERMANENT→терминал). Персистится.
-        self._beh_gc_keep_cd: dict = {}   # cid → {role: tick} KEEP-cooldown
-        self._BEH_GC_KEEP_COOLDOWN: int = 6388 * 13  # epoch_interval × Fib(13)
-        # АНТИ-ОСЦИЛЛЯЦИЯ (Фрай 10.06): behavior-pruned ткань возвращается в
-        # сайдкары, где она ВСЁ ЕЩЁ prediction-good → без метки вечный churn
-        # graduate↔prune. Метка «behavior-rejected до изменения мира»: остаётся
-        # prediction-сайдкаром, повторный выпуск ЗАБЛОКИРОВАН. Персистится.
-        # Сброс — reset_behavior_rejected() при изменении мира (новые аффордансы).
-        self._beh_rejected_roles: dict = {}  # cid → set(role) без повторного выпуска
-        self._beh_gc_done: int = 0        # behavioral-keep'ов (метрика)
-        self._beh_gc_pruned: int = 0      # behavioral-prune'ов
-        self._BEH_GC_WINDOW: int = 233    # тиков на окно (= погодный sin-цикл)
-        self._BEH_GC_TRANSIENT: int = 21  # discard тиков после toggle (Fib, мотор устаканивается)
-        # Мощность (Фрай 10.06): 5 пар underpowered — window-усреднение теряет
-        # внутри-окно N, погодный дрейф между парными окнами раздувает paired-sd.
-        # 13 пар (Fib, df=12, t_keep 2.18) + STEP-1 эффект cort Δ7/sd~6 → t~4 >2.18.
-        # 13×2×233=6058т ≈ один климат-цикл (epoch 6388) — укладывается.
-        self._BEH_GC_PAIRS: int = 13      # пар ablate/restore окон (paired-t N=13)
-        self._BEH_GC_T_KEEP: float = 2.179  # t-крит paired N=13 (df=12, две-стор. 0.05)
-        # POWER-AWARE метка (Фрай (1) 10.06): permanent reject ТОЛЬКО при adequate
-        # power по ВСЕМ измерениям. Целевой эффект per-dim = известный размер из
-        # Step-1 ablation grown133 (cort Δ7) / типичная динамика. MDE≤target =
-        # powered. Underpowered измерение → prune остаётся SOFT (retry).
-        self._BEH_GC_MDE_TARGET = {
-            "neg_cortisol": 7.0,   # Step-1: grown133 ablation cort Δ7
-            "glucose": 5.0,        # метаболический сдвиг сопоставим
-            "hydration": 2.0,      # water-специалист
-            "income": 1.0,         # foraging-rate сдвиг
-            "meat": 0.5,           # hunt-ось PLACEHOLDER — нет prior данных (охота dormant
-            #                        до флипа hunting); BEH-GC-WINDOW meat-лог даст Фраю
-            #                        калибровать от живых kill-окон (как neg_damage 0.5→0.3).
-            "neg_damage": 0.3,     # fear-ось (Фрай 11.06, калибр. от живых negDmg):
-            #                        ≈φ⁻²·baseline (0.382·0.86 урон/окно ≈ 0.33) =
-            #                        принципиальная «значимая доля»; чуть ниже 13-пар
-            #                        MDE 0.308 → borderline fear-ткань форсится на
-            #                        34-пар досветку → первый fear-KEEP с сильным
-            #                        евиденсом. Re-tune если baseline уползёт с данными.
-        }
-        # ПЕТЛЯ №1 (Фрай ок 10.06): SOFT-prune НЕ ставил graduation-cooldown →
-        # вечная осцилляция graduate↔soft-prune (hard insert/remove ~1.5-2ч).
-        # Фикс: SOFT инкрементит _grad_revert_count (re-graduate откладывается
-        # Fib-эскалацией), + repeat-soft роль АВТО-роутится в 34-ПАР ДОСВЕТКУ
-        # (один длинный powered-тест вместо многих коротких → keep/permanent
-        # окончательно, петля рвётся; graduation-churn меньше).
-        self._beh_soft_count: dict = {}       # cid → {role: n SOFT-prune'ов} (персист)
-        self._BEH_GC_DEEP_AFTER_SOFTS: int = 2   # Fib — softs до досветки
-        self._BEH_GC_PAIRS_DEEP: int = 34     # Fib — пар в досветке (MDE cort ≈ ±7)
-        self._BEH_GC_T_KEEP_DEEP: float = 2.035  # t-крит df=33 (две-стор. 0.05)
 
         # Brain migration (10.05.2026): высшие ткани S2.E/G/A/F per cid.
         # Forward-only (MVP-lite, без supervised), Y50 наследование от родителя.
@@ -890,7 +589,6 @@ class LocalColonyCompute:
         # Внутрижизненная эволюция тела → наследуется через crossover.
         self._skill_eat: dict = {}          # cid → eat count (окно 200т)
         self._skill_kill: dict = {}         # cid → kill count
-        self._skill_kill_medium: dict = {}  # cid → kill count средней дичи (Phase 2 verify, delta_e≥34)
         self._skill_atk: dict = {}          # cid → melee-ATTACK count (§6 atk-growth)
         self._skill_move: dict = {}         # cid → move count
         self._skill_window_tick: dict = {}  # cid → world_tick последнего окна
@@ -934,7 +632,6 @@ class LocalColonyCompute:
         self._metab_applies: int = 0          # для METAB_DIAG
         self._metab_dt_sum: float = 0.0       # Σ dt_seconds — средний интервал
         self._metab_sc_sum: float = 0.0       # Σ step_cost_now (per-sec rate)
-        self._metab_basal_sum: float = 0.0    # Σ BMR basal-drain (Phase 2.5h, METAB_DIAG)
         # bias_scale curriculum (01.06.2026, порт server routes_world/loop.py:
         # 600-636 — Фрай/Хьюберт). Кроссфейд shaping↔motor: own_contribution =
         # max(0, 1-bias_scale) масштабирует motor_delta. Старт 1.0 (untrained →
@@ -945,10 +642,6 @@ class LocalColonyCompute:
         self._bias_last_update_tick: int = 0
         self.last_stress: dict = {}        # cid → float ∈ [0, 1]
         self.last_dmn_floor: dict = {}     # cid → float ∈ [0, _DEFAULT_MODE_FLOOR_MAX]
-        # §3.2 (Фрай 09.06.2026): последний P40-intero[7] per-cid — для carry
-        # slots 2/6 (age/valence) в client-built intero + fallback, если
-        # биохимии нет. См. _build_client_intero.
-        self._last_p40_intero: dict = {}   # cid → np.ndarray[7]
         # Phase 5d (NEOL, 14.05.2026) — reward-gated Hebbian.
         # TD = β_local − EMA(β_local, α=0.01) per-cid, обновляется один раз за
         # тик в _compute_higher_tissues. effective_eta_reward = lr_reward ·
@@ -1018,13 +711,6 @@ class LocalColonyCompute:
         self._it_baseline: dict = {}          # cid → бегущая средняя advantage (variance-reduction)
         self._it_last_tmod: dict = {}         # cid → последний T_mod (телеметрия обучения моста)
         self._insula_temp_enabled: bool = False
-        # §3.2 (Фрай 09.06.2026): felt-thirst gradual drive. False (дефолт) →
-        # текущий бинарный 30% water-seek (прод не меняется до go). True →
-        # градуальный felt-drive (intero[1]-афферент масштабирует приоритет
-        # рефлекса A, φ-onset 0.382). Мгновенный on/off через client_flags
-        # (felt_thirst_drive); kill-switch = false → откат к бинарному. См.
-        # ws_client._apply_water_seek.
-        self._felt_thirst_drive_enabled: bool = False
 
         # SFNN S6.4 (16.05.2026): per-cid SFNN-правила для 10 базовых тканей
         # organism graph. Веса самих тканей живут в HebbianController; здесь
@@ -1530,39 +1216,6 @@ class LocalColonyCompute:
         self.hebbian.pop(cid, None)
         self.predictor.pop(cid, None)
         self.predictor_opt.pop(cid, None)
-        self._cerebellum_tid.pop(cid, None)
-        self._cerebellum_out.pop(cid, None)
-        self._cerebellum_hooked.discard(cid)
-        self._growth_state.pop(cid, None)
-        self._growth_intr_hist.pop(cid, None)
-        self._growth_stagnation_n.pop(cid, None)
-        self._growth_rejected.pop(cid, None)
-        self._tissue_growth_state.pop(cid, None)   # §10.8 рост тканей cleanup
-        self._tissue_grown_specs.pop(cid, None)
-        self._grown_tissues.pop(cid, None)         # §10.8 редизайн a: сайдкары
-        self._tissue_last_resolve.pop(cid, None)
-        self._tissue_gc_state.pop(cid, None)       # §10.8 GC cleanup
-        self._tissue_gc_tested.pop(cid, None)
-        self._tissue_gc_sweep_done.pop(cid, None)
-        self._tissue_grad_state.pop(cid, None)     # §10.8 graduation cleanup
-        self._tissue_graduated.pop(cid, None)
-        self._tissue_gc_keep_rise.pop(cid, None)
-        self._beh_gc_state.pop(cid, None)          # §10.3 behavioral-GC cleanup
-        self._beh_income_cum.pop(cid, None)
-        self._beh_damage_cum.pop(cid, None)   # fear-ось cost-of-encounter cleanup
-        self._beh_meat_cum.pop(cid, None)     # hunt-ось meat-outcome cleanup
-        self._beh_gc_rejected.pop(cid, None)
-        self._beh_gc_keep_cd.pop(cid, None)
-        self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
-        self._beh_gc_abort_cd.pop(cid, None)
-        self._last_paralysis_tick.pop(cid, None)
-        self._grad_value.pop(cid, None)         # cumulative-monitor cleanup
-        self._grad_health_ewma.pop(cid, None)
-        self._beh_rejected_roles.pop(cid, None)
-        self._grad_rejected.pop(cid, None)         # анти-churn cleanup
-        self._grad_revert_count.pop(cid, None)
-        self._beh_soft_count.pop(cid, None)
-        self._grad_health_streak.pop(cid, None)
         self.prev_obs.pop(cid, None)
         self.loss_ema.pop(cid, None)
         self.pred_loss_history.pop(cid, None)
@@ -1586,7 +1239,6 @@ class LocalColonyCompute:
         self.imagination.pop(cid, None)
         self.planner.pop(cid, None)
         self.insula.pop(cid, None)
-        self._last_p40_intero.pop(cid, None)   # §3.2 carry cleanup
         # 13.05.2026: S2.D default_mode.
         self.default_mode.pop(cid, None)
         self.last_beta_local.pop(cid, None)
@@ -1622,9 +1274,6 @@ class LocalColonyCompute:
         self._tile_yield_mem.pop(cid, None)       # «доедай» yield-память (Фрай 06.06)
         self._logit_dbg.pop(cid, None)
         self._skill_eat.pop(cid, None)
-        self._stat_ate_total.pop(cid, None)
-        self._last_pred_prox.pop(cid, None)   # predator-аффорданс cleanup
-        self._camp_hit_streak.pop(cid, None)  # camp-break cleanup
         self._skill_kill.pop(cid, None)
         self._skill_atk.pop(cid, None)
         self._skill_move.pop(cid, None)
@@ -1944,150 +1593,6 @@ class LocalColonyCompute:
             logger.warning("restore_persisted_state: cid=%s unknown (skip)", cid)
             return
         org = self.organisms[cid]
-        # §10.8 рост тканей (редизайн a): ПЕРЕСОЗДАТЬ выросшие ткани как PREDICTOR-
-        # САЙДКАРЫ (self._grown_tissues, НЕ в org.tissues/граф → мотор изолирован).
-        # Из спека + load весов (payload["grown_weights"]). Durable через рестарт.
-        _gl0 = payload.get("growth_loop")
-        _gw = payload.get("grown_weights") or {}
-        # STAGE 2 PERSIST (Фрай go 10.06): graduated-узлы пересоздаём В ГРАФ
-        # (org.tissues + ген уже в tissue_topology_genes → overlay ниже проведёт
-        # ребро). ГАРД: без enabled-гена {role}→cerebellum узел НЕ вставляем
-        # (узел без исходящего ребра workbench счёл бы МОТОР-выходом — мусор в
-        # действия) → такой деградирует в сайдкар (Stage 1 семантика).
-        _graduated_roles: set = set()
-        if isinstance(_gl0, dict) and _gl0.get("graduated_tissues"):
-            _genes_raw = payload.get("tissue_topology_genes") or []
-            _has_gene = {
-                str(d.get("source_role")) for d in _genes_raw
-                if d.get("enabled") and d.get("target_role") == "cerebellum"}
-            for _sp in (_gl0.get("graduated_tissues") or []):
-                try:
-                    _role = str(_sp.get("role"))
-                    if _role not in _has_gene:
-                        logger.warning("restore graduated %s/%s: ген отсутствует "
-                                       "→ деградация в сайдкар", cid, _role)
-                        continue
-                    _t = self._make_higher_tissue(
-                        _role, data_dim=int(_sp.get("data_dim", 64)),
-                        n_embd=int(_sp.get("n_embd", 21)))
-                    if _t is None:
-                        continue
-                    if _role in _gw:
-                        try:
-                            _t.load_state_dict(_gw[_role])
-                        except Exception as e:
-                            logger.debug("restore graduated weights %s/%s: %s",
-                                         cid, _role, e)
-                    org.tissues[getattr(_t, "tissue_id")] = _t
-                    self._tissue_graduated.setdefault(cid, {})[_role] = _t
-                    _graduated_roles.add(_role)
-                    logger.info("restore graduated %s/%s → ГРАФ-узел (Stage 2 "
-                                "persist, ребро проведёт overlay)", cid, _role)
-                except Exception as e:
-                    logger.debug("restore graduated tissue %s: %s", cid, e)
-            try:
-                self._tissue_grad_done = max(self._tissue_grad_done,
-                                             int(_gl0.get("grad_done", 0)))
-                self._tissue_grad_reverted = max(
-                    self._tissue_grad_reverted,
-                    int(_gl0.get("grad_reverted", 0)))
-            except Exception:
-                pass
-        # эскалация cooldown: revert-counts durable.
-        if isinstance(_gl0, dict) and _gl0.get("grad_revert_count"):
-            try:
-                self._grad_revert_count[cid] = {
-                    str(k): int(v)
-                    for k, v in _gl0["grad_revert_count"].items()}
-            except Exception:
-                pass
-        if isinstance(_gl0, dict) and _gl0.get("beh_soft_count"):
-            try:
-                self._beh_soft_count[cid] = {
-                    str(k): int(v) for k, v in _gl0["beh_soft_count"].items()}
-            except Exception:
-                pass
-        if isinstance(_gl0, dict) and _gl0.get("beh_gc_keep_cd"):
-            try:
-                self._beh_gc_keep_cd[cid] = {
-                    str(k): int(v) for k, v in _gl0["beh_gc_keep_cd"].items()}
-            except Exception:
-                pass
-        # §3-abort escalating cooldown durable (иначе рестарт обнулял бы эскалацию
-        # и дестабилизирующий узел вернулся бы в очередь GC сразу).
-        if isinstance(_gl0, dict) and _gl0.get("beh_gc_abort_count"):
-            try:
-                self._beh_gc_abort_count[cid] = {
-                    str(k): int(v)
-                    for k, v in _gl0["beh_gc_abort_count"].items()}
-            except Exception:
-                pass
-        if isinstance(_gl0, dict) and _gl0.get("beh_gc_abort_cd"):
-            try:
-                self._beh_gc_abort_cd[cid] = {
-                    str(k): int(v) for k, v in _gl0["beh_gc_abort_cd"].items()}
-            except Exception:
-                pass
-        # §6.2 одометр lifetime: restore монотонные счётчики (max — не регресс).
-        if isinstance(_gl0, dict):
-            try:
-                if _gl0.get("ate_total"):
-                    self._stat_ate_total[cid] = max(
-                        self._stat_ate_total.get(cid, 0), int(_gl0["ate_total"]))
-                self._stat_paralysis_count = max(
-                    self._stat_paralysis_count, int(_gl0.get("paralysis_count", 0)))
-                self._stat_recovery_count = max(
-                    self._stat_recovery_count, int(_gl0.get("recovery_count", 0)))
-                # Блок 7b: поведенческие вердикты durable через рестарт — иначе
-                # self-update/сбой питания обнуляет _stat_beh_verdicts → секция
-                # «Поведенческая ценность тканей» пустеет и набирается заново
-                # (Шеф 11.06: «ткань появляется, через время исчезает»).
-                _bv = _gl0.get("beh_verdicts")
-                if isinstance(_bv, dict):
-                    for _r, _v in _bv.items():
-                        self._stat_beh_verdicts.setdefault(str(_r), _v)
-            except Exception:
-                pass
-        # анти-осцилляция: behavior-rejected метки durable через рестарт.
-        if isinstance(_gl0, dict) and _gl0.get("beh_rejected"):
-            try:
-                self._beh_rejected_roles[cid] = {
-                    str(r) for r in _gl0["beh_rejected"]}
-            except Exception:
-                pass
-        if isinstance(_gl0, dict) and _gl0.get("grown_tissues"):
-            _specs_ok = []
-            for _sp in (_gl0.get("grown_tissues") or []):
-                try:
-                    _role = str(_sp.get("role"))
-                    _dd = int(_sp.get("data_dim", 64))
-                    _ne = int(_sp.get("n_embd", 21))
-                    if _role in _graduated_roles:
-                        # уже в графе (Stage 2) — сайдкар-двойник дал бы ДВОЙНОЙ
-                        # вклад (узел→cerebellum + сайдкар→predictor). Спек
-                        # оставляем (источник истины + деградация на старом коде).
-                        _specs_ok.append({"role": _role, "data_dim": _dd, "n_embd": _ne})
-                        continue
-                    _t = self._make_higher_tissue(_role, data_dim=_dd, n_embd=_ne)
-                    if _t is not None:
-                        if _role in _gw:
-                            try:
-                                _t.load_state_dict(_gw[_role])
-                            except Exception as e:
-                                logger.debug("restore grown weights %s/%s: %s", cid, _role, e)
-                        self._grown_tissues.setdefault(cid, {})[_role] = _t
-                        _specs_ok.append({"role": _role, "data_dim": _dd, "n_embd": _ne})
-                except Exception as e:
-                    logger.debug("restore grown tissue %s: %s", cid, e)
-            if _specs_ok:
-                self._tissue_grown_specs[cid] = _specs_ok
-                _maxn = self._tissue_propose_count
-                for _s in _specs_ok:
-                    try:
-                        _maxn = max(_maxn, int(str(_s["role"]).replace("grown", "")))
-                    except Exception:
-                        pass
-                self._tissue_propose_count = _maxn
         # tissues_by_role — bit-exact (no Y50)
         tbr = payload.get("tissues_by_role")
         if isinstance(tbr, dict) and tbr:
@@ -2155,27 +1660,6 @@ class LocalColonyCompute:
                     getattr(self, target)[cid] = float(payload[key])
                 except Exception:
                     pass
-        # §6 рост мозга durable (Фрай 09.06): восстановить ПРОГРЕСС петли роста
-        # (kept/reverted KPI + трейлинг-floor deque + стагнация). predictor цел →
-        # floor-история валидна → PROPOSE возобновляется без re-warm. См. save_state.
-        _gl = payload.get("growth_loop")
-        if isinstance(_gl, dict):
-            try:
-                self._growth_kept = int(_gl.get("kept", self._growth_kept))
-                self._growth_reverted = int(_gl.get("reverted", self._growth_reverted))
-                self._tissue_kept = int(_gl.get("tissue_kept", self._tissue_kept))
-                self._tissue_reverted = int(
-                    _gl.get("tissue_reverted", self._tissue_reverted))
-                self._tissue_gc_pruned = int(
-                    _gl.get("tissue_gc_pruned", self._tissue_gc_pruned))
-                _hist = _gl.get("intr_hist") or []
-                if _hist:
-                    self._growth_intr_hist[cid] = deque(
-                        (float(x) for x in _hist),
-                        maxlen=self._growth_intr_window)
-                self._growth_stagnation_n[cid] = int(_gl.get("stagnation_n", 0))
-            except Exception as e:
-                logger.debug("restore_persisted_state %s growth_loop: %s", cid, e)
         # Higher tissues (brain migration) — exact, без Y50
         for key, store in (
             ("dopamine", self.dopamine),
@@ -2798,19 +2282,6 @@ class LocalColonyCompute:
                         "сохранены для ре-enable)")
         return self._insula_temp_enabled
 
-    def set_felt_thirst_drive(self, on: bool) -> bool:
-        """Канал client_flags: вкл/выкл §3.2 felt-thirst gradual drive МГНОВЕННО
-        (без деплоя/рестарта). on=True: рефлекс A (water-seek) масштабирует
-        приоритет по градуальному felt-сигналу жажды (intero[1]-афферент,
-        φ-onset 0.382) вместо бинарного порога 30%. on=False (kill-switch):
-        откат к проверенному бинарному 30% (read-only флаг — поведение
-        water-seek читает его per-тик; ткани/состояние не трогаются). Реверс
-        мгновенный. backoff: VPS/кабинет ставит false, если выживание падает."""
-        self._felt_thirst_drive_enabled = bool(on)
-        logger.info("set_felt_thirst_drive: %s (%s)", on,
-                    "градуальный felt-drive" if on else "бинарный 30% (kill-switch)")
-        return self._felt_thirst_drive_enabled
-
     def set_motor_renorm_cap(self, cap: float) -> float:
         """Канал client_flags: рекалибровка motor renorm growth-cap (Ступень 2,
         Фрай). cap=1.0 → пин магнитуды к target (текущее); cap>1 → веса motor_policy
@@ -3352,11 +2823,6 @@ class LocalColonyCompute:
                     pred_input = torch.from_numpy(obs68).to(
                         self.device).unsqueeze(0)
 
-                # Вариант A: hook на cerebellum (один раз/cid) — ДО forward,
-                # чтобы organism.forward (ниже) наполнил _cerebellum_out[cid].
-                if self._predictor_from_cerebellum and self._single_organism:
-                    self._ensure_cerebellum_hook(cid, organism)
-
                 heb = self.hebbian.get(cid)
                 if heb is not None:
                     try:
@@ -3370,44 +2836,11 @@ class LocalColonyCompute:
                 # org.forward доминирует vs (B) obs-градиент слаб.
                 _raw_dbg = logits[0, :N_ACTIONS].detach().clone()
 
-                # Вариант A: вход predictor'а = выход cerebellum (связи кормят
-                # прогноз). Берём ПОСЛЕ organism.forward (hook наполнил
-                # _cerebellum_out). Только при совпадении размерности с predictor
-                # (64) — иначе остаёмся на obs-пути (predictor-68 не трогаем).
-                # target остаётся obs_{t+1} → loss_ema/intrinsic сопоставимы.
-                if (self._predictor_from_cerebellum and self._single_organism
-                        and _pred is not None):
-                    _cer = self._cerebellum_out.get(cid)
-                    if _cer is not None and int(getattr(
-                            _pred, "data_dim", _SELF_OBS_OFFSET)) == int(_cer.shape[-1]):
-                        pred_input = _cer
-                # §10.8 (редизайн a): вклад выросших predictor-сайдкаров → во вход
-                # предиктора (изолирован от cerebellum/motor → мотор не возмущается).
-                if self._tissue_growth_enabled or self._grown_tissues.get(cid):
-                    _gc = self._grown_pred_contribution(cid, obs_tensor)
-                    if _gc is not None and int(_gc.shape[-1]) == int(pred_input.shape[-1]):
-                        pred_input = pred_input + _gc
-
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
                 # в r_imm_total как baseline-сигнал.
                 intrinsic_now = self._predictor_train_step(
                     cid, obs_tensor, pred_input)
-
-                # Шаг 2 — петля роста связей (propose→dwell→Δloss_ema→keep/backoff).
-                # После train-step (loss_ema свежий). Gated: только single-Adam + флаг.
-                if self._growth_enabled and self._single_organism:
-                    try:
-                        self._brain_growth_step(cid)
-                    except Exception as e:
-                        logger.warning("brain-growth step %s: %s", cid, e)
-                # §10.8 — петля роста ТКАНЕЙ (узлами). Gated отдельным флагом;
-                # растит узел ТОЛЬКО когда связи насыщены (узлы после рёбер).
-                if self._tissue_growth_enabled and self._single_organism:
-                    try:
-                        self._tissue_growth_step(cid)
-                    except Exception as e:
-                        logger.warning("tissue-growth step %s: %s", cid, e)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -3447,8 +2880,7 @@ class LocalColonyCompute:
                     # server-side → инжектим сами (само-содержащееся). obs[62]=dist-
                     # сигнал 1/(1+dist) (1=на флоре, →0 далеко), obs[63]=kind/3. Мотор
                     # читает → медленный канал учит «GATHER↔высокий obs62» = контекст.
-                    if (_nf_cid is not None and len(obs_arr) > 63
-                            and _nf_cid.get("dist") is not None):
+                    if _nf_cid is not None and len(obs_arr) > 63:
                         try:
                             _d = float(_nf_cid.get("dist", 0.0) or 0.0)
                             _k = float(_nf_cid.get("kind", 0) or 0)
@@ -3461,100 +2893,6 @@ class LocalColonyCompute:
                                 obs_tensor[0, 63] = _o63
                         except Exception:
                             pass
-                    # Phase 1 feeding-ladder (Фрай go / Хьюберт d972ea7): НАВИГАЦИЯ
-                    # к nearest-EDIBLE (мимо обесцененной травы). obs[62-63] ВЫШЕ
-                    # остались на legacy nearest_flora (discrimination, Фрай-инвариант
-                    # «не прячем траву»). Переключаем _nf_cid на edible-цель ТОЛЬКО
-                    # для нав-кода ниже (arrival-commit + stuck). Нет edible (колония
-                    # / нет съедобного рядом) → fallback legacy (нав к чему есть).
-                    # PHASE 2 (Фрай 12.06, pounce-модель): средняя дичь = отдельная
-                    # цель. Извлекаем ДО edible-reassign (тот перезатирает _nf_cid).
-                    # _mp_cid = {dr,dc,dist,...}|None. Pounce-флаг: голоден (надо
-                    # лезть на 55) И способен (не критично-истощён) И дичь в упоре
-                    # (dist ≤ _POUNCE_DIST) → +1 рывок на entry (короткий burst).
-                    _mp_cid = (_nf_cid.get("medium_prey")
-                               if isinstance(_nf_cid, dict) else None)
-                    # PHASE C: nearest_corpse для corpse-nav (труп ценнее травы — мясо)
-                    _corpse_cid = (_nf_cid.get("corpse")
-                                   if isinstance(_nf_cid, dict) else None)
-                    _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
-                    _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
-                    if (self._hunting_enabled and _mp_cid is not None
-                            and _hungry_for_med and _capable):
-                        try:
-                            _mpd = _mp_cid.get("dist")
-                            if (_mpd is not None
-                                    and float(_mpd) <= self._POUNCE_DIST):
-                                self._hunt_pounce[cid] = 1
-                            else:
-                                self._hunt_pounce.pop(cid, None)
-                        except (TypeError, ValueError):
-                            self._hunt_pounce.pop(cid, None)
-                    else:
-                        self._hunt_pounce.pop(cid, None)
-                    # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
-                    # dist≤1 ИЛИ small-prey prox≥0.5) + голод + hunting → флаг для
-                    # _maybe_force_stay: ATTACK проходит сквозь §3-force-STAY. Еда у
-                    # рта берётся даже парализованным = выход из голод-капкана.
-                    _mp_contact = (isinstance(_mp_cid, dict)
-                                   and _mp_cid.get("dist") is not None
-                                   and float(_mp_cid.get("dist", 99.0)) <= 1.0)
-                    _sp_contact = (len(obs_arr) > 58 and float(obs_arr[58]) >= 0.5)
-                    if (self._hunting_enabled and _hungry_for_med
-                            and (_mp_contact or _sp_contact)):
-                        self._hunt_contact[cid] = 1
-                    else:
-                        self._hunt_contact.pop(cid, None)
-                    # §3-EAT bypass (eating.md): на флора-тайле + голоден → EAT
-                    # проходит сквозь §3-force-STAY (выедание из §3 через еду, как
-                    # hunt-out-of-§3). Под passive-gate §3-Адам ДОЛЖЕН EAT, иначе капкан.
-                    # PHASE B (#6): доедать НАЧАТЫЙ укус, даже если на миг сыт (0<progress<1)
-                    # — «не бросать near-complete ради upgrade» (commit реален). Под timer
-                    # energy@completion Адам обычно голоден всё поедание; это страховка.
-                    _evp = (events_per_cid.get(cid) or {}) if events_per_cid else {}
-                    _eprog = float(_evp.get("eating_progress", 0.0) or 0.0)
-                    self._eating_progress[cid] = _eprog
-                    _mid_eat = 0.0 < _eprog < 1.0
-                    # PHASE C: труп = тот же EAT-floor что флора. on_corpse → рефлекс
-                    # фичрит (детерм. EAT). post-kill commit: доедать тушу, не уходить.
-                    _on_corpse = bool(_evp.get("on_corpse"))
-                    # CORPSE_DIAG триангуляция (1/100): on_corpse + nearest_corpse +
-                    # eating_target_kind — найти где рвётся corpse-eat (Адам убивает,
-                    # туши не ест). Зеркало EAT_DIAG Phase A.
-                    self._corpsediag_n = getattr(self, "_corpsediag_n", 0) + 1
-                    if self._corpsediag_n % 100 == 0:
-                        logger.info(
-                            "CORPSE_DIAG cid=%s on_corpse=%d nearest_corpse=%s "
-                            "eat_kind=%s er=%.3f", cid, int(_on_corpse),
-                            "Y" if (_corpse_cid is not None) else "N",
-                            _evp.get("eating_target_kind"), _er)
-                    if (_onf or _on_corpse) and (_hungry_for_med or _mid_eat):
-                        self._on_food[cid] = 1
-                    else:
-                        self._on_food.pop(cid, None)
-                    # EAT_REFLEX триангуляция (rate 1/100): почему рефлекс не фичрит.
-                    self._eatdiag_n = getattr(self, "_eatdiag_n", 0) + 1
-                    if self._eatdiag_n % 100 == 0:
-                        logger.info("EAT_DIAG cid=%s onf=%d hungry=%d on_food=%d er=%.3f",
-                                    cid, int(_onf), int(_hungry_for_med),
-                                    int(bool(self._on_food.get(cid))), _er)
-                    # PHASE 2 verify-диаг (Фрай satiation-тест): дип голода →
-                    # погоня → pounce. Видеть цепочку acceptance live (rate 1/50).
-                    if self._hunting_enabled and _mp_cid is not None:
-                        self._md_diag_n = getattr(self, "_md_diag_n", 0) + 1
-                        if self._md_diag_n % 50 == 0:
-                            try:
-                                logger.info(
-                                    "MEDIUM_DIAG cid=%s mdist=%s er=%.3f hungry=%d "
-                                    "capable=%d pounce=%d d_prox=%.2f", cid,
-                                    _mp_cid.get("dist"), _er,
-                                    int(_hungry_for_med), int(_capable),
-                                    int(bool(self._hunt_pounce.get(cid))),
-                                    float(obs_arr[61]) if len(obs_arr) > 61 else -1.0)
-                            except Exception:
-                                pass
-                    if isinstance(_nf_cid, dict) and _nf_cid.get("edible") is not None:
-                        _nf_cid = _nf_cid["edible"]
                     # FLORA_NAV-диаг (Фрай 05.06): подтвердить приём сигнала +
                     # dist-тренд (arrival-прокси) + obs[62/63]. Rate-limit 1/50.
                     if _nf_cid is not None:
@@ -3599,20 +2937,7 @@ class LocalColonyCompute:
                     # (damage_taken>0) = хищник ТОЧНО был в radius=1 → надёжнейший
                     # сигнал контакта (лучше obs[61], который лагает/не пикует). →
                     # сильный ATTACK-bias «бей в ответ, пока он рядом».
-                    _dmg_taken = float(_ev_cid.get("damage_taken", 0.0) or 0.0)
-                    _just_hit = _dmg_taken > 0.0
-                    # FEAR-ось: монотонный Σ damage_taken (cost-of-encounter дима GC).
-                    if _dmg_taken > 0.0:
-                        self._beh_damage_cum[cid] = (
-                            self._beh_damage_cum.get(cid, 0.0) + _dmg_taken)
-                    # CAMP-BREAK streak: consecutive just_hit = хищник camp'ит и бьёт.
-                    # N тиков подряд = контратака futile (не убили) → пора рвать FLEE.
-                    if _just_hit:
-                        self._camp_hit_streak[cid] = self._camp_hit_streak.get(cid, 0) + 1
-                    else:
-                        self._camp_hit_streak[cid] = 0
-                    _camp_break = (self._camp_hit_streak.get(cid, 0)
-                                   >= self._CAMP_BREAK_TICKS)
+                    _just_hit = float(_ev_cid.get("damage_taken", 0.0) or 0.0) > 0.0
                     # ARRIVAL STUCK-DETECTION (Фрай 07.06 go): вектор (dr,dc,dist)
                     # к nearest_flora НЕ меняется N=13 тиков (φ-Fib) при dist>0 (не
                     # на флоре) → цель недостижима (P40 блокит ход через воду) →
@@ -3658,10 +2983,7 @@ class LocalColonyCompute:
                                               recent_yield=_staying,
                                               on_flora=_onf,
                                               just_hit=_just_hit,
-                                              camp_break=_camp_break,
-                                              flora_abandon_dir=_abandon_dir,
-                                              medium_prey=_mp_cid,
-                                              corpse=_corpse_cid)
+                                              flora_abandon_dir=_abandon_dir)
                     # Newborn-инстинкт (Фрай, порт phase_a.py:748-755): тяга к
                     # GATHER/EAT, затухает за 500 тиков. Только client-рождённые
                     # (birth_tick трекается в mate-flow). Даёт eat-reward →
@@ -3718,10 +3040,6 @@ class LocalColonyCompute:
                         float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)  # predator-близость
                     action = int(selector.select(
                         action_slice, n_actions=N_ACTIONS))
-                    # predator-аффорданс v0.1: стэш pred_prox (obs[61]) → спайк
-                    # adrenaline в _apply_biochem_decay (оживляет ось).
-                    self._last_pred_prox[cid] = (
-                        float(obs_arr[61]) if len(obs_arr) > 61 else 0.0)
                     # Policy-gradient контекст (Фрай 04.06): сохранить СЭМПЛИРОВАННОЕ
                     # действие + π=softmax(action_slice) для PG-апдейта output_proj
                     # (∇log π·advantage к выбранному действию) на следующем тике —
@@ -3780,7 +3098,6 @@ class LocalColonyCompute:
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
                 out[cid] = {"action": action, "target_id": None}
-                self._stat_last_action[cid] = int(action)  # /stats active_eat_rate
                 # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
                 # за флагом park_test (контролируемое условие). По-тиковый лог,
                 # выровнен по world_tick для кросс-сверки со steps/tick сервера.
@@ -3893,29 +3210,16 @@ class LocalColonyCompute:
                     self._skill_window_tick[cid] = _sn
 
                 # Brain migration (10.05.2026): forward S2.E/G/A/F (no_grad).
-                # §3.2 (Фрай 09.06.2026): client-authoritative intero — строим
-                # ЛОКАЛЬНО из self.biochem (primary), P40-intero храним для carry
-                # slots 2/6 + fallback. Снимает P40-blind risk (insula не слепнет
-                # без P40-поля). См. _build_client_intero.
                 intero_tensor = None
                 if intero_per_cid is not None:
-                    _p40_intero = intero_per_cid.get(cid)
-                    if _p40_intero is not None:
+                    intero_arr = intero_per_cid.get(cid)
+                    if intero_arr is not None:
                         try:
-                            self._last_p40_intero[cid] = np.asarray(
-                                _p40_intero, dtype=np.float32).reshape(-1)
+                            intero_tensor = torch.from_numpy(
+                                np.asarray(intero_arr, dtype=np.float32)
+                            ).to(self.device).unsqueeze(0)
                         except Exception:
-                            pass
-                intero_arr = self._build_client_intero(cid)
-                if intero_arr is None:
-                    intero_arr = self._last_p40_intero.get(cid)  # fallback P40
-                if intero_arr is not None:
-                    try:
-                        intero_tensor = torch.from_numpy(
-                            np.asarray(intero_arr, dtype=np.float32).reshape(-1)
-                        ).to(self.device).unsqueeze(0)
-                    except Exception:
-                        intero_tensor = None
+                            intero_tensor = None
                 self._compute_higher_tissues(cid, obs_tensor, intero_tensor)
 
                 # Z1 (16.05.2026, Зодчий) — apply-step 7 высших тканей
@@ -4102,14 +3406,7 @@ class LocalColonyCompute:
                 # cortisol/serotonin/...), потом recompute mental_break,
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
-                self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
-                # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
-                # force-STAY). Раньше _stat_last_action писался при селекторе (выбор
-                # мотора) → рефлекс-EAT не отражался (телеметрия слепа к override).
-                _fa = (out.get(cid) or {}).get("action")
-                if _fa is not None:
-                    self._stat_last_action[cid] = int(_fa)
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
@@ -4192,82 +3489,6 @@ class LocalColonyCompute:
                 payload["intrinsic_ema"] = float(self.intrinsic_ema.get(cid, 0.0))
             except Exception as e:
                 logger.debug("save_state %s predictor: %s", cid, e)
-        # §6 рост мозга durable (Фрай 09.06): персистить ПРОГРЕСС петли роста.
-        # predictor цел (loss_ema непрерывен) → трейлинг-floor история ВАЛИДНА →
-        # PROPOSE возобновляется без ~233-тик re-warm после сбоя питания.
-        # growth_kept/reverted — KPI «закреплено» больше не врёт «0» после рестарта;
-        # intr_hist — трейлинг-floor deque; stagnation_n — счётчик «у floor».
-        # _growth_saturated НЕ персистим: на рестарте сброс в False → петля заново
-        # ищет (durable-инвариант роста, Фрай). См. restore_persisted_state.
-        try:
-            _gi_hist = self._growth_intr_hist.get(cid)
-            payload["growth_loop"] = {
-                "kept": int(self._growth_kept),
-                "reverted": int(self._growth_reverted),
-                "intr_hist": list(_gi_hist) if _gi_hist is not None else [],
-                "stagnation_n": int(self._growth_stagnation_n.get(cid, 0)),
-                # §10.8 рост тканей: счётчики + СПЕКИ выросших predictor-сайдкаров
-                # для recreate-on-restore. Веса сайдкаров — отдельно (grown_weights),
-                # т.к. они НЕ в org.tissues (редизайн a: изоляция от мотора).
-                "tissue_kept": int(self._tissue_kept),
-                "tissue_reverted": int(self._tissue_reverted),
-                "tissue_gc_pruned": int(self._tissue_gc_pruned),
-                "grown_tissues": list(self._tissue_grown_specs.get(cid, [])),
-                # STAGE 2 PERSIST (Фрай go 10.06): graduated-узлы помечаем
-                # ОТДЕЛЬНО — restore пересоздаёт их В ГРАФ (не сайдкаром).
-                # Роль ОСТАЁТСЯ и в grown_tissues (backward-compat: старый
-                # клиент без Stage 2 деградирует её в сайдкар — Stage 1
-                # семантика, безопасно). Спек берём из grown_specs (он там
-                # остаётся после graduation — источник истины по dims).
-                # MID-WATCH узел (in-flight _tissue_grad_state) НЕ помечаем:
-                # §3-окно не завершено → на restore консервативно сайдкаром,
-                # graduation пройдёт заново с чистым watch.
-                "graduated_tissues": [
-                    dict(s) for s in self._tissue_grown_specs.get(cid, [])
-                    if s.get("role") in (self._tissue_graduated.get(cid) or {})
-                    and s.get("role") != (self._tissue_grad_state.get(cid)
-                                          or {}).get("role")
-                ],
-                "grad_done": int(self._tissue_grad_done),
-                "grad_reverted": int(self._tissue_grad_reverted),
-                # анти-осцилляция (Фрай 10.06): behavior-rejected — durable
-                # (иначе после рестарта churn graduate↔prune вернулся бы).
-                "beh_rejected": sorted(self._beh_rejected_roles.get(cid) or []),
-                # эскалация cooldown выпуска: revert-counts durable (иначе
-                # рестарт обнулял бы и вредная ткань вернулась бы в очередь).
-                "grad_revert_count": dict(self._grad_revert_count.get(cid) or {}),
-                "beh_soft_count": dict(self._beh_soft_count.get(cid) or {}),
-                "beh_gc_keep_cd": dict(self._beh_gc_keep_cd.get(cid) or {}),
-                "beh_gc_abort_count": dict(self._beh_gc_abort_count.get(cid) or {}),
-                "beh_gc_abort_cd": dict(self._beh_gc_abort_cd.get(cid) or {}),
-                # §6.2 одометр lifetime — durable (иначе рестарт обнулял бы).
-                "ate_total": int(self._stat_ate_total.get(cid, 0)),
-                "paralysis_count": int(self._stat_paralysis_count),
-                "recovery_count": int(self._stat_recovery_count),
-                # Блок 7b — поведенческие вердикты durable (стабильная секция UI).
-                "beh_verdicts": dict(self._stat_beh_verdicts),
-            }
-        except Exception as e:
-            logger.debug("save_state %s growth_loop: %s", cid, e)
-        # §10.8 (редизайн a): веса выросших predictor-сайдкаров (НЕ в tissues_by_role).
-        try:
-            _gd = dict(self._grown_tissues.get(cid) or {})
-            # GC держит один сайдкар «в стороне» во время абляции-dwell — его спек
-            # ещё в grown_specs, значит на restore он пересоздастся: сохраним и его
-            # веса, иначе мид-GC сейв потеряет обучение этого сайдкара.
-            _gcs = self._tissue_gc_state.get(cid)
-            if _gcs and _gcs.get("role") and _gcs.get("tissue") is not None:
-                _gd.setdefault(_gcs["role"], _gcs["tissue"])
-            # graduation (Stage 1, in-memory): graduated-узел живёт в org.tissues,
-            # НЕ в _grown_tissues, но спек остался сайдкарным → на restore он
-            # пересоздастся САЙДКАРОМ (деградация). Сохраняем его веса сюда,
-            # иначе рестарт мид-graduation потерял бы обучение ткани.
-            for _r, _t in (self._tissue_graduated.get(cid) or {}).items():
-                _gd.setdefault(_r, _t)
-            if _gd:
-                payload["grown_weights"] = {r: t.state_dict() for r, t in _gd.items()}
-        except Exception as e:
-            logger.debug("save_state %s grown_weights: %s", cid, e)
         # Phase 6 — self-observable EMAs.
         if cid in self.entropy_ema:
             payload["entropy_ema"] = float(self.entropy_ema.get(cid, 0.0))
@@ -4336,9 +3557,7 @@ class LocalColonyCompute:
             if not payload:
                 continue
             try:
-                _path = dir_path / f"{cid}.pt"
-                torch.save(payload, _path)
-                self._last_pt_path[cid] = str(_path)   # /stats Блок 1b (size_disk)
+                torch.save(payload, dir_path / f"{cid}.pt")
                 n += 1
             except Exception as e:
                 logger.warning("save_state %s torch.save failed: %s", cid, e)
@@ -5211,9 +4430,7 @@ class LocalColonyCompute:
                              recent_yield: bool = False,
                              on_flora: bool = False,
                              just_hit: bool = False,
-                             camp_break: bool = False,
-                             flora_abandon_dir: "Optional[int]" = None,
-                             medium_prey=None, corpse=None) -> None:
+                             flora_abandon_dir: "Optional[int]" = None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -5280,25 +4497,8 @@ class LocalColonyCompute:
                         logits[13] += PHI * DS           # GATHER (доедай на месте)
                         logits[14] += (1.0 / PHI) * DS   # EAT
                     elif _dist <= 0.0:
-                        # EAT-КОММИТ (Фрай Phase A 13.06, eating.md): без passive-
-                        # вакуума Адам ДОЛЖЕН осознанно EAT, иначе server-gate=голод
-                        # (active_eat был 2-3%). Голоден на еде + НЕТ хищника →
-                        # ДОМИНАНТНЫЙ EAT + гаси move (стой и ешь, не пылесось на ходу).
-                        # Поднимаем recent_yield-прайор в основной путь. Иерархия
-                        # predator>eat: гейт d_prox<0.15 (хищник близко → §4 FLEE ниже
-                        # перебьёт, EAT-коммит НЕ эмитим). Сыт → слабый прайор (как было).
-                        _dpx_eat = float(obs_arr[61]) if n > 61 else 0.0
-                        if energy_ratio < (1.0 / PHI) and _dpx_eat < 0.15:
-                            # РЕШИТЕЛЬНЫЙ EAT (мотор-биас на move из вакуум-эры
-                            # перебивал — гасим move жёстче ×0.2, EAT ×2.5φ).
-                            logits[14] += 2.5 * PHI * DS   # доминантный EAT
-                            logits[13] += PHI * DS         # GATHER (на месте)
-                            logits[4] += (1.0 / PHI) * DS  # STAY-поддержка
-                            logits[0] *= 0.2; logits[1] *= 0.2   # жёстко гаси move (не уходи с еды)
-                            logits[2] *= 0.2; logits[3] *= 0.2
-                        else:
-                            logits[13] += 2.0 * DS    # GATHER (сыт/хищник — слабый прайор)
-                            logits[14] += 1.0 * DS    # EAT
+                        logits[13] += 2.0 * DS    # GATHER (на флоре, пол Старших)
+                        logits[14] += 1.0 * DS    # EAT
                     elif _dist <= 1.0:
                         # ARRIVAL COMMIT (Фрай 07.06, predator_defense-зеркало):
                         # флора ВПЛОТНУЮ (dist≈1, cardinal-смежная) → ДОМИНАНТНЫЙ
@@ -5311,11 +4511,7 @@ class LocalColonyCompute:
                         # специфично (nearest_flora 62/63). С §4 predator (по obs[61],
                         # ниже) НЕ конфликтует — хищник вплотную перебьёт (×0.5 move +
                         # ATTACK/FLEE). Встанет НА тайл → след.тик dist=0 → GATHER/EAT.
-                        # ARRIVAL-to-LAND: голоден → сильнее коммит ПОСАДКИ (×3φ),
-                        # чтобы реально встать на еду (onf-bottleneck: Адам не лендил,
-                        # мотор тащил мимо). Сыт → обычный 2φ.
-                        _hungry_land = energy_ratio < (1.0 / PHI)
-                        _cw = (3.0 if _hungry_land else 2.0) * PHI * DS  # commit-сила шага
+                        _cw = 2.0 * PHI * DS          # commit-сила шага
                         _af = PHI * DS                # анти-флип обратного напр.
                         if _dr < 0:
                             logits[0] += _cw; logits[1] -= _af   # NORTH, гаси SOUTH
@@ -5353,30 +4549,9 @@ class LocalColonyCompute:
             p_ew = float(obs_arr[57]) if n > 58 else 0.0
             p_prox = float(obs_arr[58]) if n > 58 else 0.0
             p_ns, p_ew = _unit(p_ns, p_ew)
-            # HUNT-SEEK калибровка (Фрай 12.06, live reach=0 фикс): УБРАЛ ∝p_prox
-            # attenuation (она убивала far-seek — Адам не доходил до добычи) +
-            # ГОЛОД-модуляция. base_prey без ослабления; prey_weight = base·hunger:
-            #   сытый (energy_ratio≥φ⁻¹=0.62) → φ⁻²=0.382 → prey≈1.7·DS < grass 2.76
-            #     → форажит траву; голодный (≤φ⁻²=0.38) → 1.0 → prey≈4.47·DS≈φ×grass
-            #     → активно охотится; линейно между, clamp. = лестница дефицит→голод→hunt.
-            base_prey = (2.0 + 4.0 * diet) * DS
-            _pinv, _pinv2 = 1.0 / PHI, 1.0 / (PHI * PHI)   # 0.618 / 0.382
-            if energy_ratio >= _pinv:
-                _hf = _pinv2
-            elif energy_ratio <= _pinv2:
-                _hf = 1.0
-            else:
-                _hf = _pinv2 + (_pinv - energy_ratio) / (_pinv - _pinv2) * (1.0 - _pinv2)
-            pw = base_prey * _hf
+            pw = (2.0 + 4.0 * diet) * DS * min(p_prox + 0.1, 1.0)
             logits[0] -= pw * p_ns; logits[1] += pw * p_ns
             logits[2] += pw * p_ew; logits[3] -= pw * p_ew
-            # BASELINE-ОПОРТУНИЗМ (Фрай): близкая добыча (≤~5 тайлов, p_prox≥0.2)
-            # → малый фикс pull НЕзависимо от голода → adjacent prey берётся даже
-            # сытым (baseline kills для verify; contact-commit добивает на контакте).
-            if p_prox >= 0.2:
-                _opp = 1.5 * DS
-                logits[0] -= _opp * p_ns; logits[1] += _opp * p_ns
-                logits[2] += _opp * p_ew; logits[3] -= _opp * p_ew
             # Predator-градиент (беги ПРОТИВ градиента).
             d_ns = float(obs_arr[59]) if n > 61 else 0.0
             d_ew = float(obs_arr[60]) if n > 61 else 0.0
@@ -5399,18 +4574,9 @@ class LocalColonyCompute:
             # И возвращал berserk-on-presence при climb pressure. Теперь: реально
             # ударили → контратака; контакт БЕЗ урона (пассив/транзиент) → НЕ бей,
             # пасись/настороже; приближается (не контакт) → уйди до удара.
-            if just_hit and camp_break:
-                # CAMP-BREAK (Фрай N=5/Хьюберт/Шеф 11.06): контратака N тиков НЕ
-                # убила хищника (всё ещё бьёт) = futile стенд, только дренит → РВИ
-                # camp: сильный FLEE (action 10 = life_critical → исполнится в §3,
-                # +2 burst Шефа в _flee_speed_boost разорвёт gap), гаси ATTACK.
-                # Хищник camp'ил т.к. ATTACK не life_critical → P40 force-STAY'ил.
-                logits[10] += 2.0 * PHI * DS     # сильный FLEE — разорвать camp
-                logits[5] -= PHI * DS            # хватит контратаковать (futile)
-            elif just_hit:
+            if just_hit:
                 # damage_taken>0 = хищник ТОЧНО ударил ЭТОТ тик → бей в ответ СИЛЬНО,
-                # гаси бегство + move-прочь (стой в radius=1, добей). Первые N тиков:
-                # дай контратаке шанс убить; не убил за N → camp_break рвёт (выше).
+                # гаси бегство + move-прочь (стой в radius=1, добей).
                 logits[5] += 2.0 * PHI * DS      # сильный ATTACK
                 logits[10] -= PHI * DS           # НЕ беги — контратакуй
                 logits[0] *= 0.5; logits[1] *= 0.5
@@ -5422,28 +4588,6 @@ class LocalColonyCompute:
             # бой на присутствие/в воздух) — единственный буст ATTACK = just_hit выше.
             if not just_hit:
                 logits[5] -= PHI * DS
-            # PHASE C corpse-nav (eating.md): голоден + труп (мясо, ценнее травы) + не
-            # на нём (dist>1) + нет хищника → nav к трупу (direction-only, как medium-
-            # seek). На трупе (dist≤1) corpse-EAT рефлекс (on_corpse) добьёт. Иерархия:
-            # predator-FLEE > corpse (d_prox<0.3).
-            if corpse is not None and energy_ratio < (1.0 / PHI) and d_prox < 0.3:
-                try:
-                    _cds_raw = corpse.get("dist")
-                    _cds = float(_cds_raw) if _cds_raw is not None else 99.0
-                    if _cds > 1.0:
-                        _cdr = float(corpse.get("dr", 0.0))
-                        _cdc = float(corpse.get("dc", 0.0))
-                        _wc = 3.0 * DS   # сильный pull к мясу (ценнее травы)
-                        if _cdr < 0:
-                            logits[0] += _wc
-                        elif _cdr > 0:
-                            logits[1] += _wc
-                        if _cdc > 0:
-                            logits[2] += _wc
-                        elif _cdc < 0:
-                            logits[3] += _wc
-                except (TypeError, ValueError):
-                    pass
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
             logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
@@ -5466,61 +4610,6 @@ class LocalColonyCompute:
                     logits[5] += 1.5 * BS        # добыча достижима
                     if diet > 0.7:
                         logits[5] += 3.0 * diet * min(p_prox, 1.0)  # карнивор-охота
-                # DS-HUNT (Фрай hunting.md): BS-prey-ATTACK (выше) инертна у
-                # single-Adam (BS=0) → DS-версия. Всеядный Адам атакует достижимую
-                # добычу, перебивая §4-ATTACK-suppress (−φ·DS при not just_hit).
-                # ТОЛЬКО если рядом НЕТ хищника (d_prox<0.3): выживание > охота
-                # (хищник → §4 FLEE/defend приоритетнее).
-                if p_prox > 0.3 and d_prox < 0.3:
-                    logits[5] += (1.5 + 2.0 * min(p_prox, 1.0)) * DS  # > φ·DS suppress
-                    logits[10] -= 0.3 * DS       # не беги от добычи (не угроза)
-                    # КОНТАКТ-COMMIT (fix 12.06, live: Адам на prey_prox=1.0 ВЫБИРАЛ
-                    # MOVE не ATTACK — prey-НАВИГАЦИЯ (pw, выше) тянет move даже на
-                    # контакте → «наезжает» и обходит, не бьёт). Зеркало §4 just_hit:
-                    # на контакте ГАСИМ move + доминантный ATTACK → бей, не обходи.
-                    if p_prox > 0.5:
-                        logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (как §4)
-                        logits[0] *= 0.4; logits[1] *= 0.4
-                        logits[2] *= 0.4; logits[3] *= 0.4
-                elif p_prox <= 0.1:
-                    logits[5] -= 0.5 * DS        # добычи нет → ATTACK впустую
-                # PHASE 2 MEDIUM-SEEK (Фрай 12.06 pounce): арбитраж — голоден И
-                # способен → коммит ОДНУ среднюю дичь (55 = больший обед, тянет
-                # СИЛЬНЕЕ мелкой 21). Настойчивая погоня: ровный direction-only pull
-                # по dr/dc (НЕ ∝1/dist — иначе бросит далёкую, как был reach=0 фикс
-                # для мелкой). φ-доминантна над мелкой-prey nav. Survival-гейт
-                # d_prox<0.3 (как DS-hunt): хищник рядом → НЕ лезь на среднюю. На
-                # контакте (dist≤1) — доминантный ATTACK + гаси move (бей, не обходи).
-                # Pounce (+1 рывок на entry) ставится в obs-loop по dist≤_POUNCE_DIST.
-                # Гейт: ГОЛОД (er<φ⁻¹) + хищника рядом нет. CONTACT-ATTACK (dist≤1)
-                # фичрит при ЛЮБОМ голоде — еда у рта берётся даже при er=0 (§3-выход
-                # из голод-капкана). ПОГОНЯ (dist>1) — только если СПОСОБЕН (er>φ⁻⁵):
-                # не гнаться умирая, но добить вплотную — всегда (Шеф 12.06).
-                if (self._hunting_enabled and medium_prey is not None
-                        and d_prox < 0.3
-                        and energy_ratio < _pinv):
-                    try:
-                        _mdr = float(medium_prey.get("dr", 0.0))
-                        _mdc = float(medium_prey.get("dc", 0.0))
-                        _mds_raw = medium_prey.get("dist")
-                        _mds = float(_mds_raw) if _mds_raw is not None else 99.0
-                        if _mds <= 1.0:
-                            logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (контакт, даже er=0)
-                            logits[0] *= 0.4; logits[1] *= 0.4
-                            logits[2] *= 0.4; logits[3] *= 0.4
-                        elif energy_ratio > _pinv ** 5:   # погоня только если способен
-                            _wm = (2.0 + 4.0 * diet) * DS * PHI  # ровная φ-погоня
-                            if _mdr < 0:
-                                logits[0] += _wm          # NORTH
-                            elif _mdr > 0:
-                                logits[1] += _wm          # SOUTH
-                            if _mdc > 0:
-                                logits[2] += _wm          # EAST
-                            elif _mdc < 0:
-                                logits[3] += _wm          # WEST
-                            logits[10] -= 0.3 * DS        # не беги от добычи
-                    except (TypeError, ValueError):
-                        pass
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
@@ -6172,1242 +5261,6 @@ class LocalColonyCompute:
             except Exception as e:
                 logger.debug("basic_sfnn_update %s/%s: %s", role, cid, e)
 
-    def _cerebellum_tissue_id(self, cid: str, org) -> "str | None":
-        """tissue_id ткани role=='cerebellum' (cache per cid). Вариант A:
-        cerebellum — каноничный in-graph узел (бит 18), через который связи
-        кормят прогноз. None если ткани нет → predictor остаётся на raw obs."""
-        if cid in self._cerebellum_tid:
-            return self._cerebellum_tid[cid]
-        tid = None
-        try:
-            for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
-                role = getattr(tissue, "role", None)
-                if role is None:
-                    spec = getattr(tissue, "spec", None)
-                    role = getattr(spec, "role", None) if spec is not None else None
-                if role == "cerebellum":
-                    tid = _tid
-                    break
-        except Exception as e:
-            logger.debug("cerebellum resolve %s: %s", cid, e)
-        self._cerebellum_tid[cid] = tid
-        return tid
-
-    def _ensure_cerebellum_hook(self, cid: str, org) -> None:
-        """Регистрирует forward-hook на cerebellum-ткани (один раз/cid): ловит
-        её выход в self._cerebellum_out[cid] (detach). Tissue — nn.Module,
-        forward → {port: tensor}. No-op (но помечает cid), если ткани нет."""
-        if cid in self._cerebellum_hooked:
-            return
-        tid = self._cerebellum_tissue_id(cid, org)
-        tissues = getattr(org, "tissues", {}) or {}
-        tissue = tissues.get(tid) if tid is not None else None
-        if tissue is None or not hasattr(tissue, "register_forward_hook"):
-            self._cerebellum_hooked.add(cid)  # нет ткани — больше не пытаемся
-            return
-
-        def _hook(_module, _inp, output, _cid=cid):
-            try:
-                if isinstance(output, dict) and output:
-                    t = next(iter(output.values()))
-                    self._cerebellum_out[_cid] = t.detach()
-            except Exception:
-                pass
-
-        try:
-            tissue.register_forward_hook(_hook)
-            logger.info("cerebellum hook cid=%s tid=%s (variant A: predictor "
-                        "input ← cerebellum)", cid, tid)
-        except Exception as e:
-            logger.warning("cerebellum hook %s: %s", cid, e)
-        self._cerebellum_hooked.add(cid)
-
-    # ── Шаг 2 — петля роста связей (in-life topology growth) ──────────────
-
-    def _intrinsic_plateaued(self, cid: str) -> bool:
-        """§10.8 (Фрай 09.06): noise-robust ОТНОСИТЕЛЬНОЕ плато. intrinsic СОШЁЛСЯ
-        (флуктуирует у трейлинг-floor) ⇔ доля near-floor сэмплов в окне ≥ φ⁻¹.
-        Устойчиво к всплескам (погода): 75.5% near-floor при сходимости проходит
-        порог 61.8%, а активное обучение (низкая доля near-floor) — нет. Заменяет
-        55-подряд (всплески сбивали consecutive). Нужна полная история (≥55)."""
-        hist = self._growth_intr_hist.get(cid)
-        if not hist or len(hist) < self._growth_plateau_ticks:
-            return False
-        floor = min(hist)
-        thr = floor * (1.0 + self._growth_near_floor_margin)
-        near = sum(1 for x in hist if x <= thr)
-        return (near / len(hist)) >= self._growth_plateau_frac
-
-    def _connections_saturated(self, org) -> bool:
-        """§10.8 (Фрай 09.06): ВСЕ не-cerebellum роли подключены к cerebellum
-        (enabled) = жёсткое насыщение связей (рёбра исчерпаны → расти узлами).
-        ГРАФ-derived (restart-robust, не stale-флаг _growth_saturated, который
-        сбрасывается на рестарте). Самокорректируется."""
-        tissues = getattr(org, "tissues", None) or {}
-        roles = set()
-        has_cer = False
-        for t in tissues.values():
-            r = getattr(t, "role", None)
-            if r == "cerebellum":
-                has_cer = True
-            elif r:
-                roles.add(r)
-        if not roles or not has_cer:
-            return False
-        genes = getattr(org, "tissue_topology_genes", None) or []
-        connected = {getattr(g, "source_role", None) for g in genes
-                     if getattr(g, "enabled", False)
-                     and getattr(g, "target_role", None) == "cerebellum"}
-        return roles.issubset(connected)
-
-    def _brain_growth_step(self, cid: str) -> None:
-        """Один тик петли роста. idle→(плато intrinsic)→propose+dwell→измерить
-        Δloss_ema→keep/backoff. keep на ЗНАЧИМОМ сошедшемся улучшении; backoff
-        revert'ит ребро и защищает net/§3. Одна связь в полёте. Gated снаружи
-        (_growth_enabled + single_organism)."""
-        org = self.organisms.get(cid)
-        pred = self.predictor.get(cid)
-        if org is None or pred is None:
-            return
-        if self._cerebellum_tissue_id(cid, org) is None:
-            return  # нет cerebellum → расти некуда (драйвер не отзовётся)
-        st = self._growth_state.get(cid)
-        if st is None:
-            # Трейлинг-floor историю поддерживаем КАЖДЫЙ тик — она нужна и tissue-
-            # петле (даже когда связи насыщены и эта петля на паузе). Поэтому append
-            # ДО saturated-gate (иначе hist застывал бы → плато на стале-данных).
-            intr = float(self.intrinsic_ema.get(cid, 0.0))
-            hist = self._growth_intr_hist.get(cid)
-            if hist is None:
-                hist = deque(maxlen=self._growth_intr_window)
-                self._growth_intr_hist[cid] = hist
-            hist.append(intr)
-            if self._growth_saturated:
-                return  # связи насыщены — петля РЁБЕР на паузе (рост узлами, §10.8)
-            # Noise-robust ОТНОСИТЕЛЬНОЕ плато (доля near-floor ≥ φ⁻¹): intrinsic
-            # СОШЁЛСЯ → весами учиться нечему → propose-EDGE. Устойчиво к всплескам
-            # погоды (см. _intrinsic_plateaued). Заменяет 55-подряд (Фрай 09.06).
-            if self._intrinsic_plateaued(cid):
-                self._propose_growth_edge(cid, org)
-            return
-        # dwell: ждём пере-сходимости predictor'а с новым входом (Фрай: достаточно,
-        # чтобы не принять шум за сигнал).
-        st["ticks"] += 1
-        if st["ticks"] < self._growth_dwell_ticks:
-            return
-        # measure + keep/backoff
-        loss_before = float(st["loss_before"])
-        loss_after = float(self.loss_ema.get(cid, loss_before))
-        delta = loss_before - loss_after  # >0 = прогноз улучшился
-        signif = delta >= loss_before * self._growth_min_delta_frac
-        # net/§3-защита: §3 не ухудшился (par не вырос) И энергия не обвалилась.
-        net_ok = int(self._paralysis_window_n) <= int(st["par_before"])
-        bc = self.biochem.get(cid)
-        if bc is not None and st.get("energy_before") is not None:
-            net_ok = net_ok and (float(getattr(bc, "energy", 0.0))
-                                 >= float(st["energy_before"]) * 0.618)
-        keep = bool(signif and net_ok)
-        gene = st["gene"]
-        if keep:
-            self._growth_kept += 1
-            # KEEP = поиск ещё продуктивен → сбрасываем насыщение.
-            self._growth_fallback_streak = 0
-            self._growth_saturated = False
-            logger.info("brain-growth KEEP cid=%s edge=%s→cerebellum Δloss=%.5f "
-                        "(%.1f%%) kept=%d", cid, gene.source_role, delta,
-                        100.0 * delta / max(1e-9, loss_before), self._growth_kept)
-        else:
-            try:
-                gene.enabled = False
-                from core.tissue_topology import apply_topology_overlay_to_org
-                apply_topology_overlay_to_org(org)
-            except Exception as e:
-                logger.warning("brain-growth backoff %s: %s", cid, e)
-            # cooldown: отметить ребро отвергнутым (не ретраить ~cooldown проб).
-            self._growth_rejected.setdefault(cid, {})[gene.source_role] = (
-                self._growth_propose_count)
-            self._growth_reverted += 1
-            # SATURATION: backoff из fallback (свежих кандидатов не было) → копим
-            # streak. Порог → пауза петли + сигнал готовности к фазе тканей.
-            if st.get("from_fallback"):
-                self._growth_fallback_streak += 1
-                if (not self._growth_saturated and self._growth_fallback_streak
-                        >= self._growth_saturation_threshold):
-                    self._growth_saturated = True
-                    n_active = sum(1 for g in (
-                        getattr(org, "tissue_topology_genes", []) or [])
-                        if getattr(g, "enabled", False))
-                    logger.info("brain-growth SATURATED cid=%s: полезные связи "
-                                "исчерпаны (active=%d), петля связей НА ПАУЗЕ — "
-                                "готов к фазе тканей §3.2", cid, n_active)
-            else:
-                self._growth_fallback_streak = 0  # был свежий кандидат → не насыщение
-            logger.info("brain-growth BACKOFF cid=%s edge=%s→cerebellum Δloss=%.5f "
-                        "signif=%s net_ok=%s reverted=%d", cid, gene.source_role,
-                        delta, signif, net_ok, self._growth_reverted)
-        self._growth_state.pop(cid, None)
-        # После keep/backoff — заново копим стагнацию у floor до следующего propose.
-        self._growth_stagnation_n[cid] = 0
-
-    def _propose_growth_edge(self, cid: str, org) -> bool:
-        """Предложить ОДНУ связь {роль}→cerebellum (gene-формат + innovation
-        tracker как у Хьюберта, target=cerebellum чтобы двигать вход прогноза).
-        Записывает state для dwell. True если ребро добавлено."""
-        try:
-            from core.tissue_topology import (
-                TissueConnectionGene, apply_topology_overlay_to_org,
-                TissueInnovationTracker)
-            from core.connection import ConnectionType
-        except Exception as e:
-            logger.warning("brain-growth import %s: %s", cid, e)
-            return False
-        if self._growth_tracker is None:
-            self._growth_tracker = TissueInnovationTracker()
-        role_to_id: dict = {}
-        for _tid, tissue in (getattr(org, "tissues", {}) or {}).items():
-            role = getattr(tissue, "role", None)
-            if role is None:
-                spec = getattr(tissue, "spec", None)
-                role = getattr(spec, "role", None) if spec is not None else None
-            if role:
-                role_to_id[role] = _tid
-        if "cerebellum" not in role_to_id:
-            return False
-        genes = getattr(org, "tissue_topology_genes", None)
-        if genes is None:
-            genes = []
-            org.tissue_topology_genes = genes
-        taken = {g.source_role for g in genes
-                 if g.enabled and g.target_role == "cerebellum"}
-        all_cand = sorted(r for r in role_to_id
-                          if r != "cerebellum" and r not in taken)
-        if not all_cand:
-            # ВСЕ роли→cerebellum уже есть = ЖЁСТКОЕ насыщение связей → ставим флаг
-            # (ROOT 2, Фрай 09.06): иначе после рестарта _growth_saturated=False, а
-            # ре-насыщение через fallback-backoff недостижимо (propose сразу выходит
-            # тут) → tissue-петля гатнута навечно. Теперь насыщение само ставится.
-            self._growth_saturated = True
-            return False
-        # COOLDOWN: предпочитаем рёбра, не отвергнутые за последние
-        # _growth_retry_cooldown проб. Если свежих нет (всё в cooldown) —
-        # fallback на all_cand (cooldown = предпочтение, не сталл).
-        rej = self._growth_rejected.get(cid, {})
-        cd = int(self._growth_retry_cooldown)
-        fresh = [r for r in all_cand
-                 if r not in rej or (self._growth_propose_count - rej[r]) >= cd]
-        used_fallback = not fresh   # свежих кандидатов нет → гоняем оставшиеся
-        candidates = fresh if fresh else all_cand
-        self._growth_propose_count += 1
-        src = self._growth_rng.choice(candidates)
-        gene = TissueConnectionGene(
-            innovation=self._growth_tracker.reserve(src, "cerebellum"),
-            source_role=src, target_role="cerebellum",
-            conn_type=ConnectionType.DIRECT, weight=1.0, enabled=True)
-        genes.append(gene)
-        try:
-            apply_topology_overlay_to_org(org)
-        except Exception as e:
-            logger.warning("brain-growth apply %s: %s", cid, e)
-            genes.remove(gene)
-            return False
-        bc = self.biochem.get(cid)
-        self._growth_state[cid] = {
-            "gene": gene,
-            "loss_before": float(self.loss_ema.get(cid, 0.0)),
-            "ticks": 0,
-            "par_before": int(self._paralysis_window_n),
-            "energy_before": (float(getattr(bc, "energy", 0.0))
-                              if bc is not None else None),
-            "from_fallback": used_fallback,
-        }
-        logger.info("brain-growth PROPOSE cid=%s edge=%s→cerebellum loss_before=%.5f",
-                    cid, src, self._growth_state[cid]["loss_before"])
-        return True
-
-    def reset_growth_saturation(self) -> None:
-        """Снять насыщение роста связей. Вызывать при добавлении ТКАНЕЙ (§3.2):
-        новые роли = новые {роль}→cerebellum кандидаты → петле снова есть что
-        пробовать. Идемпотентно."""
-        if self._growth_saturated or self._growth_fallback_streak:
-            logger.info("brain-growth saturation reset (новые ткани/роли — "
-                        "петля связей возобновлена)")
-        self._growth_saturated = False
-        self._growth_fallback_streak = 0
-
-    def set_tissue_growth(self, on: bool) -> bool:
-        """Канал client_flags: вкл/выкл §10.8 рост ТКАНЕЙ (узлами) МГНОВЕННО.
-        on=True: после насыщения связей петля растит ткань-кандидата.
-        on=False (kill-switch) = ПОЛНЫЙ РЕВЕРТ (Фрай 09.06, после live-кризиса:
-        выросшие ткани кормят cerebellum→motor → возмущают поведение → Адам ушёл
-        в §3). Убираем ВСЕ выросшие ткани (узлы+рёбра) + чистим спеки/счётчик →
-        восстанавливаем до-ростовой мозг (выживание > прогноз-выигрыш). Также
-        срабатывает на рестарте: restore пересоздаёт grown из спеков → off-вызов
-        их убирает. Идемпотентно."""
-        self._tissue_growth_enabled = bool(on)
-        if not on:
-            n_removed = 0
-            for cid in list(self.organisms.keys()):
-                # graduation (Stage 1): сперва вернуть граф-узлы в сайдкары
-                # (вытащить из cerebellum→motor), потом убрать как сайдкары.
-                st = self._tissue_grad_state.get(cid)
-                if st is not None:
-                    self._revert_graduation(cid, self.organisms.get(cid), st,
-                                            reason="tissue_growth kill-switch")
-                for role in list((self._tissue_graduated.get(cid) or {}).keys()):
-                    self._degraduate_node(cid, self.organisms.get(cid), role,
-                                          reason="tissue_growth kill-switch")
-                d = self._grown_tissues.get(cid) or {}
-                n_removed += len(d)
-                self._grown_tissues.pop(cid, None)
-                self._tissue_grown_specs.pop(cid, None)
-                self._tissue_growth_state.pop(cid, None)
-                self._tissue_gc_state.pop(cid, None)       # GC held-aside тоже убираем
-                self._tissue_gc_tested.pop(cid, None)
-                self._tissue_gc_sweep_done.pop(cid, None)
-                self._tissue_gc_keep_rise.pop(cid, None)   # graduation-кандидаты
-            if n_removed:
-                self._tissue_kept = 0
-                logger.info("set_tissue_growth OFF: РЕВЕРТ — убрано %d выросших "
-                            "predictor-сайдкаров (до-ростовой мозг)", n_removed)
-        logger.info("set_tissue_growth: %s", on)
-        return self._tissue_growth_enabled
-
-    def _propose_growth_tissue(self, cid: str, org) -> bool:
-        """§10.8 (Фрай 09.06 редизайн a): предложить ткань-кандидата как PREDICTOR-
-        САЙДКАР. Минт sidecar 21/3/1 (читает obs64), кладём в self._grown_tissues —
-        НЕ в org.tissues, НЕ в граф. Её выход добавляется во вход предиктора
-        (изолированно от cerebellum/motor) → улучшает ПРОГНОЗ без возмущения мотора.
-        Драйвер Δloss сохраняется. Записывает state для dwell. True если создана."""
-        pred = self.predictor.get(cid)
-        if pred is None:
-            return False
-        self._tissue_propose_count += 1
-        n = self._tissue_propose_count
-        role = f"grown{n}"
-        data_dim = int(self._TISSUE_GROWTH_DATA_DIM)
-        n_embd = int(self._TISSUE_GROWTH_N_EMBD)
-        tissue = self._make_higher_tissue(role, data_dim=data_dim, n_embd=n_embd)
-        if tissue is None:
-            return False
-        self._grown_tissues.setdefault(cid, {})[role] = tissue  # сайдкар, НЕ в графе
-        bc = self.biochem.get(cid)
-        self._tissue_growth_state[cid] = {
-            "role": role,
-            "spec": {"role": role, "data_dim": data_dim, "n_embd": n_embd},
-            "loss_before": float(self.loss_ema.get(cid, 0.0)),
-            "ticks": 0,
-            "par_before": int(self._paralysis_window_n),
-            "energy_before": (float(getattr(bc, "energy", 0.0))
-                              if bc is not None else None),
-        }
-        logger.info("brain-growth TISSUE-PROPOSE cid=%s role=%s (predictor-sidecar, "
-                    "motor-isolated) loss_before=%.5f", cid, role,
-                    self._tissue_growth_state[cid]["loss_before"])
-        return True
-
-    def _grown_pred_contribution(self, cid: str, obs_tensor):
-        """§10.8 (редизайн a): агрегат выходов выросших predictor-сайдкаров (читают
-        obs64) → ДОБАВЛЯЕТСЯ во вход предиктора. None если сайдкаров нет. Грон НЕ в
-        графе → cerebellum/motor изолированы. [1, DATA_DIM]."""
-        d = self._grown_tissues.get(cid)
-        if not d:
-            return None
-        torch = self._torch
-        agg = None
-        for role, t in list(d.items()):
-            try:
-                with torch.no_grad():
-                    o = t({"input": obs_tensor.detach()})["output"]
-                agg = o if agg is None else (agg + o)
-            except Exception as e:
-                logger.debug("grown sidecar fwd %s/%s: %s", cid, role, e)
-        return agg
-
-    def _remove_grown_tissue(self, cid: str, org=None, tid=None, role: str = "",
-                              gene=None) -> None:
-        """§10.8 backoff/revert (редизайн a): убрать выросший predictor-сайдкар из
-        self._grown_tissues. Грон НЕ в графе → cerebellum/motor не трогаются. Параметры
-        org/tid/gene — для backward-compat вызовов, игнорируются."""
-        try:
-            d = self._grown_tissues.get(cid)
-            if d is not None:
-                d.pop(role, None)
-                if not d:
-                    self._grown_tissues.pop(cid, None)
-        except Exception as e:
-            logger.warning("tissue-growth remove %s role=%s: %s", cid, role, e)
-
-    def _prune_grown_spec(self, cid: str, role: str) -> None:
-        """GC: убрать спек сайдкара из grown_specs (чтобы restore его НЕ пересоздал).
-        Грон-объект уже отсутствует в _grown_tissues (был held GC). Навсегда."""
-        specs = self._tissue_grown_specs.get(cid)
-        if specs:
-            specs = [s for s in specs if s.get("role") != role]
-            if specs:
-                self._tissue_grown_specs[cid] = specs
-            else:
-                self._tissue_grown_specs.pop(cid, None)
-
-    def set_tissue_graduation(self, on: bool) -> bool:
-        """Канал client_flags: вкл/выкл Stage 1 GRADUATION (Фрай 10.06). on=True:
-        при появлении durable-кандидата (GC-KEEP) — graduation ОДНОЙ ткани в граф.
-        on=False (kill-switch) = revert всех graduated-узлов ОБРАТНО В САЙДКАРЫ
-        (веса целы, изоляция от мотора восстановлена). Идемпотентно."""
-        self._tissue_graduation_enabled = bool(on)
-        if on:
-            # re-flip = осознанный рестарт выпуска: снять HALT + streak (анти-
-            # churn (3)); health-гейт (A) всё равно потребует stable recovery.
-            if self._grad_halted or self._grad_revert_streak:
-                logger.info("set_tissue_graduation: HALT снят re-flip'ом "
-                            "(streak=%d)", self._grad_revert_streak)
-            self._grad_halted = False
-            self._grad_revert_streak = 0
-        if not on:
-            for cid in list(self.organisms.keys()):
-                st = self._tissue_grad_state.get(cid)
-                if st is not None:
-                    self._revert_graduation(cid, self.organisms.get(cid), st,
-                                            reason="kill-switch")
-                # graduated без in-flight state (watch уже пройден) — тоже вернуть
-                for role in list((self._tissue_graduated.get(cid) or {}).keys()):
-                    self._degraduate_node(cid, self.organisms.get(cid), role,
-                                          reason="kill-switch")
-        logger.info("set_tissue_graduation: %s", on)
-        return self._tissue_graduation_enabled
-
-    def set_behavioral_probe(self, role: str) -> str:
-        """§10.3 Step-1 (Фрай 10.06): behavioral leave-one-out ПРОБА для замера
-        СИГНАЛА graduated-узла по измерениям самочувствия. role!="" → ablate эту
-        ткань (workbench выход→нули, мотор-вклад исчезает); ""→снять абляцию.
-        BIOCHEM_DEBUG ловит сдвиг измерений (ablated vs baseline). Ребро/узел НЕ
-        трогаем — обратимо мгновенно (это и есть GC-ablation, переиспользуем
-        для Stage 3). Мотор-риска нет: ablation = МЕНЬШЕ сигнала в cerebellum,
-        не больше (графа не возмущаем)."""
-        role = str(role or "")
-        self._behavioral_probe_role = role
-        for _cid, org in self.organisms.items():
-            try:
-                abl = getattr(org, "_ablated_roles", None)
-                if abl is None:
-                    org._ablated_roles = abl = set()
-                # снять прошлую пробу (наши grownN-роли), оставить чужие абляции
-                for r in [x for x in abl if str(x).startswith("grown")]:
-                    abl.discard(r)
-                if role:
-                    abl.add(role)
-                if hasattr(org, "_cached_levels"):
-                    org._cached_levels = None
-            except Exception as e:
-                logger.warning("behavioral probe %s/%s: %s", _cid, role, e)
-        logger.info("set_behavioral_probe: role=%r (ablate для замера сигнала)",
-                    role)
-        return role
-
-    def reset_behavior_rejected(self) -> int:
-        """Сброс анти-осцилляционных меток «behavior-rejected». Вызывать при
-        ИЗМЕНЕНИИ МИРА (новые аффордансы Хьюберта: хищник/нагрузка/...) — ткань,
-        бесполезная в старом мире, может стать специалистом в новом. Идемпотентно."""
-        n = sum(len(s) for s in self._beh_rejected_roles.values())
-        if n:
-            logger.info("behavior-rejected метки сброшены (%d ролей) — мир "
-                        "изменился, повторный выпуск разрешён", n)
-        self._beh_rejected_roles.clear()
-        return n
-
-    def behavioral_gc_retest(self) -> int:
-        """Power-калибровка/пере-прогон (Фрай 10.06): снять behavior-rejected
-        метки + cooldown + сбросить Stage-1 grad-лимит → durable-сайдкары снова
-        выпускаются и проходят behavioral-GC. Для замера мощности на известно-
-        хорошей ткани (grown133). Возвращает число снятых меток."""
-        n = self.reset_behavior_rejected()
-        self._beh_gc_rejected.clear()
-        self._beh_gc_keep_cd.clear()
-        self._beh_gc_abort_count.clear()   # §3-abort escalating cooldown reset
-        self._beh_gc_abort_cd.clear()
-        self._grad_rejected.clear()
-        self._grad_revert_count.clear()
-        self._beh_soft_count.clear()
-        self._grad_halted = False
-        self._grad_revert_streak = 0
-        self._tissue_grad_done = 0
-        logger.info("behavioral_gc RETEST: метки/cooldown сняты, grad-лимит "
-                    "сброшен — durable-сайдкары снова выпускаются")
-        return n
-
-    def set_behavioral_gc(self, on: bool) -> bool:
-        """Канал client_flags: вкл/выкл §10.3 Stage 3 behavioral-GC. on=False
-        (kill-switch): прервать активный GC, ВОССТАНОВИТЬ edge-weight (узел
-        обратно в полноценный graduated). Идемпотентно."""
-        self._behavioral_gc_enabled = bool(on)
-        if not on:
-            for cid in list(self._beh_gc_state.keys()):
-                self._abort_behavioral_gc(cid, self.organisms.get(cid),
-                                          reason="kill-switch")
-        logger.info("set_behavioral_gc: %s", on)
-        return self._behavioral_gc_enabled
-
-    def set_hunting(self, on: bool) -> bool:
-        """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
-        on=True: Адам→ВСЕЯДНЫЙ (diet_gene→φ⁻¹=0.618) → (а) server даёт kill-energy
-        (energy+=φ⁷×diet), (б) DS-hunt-ATTACK активен (gate diet>0.5), (в) meat-
-        дима GC накапливается. off: травоядный (diet→0.0) = текущее поведение.
-        Меняет diet в traits → re-announce (_skill_changed_cids → P40 mirror).
-        ТОЛЬКО single-organism (Адам); другим owned диету не трогаем. Идемпотентно."""
-        self._hunting_enabled = bool(on)
-        if not self._single_organism:
-            logger.info("set_hunting: %s (НЕ single-organism → diet не трогаю)", on)
-            return self._hunting_enabled
-        target = self._OMNIVORE_DIET if on else 0.0
-        n = 0
-        for cid in list(self.organisms.keys()):
-            cur = self.traits.get(cid)
-            if not isinstance(cur, dict):
-                cur = {}
-                self.traits[cid] = cur
-            cur["diet_gene"] = target
-            org = self.organisms.get(cid)
-            if org is not None:
-                try:
-                    setattr(org, "diet_gene", target)
-                except Exception:
-                    pass
-            self._skill_changed_cids.add(cid)   # re-announce → P40 kill_energy×diet
-            n += 1
-        logger.info("set_hunting: %s (diet_gene→%.3f, %d owned re-announce)",
-                    on, target, n)
-        return self._hunting_enabled
-
-    def _beh_gc_set_edge_weight(self, org, role: str, w: float) -> None:
-        """Soft ablate/restore (Фрай 10.06): менять ВЕС ребра {role}→cerebellum,
-        НЕ удалять узел — топология стабильна → нет churn → нет §3-триггера.
-        overlay переписывает conn.weight из gene.weight."""
-        try:
-            genes = getattr(org, "tissue_topology_genes", None) or []
-            for g in genes:
-                if (getattr(g, "source_role", None) == role
-                        and getattr(g, "target_role", None) == "cerebellum"):
-                    g.weight = float(w)
-            from core.tissue_topology import apply_topology_overlay_to_org
-            apply_topology_overlay_to_org(org)
-        except Exception as e:
-            logger.warning("beh-gc edge-weight %s/%s→%.3f: %s", role, role, w, e)
-
-    def _beh_gc_sample(self, cid: str) -> dict:
-        """Снимок live-variance измерений самочувствия. income — RATE (дельта
-        монотонного аккумулятора, выставляется per-окно). cortisol инвертируем
-        (↓=благо) → все измерения в семантике «больше=лучше»."""
-        bc = self.biochem.get(cid)
-        if bc is None:
-            return {}
-        return {
-            "neg_cortisol": -float(getattr(bc, "cortisol", 0.0)),
-            "glucose": float(getattr(bc, "glucose", 0.0)),
-            "hydration": float(getattr(bc, "hydration", 0.0)),
-            "income_cum": float(self._beh_income_cum.get(cid, 0.0)),
-            "damage_cum": float(self._beh_damage_cum.get(cid, 0.0)),  # fear-ось (rate, neg)
-            "meat_cum": float(self._beh_meat_cum.get(cid, 0.0)),      # hunt-ось (rate, pos)
-        }
-
-    def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
-        """Запустить парный GC на graduated-узле (durable, не в cooldown). Стартуем
-        в ablate-фазе (edge-weight→0). True если начат."""
-        # ЭНЕРГО-ГЕЙТ (Фрай 11.06, инцидент 52%-паралич): GC стартовал в окне
-        # paralysis==0 МЕЖДУ §3-провалами и сам аблейтил в §3 → спираль. Не
-        # начинаем ablate пока Адам не здоров (energy≥φ⁻¹·max) И нет недавнего §3.
-        bc = self.biochem.get(cid)
-        e_now = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
-        if e_now < self._GRAD_HEALTH_ENERGY:
-            return False
-        if (self._last_world_tick - self._last_paralysis_tick.get(cid, -10**9)) \
-                < self._BEH_GC_NO_PAR_TICKS:
-            return False   # недавний §3 → ждём стабильности перед ablate
-        grad = self._tissue_graduated.get(cid) or {}
-        rej = self._beh_gc_rejected.get(cid) or {}
-        kcd = self._beh_gc_keep_cd.get(cid) or {}
-        acd = self._beh_gc_abort_cd.get(cid) or {}   # §3-abort escalating cooldown
-        cand = [r for r in grad
-                if (self._last_world_tick - rej.get(r, -10**9))
-                >= self._tissue_gc_epoch_interval
-                # KEEP-cooldown: подтверждённый узел ждёт длинную паузу до
-                # ре-валидации (не ревизуется по кругу сразу после KEEP).
-                and (self._last_world_tick - kcd.get(r, -10**9))
-                >= self._BEH_GC_KEEP_COOLDOWN
-                # ABORT-cooldown: §3-дестабилизировавший узел отдыхает Fib-эскал.
-                and self._last_world_tick >= acd.get(r, 0)]
-        if not cand:
-            return False
-        role = cand[0]
-        # ДОСВЕТКА (Фрай 10.06): repeat-soft роль → 34 пары (powered-тест,
-        # keep/permanent окончательно) вместо очередного 13-пар цикла.
-        deep = (self._beh_soft_count.get(cid, {}).get(role, 0)
-                >= self._BEH_GC_DEEP_AFTER_SOFTS)
-        pairs = self._BEH_GC_PAIRS_DEEP if deep else self._BEH_GC_PAIRS
-        t_keep = self._BEH_GC_T_KEEP_DEEP if deep else self._BEH_GC_T_KEEP
-        self._beh_gc_set_edge_weight(org, role, 0.0)   # старт: ablate
-        self._beh_gc_state[cid] = {
-            "role": role,
-            "phase": "ablate",
-            "pairs_done": 0,
-            "pairs_target": pairs,
-            "t_keep": t_keep,
-            "win_ticks": 0,
-            "win0_income": float(self._beh_income_cum.get(cid, 0.0)),
-            "win0_damage": float(self._beh_damage_cum.get(cid, 0.0)),
-            "win0_meat": float(self._beh_meat_cum.get(cid, 0.0)),
-            "acc": {}, "acc_n": 0,
-            "samples": {"ablate": {}, "restore": {}},
-            "par_before": int(self._paralysis_window_n),
-        }
-        logger.info("brain-growth BEH-GC-START cid=%s role=%s (парный interleaved, "
-                    "soft-ablate edge→0, %d пар × %d тиков%s)", cid, role,
-                    pairs, self._BEH_GC_WINDOW,
-                    ", ДОСВЕТКА repeat-soft" if deep else "")
-        return True
-
-    def _abort_behavioral_gc(self, cid: str, org, reason: str) -> None:
-        """Прервать GC: восстановить edge-weight (узел снова полноценный graduated)."""
-        st = self._beh_gc_state.pop(cid, None)
-        if st is None:
-            return
-        if org is not None:
-            self._beh_gc_set_edge_weight(org, st["role"],
-                                         self._TISSUE_GRAD_EDGE_WEIGHT)
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        role = st["role"]
-        # ABORT-COOLDOWN escalating Fib (Фрай 11.06): §3-abort → роль отдыхает
-        # ×Fib(abort_count) epoch_interval'ов перед ре-попыткой. Рвёт спираль
-        # (узел, дестабилизирующий §3, не долбит мотор по кругу). Только на §3-
-        # abort (не kill-switch — там вся GC off, cooldown бессмыслен).
-        if reason.startswith("§3"):
-            ac = self._beh_gc_abort_count.setdefault(cid, {})
-            ac[role] = ac.get(role, 0) + 1
-            mult = self._GRAD_COOLDOWN_FIB[
-                min(ac[role] - 1, len(self._GRAD_COOLDOWN_FIB) - 1)]
-            until = int(self._last_world_tick) + mult * self._tissue_gc_epoch_interval
-            self._beh_gc_abort_cd.setdefault(cid, {})[role] = until
-            logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge "
-                        "восстановлен, abort#%d → cooldown ×%d (до тика %d)",
-                        cid, role, reason, ac[role], mult, until)
-        else:
-            logger.info("brain-growth BEH-GC-ABORT cid=%s role=%s (%s) — edge-weight "
-                        "восстановлен", cid, role, reason)
-
-    def _behavioral_gc_step(self, cid: str, org) -> None:
-        """Один тик парной машины. §3-abort → discard transient → накопить окно →
-        на закрытии окна toggle фазы (edge-weight) → собрать BEH_GC_PAIRS пар →
-        resolve (paired-t per-dim, specialist-keep + veto net-harm)."""
-        st = self._beh_gc_state.get(cid)
-        if st is None:
-            return
-        # §3-монитор (Фрай): дестабилизировал → немедленный abort + restore.
-        if int(self._paralysis_window_n) > int(st["par_before"]):
-            self._abort_behavioral_gc(cid, org, reason="§3 paralysis")
-            return
-        st["win_ticks"] += 1
-        # discard пост-toggle transient (мотор устаканивается перед замером)
-        if st["win_ticks"] <= self._BEH_GC_TRANSIENT:
-            return
-        s = self._beh_gc_sample(cid)
-        for k, v in s.items():
-            if k not in ("income_cum", "damage_cum", "meat_cum"):  # cum'ы → RATE, не mean
-                st["acc"][k] = st["acc"].get(k, 0.0) + v
-        st["acc_n"] += 1
-        if st["win_ticks"] < self._BEH_GC_WINDOW:
-            return
-        # закрыть окно: средние измерений + income/neg_damage-RATE за окно
-        phase = st["phase"]
-        win = {k: st["acc"][k] / max(1, st["acc_n"]) for k in st["acc"]}
-        inc_now = float(self._beh_income_cum.get(cid, 0.0))
-        win["income"] = (inc_now - st["win0_income"]) / max(1, st["win_ticks"])
-        dmg_now = float(self._beh_damage_cum.get(cid, 0.0))
-        # neg_damage_rate: МЕНЬШЕ урона = ЛУЧШЕ (семантика «больше=лучше», как все дим).
-        win["neg_damage"] = -(dmg_now - st["win0_damage"]) / max(1, st["win_ticks"])
-        meat_now = float(self._beh_meat_cum.get(cid, 0.0))
-        # meat_rate: БОЛЬШЕ мяса = ЛУЧШЕ (hunt-outcome). Чистый hunt-сигнал.
-        win["meat"] = (meat_now - st["win0_meat"]) / max(1, st["win_ticks"])
-        for k, v in win.items():
-            st["samples"][phase].setdefault(k, []).append(v)
-        logger.info("brain-growth BEH-GC-WINDOW cid=%s role=%s phase=%s pair=%d "
-                    "negCort=%.1f gluc=%.1f hyd=%.1f inc=%.3f negDmg=%.3f meat=%.3f", cid,
-                    st["role"], phase, st["pairs_done"], win.get("neg_cortisol", 0.0),
-                    win.get("glucose", 0.0), win.get("hydration", 0.0),
-                    win.get("income", 0.0), win.get("neg_damage", 0.0), win.get("meat", 0.0))
-        # toggle фазы (soft edge-weight) + сброс окна
-        new_phase = "restore" if phase == "ablate" else "ablate"
-        self._beh_gc_set_edge_weight(
-            org, st["role"],
-            0.0 if new_phase == "ablate" else self._TISSUE_GRAD_EDGE_WEIGHT)
-        st["phase"] = new_phase
-        st["win_ticks"] = 0
-        st["acc"] = {}
-        st["acc_n"] = 0
-        st["win0_income"] = inc_now
-        st["win0_damage"] = dmg_now
-        st["win0_meat"] = meat_now
-        if new_phase == "ablate":        # завершилась полная пара (restore→ablate)
-            st["pairs_done"] += 1
-            if st["pairs_done"] >= st.get("pairs_target", self._BEH_GC_PAIRS):
-                self._resolve_behavioral_gc(cid, org, st)
-
-    @staticmethod
-    def _robust_paired(diffs: list):
-        """Robust paired-статистика (Фрай (в) 10.06): median + MAD вместо
-        mean+sd — давит жажда-спайки кортизола (выброс не тащит вердикт).
-        Возвращает (median, robust_sd=1.4826·MAD, t_robust). MDE считается
-        снаружи из robust_sd. n<2 → (md,0,0)."""
-        n = len(diffs)
-        if n < 2:
-            return (sum(diffs) / max(1, n), 0.0, 0.0)
-        sd = sorted(diffs)
-        med = (sd[n // 2] if n % 2 else (sd[n // 2 - 1] + sd[n // 2]) / 2.0)
-        absdev = sorted(abs(x - med) for x in diffs)
-        mad = (absdev[n // 2] if n % 2
-               else (absdev[n // 2 - 1] + absdev[n // 2]) / 2.0)
-        rsd = 1.4826 * mad
-        t = med / (rsd / (n ** 0.5)) if rsd >= 1e-9 else 0.0
-        return (med, rsd, t)
-
-    def _stat_event(self, kind: str, role: str, text: str) -> None:
-        """/stats Блок 7/9: записать событие роста в кольцевой буфер (ленту)."""
-        self._stat_growth_events.append({
-            "t": int(self._last_world_tick), "kind": kind,
-            "role": role, "text": text})
-
-    def _resolve_behavioral_gc(self, cid: str, org, st: dict) -> None:
-        """Robust paired per-dim (median+MAD, Фрай (в)): ablate vs restore окна.
-        Все измерения «больше=лучше» → ablate НИЖЕ restore значимо = ткань ПОЛЕЗНА.
-        specialist-keep (любое durable-полезно) + veto net-harm. POWER-AWARE метка
-        (Фрай (1)): permanent beh_rejected ТОЛЬКО если ВСЕ live-измерения adequately
-        powered (MDE ≤ целевой эффект Step-1) И benefit'а нет; иначе SOFT cooldown
-        (inconclusive → retry; на 13 парах cortisol underpowered → permanent
-        невозможен). keep→edge restore; prune→degraduate."""
-        role = st["role"]
-        t_keep = float(st.get("t_keep", self._BEH_GC_T_KEEP))
-        dims = ("neg_cortisol", "glucose", "hydration", "income")
-        benefit, harm, detail = 0.0, 0.0, []
-        all_powered = True       # все измерения adequately powered?
-        dim_stats = {}           # /stats Блок 7b: per-dim t/med/mde/powered
-        for d in dims:
-            a = st["samples"]["ablate"].get(d, [])
-            r = st["samples"]["restore"].get(d, [])
-            n = min(len(a), len(r))
-            if n < 2:
-                all_powered = False
-                continue
-            diffs = [a[i] - r[i] for i in range(n)]   # ablate − restore
-            med, rsd, t = self._robust_paired(diffs)
-            mde = t_keep * rsd / (n ** 0.5)   # min detectable effect
-            powered = mde <= self._BEH_GC_MDE_TARGET.get(d, 1e9)
-            all_powered = all_powered and powered
-            dim_stats[d] = {"t": round(t, 2), "med": round(med, 2),
-                            "mde": round(mde, 2), "powered": bool(powered)}
-            logger.info("brain-growth BEH-GC-DIM cid=%s role=%s dim=%s n=%d "
-                        "med=%.3f rsd=%.3f t=%.2f MDE=%.2f target=%.2f powered=%s",
-                        cid, role, d, n, med, rsd, t, mde,
-                        self._BEH_GC_MDE_TARGET.get(d, 0.0), powered)
-            if rsd < 1e-9:
-                continue
-            if t <= -t_keep:                           # ablate ниже = польза
-                benefit += abs(med) / rsd
-                detail.append(f"{d}:t={t:.1f}(польза)")
-            elif t >= t_keep:                          # ablate выше = ткань ВРЕДИТ
-                harm += abs(med) / rsd
-                detail.append(f"{d}:t={t:.1f}(вред)")
-        keep = benefit > 0.0 and benefit >= harm       # specialist + veto net-harm
-        self._beh_gc_state.pop(cid, None)
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        self._beh_gc_set_edge_weight(org, role, self._TISSUE_GRAD_EDGE_WEIGHT)
-        if keep:
-            self._beh_gc_done += 1
-            # решено powered-KEEP'ом → роль чиста (петля №1 закрыта)
-            (self._beh_soft_count.get(cid) or {}).pop(role, None)
-            (self._grad_revert_count.get(cid) or {}).pop(role, None)
-            (self._beh_gc_abort_count.get(cid) or {}).pop(role, None)  # §3-abort reset
-            (self._beh_gc_abort_cd.get(cid) or {}).pop(role, None)
-            # KEEP-cooldown (Фрай): длинная пауза до ре-валидации (не по кругу).
-            self._beh_gc_keep_cd.setdefault(cid, {})[role] = int(self._last_world_tick)
-            # value↑ для shed-ранжирования: поведенчески-durable = высокая
-            # ценность (+10 над prediction-rise) → shed'ится последним.
-            self._grad_value.setdefault(cid, {})[role] = 10.0 + benefit
-            logger.info("brain-growth BEH-GC-KEEP cid=%s role=%s benefit=%.2f "
-                        "harm=%.2f [%s] — узел behavioral-durable, ЖИВЁТ",
-                        cid, role, benefit, harm, ", ".join(detail) or "—")
-            self._stat_beh_verdicts[role] = {"verdict": "KEEP", "dims": dim_stats}
-            self._stat_event("beh-keep", role,
-                             f"ткань {role} поведенчески полезна [{', '.join(detail) or '—'}]")
-            return
-        # PRUNE: degraduate в сайдкар + cooldown ВСЕГДА; метка permanent —
-        # ТОЛЬКО при adequate power (no-benefit ДОКАЗАН). underpowered →
-        # SOFT (absence-of-evidence ≠ no-benefit, Фрай): остаётся кандидатом.
-        self._beh_gc_pruned += 1
-        self._beh_gc_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
-        self._degraduate_node(cid, org, role, reason="behavioral-prune")
-        if all_powered:
-            self._beh_rejected_roles.setdefault(cid, set()).add(role)
-            (self._beh_soft_count.get(cid) or {}).pop(role, None)
-            verdict = "PERMANENT (power adequate, no-benefit доказан)"
-        else:
-            # ПЕТЛЯ №1 (Фрай): SOFT тоже эскалирует graduation-cooldown
-            # (re-graduate разрежается ×Fib) + копит soft_count → досветка.
-            _rc = self._grad_revert_count.setdefault(cid, {})
-            _rc[role] = _rc.get(role, 0) + 1
-            self._grad_rejected.setdefault(cid, {})[role] = int(self._last_world_tick)
-            _sc = self._beh_soft_count.setdefault(cid, {})
-            _sc[role] = _sc.get(role, 0) + 1
-            verdict = (f"SOFT cooldown #{_sc[role]} (underpowered → retry; "
-                       f"досветка 34-пар после {self._BEH_GC_DEEP_AFTER_SOFTS})")
-        logger.info("brain-growth BEH-GC-PRUNE cid=%s role=%s benefit=%.2f harm=%.2f "
-                    "[%s] — degraduate в сайдкар; %s", cid, role, benefit, harm,
-                    ", ".join(detail) or "—", verdict)
-        _vlabel = ("PERMANENT" if all_powered
-                   else f"SOFT#{self._beh_soft_count.get(cid, {}).get(role, 1)}")
-        self._stat_beh_verdicts[role] = {"verdict": _vlabel, "dims": dim_stats}
-        self._stat_event("beh-prune", role,
-                         f"ткань {role}: {_vlabel} [{', '.join(detail) or '—'}]")
-
-    def _graduate_tissue(self, cid: str, org) -> bool:
-        """Stage 1 GRADUATION (Фрай 10.06, направление B): durable-сайдкар →
-        ГРАФ-узел в cerebellum→motor контур. Кандидат = GC-KEEP-verified с max
-        rise (только durable этой сессии). Акт: ткань из _grown_tissues (выход
-        уходит из прямого входа предиктора) → org.tissues (входящих рёбер нет =
-        СЕНСОР, читает obs64 — та же семантика входа, что у сайдкара) + ген
-        {role}→cerebellum весом φ⁻² (мягкая стыковка) + overlay. Вклад теперь
-        течёт obs→узел→cerebellum→{motor, predictor-hook}. IN-MEMORY: спек
-        остаётся сайдкарным в grown_specs → рестарт = деградация в сайдкар.
-        True если graduation начата (watch-окно открыто)."""
-        d = self._grown_tissues.get(cid) or {}
-        rises = self._tissue_gc_keep_rise.get(cid) or {}
-        # анти-осцилляция (Фрай): behavior-rejected роли НЕ выпускаем повторно
-        # (prediction-good, но поведенчески бесполезны — иначе вечный churn).
-        rej = self._beh_rejected_roles.get(cid) or set()
-        # анти-churn (2): роль после revert в cooldown (не долбить тот же узел).
-        # ЭСКАЛАЦИЯ (Фрай): cooldown × Fib(revert_count) — проверенно-вредная
-        # (2+ revert) ждёт кратно дольше, живёт prediction-сайдкаром.
-        grej = self._grad_rejected.get(cid) or {}
-        gcnt = self._grad_revert_count.get(cid) or {}
-        def _cd(r):
-            n = int(gcnt.get(r, 1))
-            mult = self._GRAD_COOLDOWN_FIB[min(n - 1, len(self._GRAD_COOLDOWN_FIB) - 1)]
-            return self._tissue_gc_epoch_interval * mult
-        cands = [(r, rises[r]) for r in d.keys()
-                 if r in rises and r not in rej
-                 and (self._last_world_tick - grej.get(r, -10**9)) >= _cd(r)]
-        if not cands:
-            return False        # durable-verified кандидатов нет — ждём GC-KEEP
-        role = max(cands, key=lambda x: x[1])[0]
-        try:
-            from core.tissue_topology import (
-                TissueConnectionGene, apply_topology_overlay_to_org,
-                TissueInnovationTracker)
-            from core.connection import ConnectionType
-        except Exception as e:
-            logger.warning("tissue-graduation import %s: %s", cid, e)
-            return False
-        if self._growth_tracker is None:
-            self._growth_tracker = TissueInnovationTracker()
-        tissue = d.get(role)
-        tid = getattr(tissue, "tissue_id", None)
-        if tissue is None or tid is None:
-            return False
-        genes = getattr(org, "tissue_topology_genes", None)
-        if genes is None:
-            genes = []
-            org.tissue_topology_genes = genes
-        # ре-использовать существующий ген (re-graduation после revert/рестарта),
-        # НЕ дублировать — дубль удвоил бы сигнал в cerebellum.
-        gene = next((g for g in genes
-                     if getattr(g, "source_role", None) == role
-                     and getattr(g, "target_role", None) == "cerebellum"), None)
-        if gene is None:
-            gene = TissueConnectionGene(
-                innovation=self._growth_tracker.reserve(role, "cerebellum"),
-                source_role=role, target_role="cerebellum",
-                conn_type=ConnectionType.DIRECT,
-                weight=float(self._TISSUE_GRAD_EDGE_WEIGHT), enabled=True)
-            genes.append(gene)
-        else:
-            gene.enabled = True
-            gene.weight = float(self._TISSUE_GRAD_EDGE_WEIGHT)
-        # вставка узла ПЕРЕД overlay (резолв роли требует ткань в org.tissues)
-        d.pop(role, None)
-        if not d:
-            self._grown_tissues.pop(cid, None)
-        org.tissues[tid] = tissue
-        try:
-            apply_topology_overlay_to_org(org)
-        except Exception as e:
-            # rollback: узел из графа, ген off, сайдкар назад — состояние «до»
-            logger.warning("tissue-graduation overlay %s/%s: %s", cid, role, e)
-            org.tissues.pop(tid, None)
-            gene.enabled = False
-            self._grown_tissues.setdefault(cid, {})[role] = tissue
-            return False
-        self._tissue_graduated.setdefault(cid, {})[role] = tissue
-        # value для shed-ранжирования (cumulative-monitor): стартовая = GC-KEEP
-        # rise (prediction-durability); behavioral-KEEP позже поднимет (поведение).
-        self._grad_value.setdefault(cid, {})[role] = float(rises.get(role, 0.0))
-        bc = self.biochem.get(cid)
-        self._tissue_grad_state[cid] = {
-            "role": role,
-            "tid": tid,
-            "gene": gene,
-            "ticks": 0,
-            "loss_before": float(self.loss_ema.get(cid, 0.0)),
-            "par_before": int(self._paralysis_window_n),
-            "energy_before": (float(getattr(bc, "energy", 0.0))
-                              if bc is not None else None),
-            # КУМУЛЯТИВНЫЙ energy-тренд (Фрай 10.06): первый §3 был МЕДЛЕННЫЙ
-            # bleed (форейдж деградировал постепенно) — мгновенный детектор его
-            # прозевает. Копим средние по половинам окна: avg2<avg1 значимо
-            # (φ⁻⁵) в конце окна → revert, даже без мгновенного паралича.
-            "e_sum1": 0.0, "e_n1": 0,    # первая половина watch-окна
-            "e_sum2": 0.0, "e_n2": 0,    # вторая половина
-        }
-        logger.info("brain-growth TISSUE-GRADUATE-START cid=%s role=%s rise=%.5f "
-                    "edge_w=%.3f (сайдкар → ГРАФ-узел, §3-watch %d тиков)",
-                    cid, role, rises.get(role, 0.0),
-                    self._TISSUE_GRAD_EDGE_WEIGHT,
-                    self._tissue_growth_dwell_ticks)
-        return True
-
-    def _degraduate_node(self, cid: str, org, role: str, reason: str = "") -> None:
-        """Убрать graduated-узел из графа ОБРАТНО В САЙДКАР (веса целы, тот же
-        объект). Ген off + overlay (рёбра уходят), узел из org.tissues, ткань в
-        _grown_tissues (вклад снова идёт напрямую в предиктор, мотор изолирован)."""
-        t = (self._tissue_graduated.get(cid) or {}).pop(role, None)
-        (self._grad_value.get(cid) or {}).pop(role, None)   # cumulative-monitor
-        if not self._tissue_graduated.get(cid):
-            self._tissue_graduated.pop(cid, None)
-        if org is None or t is None:
-            return
-        try:
-            genes = getattr(org, "tissue_topology_genes", None) or []
-            for g in genes:
-                if (getattr(g, "source_role", None) == role
-                        and getattr(g, "target_role", None) == "cerebellum"):
-                    g.enabled = False
-            # overlay ДО удаления узла: disabled-ген матчит старое ребро только
-            # пока роль резолвится (узел ещё в org.tissues) — иначе ребро виснет.
-            from core.tissue_topology import apply_topology_overlay_to_org
-            apply_topology_overlay_to_org(org)
-            org.tissues.pop(getattr(t, "tissue_id", None), None)
-            if hasattr(org, "_cached_levels"):
-                org._cached_levels = None   # узел ушёл — топо-кеш невалиден
-        except Exception as e:
-            logger.warning("tissue-degraduate %s/%s: %s", cid, role, e)
-        self._grown_tissues.setdefault(cid, {})[role] = t
-        logger.info("brain-growth TISSUE-GRADUATE-REVERT cid=%s role=%s (%s) — "
-                    "узел из графа, сайдкар восстановлен (мотор изолирован)",
-                    cid, role, reason)
-
-    def _revert_graduation(self, cid: str, org, st: dict, reason: str) -> None:
-        """Revert in-flight graduation (watch-окно): немедленный откат при §3/
-        energy-сигнале или kill-switch. Анти-churn (Фрай, инцидент grown151):
-        (2) роль в cooldown — не долбить тот же узел; (3) revert'ы подряд ≥
-        лимита → HALT выпуска (до re-flip флага); health-streak сбрасывается
-        (re-attempt только после стабильного recovery)."""
-        self._tissue_grad_reverted += 1
-        self._tissue_grad_state.pop(cid, None)
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)  # rate-limit
-        if reason != "kill-switch":
-            self._grad_rejected.setdefault(cid, {})[st["role"]] = int(
-                self._last_world_tick)                       # (2) роль-cooldown
-            _rc = self._grad_revert_count.setdefault(cid, {})
-            _rc[st["role"]] = _rc.get(st["role"], 0) + 1     # эскалация (Фрай)
-            self._grad_revert_streak += 1
-            self._grad_health_streak[cid] = 0                # (A) recovery заново
-            if (not self._grad_halted
-                    and self._grad_revert_streak >= self._GRAD_REVERT_HALT):
-                self._grad_halted = True
-                logger.warning("brain-growth GRADUATE-HALT: %d revert'ов подряд "
-                               "— выпуск ОСТАНОВЛЕН до re-flip tissue_graduation "
-                               "(анти-churn, Фрай)", self._grad_revert_streak)
-        self._degraduate_node(cid, org, st["role"], reason=reason)
-
-    def _tissue_graduation_watch(self, cid: str, org, st: dict) -> None:
-        """Per-tick watch graduated-узла. §3-гейт АБСОЛЮТНЫЙ + НЕМЕДЛЕННЫЙ:
-        paralysis вырос → revert сразу (кризис 09.06 показал: ждать окно нельзя,
-        кумулятив копится). Energy-обвал (<φ⁻¹ от старта) → revert. Окно чисто
-        (полный погодный цикл 233) → GRADUATE-OK, узел остаётся в графе."""
-        st["ticks"] += 1
-        if int(self._paralysis_window_n) > int(st["par_before"]):
-            self._revert_graduation(cid, org, st, reason="§3 paralysis")
-            return
-        bc = self.biochem.get(cid)
-        if bc is not None and st.get("energy_before"):
-            e_now = float(getattr(bc, "energy", 0.0))
-            # window-based collapse (Фрай опц., инцидент grown151): rolling-mean
-            # последних 13 тиков < φ⁻¹·before — одиночный погодный провал НЕ
-            # роняет watch (мгновенный детектор ре-триггерился в фазе recovery).
-            ew = st.setdefault("e_win", [])
-            ew.append(e_now)
-            if len(ew) > self._GRAD_COLLAPSE_WIN:
-                ew.pop(0)
-            if (len(ew) >= self._GRAD_COLLAPSE_WIN
-                    and (sum(ew) / len(ew))
-                    < float(st["energy_before"]) * 0.618):
-                self._revert_graduation(cid, org, st, reason="energy-collapse")
-                return
-            # кумулятивный тренд (Фрай): сэмпл в половину окна
-            if st["ticks"] <= self._tissue_growth_dwell_ticks // 2:
-                st["e_sum1"] += e_now
-                st["e_n1"] += 1
-            else:
-                st["e_sum2"] += e_now
-                st["e_n2"] += 1
-        if st["ticks"] < self._tissue_growth_dwell_ticks:
-            return
-        # конец окна: МЕДЛЕННЫЙ bleed — средняя energy 2-й половины упала
-        # значимо (≥φ⁻⁵) против 1-й → форейдж деградирует → revert (Фрай 10.06).
-        if st["e_n1"] > 0 and st["e_n2"] > 0:
-            avg1 = st["e_sum1"] / st["e_n1"]
-            avg2 = st["e_sum2"] / st["e_n2"]
-            if avg2 < avg1 * (1.0 - self._growth_min_delta_frac):
-                logger.info("brain-growth TISSUE-GRADUATE energy-bleed cid=%s "
-                            "avg1=%.1f avg2=%.1f (кумулятивный тренд вниз)",
-                            cid, avg1, avg2)
-                self._revert_graduation(cid, org, st, reason="energy-bleed")
-                return
-        loss_before = float(st["loss_before"])
-        loss_after = float(self.loss_ema.get(cid, loss_before))
-        self._tissue_grad_done += 1
-        self._grad_revert_streak = 0          # успех рвёт revert-streak (3)
-        self._tissue_grad_state.pop(cid, None)
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        logger.info("brain-growth TISSUE-GRADUATE-OK cid=%s role=%s — мотор цел "
-                    "(paralysis=0 все %d тиков), узел ЖИВЁТ в графе. Δloss=%.5f "
-                    "(до %.5f → после %.5f, диагностика; критерий Stage 1 = §3)",
-                    cid, st["role"], st["ticks"],
-                    loss_before - loss_after, loss_before, loss_after)
-        self._stat_event("graduate-ok", st["role"],
-                         f"ткань {st['role']} выпущена в мозг (мотор цел)")
-
-    def _maybe_start_tissue_gc(self, cid: str) -> bool:
-        """§10.8 GC (Фрай 10.06): начать leave-one-out ре-оценку ОДНОГО живого
-        сайдкара. Эпоха = sweep всех живых; между эпохами отдых (длинный климат-цикл),
-        чтобы рост новых durable тканей не голодал. Абляция: убрать сайдкар из
-        _grown_tissues (вклад исчезает из входа предиктора) → dwell цикл → resolve.
-        Мотор изолирован (сайдкары не в графе). True если GC начат."""
-        d = self._grown_tissues.get(cid)
-        if not d:
-            return False
-        tested = self._tissue_gc_tested.setdefault(cid, set())
-        untested = [r for r in d.keys() if r not in tested]
-        if not untested:
-            # sweep завершён — отметить конец эпохи (один раз) и отдыхать.
-            if tested:
-                self._tissue_gc_sweep_done[cid] = int(self._last_world_tick)
-                tested.clear()
-            return False
-        # отдых между эпохами: не начинаем новый sweep, пока не прошёл климат-цикл.
-        _done = self._tissue_gc_sweep_done.get(cid)
-        if _done is not None and (self._last_world_tick - _done) < self._tissue_gc_epoch_interval:
-            return False
-        role = untested[0]
-        tissue = d.pop(role, None)
-        if not d:
-            self._grown_tissues.pop(cid, None)
-        if tissue is None:
-            return False
-        self._tissue_gc_state[cid] = {
-            "role": role,
-            "tissue": tissue,                    # held-aside (вне входа предиктора)
-            "loss_before": float(self.loss_ema.get(cid, 0.0)),
-            "ticks": 0,
-        }
-        logger.info("brain-growth TISSUE-GC-START cid=%s role=%s loss_before=%.5f "
-                    "(leave-one-out, %d untested)", cid, role,
-                    self._tissue_gc_state[cid]["loss_before"], len(untested))
-        return True
-
-    def _resolve_tissue_gc(self, cid: str, gc: dict) -> None:
-        """§10.8 GC resolve: после dwell-цикла без сайдкара — если loss вырос значимо
-        (вклад durable, его удаление повредило прогноз) → ВЕРНУТЬ; иначе (вклад распался
-        на полном цикле = фазовый шум) → ОТПУСТИТЬ навсегда. Консервативно: погодный
-        дрейф loss вверх склоняет к KEEP (не over-прунит здоровые)."""
-        gc["ticks"] += 1
-        if gc["ticks"] < self._tissue_growth_dwell_ticks:
-            return
-        role = gc["role"]
-        loss_before = float(gc["loss_before"])
-        loss_after = float(self.loss_ema.get(cid, loss_before))
-        rise = loss_after - loss_before          # >0 = удаление сайдкара подняло loss
-        durable = rise >= loss_before * self._growth_min_delta_frac
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)
-        self._tissue_gc_tested.setdefault(cid, set()).add(role)
-        if durable:
-            self._grown_tissues.setdefault(cid, {})[role] = gc["tissue"]   # вернуть
-            # graduation-кандидаты (Stage 1): durable-verified этой сессии + их rise
-            # (graduation берёт max-rise). Только GC-KEEP попадают в кандидаты.
-            self._tissue_gc_keep_rise.setdefault(cid, {})[role] = float(rise)
-            logger.info("brain-growth TISSUE-GC-KEEP cid=%s role=%s rise=%.5f "
-                        "(%.1f%%) durable", cid, role, rise,
-                        100.0 * rise / max(1e-9, loss_before))
-        else:
-            self._prune_grown_spec(cid, role)    # грон уже вне _grown_tissues
-            self._tissue_kept = max(0, self._tissue_kept - 1)
-            self._tissue_gc_pruned += 1
-            (self._tissue_gc_keep_rise.get(cid) or {}).pop(role, None)
-            logger.info("brain-growth TISSUE-GC-PRUNE cid=%s role=%s rise=%.5f "
-                        "(noise-fit отпущен) pruned=%d kept=%d", cid, role, rise,
-                        self._tissue_gc_pruned, self._tissue_kept)
-        self._tissue_gc_state.pop(cid, None)
-
-    def _cumulative_grad_health(self, cid: str, org) -> None:
-        """CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): непрерывный collective-health
-        выпущенных узлов. Per-add §3-watch проверяет на add-time (233-окно);
-        медленный collective-drift (N узлов СОВОКУПНО проседают мотор) он
-        пропускает. Здесь: energy EWMA + §3-paralysis по всем graduated. Просел →
-        ПАУЗА graduation + SHED наименее-ценного (revert lowest _grad_value) до
-        recovery. Активен при ≥1 graduated (Фрай 11.06: инцидент ДОКАЗАЛ gap при
-        N=1 — одиночный узел дренил без страховки до 52%-паралича, понадобился
-        manual kill-switch; монитор при ≥1 ловит drain РАНЬШЕ и АВТО-шедит.
-        φ-гистерезис не флапнет; shed одиночки recoverable — узел назад в сайдкар)."""
-        grad = self._tissue_graduated.get(cid) or {}
-        if len(grad) < 1:
-            self._grad_collective_paused = False   # нечему дрейфовать
-            return
-        bc = self.biochem.get(cid)
-        e_now = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
-        prev = self._grad_health_ewma.get(cid)
-        ewma = e_now if prev is None else (0.9 * prev + 0.1 * e_now)  # сглаж.
-        self._grad_health_ewma[cid] = ewma
-        par = int(self._paralysis_window_n)
-        drift = (par > 0) or (ewma < self._GRAD_SHED_ENERGY)
-        if drift and not self._grad_collective_paused:
-            # SHED: revert НАИМЕНЕЕ ценного graduated (lowest _grad_value).
-            vals = self._grad_value.get(cid) or {}
-            shed = min(grad.keys(), key=lambda r: vals.get(r, 0.0))
-            self._grad_collective_paused = True
-            self._tissue_grad_reverted += 1
-            (self._grad_value.get(cid) or {}).pop(shed, None)
-            self._degraduate_node(cid, org, shed, reason="collective-drift shed")
-            logger.warning("brain-growth GRAD-SHED cid=%s role=%s (collective-"
-                           "drift: par=%d energy_ewma=%.0f, %d graduated) — "
-                           "выпуск НА ПАУЗУ, revert наименее-ценного до recovery",
-                           cid, shed, par, ewma, len(grad))
-        elif self._grad_collective_paused and par == 0 \
-                and ewma >= self._GRAD_HEALTH_ENERGY:
-            self._grad_collective_paused = False
-            logger.info("brain-growth GRAD-RESUME cid=%s — collective-health "
-                        "восстановлен (energy_ewma=%.0f, par=0), выпуск возобновлён",
-                        cid, ewma)
-
-    def _tissue_growth_step(self, cid: str) -> None:
-        """§10.8: propose→dwell→Δloss_ema→keep/backoff для ТКАНЕЙ-узлов. Растит
-        узел ТОЛЬКО когда связи насыщены (19/19) И intrinsic у floor (тот же
-        плато-критерий). keep на ЗНАЧИМОМ Δloss И net/§3 ok; иначе backoff (узел
-        удаляется). Драйвер prediction спит, пока мир не вернёт давление — тогда
-        keep оживёт; механизм/персист готовы заранее."""
-        org = self.organisms.get(cid)
-        pred = self.predictor.get(cid)
-        if org is None or pred is None:
-            return
-        if self._cerebellum_tissue_id(cid, org) is None:
-            return
-        # CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): непрерывно (каждый тик) — ловит
-        # collective-drift многих выпускников, паузит/shed'ит. До всех веток.
-        self._cumulative_grad_health(cid, org)
-        # BEHAVIORAL-GC (Stage 3, Фрай 10.06) — если активен парный замер,
-        # ведём его и НИЧЕГО больше (изолированный мотор-сигнал, как graduation).
-        if cid in self._beh_gc_state:
-            self._behavioral_gc_step(cid, org)
-            return
-        # GRADUATION watch (Stage 1, Фрай 10.06) — ПЕРВЫМ: пока узел под §3-
-        # наблюдением, петля (propose/GC) на паузе → мотор-сигнал чистый, без
-        # интерференции других экспериментов.
-        gs = self._tissue_grad_state.get(cid)
-        if gs is not None:
-            self._tissue_graduation_watch(cid, org, gs)
-            return
-        # GC dwell (Фрай 10.06): абляция-ре-оценка живого сайдкара идёт первой —
-        # один сайдкар «в стороне», ждём полный цикл, решаем durable/прун.
-        gc = self._tissue_gc_state.get(cid)
-        if gc is not None:
-            self._resolve_tissue_gc(cid, gc)
-            return
-        st = self._tissue_growth_state.get(cid)
-        if st is None:
-            # Узлы — ПОСЛЕ рёбер: пока ВСЕ роли→cerebellum не подключены, ткани ждут.
-            # Граф-derived (ROOT 2, Фрай 09.06) — restart-robust, не stale-флаг.
-            if not self._connections_saturated(org):
-                return
-            # (c) АБСОЛЮТНЫЙ §3-ГЕЙТ (Фрай 09.06): paralysis>0 → НЕ растим (relative
-            # net_ok пропустил кумулятив → §3-кризис). Растём только когда Адам здоров.
-            if int(self._paralysis_window_n) > 0:
-                return
-            # (b) RATE-LIMIT: пауза между propose/GC (выживание/мотор восстанавливается).
-            _last = self._tissue_last_resolve.get(cid)
-            if _last is not None and (self._last_world_tick - _last) < self._tissue_growth_cooldown:
-                return
-            # (A) СТАБИЛЬНОЕ recovery (Фрай, инцидент grown151): транзиентный
-            # просвет paralysis==0 НЕ открывает выпуск — нужен health-streak:
-            # energy ≥ φ⁻¹·max И paralysis=0 СТАБИЛЬНО 89 тиков подряд.
-            _bc = self.biochem.get(cid)
-            _e = float(getattr(_bc, "energy", 0.0)) if _bc is not None else 0.0
-            if _e >= self._GRAD_HEALTH_ENERGY:
-                self._grad_health_streak[cid] = (
-                    self._grad_health_streak.get(cid, 0) + 1)
-            else:
-                self._grad_health_streak[cid] = 0
-            # GRADUATION (Stage 1) — ПЕРЕД GC: появился durable-кандидат (GC-KEEP
-            # этой сессии) и лимит не исчерпан → один сайдкар идёт в граф под
-            # §3-watch. Гейты: paralysis==0 + rate-limit (выше) + НЕ halted (3)
-            # + стабильное recovery (A).
-            if (self._tissue_graduation_enabled
-                    and not self._grad_halted
-                    and not self._grad_collective_paused  # cumulative-monitor пауза
-                    and self._grad_health_streak.get(cid, 0) >= self._GRAD_HEALTH_TICKS
-                    and self._tissue_grad_done < self._tissue_grad_max
-                    and self._graduate_tissue(cid, org)):
-                return
-            # BEHAVIORAL-GC (Stage 3, Фрай 10.06): ревизия ВЫПУСКНИКОВ (graduated)
-            # по самочувствию — раньше роста новых сайдкаров. Парный interleaved
-            # на одном durable-узле; гейты выше дали paralysis==0 + rate-limit.
-            if (self._behavioral_gc_enabled
-                    and self._tissue_graduated.get(cid)
-                    and self._maybe_start_behavioral_gc(cid, org)):
-                return
-            # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
-            # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
-            if self._maybe_start_tissue_gc(cid):
-                return
-            # noise-robust плато (доля near-floor ≥ φ⁻¹), устойчив к всплескам погоды.
-            if self._intrinsic_plateaued(cid):
-                self._propose_growth_tissue(cid, org)
-            return
-        # dwell — ждём пере-сходимости predictor'а ≥ ПОЛНЫЙ погодный цикл (durable).
-        st["ticks"] += 1
-        if st["ticks"] < self._tissue_growth_dwell_ticks:
-            return
-        loss_before = float(st["loss_before"])
-        loss_after = float(self.loss_ema.get(cid, loss_before))
-        delta = loss_before - loss_after
-        signif = delta >= loss_before * self._growth_min_delta_frac
-        net_ok = int(self._paralysis_window_n) <= int(st["par_before"])
-        bc = self.biochem.get(cid)
-        if bc is not None and st.get("energy_before") is not None:
-            net_ok = net_ok and (float(getattr(bc, "energy", 0.0))
-                                 >= float(st["energy_before"]) * 0.618)
-        keep = bool(signif and net_ok)
-        role = st["role"]
-        self._tissue_last_resolve[cid] = int(self._last_world_tick)  # (b) rate-limit
-        if keep:
-            self._tissue_kept += 1
-            # персист спек сайдкара для recreate-on-restore (durable-инвариант).
-            self._tissue_grown_specs.setdefault(cid, []).append(st["spec"])
-            logger.info("brain-growth TISSUE-KEEP cid=%s role=%s Δloss=%.5f "
-                        "(%.1f%%) kept=%d", cid, role, delta,
-                        100.0 * delta / max(1e-9, loss_before), self._tissue_kept)
-        else:
-            self._remove_grown_tissue(cid, role=role)
-            self._tissue_reverted += 1
-            logger.info("brain-growth TISSUE-BACKOFF cid=%s role=%s Δloss=%.5f "
-                        "signif=%s net_ok=%s reverted=%d", cid, role, delta,
-                        signif, net_ok, self._tissue_reverted)
-        self._tissue_growth_state.pop(cid, None)
-        self._growth_stagnation_n[cid] = 0  # заново копим стагнацию до след. propose
-
     def _predictor_train_step(self, cid: str, obs_tensor,
                               input_tensor=None) -> float:
         """Phase 1+2: один MSE-шаг predictor + intrinsic reward.
@@ -7444,29 +5297,6 @@ class LocalColonyCompute:
                 surprise_prev = self.loss_ema.get(cid, 0.0)
                 self.loss_ema[cid] = (1 - _EMA_ALPHA) * surprise_prev + _EMA_ALPHA * loss_f
                 self.pred_loss_history[cid].append(loss_f)
-                # §10.9 v0.2-валидация: per-region predictor-loss — ГДЕ давление.
-                # [35]=temperature (прямой сигнал), [44:55]=density bins (temp-
-                # зависимы в v0.2 через respawn-лаг → сюда сядет Path-B давление),
-                # rest=базлайн. v0.1: dens≈базлайн. v0.2: dens↑ И УСТОЙЧИВО (лаг/
-                # нелинейность не выучиваются persistence'ом, в отличие от гладкого
-                # temp@35) = реальное давление. Throttled, read-only (не трогает train).
-                self._pred_region_diag_n = getattr(self, "_pred_region_diag_n", 0) + 1
-                if self._pred_region_diag_n % 600 == 1:
-                    try:
-                        with torch.no_grad():
-                            _t = obs_tensor.detach()
-                            _lt = float(F.mse_loss(out[:, 35:36], _t[:, 35:36]).item())
-                            _ld = float(F.mse_loss(out[:, 44:56], _t[:, 44:56]).item())
-                            _rest_o = torch.cat([out[:, :35], out[:, 36:44], out[:, 56:]], dim=1)
-                            _rest_t = torch.cat([_t[:, :35], _t[:, 36:44], _t[:, 56:]], dim=1)
-                            _lr = float(F.mse_loss(_rest_o, _rest_t).item())
-                        logger.info("PRED_REGION_DIAG cid=%s loss=%.5f temp35=%.5f "
-                                    "dens44_55=%.5f rest=%.5f", cid, loss_f, _lt, _ld, _lr)
-                        self._stat_pred_region[cid] = {  # /stats Блок 6
-                            "temp35": round(_lt, 5), "dens44_55": round(_ld, 5),
-                            "rest": round(_lr, 5)}
-                    except Exception:
-                        pass
                 delta = max(0.0, surprise_prev - loss_f)
                 intrinsic = _BETA_INTRINSIC * delta
                 self.intrinsic_last[cid] = intrinsic
@@ -7503,51 +5333,6 @@ class LocalColonyCompute:
             float(self.trace_norm_ema.get(cid, 0.0)),
             float(self.reward_var_ema.get(cid, 0.0)),
             1.0 if par else 0.0,
-        ], dtype=np.float32)
-
-    def _build_client_intero(self, cid: str):
-        """§3.2: client-authoritative интероцепция [7] из self.biochem.
-
-        Зеркало server `_gather_interoception` (sidecars.py:48). Slots 0,1,3,4,5
-        (energy/hydration/cortisol/serotonin/infection) — ТОЧНЫЕ из биохимии
-        Адама. Slots 2 (age) и 6 (valence=comfort−discomfort) требуют member-
-        стейта P40 (нет birth_tick / comfort-EMA client-side) → carry последнего
-        P40-intero (или 0). Снимает P40-blind risk — insula не слепнет, если P40
-        перестанет слать `intero`. Возвращает np.ndarray[7] или None (нет биохимии
-        → insula пропустится штатно).
-
-        Нормировки совпадают с server ТОЧЬ-В-ТОЧЬ:
-          slot[1] = hydration / (100·camel)  — raw camel, как в _gather (НЕ
-          kleiber); даёт ту же squashed-шкалу, что insula видела от P40. Для
-          felt-DRIVE используется нативная [0,100] шкала (см. ws_client), НЕ
-          этот squashed slot — у них разные потребители.
-        """
-        bc = self.biochem.get(cid)
-        if bc is None:
-            return None
-        energy = float(getattr(bc, "energy", 0.0) or 0.0)
-        hydration = float(getattr(bc, "hydration", 0.0) or 0.0)
-        camel = float((self.traits.get(cid, {}) or {}).get(
-            "camel", _CLIENT_DEFAULT_CAMEL) or _CLIENT_DEFAULT_CAMEL)
-        max_h = 100.0 * camel
-        cortisol = float(getattr(bc, "cortisol", 0.0) or 0.0)
-        serotonin = float(getattr(bc, "serotonin", 0.0) or 0.0)
-        infection = float(getattr(bc, "infection_severity", 0.0) or 0.0)
-        # slots 2/6 — carry последнего P40-intero (member-стейт), пока нет
-        # client-side birth_tick/comfort-EMA. Полный паритет — отд. итерацией.
-        carry = self._last_p40_intero.get(cid)
-        age_norm = (float(carry[2]) if carry is not None
-                    and len(carry) > 2 else 0.0)
-        valence = (float(carry[6]) if carry is not None
-                   and len(carry) > 6 else 0.0)
-        return np.array([
-            energy / _CLIENT_MAX_ENERGY if _CLIENT_MAX_ENERGY > 0 else 0.0,
-            hydration / max_h if max_h > 0 else 0.0,
-            age_norm,
-            cortisol / 100.0,
-            serotonin / 100.0,
-            infection,
-            valence,
         ], dtype=np.float32)
 
     def _upgrade_tissue_input_dim(self, tissue, new_data_dim: int) -> bool:
@@ -7885,21 +5670,13 @@ class LocalColonyCompute:
                  round(float(getattr(bc, "cortisol", 0.0)), 1),
                  round(float(getattr(bc, "serotonin", 0.0)), 1),
                  round(float(getattr(bc, "glucose", 0.0)), 1),
-                 str(getattr(bc, "mental_break", "") or ""),
-                 # §10.3 Step-1 (Фрай 10.06): кандидаты behavioral-composite —
-                 # замерить CV (шум-floor) на ~1 климат-цикл до включения в GC.
-                 round(float(getattr(bc, "hydration", 0.0)), 1),
-                 round(float(getattr(bc, "fatigue", 0.0)), 1),
-                 round(float(getattr(bc, "adrenaline", 0.0)), 1))
+                 str(getattr(bc, "mental_break", "") or ""))
                 for cid, bc in biochem.items()
             ])
-            _probe = (f" PROBE_ABLATE={self._behavioral_probe_role}"
-                      if self._behavioral_probe_role else "")
             logger.info(
-                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb_hyd_fat_adr:%s %s", _probe,
-                "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb},"
-                          f"hyd={hyd},fat={fat},adr={adr}"
-                          for cid, e, c, s, g, mb, hyd, fat, adr in per_cid_e))
+                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb: %s",
+                "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb}"
+                          for cid, e, c, s, g, mb in per_cid_e))
         except Exception as _e:
             logger.debug("biochem debug log failed: %s", _e)
         # INSULA_TEMP_DEBUG (Track 2 (б)): сигнал ОБУЧЕНИЯ моста — отличить
@@ -8087,8 +5864,6 @@ class LocalColonyCompute:
         if cid in self._paralysis_until:
             return
         self._paralysis_until[cid] = time.monotonic() + _PARALYSIS_SEC
-        self._stat_paralysis_count += 1  # /stats Блок 3
-        self._last_paralysis_tick[cid] = int(self._last_world_tick)  # энерго-гейт GC
         logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
                     cid, reason, _PARALYSIS_SEC)
 
@@ -8789,41 +6564,6 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("biochem mental_break update cid=%s: %s", cid, e)
 
-    def _apply_eat_reflex(self, cid: str, out: dict, obs) -> None:
-        """ДЕТЕРМИНИРОВАННЫЙ EAT-рефлекс-floor (Фрай/Шеф 13.06, eating.md).
-
-        Поедание = рефлекс «класть в рот и пробовать», НЕ shaping (телеметрия
-        доказала: shaping-EAT мотор не пробивает, own=1.0 драйвит → argmax=MOVE
-        даже на еде). Поэтому ДЕТЕРМИНИРОВАННЫЙ override (как §3-force-STAY): голоден
-        + на ЛЮБОЙ съедобной флоре под ногами (_on_food = _onf+голод, set в obs-loop)
-        + нет хищника → action=EAT(14), в обход мотора.
-
-        Развязка от nearest_edible-нав: трава под ногами = maintenance-floor (ешь тут);
-        nearest_edible-нав (мимо травы к ягоде) ОСТАЁТСЯ для случая _onf=0 (под ногами
-        пусто → upgrade к лучшему). Рефлекс = floor «есть ли вообще»; мозг = ВЫБОР
-        (что/куда/когда прервать/охота) — рост-давление на уровне выбора, не floor.
-
-        Иерархия LOCKED: predator-FLEE > EAT (d_prox-гейт — под угрозой не ест);
-        water-seek > EAT (ws_client._apply_water_seek позже перебьёт при жажде).
-        §3-синергия: _maybe_force_stay (ниже) пропускает EAT(14) сквозь §3-force-STAY
-        (флаг _on_food) → §3-Адам на еде выедает себя.
-        """
-        if cid not in out or not self._single_organism:
-            return
-        if not self._on_food.get(cid):       # голоден + на съедобной флоре (obs-loop)
-            return
-        try:
-            _dpx = float(obs[61]) if (obs is not None and len(obs) > 61) else 0.0
-        except (TypeError, ValueError, IndexError):
-            _dpx = 0.0
-        if _dpx >= 0.15:                      # хищник близко → FLEE приоритет, не ест
-            return
-        out[cid] = {"action": 14, "target_id": None}   # EAT — детерминированно
-        self._eat_reflex_n = getattr(self, "_eat_reflex_n", 0) + 1
-        if self._eat_reflex_n % 20 == 0:     # прямое подтверждение срабатывания
-            logger.info("EAT_REFLEX cid=%s fired #%d (on_food, d_prox=%.2f) → EAT override",
-                        cid, self._eat_reflex_n, _dpx)
-
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
 
@@ -8847,16 +6587,7 @@ class LocalColonyCompute:
         # paralysis независим от биохимического force_stay.
         if cid in self._paralysis_until:
             if time.monotonic() < self._paralysis_until[cid]:
-                # §3-bypass (Шеф/Хьюберт 12-13.06): голодающий выедает себя из §3 —
-                # ATTACK(5) по дичи ВПЛОТНУЮ (hunt-out) ИЛИ EAT(14) на флора-тайле
-                # (eat-out, под passive-gate). Как life_critical FLEE обходит §3.
-                # Узко: только эти действия + соответствующий флаг. Иначе — STAY.
-                _act = (out.get(cid) or {}).get("action")
-                _hunt_ok = (self._hunting_enabled and _act == 5
-                            and self._hunt_contact.get(cid))
-                _eat_ok = (_act == 14 and self._on_food.get(cid))
-                if not (_hunt_ok or _eat_ok):
-                    out[cid] = {"action": STAY, "target_id": None}
+                out[cid] = {"action": STAY, "target_id": None}
                 return
         try:
             from environment.biochemistry import should_force_stay  # type: ignore
@@ -8927,49 +6658,13 @@ class LocalColonyCompute:
                 # Питание = и energy И glucose: при положительном delta_energy
                 # без явного ate всё равно восполняем glucose (apply_feed).
                 apply_feed(bc)
-            # PHASE 2.5m (Хьюберт 9f6e9e7): kill-АККУМУЛЯТОР — надёжный путь. per-tick
-            # killed/delta_energy ТЕРЯЛИСЬ при obs-throttle (3-5 Hz): _owned_last_events
-            # перезатирался каждый server-тик, клиент читал реже → 4 из 5 kills дропались.
-            # kill_energy_acc/kill_count_acc (read-and-reset, паттерн damage_acc) — Σ с
-            # прошлого чтения, НЕ теряются. Энергия УЖЕ применена через delta_energy
-            # (выше) — здесь ТОЛЬКО dopamine + meat-GC ось + счётчики (НЕ double-add energy).
-            _ke_acc = float(event.get("kill_energy_acc", 0.0) or 0.0)
-            _kc_acc = int(event.get("kill_count_acc", 0) or 0)
-            if _kc_acc > 0:
-                for _ in range(_kc_acc):
-                    apply_kill_prey(bc)             # dopamine per kill (награда, ось оживает)
-                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + _kc_acc
-                # meat-GC ось (Фрай hunting.md): ВСЁ мясо (prey 21 + medium 55) →
-                # hunt-сигнал, изолирован от plant-income. Надёжный Σ из аккумулятора.
-                self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + _ke_acc
-                # medium-тир: avg energy/kill ≥34 (Fib-порог 21<x<55) → средняя дичь.
-                _avg_ke = _ke_acc / _kc_acc
-                if _avg_ke >= 34.0:
-                    self._skill_kill_medium[cid] = (
-                        self._skill_kill_medium.get(cid, 0) + _kc_acc)
-                    logger.info(
-                        "MEDIUM_KILL cid=%s ke_acc=%.1f count=%d avg=%.1f "
-                        "total_med=%d energy=%.0f", cid, _ke_acc, _kc_acc,
-                        _avg_ke, self._skill_kill_medium[cid],
-                        float(getattr(bc, "energy", 0.0)))
-            elif event.get("killed"):
-                # БЭККОМПАТ (old P40 / колонии без аккумулятора): per-tick killed.
+            if event.get("killed"):
                 apply_kill_prey(bc)
-                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1
-                if delta_e > 0.0:
-                    self._beh_meat_cum[cid] = self._beh_meat_cum.get(cid, 0.0) + delta_e
-                if delta_e >= 34.0:
-                    self._skill_kill_medium[cid] = (
-                        self._skill_kill_medium.get(cid, 0) + 1)
-                    logger.info(
-                        "MEDIUM_KILL cid=%s delta_e=%.1f total_med=%d energy=%.0f",
-                        cid, delta_e, self._skill_kill_medium[cid],
-                        float(getattr(bc, "energy", 0.0)))
+                self._skill_kill[cid] = self._skill_kill.get(cid, 0) + 1  # F5
             # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
             # опыт фуражёра → efficiency растёт каждые 200 тиков.
             if event.get("ate") or delta_e > 0.0:
                 self._skill_eat[cid] = self._skill_eat.get(cid, 0) + 1
-                self._stat_ate_total[cid] = self._stat_ate_total.get(cid, 0) + 1  # /stats lifetime (монотонный)
             damage = float(event.get("damage_taken", 0.0) or 0.0)
             if damage > 0:
                 apply_pvp_hit(bc, kind="cross_clan_target")
@@ -8981,11 +6676,6 @@ class LocalColonyCompute:
                 bc.energy = max(0.0, min(1000.0, float(bc.energy) + delta_e))
                 if delta_e > 0.0:
                     self._e_income_sum += delta_e  # ENERGY_CALIB income
-                    # §10.3: монотонный income-аккумулятор (НЕ сбрасывается на
-                    # 300-ledger-окне) → behavioral-GC меряет income-rate
-                    # (unsaturated energy-измерение) дельтой между сэмплами.
-                    self._beh_income_cum[cid] = (
-                        self._beh_income_cum.get(cid, 0.0) + delta_e)
                 else:
                     # §3.5-ПОЛНОТА (Фрай 07.06): ОТРИЦАТЕЛЬНЫЙ delta_energy =
                     # серверная per-event цена (атаки/combat/действия) — списывал
@@ -9145,7 +6835,6 @@ class LocalColonyCompute:
                 # §3.5: per-client-tick rate, применяется один раз за apply (БЕЗ
                 # wall-dt). Та же шкала, что income → per-tick net = серверный.
                 step_cost = float(rates.get("step_cost_per_tick", 0.0) or 0.0)
-                basal = float(rates.get("basal_drain_per_tick", 0.0) or 0.0)  # BMR — всегда
                 thirst = float(rates.get("thirst_per_tick", 0.0) or 0.0)
                 tel_decay = float(rates.get("telomere_decay_per_tick", 0.0) or 0.0)
                 self._metab_sc_sum += step_cost     # METAB_DIAG (теперь per-tick)
@@ -9166,7 +6855,6 @@ class LocalColonyCompute:
                 _sc_rate = float(rates.get("step_cost_per_sec", 0.0) or 0.0)
                 self._metab_sc_sum += _sc_rate      # per-sec rate (METAB_DIAG)
                 step_cost = _sc_rate * dt           # energy/сек × сек (wall-dt)
-                basal = float(rates.get("basal_drain_per_sec", 0.0) or 0.0) * dt  # BMR
                 thirst = float(rates.get("thirst_per_sec", 0.0) or 0.0) * dt
                 tel_decay = float(rates.get("telomere_decay_per_sec", 0.0) or 0.0) * dt
                 _dmg = 0.0                           # damage только per-tick (Адам)
@@ -9176,14 +6864,6 @@ class LocalColonyCompute:
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
                 self._e_cost_sum += step_cost  # ENERGY_CALIB
-            # BMR (Шеф 12.06, Phase 2.5h): базовый метаболизм — ВСЕГДА, независимо
-            # от движения/action (step_cost выше — только при движении). «Покой не
-            # бесплатен»: чинит ягода-кемп эксплойт (стоял/ленивый роуминг = вечная
-            # сытость). Идёт в _e_cost_sum → ENERGY_CALIB net учитывает BMR.
-            if basal > 0.0:
-                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - basal)
-                self._e_cost_sum += basal
-                self._metab_basal_sum = getattr(self, "_metab_basal_sum", 0.0) + basal
             # DAMAGE-канал: применяем predator-урон к авторитетной energy
             # (per-client-tick, §3.5). Идёт в _e_cost_sum → ENERGY_CALIB net
             # учитывает урон. §3 ловит energy≤0 → паралич, не смерть.
@@ -9262,7 +6942,6 @@ class LocalColonyCompute:
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
                     self._paralysis_window_n += 1  # §3.5-ledger: грант искажает Δ
-                    self._stat_recovery_count += 1  # /stats Блок 3
                     # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
                     # recovery = «передышка» → снимает не только паралич, но и
                     # стресс-залипание catatonic (cortisol застревает на 99.5 от
@@ -9384,12 +7063,6 @@ class LocalColonyCompute:
                     "после фикса; paralysis>0 = §3-несустейнабельно)",
                     _net, _net_true, _residual, self._e_srv_cost_sum,
                     self._paralysis_window_n, self._e_window_e0, _e_now)
-                self._stat_ledger = {  # /stats Блок 4 (истинный баланс §3.5)
-                    "net_true": round(_net_true, 1),
-                    "net_comp": round(_net, 1),
-                    "residual": round(_residual, 1),
-                    "srv_cost": round(float(self._e_srv_cost_sum), 1),
-                    "paralysis_window": int(self._paralysis_window_n)}
                 # INSTINCT_DIAG (Фрай): natural-роды vs bootstrap-омоложение +
                 # сколько особей сейчас в активном инстинкте. Критерий успеха:
                 # natural>0 (пошли роды) + eff_mean ползёт 5→10. Если держится
@@ -9472,11 +7145,11 @@ class LocalColonyCompute:
                 _tick_n = getattr(self, "_metab_tick_n", 0)
                 logger.info(
                     "METAB_DIAG applies=%d mean_rate=%.4f mean_dt=%.2f "
-                    "mean_drain_per_apply=%.4f basal_sum=%.1f tick_mode=%d/%d",
+                    "mean_drain_per_apply=%.4f tick_mode=%d/%d",
                     self._metab_applies, self._metab_sc_sum / _ma,
                     self._metab_dt_sum / _ma,
                     (self._metab_sc_sum / _ma) * (self._metab_dt_sum / _ma),
-                    self._metab_basal_sum, _tick_n, self._metab_applies)
+                    _tick_n, self._metab_applies)
                 # DAMAGE_DIAG (Фрай 07.06): predator-давление + применённый урон.
                 # dmg_applied=Σ урона к energy за окно; pred_ticks=тиков под атакой;
                 # mean_rate=средний raw damage_per_tick; factor=калибровка.
@@ -9496,7 +7169,6 @@ class LocalColonyCompute:
                 self._metab_applies = 0
                 self._metab_dt_sum = 0.0
                 self._metab_sc_sum = 0.0
-                self._metab_basal_sum = 0.0
                 self._metab_tick_n = 0
                 self._dmg_sum = 0.0
                 self._dmg_rate_sum = 0.0
@@ -9569,27 +7241,6 @@ class LocalColonyCompute:
             decay_step(bc, _FakeWorld())
         except Exception as e:
             logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
-        # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox → adrenaline спайк ПОСЛЕ
-        # decay (decay −2/тик уже отработал → спайк держит уровень, пока хищник
-        # воспринимается; уйдёт хищник → pred_prox→0 → не спайкаем → decay гасит =
-        # ТРАНЗИЕНТ, safeguard Фрая). Оживляет мёртвую ось adrenaline.
-        try:
-            _pp = float(self._last_pred_prox.get(cid, 0.0))
-            if _pp >= self._ADRENALINE_PRED_GATE:
-                _target = min(100.0, _pp * self._ADRENALINE_PRED_SCALE)
-                _cur = float(getattr(bc, "adrenaline", 0.0))
-                if _target > _cur:
-                    # ONSET-ЛАТЕНТНОСТЬ (Фрай 11.06, ключевое): adrenaline
-                    # нарастает НЕ мгновенно (rate-limit _ADRENALINE_ONSET/тик) к
-                    # target → innate ответ ДОСТАТОЧЕН-НО-НЕСОВЕРШЕНЕН: при
-                    # внезапном близком хищнике boost растёт с лагом → иногда
-                    # ловят до пика → escape <100% = LEARNABLE BAND. Ткань,
-                    # реагирующая РАНЬШЕ/резче (anticipation/timing), поднимает
-                    # escape-rate → behavioral-GC её ОТБИРАЕТ (selection-градиент,
-                    # не просто живая ось). Тюн onset к INTERMEDIATE escape-rate.
-                    bc.adrenaline = min(_target, _cur + self._ADRENALINE_ONSET)
-        except Exception as e:
-            logger.debug("adrenaline pred-spike %s: %s", cid, e)
         # Phase 4 fix 0.11.6 (29.05): glucose floor energy-coupled (вариант 1,
         # одобрен Фраем). Физиология: глюкоза поддерживается из энергозапасов
         # (гомеостаз). Если organism сыт (energy высокая, P40 держит ~500),
@@ -9815,75 +7466,6 @@ class LocalColonyCompute:
                 "hebbian_updates": int(self.hebbian_updates),
             },
             "sample": sample,
-        }
-
-    def _growth_graph_counts(self, org=None) -> tuple:
-        """§6 рост (09.06): (закреплено, отвергнуто) ИЗ ГРАФА — durable, не из
-        волатильного счётчика _growth_kept (тот обнуляется на рестарте → врал «0»
-        в /stats, хотя связи живы). Адам стартует topo=0 → ВСЕ topology_genes
-        выращены петлёй: enabled = закреплённые связи, disabled = откатанные.
-        Граф персистит в .pt → всегда отражает реальность, переживает сбои питания.
-        org=None → сумма по всем организмам (агрегат); иначе по одному."""
-        orgs = [org] if org is not None else list(self.organisms.values())
-        kept = reverted = 0
-        for o in orgs:
-            for g in (getattr(o, "tissue_topology_genes", []) or []):
-                if getattr(g, "enabled", False):
-                    kept += 1
-                else:
-                    reverted += 1
-        return kept, reverted
-
-    def _tissue_growth_metrics(self, cid: str = None) -> dict:
-        """§10.8 рост ТКАНЕЙ (predictor-сайдкары, ВНЕ графа) для UI/диагностики —
-        ОТДЕЛЬНО от роста СВЯЗЕЙ (topo_active = рёбра→cerebellum). Сайдкары читают
-        obs64, их выход добавляется во вход предиктора (улучшает прогноз), мотор
-        изолирован. cid=None → агрегат по всем организмам.
-          tissue_grown_live   — ЖИВЫХ выросших тканей сейчас (вкл. 1 в GC-абляции)
-          tissue_kept         — закреплено durable (= live; обнуляемо GC-пруном)
-          tissue_reverted     — отвергнуто при рождении (backoff: Δloss не значим)
-          tissue_gc_pruned    — отпущено GC (noise-fit: вклад распался на цикле)
-          tissue_propose_total— всего предложено за жизнь (монотонный)
-          tissue_growing      — 1 если сейчас растит/dwell новую (in-flight)
-          tissue_gc_evaluating— 1 если сейчас GC-ре-оценка (leave-one-out dwell)
-          tissue_growth_enabled — флаг роста ON/OFF."""
-        if cid is None:
-            live = sum(len(d or {}) for d in self._grown_tissues.values())
-            live += len(self._tissue_gc_state)        # held-aside в GC ещё живой
-            growing = len(self._tissue_growth_state)
-            evaluating = len(self._tissue_gc_state)
-            graduated = sum(len(d or {}) for d in self._tissue_graduated.values())
-            grad_watch = len(self._tissue_grad_state)
-        else:
-            live = len(self._grown_tissues.get(cid) or {})
-            if cid in self._tissue_gc_state:
-                live += 1
-            growing = 1 if cid in self._tissue_growth_state else 0
-            evaluating = 1 if cid in self._tissue_gc_state else 0
-            graduated = len(self._tissue_graduated.get(cid) or {})
-            grad_watch = 1 if cid in self._tissue_grad_state else 0
-        return {
-            "tissue_grown_live": int(live),
-            "tissue_kept": int(self._tissue_kept),
-            "tissue_reverted": int(self._tissue_reverted),
-            "tissue_gc_pruned": int(self._tissue_gc_pruned),
-            "tissue_propose_total": int(self._tissue_propose_count),
-            "tissue_growing": int(growing),
-            "tissue_gc_evaluating": int(evaluating),
-            "tissue_growth_enabled": bool(self._tissue_growth_enabled),
-            # Stage 1 GRADUATION (узлы в графе ≠ сайдкары; live их НЕ включает)
-            "tissue_graduated_live": int(graduated),
-            "tissue_grad_watch": int(grad_watch),
-            "tissue_grad_done": int(self._tissue_grad_done),
-            "tissue_grad_reverted": int(self._tissue_grad_reverted),
-            "tissue_graduation_enabled": bool(self._tissue_graduation_enabled),
-            # Stage 3 BEHAVIORAL-GC (парная ревизия выпускников по самочувствию)
-            "beh_gc_active": int(1 if cid in self._beh_gc_state else (
-                len(self._beh_gc_state) if cid is None else 0)),
-            "beh_gc_kept": int(self._beh_gc_done),
-            "beh_gc_pruned": int(self._beh_gc_pruned),
-            "behavioral_gc_enabled": bool(self._behavioral_gc_enabled),
-            "grad_collective_paused": bool(self._grad_collective_paused),
         }
 
     def diagnostics(self) -> dict:  # noqa: C901
@@ -10339,22 +7921,10 @@ class LocalColonyCompute:
                 if epi_norms else 0.0),
         }
 
-        # §6 рост (09.06): «закреплено»/«отвергнуто» из ГРАФА (durable), НЕ из
-        # волатильного счётчика (тот обнулялся на рестарте → врал «0»). См.
-        # _growth_graph_counts.
-        _gk, _gr = self._growth_graph_counts()
-
         return {
             "n_alive": n,
             "n_predictors": len(self.predictor),
             "n_prev_obs": len(self.prev_obs),
-            # Рост мозга при жизни (§6): закреплённых/откатанных связей + в полёте.
-            "tissue_topology_mutations_total": _gk + _gr,
-            "growth_kept": _gk,
-            "growth_reverted": _gr,
-            "growth_in_flight": len(self._growth_state),
-            # §10.8 рост ТКАНЕЙ (сайдкары, вне графа) — отдельно от роста СВЯЗЕЙ выше.
-            **self._tissue_growth_metrics(),
             "prediction_accuracy": pred_acc,
             "prediction_loss_avg": pred_loss_avg,
             "intrinsic_reward_avg": (
@@ -10422,105 +7992,9 @@ class LocalColonyCompute:
             "s2_dopa_td_avg": s2_dopa_td_avg,
             "s2_action_dist_avg": s2_action_dist_avg,
             "s2_bias_max_avg": s2_bias_max_avg,
-            # /stats Фаза 2 (v1.3): owner-агрегат Блоков 3/4/7/7b/10.
-            **self._stat_owner_extra(),
             "creatures": self._per_creature_stats(
                 action_dists=action_dists, bias_max=bias_max),
         }
-
-    def _stat_owner_extra(self) -> dict:
-        """/stats v1.3 Фаза 2: owner-агрегат — §3.5-ledger, §3-счётчики,
-        поведенческие вердикты (Блок 7b), лента роста, железо клиента (Блок 10)."""
-        _par_total = self._stat_paralysis_count or 1
-        return {
-            # Блок 4 — истинный баланс (§3.5-ledger)
-            **{f"ledger_{k}": v for k, v in (self._stat_ledger or {}).items()},
-            # Блок 3 — §3 бессмертие
-            "paralysis_count": int(self._stat_paralysis_count),
-            "recovery_count": int(self._stat_recovery_count),
-            "paralyzed_fraction": round(
-                1.0 - self._stat_recovery_count / _par_total, 4)
-                if self._stat_paralysis_count else 0.0,
-            "recovery_energy": round(float(self._recovery_energy), 1),
-            "immortal": bool(self._single_organism),
-            # Блок 7b — поведенческие вердикты тканей
-            "beh_verdicts": [
-                {"role": r, **v} for r, v in self._stat_beh_verdicts.items()],
-            # Блок 7/9 — лента событий роста
-            "growth_events": list(self._stat_growth_events),
-            # Блок 7 — ступенчатый ряд роста (lifetime-история сложности)
-            "growth_history": self._stat_snapshot_growth_history(),
-            # Блок 4 — foraging «учится ли активно кормиться» (ws_client rollup)
-            "foraging": dict(self._stat_foraging),
-            # §6.2 — одометр жизни Адама (lifetime-накопители)
-            "lifetime": self._stat_lifetime(),
-            # Блок 10 — железо клиента
-            "hardware": self._stat_hardware(),
-        }
-
-    def _stat_snapshot_growth_history(self) -> list:
-        """/stats Блок 7: дописать текущую точку (t, n_tissues, n_params, grown,
-        graduated) в ring-288 и вернуть последние ~288 — lifetime-ступеньки роста.
-        Вызывается из owner-extra (каденс ≈ push 30с → ring ~2.4ч)."""
-        try:
-            org = next(iter(self.organisms.values()), None)
-            if org is not None:
-                tissues = getattr(org, "tissues", {}) or {}
-                n_params = 0
-                try:
-                    n_params = sum(p.numel() for t in tissues.values()
-                                   for c in t.cells.values()
-                                   for p in c.parameters())
-                except Exception:
-                    pass
-                grown = sum(len(d or {}) for d in self._grown_tissues.values())
-                grad = sum(len(d or {}) for d in self._tissue_graduated.values())
-                self._stat_growth_history.append({
-                    "t": int(self._last_world_tick),
-                    "n_tissues": len(tissues),
-                    "n_params": int(n_params),
-                    "grown": int(grown), "graduated": int(grad)})
-        except Exception as e:
-            logger.debug("growth_history snapshot: %s", e)
-        return list(self._stat_growth_history)
-
-    def _stat_lifetime(self) -> dict:
-        """§6.2 одометр: накопленное за жизнь Адама. ate_total монотонный;
-        ticks_lived = возраст; paralysis_survived = восстановлений."""
-        cid = next(iter(self.organisms.keys()), None)
-        _bt = self._birth_tick.get(cid) if cid else None
-        ticks_lived = (max(0, int(self._last_world_tick) - int(_bt))
-                       if _bt is not None else int(self._last_world_tick))
-        return {
-            "ate_total": int(sum(self._stat_ate_total.values())),
-            "ticks_lived": int(ticks_lived),
-            "paralysis_survived": int(self._stat_recovery_count),
-        }
-
-    def _stat_hardware(self) -> dict:
-        """/stats Блок 10: железо клиента (статика + загрузка). psutil/platform
-        опциональны — без них отдаём что есть."""
-        from utopia_client import __version__ as _ver
-        import platform
-        hw = {"os_name": platform.platform(terse=True),
-              "client_version": _ver,
-              "device": str(self.device)}
-        try:
-            import psutil
-            hw["cpu_cores"] = psutil.cpu_count(logical=False)
-            hw["cpu_threads"] = psutil.cpu_count(logical=True)
-            hw["cpu_util_pct"] = round(psutil.cpu_percent(interval=None), 1)
-            _vm = psutil.virtual_memory()
-            hw["ram_total_gb"] = round(_vm.total / 1e9, 1)
-            hw["ram_used_gb"] = round(_vm.used / 1e9, 1)
-            hw["ram_util_pct"] = round(_vm.percent, 1)
-        except Exception:
-            pass
-        try:
-            hw["cpu_model"] = platform.processor() or "unknown"
-        except Exception:
-            pass
-        return hw
 
     def _per_creature_stats(
         self,
@@ -10582,24 +8056,11 @@ class LocalColonyCompute:
                      if _age is not None else None)
             _food = (int(self._carried_food.get(cid, 0))
                      if _bt is not None else None)
-            # §6 рост (09.06): «закреплено»/«отвергнуто» из ГРАФА (durable, не
-            # волатильный счётчик — тот обнулялся на рестарте, врал «0»). См.
-            # _growth_graph_counts.
-            _topo_enabled, _topo_reverted = self._growth_graph_counts(org)
-            _topo_total = _topo_enabled + _topo_reverted
             out.append({
                 "cid": str(cid),
                 "species_id": self.species_id.get(cid),
                 "gen": int(getattr(org, "generation", 0) or 0),
-                "topo": _topo_total,
-                # topo_active/growth_kept = живые (enabled) выросшие связи;
-                # growth_reverted = откатанные (disabled). Из графа → durable.
-                "topo_active": _topo_enabled,
-                "growth_kept": _topo_enabled,
-                "growth_reverted": _topo_reverted,
-                "tissue_topology_mutations_total": _topo_total,
-                # §10.8 рост ТКАНЕЙ (сайдкары) — per-creature, отдельно от связей.
-                **self._tissue_growth_metrics(cid),
+                "topo": len(getattr(org, "tissue_topology_genes", []) or []),
                 "age": _age,
                 "inst": _inst,
                 "food": _food,
@@ -10662,55 +8123,5 @@ class LocalColonyCompute:
                 "client_episodic_recall_norm": (
                     round(float(self.last_episodic_recall[cid].norm().item()), 4)
                     if cid in self.last_episodic_recall else 0.0),
-                # /stats Фаза 2 (v1.3): §3 / самосознание / тех-паспорт / погода.
-                **self._stat_per_creature_extra(cid, org, tissues, n_params),
             })
         return out
-
-    def _stat_per_creature_extra(self, cid, org, tissues, n_params) -> dict:
-        """/stats v1.3 Фаза 2: per-creature поля Блоков 1b/2/3/6 — клиент знает,
-        UI ждёт. §3-статус, felt-thirst, insula-T, трейты, тех-паспорт, pred_region."""
-        bc = self.biochem.get(cid)
-        # §3 paralysis (Блок 3): статус из _paralysis_until (монотонные секунды).
-        par, ticks_rem = False, 0
-        _until = self._paralysis_until.get(cid)
-        if _until is not None:
-            _rem = _until - time.monotonic()
-            if _rem > 0:
-                par, ticks_rem = True, max(0, round(_rem * 30.0))
-        # felt-thirst (Блок 2): inline из hydration (§3.2 concave φ⁻¹).
-        felt = 0.0
-        if bc is not None:
-            _hyd = float(getattr(bc, "hydration", 100.0))
-            if _hyd < 38.2:
-                felt = round((max(0.0, (38.2 - _hyd) / 38.2)) ** 0.618, 3)
-        # тех-паспорт (Блок 1b): клиент знает суммы по тканям + .pt размер.
-        n_cells = n_syn = 0
-        try:
-            for t in (tissues or {}).values():
-                n_cells += len(getattr(t, "cells", {}) or {})
-            n_syn = int(n_params)  # обучаемые веса ≈ синапсы
-        except Exception:
-            pass
-        _disk = 0.0
-        _pt = self._last_pt_path.get(cid)
-        try:
-            if _pt and os.path.exists(_pt):
-                _disk = round(os.path.getsize(_pt) / 1e6, 2)
-        except Exception:
-            pass
-        return {
-            "paralyzed": bool(par),
-            "paralysis_ticks_remaining": int(ticks_rem),
-            "felt_thirst": felt,
-            "insula_t_mod": round(float(self._it_last_tmod.get(cid, 1.0)), 4),
-            "traits": {k: int((self.traits.get(cid) or {}).get(k, 0))
-                       for k in ("move_speed", "attack_power", "efficiency")},
-            "pred_region": self._stat_pred_region.get(cid, {}),
-            "n_cells": int(n_cells),
-            "n_synapses": int(n_syn),
-            "size_disk_mb": _disk,
-            "predictor_dim": int(getattr(self, "_predictor_data_dim", 64) or 64),
-            "device": str(self.device),
-            "dtype": "float32",
-        }
