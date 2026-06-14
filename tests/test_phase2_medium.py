@@ -425,6 +425,47 @@ def test_corpse_step_overrides_hunt_commit():
     assert out["a"]["action"] == 0                       # туша перебила (мясо рядом > трек)
 
 
+# ── predator-hunt: добивание раненого хищника (Фрай 14.06, узкое окно) ──
+
+def test_predator_hunt_fires_attack():
+    # окно держится (obs-loop посчитал _predator_hunt=ATTACK) + enabled → ATTACK override
+    # (поверх FLEE мотора для ослабленного хищника).
+    c = _c()
+    c._predator_hunt_enabled = True
+    c._predator_hunt["a"] = 5
+    out = {"a": {"action": 10, "target_id": None}}      # мотор: FLEE
+    c._apply_predator_hunt("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 5                       # добивает раненого
+
+
+def test_predator_hunt_dormant_off():
+    # флаг OFF (dormant) → predator-hunt молчит, FLEE мотора стоит (survival-floor).
+    c = _c()
+    c._predator_hunt_enabled = False
+    c._predator_hunt["a"] = 5
+    out = {"a": {"action": 10, "target_id": None}}
+    c._apply_predator_hunt("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 10                      # FLEE цел (не тронут)
+
+
+def test_predator_hunt_noop_no_window():
+    # окно НЕ держится (нет _predator_hunt) → не трогает → FLEE-floor §4 отрабатывает.
+    c = _c()
+    c._predator_hunt_enabled = True
+    out = {"a": {"action": 10, "target_id": None}}
+    c._apply_predator_hunt("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 10
+
+
+def test_set_predator_hunt_toggles():
+    c = _c()
+    assert c._predator_hunt_enabled is False             # дефолт dormant
+    assert c.set_predator_hunt(True) is True
+    assert c._predator_hunt_enabled is True
+    assert c.set_predator_hunt(False) is False
+    assert c._predator_hunt_enabled is False
+
+
 def test_paralysis_allows_corpse_step():
     # §3-STEP bypass (medium-fix): парализован + adjacent-труп (флаг=move) → шаг проходит
     # (голодающий ДОХОДИТ до мяса из паралича). Иначе заперт рядом с несъеденными 55.

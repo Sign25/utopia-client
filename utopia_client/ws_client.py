@@ -1815,8 +1815,11 @@ class ColonyWSClient:
             # PHASE C: nearest_corpse {dr,dc,dist,energy_remaining} — нав к трупу (как
             # medium_prey). Держим контейнер даже при nearest_flora=None.
             _p40_corpse = c.get("nearest_corpse")
+            # PREDATOR-HUNT (Фрай 14.06): nearest_predator {dr,dc,dist,hp,max_hp,hp_ratio,
+            # attackable,kind,fauna_id} — добивание РАНЕНОГО хищника (как medium_prey/corpse).
+            _p40_pred = c.get("nearest_predator")
             if (_p40_nf is not None or _p40_mp is not None
-                    or _p40_corpse is not None):
+                    or _p40_corpse is not None or _p40_pred is not None):
                 _ent = dict(_p40_nf) if _p40_nf is not None else {
                     "dr": 0, "dc": 0, "dist": None, "kind": None}
                 # Phase 1 feeding-ladder (Хьюберт d972ea7, Adam-only): nearest_EDIBLE
@@ -1830,6 +1833,8 @@ class ColonyWSClient:
                     _ent["medium_prey"] = _p40_mp
                 if _p40_corpse is not None:
                     _ent["corpse"] = _p40_corpse
+                if _p40_pred is not None:
+                    _ent["predator_hunt"] = _p40_pred
                 nearest_flora_per_cid[cid_s] = _ent
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")

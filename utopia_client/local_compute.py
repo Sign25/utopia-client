@@ -499,6 +499,15 @@ class LocalColonyCompute:
         self._corpse_approach: dict = {}    # cid → MOVE-action к adjacent-туше (Phase C medium-fix, §3-STEP bypass)
         self._forage_dir: dict = {}         # cid → MOVE-action к БЛИЖАЙШЕЙ видимой еде (anti-absorbing §3-floor, Фрай 14.06)
         self._hunt_commit: dict = {}        # cid → ACTION (MOVE-к-медиуму/ATTACK) — детерм. hunt-commit (gate в, Фрай 14.06: поднять дно)
+        # PREDATOR-HUNT (Фрай 14.06, после термокомфорта): добивание РАНЕНОГО хищника —
+        # узкое окно поверх АБСОЛЮТНОГО FLEE-floor. ATTACK ТОЛЬКО hp_ratio<φ⁻² + er>φ⁻¹
+        # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
+        # (max safety). Давление: прогноз «одолею?» = predictor → рост. GC-ось инверсия страха.
+        self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
+        self._predator_hunt: dict = {}      # cid → ACTION (ATTACK раненого хищника)
+        self._predhunt_disengage: dict = {} # cid → until_tick (FLEE-cooldown после урона)
+        self._predhunt_dmg_seen: dict = {}  # cid → последний _beh_damage_cum (детект урона)
+        self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
@@ -1578,6 +1587,9 @@ class LocalColonyCompute:
         self._beh_meat_cum.pop(cid, None)     # hunt-ось meat-outcome cleanup
         self._beh_thermal_cum.pop(cid, None)  # термо-ось cleanup
         self._adam_temp.pop(cid, None)        # temp-stash cleanup
+        self._beh_predkill_cum.pop(cid, None) # predator-hunt ось cleanup
+        self._predhunt_disengage.pop(cid, None)
+        self._predhunt_dmg_seen.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -3504,6 +3516,9 @@ class LocalColonyCompute:
                     # PHASE C: nearest_corpse для corpse-nav (труп ценнее травы — мясо)
                     _corpse_cid = (_nf_cid.get("corpse")
                                    if isinstance(_nf_cid, dict) else None)
+                    # PREDATOR-HUNT (Фрай 14.06): nearest_predator {hp_ratio,attackable,dr,dc}
+                    _pred_cid = (_nf_cid.get("predator_hunt")
+                                 if isinstance(_nf_cid, dict) else None)
                     _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
                     _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
                     # ТЕРМОКОМФОРТ (Фрай 14.06): stash temp@obs[35] ∈[-1,1] для
@@ -3548,6 +3563,25 @@ class LocalColonyCompute:
                                     self._hunt_commit[cid] = 0 if _mdr < 0 else 1
                                 else:
                                     self._hunt_commit[cid] = 2 if _mdc > 0 else 3
+                        except (TypeError, ValueError):
+                            pass
+                    # PREDATOR-HUNT окно (Фрай 14.06): добить РАНЕНОГО хищника — узкое
+                    # окно поверх АБСОЛЮТНОГО FLEE-floor. 4-AND КОНСЕРВАТИВНО: hp_ratio<φ⁻²
+                    # (ослаблен) + er>φ⁻¹ (СЫТ — НЕ голод, predator-hunt=роскошь) + attackable
+                    # (упор — хищник САМ подошёл, Адам не лезет) + НЕ disengaged. damage>0 →
+                    # disengage cooldown FLEE (max safety). Вне окна → молчит → FLEE-floor §4.
+                    self._predator_hunt.pop(cid, None)
+                    _dmg_now = self._beh_damage_cum.get(cid, 0.0)
+                    if _dmg_now > self._predhunt_dmg_seen.get(cid, _dmg_now):
+                        self._predhunt_disengage[cid] = int(self._last_world_tick) + 21  # Fib FLEE-cooldown
+                    self._predhunt_dmg_seen[cid] = _dmg_now
+                    _ph_dis = int(self._last_world_tick) < self._predhunt_disengage.get(cid, 0)
+                    if (self._predator_hunt_enabled and isinstance(_pred_cid, dict)
+                            and not _ph_dis and _er > (1.0 / _PHI)):     # er>φ⁻¹ = СЫТ
+                        try:
+                            _hpr = float(_pred_cid.get("hp_ratio", 1.0) or 1.0)
+                            if _hpr < (1.0 / _PHI) ** 2 and bool(_pred_cid.get("attackable")):
+                                self._predator_hunt[cid] = 5   # ATTACK раненого (server резолвит)
                         except (TypeError, ValueError):
                             pass
                     # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
@@ -4227,6 +4261,7 @@ class LocalColonyCompute:
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
                 self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
+                self._apply_predator_hunt(cid, out, obs_per_cid.get(cid))
                 self._apply_hunt_commit(cid, out, obs_per_cid.get(cid))
                 self._apply_corpse_approach(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
@@ -6782,6 +6817,15 @@ class LocalColonyCompute:
         logger.info("set_thermocomfort: %s (k=%.3f)", on, self._THERMO_K)
         return self._thermocomfort_enabled
 
+    def set_predator_hunt(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл PREDATOR-HUNT (Фрай 14.06). on=True: Адам может
+        добивать РАНЕНОГО хищника в узком окне (hp_ratio<φ⁻²+сыт+упор). on=False
+        (kill-switch): predator-hunt молчит → чистый FLEE-floor (§4). Survival-инвариант
+        держит disengage (любой урон→FLEE). Rollback при death>0 / §3-рецидиве."""
+        self._predator_hunt_enabled = bool(on)
+        logger.info("set_predator_hunt: %s", on)
+        return self._predator_hunt_enabled
+
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
         on=True: Адам→ВСЕЯДНЫЙ (diet_gene→φ⁻¹=0.618) → (а) server даёт kill-energy
@@ -6843,6 +6887,7 @@ class LocalColonyCompute:
             "damage_cum": float(self._beh_damage_cum.get(cid, 0.0)),  # fear-ось (rate, neg)
             "meat_cum": float(self._beh_meat_cum.get(cid, 0.0)),      # hunt-ось (rate, pos)
             "thermal_cum": float(self._beh_thermal_cum.get(cid, 0.0)),  # термо-ось (rate, neg; selectable P2/BUILD)
+            "predkill_cum": float(self._beh_predkill_cum.get(cid, 0.0)),  # predator-hunt ось (инверсия страха, pos)
         }
 
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
@@ -9063,6 +9108,31 @@ class LocalColonyCompute:
             logger.info("HUNT_COMMIT cid=%s fired #%d (умеренный голод+medium, act=%d) → к мясу",
                         cid, self._hunt_commit_n, int(_hc))
 
+    def _apply_predator_hunt(self, cid: str, out: dict, obs) -> None:
+        """ДЕТЕРМ. ДОБИВАНИЕ РАНЕНОГО ХИЩНИКА (Фрай 14.06). Узкое окно поверх АБСОЛЮТНОГО
+        FLEE-floor — НЕ floor (не форсит на хищника). Окно (4-AND, посчитан в obs-loop →
+        _predator_hunt): хищник ослаблен (hp_ratio<φ⁻²) + Адам СЫТ (er>φ⁻¹ — роскошь, не
+        нужда: структурно нужда НЕ толкает на хищника) + attackable (упор, хищник САМ
+        подошёл) + НЕ disengaged (любой полученный урон → cooldown FLEE, Фрай max safety).
+        Вне окна молчит → FLEE-floor (§4 predator_defense) отрабатывает.
+
+        Иерархия (Фрай LOCKED): predator-FLEE-floor = ДЕФОЛТ; predator-hunt = ГЕЙТНУТОЕ
+        исключение ТОЛЬКО в окне. Взаимоисключимо с голод-override (eat/hunt-commit/corpse
+        — все er<φ⁻¹; predator-hunt er>φ⁻¹). Disengage держит recoverable (survival > yield).
+        Давление: прогноз исхода боя «одолею?» → predictor-рост; GC-ось инверсия страха.
+        """
+        if (cid not in out or not self._single_organism
+                or not self._predator_hunt_enabled):
+            return
+        _ph = self._predator_hunt.get(cid)
+        if _ph is None:
+            return
+        out[cid] = {"action": int(_ph), "target_id": None}    # ATTACK раненого хищника
+        self._predhunt_n = getattr(self, "_predhunt_n", 0) + 1
+        if self._predhunt_n % 10 == 0:
+            logger.info("PRED_HUNT cid=%s fired #%d (ослабл. хищник + сыт + упор) → ATTACK",
+                        cid, self._predhunt_n)
+
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
 
@@ -9211,6 +9281,16 @@ class LocalColonyCompute:
                         "total_med=%d energy=%.0f", cid, _ke_acc, _kc_acc,
                         _avg_ke, self._skill_kill_medium[cid],
                         float(getattr(bc, "energy", 0.0)))
+                # PREDATOR-KILL ось (Фрай 14.06, инверсия страха): avg energy/kill ≥70
+                # (predator yield 89/F11 или 144/F12 > medium 55) → добил хищника.
+                # _beh_predkill_cum = outcome-метрика «одолел бой» (predator-hunt GC-ось).
+                if _avg_ke >= 70.0:
+                    self._beh_predkill_cum[cid] = (
+                        self._beh_predkill_cum.get(cid, 0.0) + _ke_acc)
+                    logger.info("PRED_KILL cid=%s ke_acc=%.1f count=%d avg=%.1f cum=%.1f "
+                                "energy=%.0f (добил раненого хищника)", cid, _ke_acc,
+                                _kc_acc, _avg_ke, self._beh_predkill_cum[cid],
+                                float(getattr(bc, "energy", 0.0)))
             elif event.get("killed"):
                 # БЭККОМПАТ (old P40 / колонии без аккумулятора): per-tick killed.
                 apply_kill_prey(bc)

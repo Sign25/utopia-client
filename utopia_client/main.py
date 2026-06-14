@@ -531,6 +531,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_behavioral_probe: str | None = None
     applied_behavioral_gc: bool | None = None
     applied_thermocomfort: bool | None = None
+    applied_predator_hunt: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -839,6 +840,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("thermocomfort → %s", target_thermo)
                         except Exception as e:
                             logger.warning("set_thermocomfort failed: %s", e)
+
+                    # PREDATOR-HUNT (Фрай 14.06): добивание раненого хищника (узкое окно
+                    # поверх FLEE-floor). Дефолт OFF (dormant). edge-detect; OFF=чистый FLEE.
+                    target_predhunt = bool(flags.get("predator_hunt", False))
+                    if target_predhunt != applied_predator_hunt \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_predator_hunt(target_predhunt)
+                            applied_predator_hunt = target_predhunt
+                            logger.info("predator_hunt → %s", target_predhunt)
+                        except Exception as e:
+                            logger.warning("set_predator_hunt failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +
