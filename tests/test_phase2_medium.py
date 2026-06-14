@@ -354,6 +354,77 @@ def test_corpse_approach_blocked_by_predator():
     assert out["a"]["action"] == 1                      # хищник перебил
 
 
+# ── hunt-commit: детерм. навигация к медиуму (gate в, Фрай 14.06) ──
+
+def test_hunt_commit_moves_to_medium():
+    # умеренный голод + medium видна (флаг=MOVE) + не на еде + safe → детерм. шаг к мясу
+    c = _c()
+    c._hunt_commit["a"] = 2                              # MOVE-EAST к медиуму
+    out = {"a": {"action": 0, "target_id": None}}       # мотор: NORTH (грейзинг-дрейф)
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 2                       # override → к медиуму
+
+
+def test_hunt_commit_attack_at_contact():
+    # медиум в упоре (флаг=ATTACK 5) → ATTACK (server резолвит adjacent prey)
+    c = _c()
+    c._hunt_commit["a"] = 5
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 5
+
+
+def test_hunt_commit_noop_on_food():
+    # на еде (трава/туша) → eat-рефлекс владеет, hunt-commit НЕ дёргает с еды
+    c = _c()
+    c._on_food["a"] = 1
+    c._hunt_commit["a"] = 2
+    out = {"a": {"action": 14, "target_id": None}}      # eat-рефлекс уже поставил EAT
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 14                      # не тронут
+
+
+def test_hunt_commit_blocked_by_predator():
+    # medium видна, НО хищник (d_prox≥0.15) → FLEE приоритет, не лезет к добыче
+    c = _c()
+    c._hunt_commit["a"] = 2
+    obs = [0.0] * 64
+    obs[61] = 0.5
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_hunt_commit("a", out, obs)
+    assert out["a"]["action"] == 1                       # хищник перебил
+
+
+def test_hunt_commit_noop_no_medium():
+    # нет видимого медиума (флаг пуст) → не трогает
+    c = _c()
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 1
+
+
+def test_hunt_commit_disabled_when_hunting_off():
+    # охота выключена → hunt-commit молчит
+    c = _c(hunting=False)
+    c._hunt_commit["a"] = 2
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 1
+
+
+def test_corpse_step_overrides_hunt_commit():
+    # иерархия: смежная туша (бесплатное мясо) > трек к живому медиуму. corpse_approach
+    # вызывается ПОСЛЕ hunt_commit → перебивает.
+    c = _c()
+    c._hunt_commit["a"] = 2                              # медиум на EAST
+    c._corpse_approach["a"] = 0                          # туша смежно на NORTH
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_hunt_commit("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 2                       # hunt-commit поставил
+    c._apply_corpse_approach("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 0                       # туша перебила (мясо рядом > трек)
+
+
 def test_paralysis_allows_corpse_step():
     # §3-STEP bypass (medium-fix): парализован + adjacent-труп (флаг=move) → шаг проходит
     # (голодающий ДОХОДИТ до мяса из паралича). Иначе заперт рядом с несъеденными 55.

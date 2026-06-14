@@ -498,6 +498,7 @@ class LocalColonyCompute:
         self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
         self._corpse_approach: dict = {}    # cid → MOVE-action к adjacent-туше (Phase C medium-fix, §3-STEP bypass)
         self._forage_dir: dict = {}         # cid → MOVE-action к БЛИЖАЙШЕЙ видимой еде (anti-absorbing §3-floor, Фрай 14.06)
+        self._hunt_commit: dict = {}        # cid → ACTION (MOVE-к-медиуму/ATTACK) — детерм. hunt-commit (gate в, Фрай 14.06: поднять дно)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
@@ -3506,6 +3507,33 @@ class LocalColonyCompute:
                             self._hunt_pounce.pop(cid, None)
                     else:
                         self._hunt_pounce.pop(cid, None)
+                    # HUNT-COMMIT (Фрай 14.06, gate в — поднять дно): мясной тир (+55
+                    # medium) был ЗАПЕРТ — medium-seek nav = shaping (Урок 1, не пробивает
+                    # мотор) + catch-22 (глубокий голод→incapable). Адам застрял на грейзинге
+                    # → дипы к ~4. Фикс: при УМЕРЕННОМ голоде (φ⁻⁵<er<φ⁻¹) + capable +
+                    # medium видна → ДЕТЕРМ. шаг к медиуму (ATTACK в упоре dist≤1) — floor,
+                    # как corpse-step. Охотится ПОКА capable, до глубокого дипа. _capable
+                    # уже = er>φ⁻⁵; _hungry_for_med = er<φ⁻¹.
+                    self._hunt_commit.pop(cid, None)
+                    if (self._hunting_enabled and isinstance(_mp_cid, dict)
+                            and _hungry_for_med and _capable):
+                        try:
+                            _mpd2 = float(_mp_cid.get("dist", 99.0) or 99.0)
+                            _mdr = float(_mp_cid.get("dr", 0.0) or 0.0)
+                            _mdc = float(_mp_cid.get("dc", 0.0) or 0.0)
+                            # DIST-CAP (Фрай впритык-flag): не комитим на ДАЛЁКИЙ медиум
+                            # (mdist 20-31 = долгий трек жжёт margin до прихода (a) Хьюберта,
+                            # closer-spawn). ≤13 Fib = достижимо грейзя en-route. >13 → грейзь,
+                            # ждём (a). recoverable: глубокий дип → capable=0 → trava-floor.
+                            if _mpd2 <= 1.0:
+                                self._hunt_commit[cid] = 5     # ATTACK (server резолвит adjacent prey)
+                            elif _mpd2 <= 13.0 and (_mdr != 0.0 or _mdc != 0.0):
+                                if abs(_mdr) >= abs(_mdc):
+                                    self._hunt_commit[cid] = 0 if _mdr < 0 else 1
+                                else:
+                                    self._hunt_commit[cid] = 2 if _mdc > 0 else 3
+                        except (TypeError, ValueError):
+                            pass
                     # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
                     # dist≤1 ИЛИ small-prey prox≥0.5) + голод + hunting → флаг для
                     # _maybe_force_stay: ATTACK проходит сквозь §3-force-STAY. Еда у
@@ -4183,6 +4211,7 @@ class LocalColonyCompute:
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
                 self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
+                self._apply_hunt_commit(cid, out, obs_per_cid.get(cid))
                 self._apply_corpse_approach(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
                 # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
@@ -8972,6 +9001,41 @@ class LocalColonyCompute:
         if self._corpse_step_n % 20 == 0:
             logger.info("CORPSE_STEP cid=%s fired #%d (adjacent corpse, mv=%d) → step-onto",
                         cid, self._corpse_step_n, int(_amv))
+
+    def _apply_hunt_commit(self, cid: str, out: dict, obs) -> None:
+        """ДЕТЕРМ. HUNT-COMMIT к medium-добыче (Фрай 14.06, gate в — поднять дно).
+
+        Диагноз: мясной тир (+55 medium) ЗАПЕРТ — medium-seek nav = shaping (Урок 1, не
+        пробивает обученный мотор) + catch-22 (глубокий голод er<φ⁻⁵ → capable=0 → не
+        охотится РОВНО когда мясо нужнее) → Адам застрял на грейзинге → дипы к ~4. Фикс
+        (floor-паттерн, как corpse-step/eat-рефлекс): при УМЕРЕННОМ голоде (φ⁻⁵<er<φ⁻¹) +
+        capable + medium видна + НЕ на еде + safe → детерм. навигация к медиуму (ATTACK в
+        упоре dist≤1, server резолвит adjacent prey). Охотится ПОКА capable, до дипа.
+
+        Иерархия (Фрай LOCKED): predator-FLEE > hunt-commit (d_prox-гейт); on-food
+        eat-рефлекс выше (НЕ дёргаем Адама с еды — трава/туша); corpse-step выше (вызывается
+        ПОСЛЕ → перебьёт: смежная туша = бесплатное мясо > трек к живому медиуму); глубокий
+        голод (er<φ⁻⁵ → capable=0 → _hunt_commit не выставлен) → trava-floor/anti-absorbing.
+        Дополняет (a) Хьюберта (спавн медиумов ближе) — combo закрывает дистанцию+nav.
+        """
+        if cid not in out or not self._single_organism or not self._hunting_enabled:
+            return
+        if self._on_food.get(cid):           # ест (трава/туша) → не дёргаем с еды
+            return
+        _hc = self._hunt_commit.get(cid)
+        if _hc is None:
+            return
+        try:
+            _dpx = float(obs[61]) if (obs is not None and len(obs) > 61) else 0.0
+        except (TypeError, ValueError, IndexError):
+            _dpx = 0.0
+        if _dpx >= 0.15:                      # хищник близко → FLEE приоритет (не лезь к добыче)
+            return
+        out[cid] = {"action": int(_hc), "target_id": None}    # к медиуму (MOVE) / ATTACK в упоре
+        self._hunt_commit_n = getattr(self, "_hunt_commit_n", 0) + 1
+        if self._hunt_commit_n % 20 == 0:
+            logger.info("HUNT_COMMIT cid=%s fired #%d (умеренный голод+medium, act=%d) → к мясу",
+                        cid, self._hunt_commit_n, int(_hc))
 
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
