@@ -53,7 +53,23 @@ N_ACTIONS = 16
 # НЕ трогаем. Реализация read-expansion + weight-init — отдельным шагом.
 _SELF_OBS_OFFSET = 64
 _SELF_OBS_DIM = 4
-_BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM  # 68 — окно чтения мозга
+# ── Ритм-аффорданс (serotonin-ось, Фрай 14.06.2026) ──────────────────────
+# Экстероцептивное ЦИКЛИЧЕСКОЕ время — INPUT-only давление роста (как
+# temperature@35, но в STATE_DIM-хвосте, не в env64). Строго В КОНЦЕ входа
+# [68:72]; self4@[64:68] НЕ двигается ни на индекс (любой сдвиг [0:68]
+# рассогласует выученные веса — жёсткое требование Фрая). 4 канала, ОБА
+# фазовых сигнала циклические → sin/cos на каждый (raw-скаляр рвал бы границу
+# цикла 1.0→0.0 «зима≈ранняя весна», хуже учится; 4-й канал почти бесплатен):
+#   obs[68] = day_phase_sin    obs[69] = day_phase_cos   (суточный цикл)
+#   obs[70] = year_phase_sin   obs[71] = year_phase_cos  (годовой цикл)
+# Все ∈[-1,1]. Дом — STATE_DIM[64:80] (P40 zeros, designated internal,
+# client-free), инжект ws_client из payload под WORLD_ADAM_TIME_PHASE_OBS
+# (skip_obs → отдельным полем, как temperature). target/output/мотор НЕ
+# трогаем — только вход predictor. Default zeros = dormant (флаг OFF →
+# obs[68:72]=0 → input_proj[:,68:72]=0 → math-equivalent довходу 68).
+_RHYTHM_OFFSET = _SELF_OBS_OFFSET + _SELF_OBS_DIM   # 68
+_RHYTHM_DIM = 4
+_BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM + _RHYTHM_DIM  # 72 — окно чтения мозга
 
 # Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
 # temperature-модуляция СУЩЕСТВУЮЩЕЙ motor-политики. НЕ отдельный actor.
@@ -3373,18 +3389,20 @@ class LocalColonyCompute:
                 obs64 = obs_arr[:64]
                 obs_tensor = torch.from_numpy(obs64).to(self.device).unsqueeze(0)
 
-                # Track 2 (этап 4): вход predictor = obs68 (env64 + self-observable4)
-                # ЕСЛИ predictor расширен (_enable_self_observable). target остаётся
-                # obs64 — мозг СВОИМ состоянием моделирует мир (Phase 6 самосознание).
-                # Прочие ткани (forward/hebbian/motor) пока на obs64. [I|0]-init →
-                # на старте obs68→obs64 (math-equivalence), self доучивается.
+                # Track 2 (этап 4) + ритм (Фрай 14.06): вход predictor = obs72
+                # (env64 | self-observable4 [64:68] | rhythm4 [68:72]) ЕСЛИ predictor
+                # расширен. target остаётся obs64 — мозг СВОИМ состоянием + временем
+                # моделирует мир (Phase 6 самосознание / serotonin-ось). Прочие ткани
+                # (forward/hebbian/motor) на obs64. [I|0]+preserve-init → на старте
+                # obs72→obs64 (math-equivalence: self4/rhythm4 колонки=0), доучивается.
                 _pred = self.predictor.get(cid)
                 pred_input = obs_tensor
                 if _pred is not None and int(
                         getattr(_pred, "data_dim", _SELF_OBS_OFFSET)) == _BRAIN_INPUT_DIM:
-                    so = self._build_self_observable(cid)
-                    obs68 = np.concatenate([obs64, so]).astype(np.float32)
-                    pred_input = torch.from_numpy(obs68).to(
+                    so = self._build_self_observable(cid)          # self4 [64:68]
+                    rh = self._extract_rhythm(obs_arr)             # rhythm4 [68:72]
+                    obs72 = np.concatenate([obs64, so, rh]).astype(np.float32)
+                    pred_input = torch.from_numpy(obs72).to(
                         self.device).unsqueeze(0)
 
                 # Вариант A: hook на cerebellum (один раз/cid) — ДО forward,
@@ -7711,6 +7729,25 @@ class LocalColonyCompute:
             1.0 if par else 0.0,
         ], dtype=np.float32)
 
+    def _extract_rhythm(self, obs_arr) -> "np.ndarray":
+        """Ритм-аффорданс (Фрай 14.06): 4 экстероцептивных циклических канала
+        obs[68:72] = day_phase sin/cos + year_phase sin/cos ∈[-1,1]. Живут в
+        STATE_DIM[64:80] (designated internal, P40 zeros, client-free), инжектятся
+        ws_client'ом из payload (WORLD_ADAM_TIME_PHASE_OBS, skip_obs → отд. поле,
+        как temperature@35). НЕ читаем из P40-obs[64:68] (там self4 — он строится
+        интроспективно в _build_self_observable, не из obs_arr). Default zeros
+        (dormant): флаг OFF / obs узок → нули → predictor[68:72]=0 → math-equivalent
+        входу 68. Сигнатура зеркалит _build_self_observable (оба дают хвост входа)."""
+        z = np.zeros(_RHYTHM_DIM, dtype=np.float32)
+        try:
+            if (obs_arr is not None
+                    and obs_arr.shape[0] >= _RHYTHM_OFFSET + _RHYTHM_DIM):
+                return obs_arr[
+                    _RHYTHM_OFFSET:_RHYTHM_OFFSET + _RHYTHM_DIM].astype(np.float32)
+        except Exception:
+            pass
+        return z
+
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
 
@@ -7776,10 +7813,20 @@ class LocalColonyCompute:
             with torch.no_grad():
                 w = torch.zeros(_SELF_OBS_OFFSET, new_data_dim,
                                 dtype=proj.weight.dtype, device=self.device)
-                w[:, :_SELF_OBS_OFFSET] = torch.eye(
-                    _SELF_OBS_OFFSET, dtype=proj.weight.dtype, device=self.device)
-                proj.weight.copy_(w)   # [I_64 | 0] — passthrough первые 64
-                proj.bias.zero_()
+                _old = getattr(tissue, "input_proj", None)
+                if (_old is not None and hasattr(_old, "weight")
+                        and tuple(_old.weight.shape) == (_SELF_OBS_OFFSET, cur)):
+                    # ПРЕЗЕРВ-расширение (Фрай 14.06, ритм 68→72): сохраняем ВЫУЧЕННЫЕ
+                    # cur колонок (напр. self4@64:67 уже обучены) + новые (cur:new) = 0.
+                    # БЕЗ этого fresh-[I|0] обнулил бы выученный self-observable (brain-reset).
+                    w[:, :cur] = _old.weight
+                    proj.bias.copy_(_old.bias)
+                else:
+                    # ПЕРВОЕ расширение (cur=64, input_proj ещё нет): [I_64 | 0].
+                    w[:, :_SELF_OBS_OFFSET] = torch.eye(
+                        _SELF_OBS_OFFSET, dtype=proj.weight.dtype, device=self.device)
+                    proj.bias.zero_()
+                proj.weight.copy_(w)   # passthrough первые cur (выученные/identity) | 0 новые
             tissue.input_proj = proj
             tissue.data_dim = new_data_dim
             return True
@@ -7807,22 +7854,39 @@ class LocalColonyCompute:
             # чистим: следующий forward стартует с prev=None (skip) → сохранит
             # obs68 → дальше согласовано.
             self.prev_obs.pop(cid, None)
-            logger.info("self-observable enabled cid=%s (predictor 64→68, [I|0])",
-                        cid)
+            logger.info("self-observable+rhythm enabled cid=%s (predictor →%d, "
+                        "[I|0]/preserve)", cid, _BRAIN_INPUT_DIM)
             return True
         return False
 
     def _load_predictor_sd(self, cid: str, pred_sd: dict) -> None:
-        """Robust load predictor state_dict (Track 2). Если сохранён РАСШИРЕННЫЙ
-        predictor (data_dim=68 → есть input_proj.* в sd), сначала upgrade rebuilt
-        predictor [I|0], потом load — ключи совпадут, обученный self-observable
-        input_proj переживёт restart. Иначе обычный load (64)."""
+        """Robust load predictor state_dict (Track 2 + ритм-миграция Фрай 14.06).
+        Если сохранён РАСШИРЕННЫЙ predictor (есть input_proj.weight в sd), грузим
+        НА СОХРАНЁННОМ dim, ПОТОМ preserve-расширяем до текущего _BRAIN_INPUT_DIM.
+        КРИТИЧНО для перехода 68→72: upgrade-до-72-ПЕРЕД-load крашнул бы по форме
+        (sd.input_proj=(64,68) vs model=(64,72)). Порядок: (1) rebuild input_proj
+        на saved_dim ([I|0], точное совпадение ключей) → load (выученные веса), (2)
+        preserve-expand saved→72 (выученные колонки целы, ритм-колонки=0). Старый
+        предиктор (data_dim=64, нет input_proj) → обычный load + enable растит позже."""
         pred = self.predictor.get(cid)
         if pred is None:
             return
-        if any(str(k).startswith("input_proj") for k in pred_sd.keys()):
-            self._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM)
-        pred.load_state_dict(pred_sd)
+        ipw = pred_sd.get("input_proj.weight")
+        if ipw is not None:
+            try:
+                saved_dim = int(ipw.shape[1])
+            except Exception:
+                saved_dim = _BRAIN_INPUT_DIM
+            # (1) выровнять input_proj модели под saved_dim → ключи совпадут
+            self._upgrade_tissue_input_dim(pred, saved_dim)
+            pred.load_state_dict(pred_sd)
+            # (2) preserve-расширить до текущего окна (если выросло, напр. 68→72)
+            if saved_dim < _BRAIN_INPUT_DIM:
+                self._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM)
+                logger.info("predictor load-transition cid=%s %d→%d (preserve, "
+                            "ритм-колонки=0)", cid, saved_dim, _BRAIN_INPUT_DIM)
+        else:
+            pred.load_state_dict(pred_sd)
 
     def _enable_self_obs_action_head(self, cid: str) -> bool:
         """Track 2: создать self-obs→action REINFORCE-голову для cid.

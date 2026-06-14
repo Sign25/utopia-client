@@ -1627,6 +1627,33 @@ class ColonyWSClient:
             pass
         return obs_arr
 
+    @staticmethod
+    def _apply_rhythm_to_obs(obs_arr, rhythm):
+        """Ритм-аффорданс (Фрай 14.06): 4 циклических фазовых канала → obs[68:72]
+        (STATE_DIM-хвост [64:80]: P40 zeros, designated internal, client-free).
+        rhythm = dict {day_phase_sin/cos, year_phase_sin/cos} ∈[-1,1] (контракт
+        Хьюберт WORLD_ADAM_TIME_PHASE_OBS; Адаму отд. полем — skip_obs, как
+        temperature@35). None/не-dict → no-op (dormant, флаг OFF). obs Адама может
+        быть уже, чем 72 (local-builder) → паддим до 80 (контракт np[80]), чтобы
+        ритм-канал существовал при флаге ON; [64:68] не используется (self4
+        строится client-side). daytime_fraction — диагностика, НЕ встраивается.
+        Мутирует/возвращает obs_arr (паддинг возвращает НОВЫЙ массив)."""
+        if not isinstance(rhythm, dict) or obs_arr is None:
+            return obs_arr
+        import numpy as np
+        try:
+            if obs_arr.shape[0] < 72:
+                _pad = np.zeros(80, dtype=obs_arr.dtype)
+                _pad[:obs_arr.shape[0]] = obs_arr
+                obs_arr = _pad
+            obs_arr[68] = float(rhythm.get("day_phase_sin", 0.0) or 0.0)
+            obs_arr[69] = float(rhythm.get("day_phase_cos", 0.0) or 0.0)
+            obs_arr[70] = float(rhythm.get("year_phase_sin", 0.0) or 0.0)
+            obs_arr[71] = float(rhythm.get("year_phase_cos", 0.0) or 0.0)
+        except (IndexError, TypeError, ValueError):
+            pass
+        return obs_arr
+
     def _collect_obs_batch(
         self, creatures: list
     ) -> tuple[dict, dict, dict]:
@@ -1718,7 +1745,39 @@ class ColonyWSClient:
             if _temp is None:
                 _temp = c.get("temperature")
             obs_arr = self._apply_weather_to_obs(obs_arr, _temp)
+            # РИТМ (Фрай 14.06): циклическое время → obs[68:72] (STATE_DIM-хвост,
+            # client-free). Хьюберт шлёт под WORLD_ADAM_TIME_PHASE_OBS отд. полями
+            # (skip_obs, как temperature). Контейнер: nested c["time_phase"] |
+            # flat-поля на c (читаем оба — контракт контейнера подтвердить с
+            # Хьюбертом при активации по RHYTHM_DIAG). None → no-op (dormant).
+            _rh = c.get("time_phase")
+            if not isinstance(_rh, dict):
+                if any(k in c for k in ("day_phase_sin", "day_phase_cos",
+                                        "year_phase_sin", "year_phase_cos")):
+                    _rh = {
+                        "day_phase_sin": c.get("day_phase_sin", 0.0),
+                        "day_phase_cos": c.get("day_phase_cos", 0.0),
+                        "year_phase_sin": c.get("year_phase_sin", 0.0),
+                        "year_phase_cos": c.get("year_phase_cos", 0.0),
+                    }
+                else:
+                    _rh = None
+            obs_arr = self._apply_rhythm_to_obs(obs_arr, _rh)
             obs_per_cid[cid_s] = obs_arr
+            if _rh is not None:
+                self._rhythm_diag_n = getattr(self, "_rhythm_diag_n", 0) + 1
+                if self._rhythm_diag_n % 600 == 1:
+                    try:
+                        logger.info(
+                            "RHYTHM_DIAG cid=%s obs[68:72]=[%.3f,%.3f,%.3f,%.3f] "
+                            "daytime_frac=%s src=%s", cid_s,
+                            float(obs_arr[68]), float(obs_arr[69]),
+                            float(obs_arr[70]), float(obs_arr[71]),
+                            c.get("daytime_fraction"),
+                            "time_phase" if isinstance(c.get("time_phase"), dict)
+                            else "flat")
+                    except Exception:
+                        pass
             if _temp is not None:
                 self._weather_diag_n = getattr(self, "_weather_diag_n", 0) + 1
                 if self._weather_diag_n % 600 == 1:
