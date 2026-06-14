@@ -504,9 +504,7 @@ class LocalColonyCompute:
         # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
         # (max safety). Давление: прогноз «одолею?» = predictor → рост. GC-ось инверсия страха.
         self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
-        self._predator_hunt: dict = {}      # cid → ACTION (ATTACK раненого хищника)
-        self._predhunt_disengage: dict = {} # cid → until_tick (FLEE-cooldown после урона)
-        self._predhunt_dmg_seen: dict = {}  # cid → последний _beh_damage_cum (детект урона)
+        self._predator_hunt: dict = {}      # cid → ACTION (ATTACK хищника — energy-gated combat)
         self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
@@ -1588,8 +1586,6 @@ class LocalColonyCompute:
         self._beh_thermal_cum.pop(cid, None)  # термо-ось cleanup
         self._adam_temp.pop(cid, None)        # temp-stash cleanup
         self._beh_predkill_cum.pop(cid, None) # predator-hunt ось cleanup
-        self._predhunt_disengage.pop(cid, None)
-        self._predhunt_dmg_seen.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -3565,25 +3561,16 @@ class LocalColonyCompute:
                                     self._hunt_commit[cid] = 2 if _mdc > 0 else 3
                         except (TypeError, ValueError):
                             pass
-                    # PREDATOR-HUNT окно (Фрай 14.06): добить РАНЕНОГО хищника — узкое
-                    # окно поверх АБСОЛЮТНОГО FLEE-floor. 4-AND КОНСЕРВАТИВНО: hp_ratio<φ⁻²
-                    # (ослаблен) + er>φ⁻¹ (СЫТ — НЕ голод, predator-hunt=роскошь) + attackable
-                    # (упор — хищник САМ подошёл, Адам не лезет) + НЕ disengaged. damage>0 →
-                    # disengage cooldown FLEE (max safety). Вне окна → молчит → FLEE-floor §4.
+                    # PREDATOR-HUNT окно (Фрай/Шеф 14.06 v2 — ENERGY-GATED COMBAT, disengage
+                    # СНЯТ): attackable(упор) + er≥0.5 → ATTACK хищника (ЛЮБОЙ hp_ratio —
+                    # ПЕРВЫЙ удар по healthy И добивание, без различия). er<0.5 → молчит →
+                    # FLEE (мотор §4, выход из боя). multi-hit: пока er≥0.5 Адам ОГРЫЗАЕТСЯ
+                    # (не один-удар-отскок). Energy-floor 0.5 = ЕДИНСТВЕННЫЙ предел (стая →
+                    # быстрый дренаж energy → er<0.5 → FLEE раньше; hp=energy, урон в energy).
                     self._predator_hunt.pop(cid, None)
-                    _dmg_now = self._beh_damage_cum.get(cid, 0.0)
-                    if _dmg_now > self._predhunt_dmg_seen.get(cid, _dmg_now):
-                        self._predhunt_disengage[cid] = int(self._last_world_tick) + 21  # Fib FLEE-cooldown
-                    self._predhunt_dmg_seen[cid] = _dmg_now
-                    _ph_dis = int(self._last_world_tick) < self._predhunt_disengage.get(cid, 0)
                     if (self._predator_hunt_enabled and isinstance(_pred_cid, dict)
-                            and not _ph_dis and _er > (1.0 / _PHI)):     # er>φ⁻¹ = СЫТ
-                        try:
-                            _hpr = float(_pred_cid.get("hp_ratio", 1.0) or 1.0)
-                            if _hpr < (1.0 / _PHI) ** 2 and bool(_pred_cid.get("attackable")):
-                                self._predator_hunt[cid] = 5   # ATTACK раненого (server резолвит)
-                        except (TypeError, ValueError):
-                            pass
+                            and _er >= 0.5 and bool(_pred_cid.get("attackable"))):
+                        self._predator_hunt[cid] = 5   # ATTACK (energy-gated, любой hp_ratio)
                     # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
                     # dist≤1 ИЛИ small-prey prox≥0.5) + голод + hunting → флаг для
                     # _maybe_force_stay: ATTACK проходит сквозь §3-force-STAY. Еда у
@@ -4261,9 +4248,12 @@ class LocalColonyCompute:
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
                 self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
-                self._apply_predator_hunt(cid, out, obs_per_cid.get(cid))
                 self._apply_hunt_commit(cid, out, obs_per_cid.get(cid))
                 self._apply_corpse_approach(cid, out, obs_per_cid.get(cid))
+                # predator-hunt ПОСЛЕ hunt/corpse (Фрай иерархия: predator-hunt > normal-hunt
+                # — хищник в упоре = приоритет над prey/корм). FLEE-floor (мотор) — поверх
+                # через er<0.5-гейт (вне окна молчит). Перед force_stay (§3 er≈0 < 0.5 → не overlap).
+                self._apply_predator_hunt(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
                 # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
                 # force-STAY). Раньше _stat_last_action писался при селекторе (выбор
@@ -9109,17 +9099,15 @@ class LocalColonyCompute:
                         cid, self._hunt_commit_n, int(_hc))
 
     def _apply_predator_hunt(self, cid: str, out: dict, obs) -> None:
-        """ДЕТЕРМ. ДОБИВАНИЕ РАНЕНОГО ХИЩНИКА (Фрай 14.06). Узкое окно поверх АБСОЛЮТНОГО
-        FLEE-floor — НЕ floor (не форсит на хищника). Окно (4-AND, посчитан в obs-loop →
-        _predator_hunt): хищник ослаблен (hp_ratio<φ⁻²) + Адам СЫТ (er>φ⁻¹ — роскошь, не
-        нужда: структурно нужда НЕ толкает на хищника) + attackable (упор, хищник САМ
-        подошёл) + НЕ disengaged (любой полученный урон → cooldown FLEE, Фрай max safety).
-        Вне окна молчит → FLEE-floor (§4 predator_defense) отрабатывает.
+        """ДЕТЕРМ. ATTACK ХИЩНИКА — ENERGY-GATED COMBAT (Фрай/Шеф 14.06 v2). Окно (в obs-loop
+        → _predator_hunt): attackable(упор) + er≥0.5 → ATTACK (ЛЮБОЙ hp_ratio — первый удар
+        по healthy И добивание). er<0.5 → молчит → FLEE (мотор §4, выход из боя). multi-hit:
+        пока er≥0.5 Адам ОГРЫЗАЕТСЯ (не один-удар-отскок). disengage СНЯТ (Шеф): energy-floor
+        0.5 = ЕДИНСТВЕННЫЙ предел (стая→быстрый дренаж→er<0.5→FLEE раньше; hp=energy).
 
-        Иерархия (Фрай LOCKED): predator-FLEE-floor = ДЕФОЛТ; predator-hunt = ГЕЙТНУТОЕ
-        исключение ТОЛЬКО в окне. Взаимоисключимо с голод-override (eat/hunt-commit/corpse
-        — все er<φ⁻¹; predator-hunt er>φ⁻¹). Disengage держит recoverable (survival > yield).
-        Давление: прогноз исхода боя «одолею?» → predictor-рост; GC-ось инверсия страха.
+        Иерархия: predator-hunt > normal-hunt (вызывается ПОСЛЕ hunt/corpse). FLEE-floor
+        (мотор §4) — поверх через er<0.5-гейт (вне окна молчит → бегство). Давление: прогноз
+        исхода боя «одолею?» → predictor-рост; GC-ось _beh_predkill_cum (инверсия страха).
         """
         if (cid not in out or not self._single_organism
                 or not self._predator_hunt_enabled):
