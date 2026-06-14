@@ -57,32 +57,32 @@ def test_no_candidate_without_gc_keep():
 
 
 def test_gc_keep_records_candidate_rise():
+    # paired KEEP (Фрай 14.06): durable → keep_rise = paired-median (graduation-кандидат).
     c = _c()
     t = object()
     c._grown_tissues["a"] = {"grown1": t}
     c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
-    c.loss_ema["a"] = 0.05
     c._last_world_tick = 0
     c._maybe_start_tissue_gc("a")
     gc = c._tissue_gc_state["a"]
-    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
-    c.loss_ema["a"] = 0.05 * (1 + c._growth_min_delta_frac + 0.01)   # durable
+    gc["samples"]["ablate"] = [0.060, 0.063, 0.058, 0.061, 0.059, 0.062, 0.060, 0.057]
+    gc["samples"]["restore"] = [0.050, 0.051, 0.049, 0.052, 0.048, 0.051, 0.050, 0.049]
     c._resolve_tissue_gc("a", gc)
     assert "grown1" in c._tissue_gc_keep_rise["a"]
-    assert c._tissue_gc_keep_rise["a"]["grown1"] > 0
+    assert c._tissue_gc_keep_rise["a"]["grown1"] >= c._TISSUE_GC_ABS_FLOOR
 
 
 def test_gc_prune_clears_candidate():
+    # paired PRUNE (нет durable вклада) → keep_rise очищается.
     c = _c()
     c._grown_tissues["a"] = {"grown1": object()}
     c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
     c._tissue_gc_keep_rise["a"] = {"grown1": 0.02}    # KEEP прошлой эпохи
-    c.loss_ema["a"] = 0.05
     c._last_world_tick = 0
     c._maybe_start_tissue_gc("a")
     gc = c._tissue_gc_state["a"]
-    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
-    c.loss_ema["a"] = 0.05                            # вклад распался → прун
+    gc["samples"]["ablate"] = [0.050, 0.051, 0.049, 0.050, 0.051, 0.049, 0.050, 0.050]
+    gc["samples"]["restore"] = [0.050, 0.049, 0.051, 0.050, 0.049, 0.051, 0.050, 0.050]
     c._resolve_tissue_gc("a", gc)
     assert "grown1" not in (c._tissue_gc_keep_rise.get("a") or {})
 

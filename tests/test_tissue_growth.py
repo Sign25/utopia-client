@@ -139,7 +139,9 @@ def test_tissue_dwell_is_full_weather_cycle():
     assert c._tissue_growth_dwell_ticks == 233          # = период sin/233
 
 
-def test_gc_start_ablates_one_sidecar():
+def test_gc_start_paired_soft_ablate():
+    # PAIRED (Фрай 14.06): старт = soft-маска роли (спек ЦЕЛ в _grown_tissues),
+    # НЕ held-aside removal. Машина: phase=ablate, пустые paired-samples.
     c = _c()
     c._grown_tissues["a"] = {"grown1": object(), "grown2": object()}
     c.loss_ema["a"] = 0.05
@@ -147,44 +149,84 @@ def test_gc_start_ablates_one_sidecar():
     assert c._maybe_start_tissue_gc("a") is True
     gc = c._tissue_gc_state["a"]
     assert gc["role"] in ("grown1", "grown2")
-    assert gc["role"] not in c._grown_tissues.get("a", {})   # held-aside, вне входа
-    assert gc["loss_before"] == 0.05 and gc["ticks"] == 0
+    assert gc["role"] in c._grown_tissues["a"]           # soft-маска: спек/веса целы
+    assert c._tissue_gc_ablate["a"] == gc["role"]         # роль маскирована из вклада
+    assert gc["phase"] == "ablate" and gc["pairs_done"] == 0
+    assert gc["samples"] == {"ablate": [], "restore": []}
 
 
-def test_gc_prune_releases_noise_fit():
+def test_gc_step_toggles_mask_each_window():
+    # машина: окно ablate (transient+window) → закрыть → toggle в restore (маска снята).
     c = _c()
     c._grown_tissues["a"] = {"grown1": object()}
-    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
-    c._tissue_kept = 1
     c.loss_ema["a"] = 0.05
     c._last_world_tick = 0
     c._maybe_start_tissue_gc("a")
     gc = c._tissue_gc_state["a"]
-    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
-    c.loss_ema["a"] = 0.05                               # удаление НЕ подняло loss
+    assert c._tissue_gc_ablate["a"] == "grown1"          # старт ablate
+    for _ in range(c._BEH_GC_TRANSIENT + c._BEH_GC_WINDOW):
+        c._tissue_gc_step("a", gc)
+    assert len(gc["samples"]["ablate"]) == 1             # окно ablate закрылось
+    assert gc["phase"] == "restore"                       # toggle
+    assert "a" not in c._tissue_gc_ablate                 # маска снята (restore-фаза)
+
+
+def test_gc_paired_prune_when_no_durable_effect():
+    # ablate ≈ restore (удаление НЕ меняет loss) → median≈0 → PRUNE (noise).
+    c = _c()
+    c._grown_tissues["a"] = {"grown1": object()}
+    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    c._tissue_kept = 1
+    c._last_world_tick = 0
+    c._maybe_start_tissue_gc("a")
+    gc = c._tissue_gc_state["a"]
+    gc["samples"]["ablate"] = [0.050, 0.051, 0.049, 0.050, 0.051, 0.049, 0.050, 0.050]
+    gc["samples"]["restore"] = [0.050, 0.049, 0.051, 0.050, 0.049, 0.051, 0.050, 0.050]
     c._resolve_tissue_gc("a", gc)
     assert "a" not in c._tissue_gc_state
     assert c._tissue_gc_pruned == 1 and c._tissue_kept == 0
-    assert c._tissue_grown_specs.get("a") in (None, [])   # спек убран → restore не вернёт
+    assert c._tissue_grown_specs.get("a") in (None, [])   # спек убран
     assert "grown1" not in c._grown_tissues.get("a", {})
+    assert "a" not in c._tissue_gc_ablate
 
 
-def test_gc_keep_returns_durable():
+def test_gc_paired_keep_when_durable():
+    # ablate СТАБИЛЬНО выше restore на ≥abs_floor → median≥floor, t≥t_keep → KEEP.
     c = _c()
     t = object()
     c._grown_tissues["a"] = {"grown1": t}
     c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
     c._tissue_kept = 1
-    c.loss_ema["a"] = 0.05
     c._last_world_tick = 0
     c._maybe_start_tissue_gc("a")
     gc = c._tissue_gc_state["a"]
-    gc["ticks"] = c._tissue_growth_dwell_ticks - 1
-    c.loss_ema["a"] = 0.05 * (1 + c._growth_min_delta_frac + 0.01)  # удаление подняло loss
+    # diff ≈ +0.010 с реалистичным шумом (MAD>0 → t считается, эффект чёткий >t_keep)
+    gc["samples"]["ablate"] = [0.060, 0.063, 0.058, 0.061, 0.059, 0.062, 0.060, 0.057]
+    gc["samples"]["restore"] = [0.050, 0.051, 0.049, 0.052, 0.048, 0.051, 0.050, 0.049]
     c._resolve_tissue_gc("a", gc)
     assert "a" not in c._tissue_gc_state
-    assert c._grown_tissues["a"]["grown1"] is t          # вернули ТОТ ЖЕ объект (веса целы)
+    assert c._grown_tissues["a"]["grown1"] is t           # остался (soft-маска снята)
     assert c._tissue_kept == 1 and c._tissue_gc_pruned == 0
+    assert c._tissue_gc_keep_rise["a"]["grown1"] >= c._TISSUE_GC_ABS_FLOOR
+    assert "a" not in c._tissue_gc_ablate
+
+
+def test_gc_paired_abs_floor_prunes_tiny_effect():
+    # abs-floor (Фрай): эффект ЗНАЧИМ (низкий шум, t высок) НО мал (<abs_floor) →
+    # немеряемо-малый = noise → PRUNE (не KEEP мизерный вклад).
+    c = _c()
+    c._grown_tissues["a"] = {"grown1": object()}
+    c._tissue_grown_specs["a"] = [{"role": "grown1", "data_dim": 64, "n_embd": 21}]
+    c._tissue_kept = 1
+    c._last_world_tick = 0
+    c._maybe_start_tissue_gc("a")
+    gc = c._tissue_gc_state["a"]
+    # стабильная разница ~0.001 (< abs_floor 0.005), крошечный шум → t высок
+    gc["samples"]["ablate"] = [0.0510, 0.0511, 0.0509, 0.0510, 0.0511, 0.0509, 0.0510, 0.0510]
+    gc["samples"]["restore"] = [0.0500, 0.0500, 0.0500, 0.0500, 0.0500, 0.0500, 0.0500, 0.0500]
+    c._resolve_tissue_gc("a", gc)
+    assert c._tissue_gc_pruned == 1                       # значим, но <abs-floor → noise
+    assert "grown1" not in c._grown_tissues.get("a", {})
 
 
 def test_gc_epoch_rest_lets_growth_resume():
@@ -215,14 +257,16 @@ def test_tissue_growth_metrics_for_ui():
     assert m["tissue_gc_pruned"] == 3 and m["tissue_propose_total"] == 12
     assert m["tissue_growing"] == 0 and m["tissue_gc_evaluating"] == 0
     assert m["tissue_growth_enabled"] is True
-    # GC held-aside сайдкар всё ещё считается живым + флаг evaluating
-    c._tissue_gc_state["a"] = {"role": "grown4", "tissue": object(),
-                               "loss_before": 0.05, "ticks": 0}
+    # paired-GC: сайдкар = soft-маска, остаётся в _grown_tissues (уже в live=2),
+    # НЕ +1 (иначе двойной счёт); флаг evaluating=1.
+    c._tissue_gc_state["a"] = {"role": "grown4", "phase": "ablate", "pairs_done": 0,
+                               "win_ticks": 0, "acc": 0.0, "acc_n": 0,
+                               "samples": {"ablate": [], "restore": []}}
     m2 = c._tissue_growth_metrics("a")
     assert m2["tissue_gc_evaluating"] == 1
-    assert m2["tissue_grown_live"] == 3          # 2 в dict + 1 held-aside
+    assert m2["tissue_grown_live"] == 2          # сайдкар в dict (soft-маска), не +1
     # агрегат (cid=None) по всем организмам
-    assert c._tissue_growth_metrics()["tissue_grown_live"] == 3
+    assert c._tissue_growth_metrics()["tissue_grown_live"] == 2
 
 
 def test_gc_pruned_counter_persists():

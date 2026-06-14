@@ -439,11 +439,22 @@ class LocalColonyCompute:
         # GC: ре-оценка ЖИВЫХ сайдкаров на полном цикле — фазовые отпустить (noise-fit).
         # Leave-one-out абляция: убрать сайдкар → dwell цикл → если loss НЕ вырос значимо
         # (вклад распался) → пруна навсегда; иначе вернуть (durable). Изолировано от мотора.
-        self._tissue_gc_state: dict = {}              # cid → {role,tissue,loss_before,ticks} (held-aside абляция)
+        self._tissue_gc_state: dict = {}              # cid → парная машина (phase/pairs/samples)
         self._tissue_gc_tested: dict = {}             # cid → set(role) проверенных в текущей эпохе
         self._tissue_gc_sweep_done: dict = {}         # cid → tick конца последнего sweep (отдых между эпохами)
         self._tissue_gc_epoch_interval: int = 6388    # тиков отдыха между sweep'ами (длинный климат-цикл)
         self._tissue_gc_pruned: int = 0               # сайдкаров отпущено GC (фазовый шум)
+        self._tissue_gc_ablate: dict = {}             # cid → role замаскированной из _grown_pred_contribution (paired ablate-фаза)
+        # PAIRED tissue-GC (Фрай 14.06): порт проверенного beh-GC paired-interleaved
+        # на loss. Старый leave-one-out single-window ШУМЕЛ (погодная loss-вариация
+        # между циклами > вклад сайдкара → вердикт определяла ФАЗА окна → 93 роли с
+        # флипом KEEP↔PRUNE, rise-разброс 9-106%). Теперь: toggle сайдкара в/из
+        # вклада предиктора по окнам (обе фазы в одной погоде → фаза СОКРАЩАЕТСЯ) +
+        # robust median+MAD по парным Δloss + abs-floor (немеряемый = noise, Фрай).
+        # Reuse BEH_GC_WINDOW(233=погод. цикл) / BEH_GC_TRANSIENT(21).
+        self._TISSUE_GC_PAIRS: int = 8                # пар ablate/restore (Fib, df=7)
+        self._TISSUE_GC_T_KEEP: float = 2.365         # t-крит df=7 (две-стор. 0.05)
+        self._TISSUE_GC_ABS_FLOOR: float = 0.005      # min durable paired-median Δloss (abs-floor Фрая)
         # /stats Фаза 2 (v1.3, 10.06): накопители для push в diagnostics —
         # клиент знает эти сигналы, UI их ждёт (контракт stats_redesign v1.3).
         self._stat_pred_region: dict = {}   # cid → {temp35,dens44_55,rest} (PRED_REGION)
@@ -1544,6 +1555,7 @@ class LocalColonyCompute:
         self._grown_tissues.pop(cid, None)         # §10.8 редизайн a: сайдкары
         self._tissue_last_resolve.pop(cid, None)
         self._tissue_gc_state.pop(cid, None)       # §10.8 GC cleanup
+        self._tissue_gc_ablate.pop(cid, None)      # paired-GC ablate-маска
         self._tissue_gc_tested.pop(cid, None)
         self._tissue_gc_sweep_done.pop(cid, None)
         self._tissue_grad_state.pop(cid, None)     # §10.8 graduation cleanup
@@ -4321,12 +4333,9 @@ class LocalColonyCompute:
         # §10.8 (редизайн a): веса выросших predictor-сайдкаров (НЕ в tissues_by_role).
         try:
             _gd = dict(self._grown_tissues.get(cid) or {})
-            # GC держит один сайдкар «в стороне» во время абляции-dwell — его спек
-            # ещё в grown_specs, значит на restore он пересоздастся: сохраним и его
-            # веса, иначе мид-GC сейв потеряет обучение этого сайдкара.
-            _gcs = self._tissue_gc_state.get(cid)
-            if _gcs and _gcs.get("role") and _gcs.get("tissue") is not None:
-                _gd.setdefault(_gcs["role"], _gcs["tissue"])
+            # PAIRED GC (Фрай 14.06): сайдкар под GC остаётся в _grown_tissues (soft
+            # ablate-маска, не held-aside removal) → уже включён в _gd выше. Мид-GC
+            # сейв веса не теряет; рестарт = маска сброшена (сайдкар цел).
             # graduation (Stage 1, in-memory): graduated-узел живёт в org.tissues,
             # НЕ в _grown_tissues, но спек остался сайдкарным → на restore он
             # пересоздастся САЙДКАРОМ (деградация). Сохраняем его веса сюда,
@@ -6530,7 +6539,8 @@ class LocalColonyCompute:
                 self._grown_tissues.pop(cid, None)
                 self._tissue_grown_specs.pop(cid, None)
                 self._tissue_growth_state.pop(cid, None)
-                self._tissue_gc_state.pop(cid, None)       # GC held-aside тоже убираем
+                self._tissue_gc_state.pop(cid, None)       # GC машину тоже убираем
+                self._tissue_gc_ablate.pop(cid, None)      # paired-GC ablate-маска
                 self._tissue_gc_tested.pop(cid, None)
                 self._tissue_gc_sweep_done.pop(cid, None)
                 self._tissue_gc_keep_rise.pop(cid, None)   # graduation-кандидаты
@@ -6581,9 +6591,12 @@ class LocalColonyCompute:
         d = self._grown_tissues.get(cid)
         if not d:
             return None
+        _abl = self._tissue_gc_ablate.get(cid)   # paired-GC ablate-фаза: роль замаскирована
         torch = self._torch
         agg = None
         for role, t in list(d.items()):
+            if role == _abl:                     # ablated сайдкар НЕ вносит вклад (soft)
+                continue
             try:
                 with torch.no_grad():
                     o = t({"input": obs_tensor.detach()})["output"]
@@ -7273,54 +7286,88 @@ class LocalColonyCompute:
         if _done is not None and (self._last_world_tick - _done) < self._tissue_gc_epoch_interval:
             return False
         role = untested[0]
-        tissue = d.pop(role, None)
-        if not d:
-            self._grown_tissues.pop(cid, None)
-        if tissue is None:
+        if role not in d:
             return False
+        # PAIRED старт (Фрай 14.06): SOFT ablate — роль маскируется из вклада
+        # предиктора (спек/веса целы в _grown_tissues), НЕ held-aside removal.
+        # Машина в _tissue_gc_step: toggle маски по окнам → robust paired Δloss.
+        self._tissue_gc_ablate[cid] = role          # старт в ablate-фазе
         self._tissue_gc_state[cid] = {
             "role": role,
-            "tissue": tissue,                    # held-aside (вне входа предиктора)
-            "loss_before": float(self.loss_ema.get(cid, 0.0)),
-            "ticks": 0,
+            "phase": "ablate",
+            "pairs_done": 0,
+            "win_ticks": 0,
+            "acc": 0.0, "acc_n": 0,
+            "samples": {"ablate": [], "restore": []},
         }
-        logger.info("brain-growth TISSUE-GC-START cid=%s role=%s loss_before=%.5f "
-                    "(leave-one-out, %d untested)", cid, role,
-                    self._tissue_gc_state[cid]["loss_before"], len(untested))
+        logger.info("brain-growth TISSUE-GC-START cid=%s role=%s (paired-interleaved, "
+                    "%d пар × %d тиков, %d untested)", cid, role,
+                    self._TISSUE_GC_PAIRS, self._BEH_GC_WINDOW, len(untested))
         return True
 
-    def _resolve_tissue_gc(self, cid: str, gc: dict) -> None:
-        """§10.8 GC resolve: после dwell-цикла без сайдкара — если loss вырос значимо
-        (вклад durable, его удаление повредило прогноз) → ВЕРНУТЬ; иначе (вклад распался
-        на полном цикле = фазовый шум) → ОТПУСТИТЬ навсегда. Консервативно: погодный
-        дрейф loss вверх склоняет к KEEP (не over-прунит здоровые)."""
-        gc["ticks"] += 1
-        if gc["ticks"] < self._tissue_growth_dwell_ticks:
+    def _tissue_gc_step(self, cid: str, gc: dict) -> None:
+        """Один тик ПАРНОЙ tissue-GC машины (Фрай 14.06, порт beh-GC): toggle
+        ablate-маски по окнам (обе фазы в одной погоде → фаза СОКРАЩАЕТСЯ), сэмпл
+        loss_ema, накопить окно (discard пост-toggle transient) → на закрытии toggle
+        фазу → собрать TISSUE_GC_PAIRS пар → resolve."""
+        gc["win_ticks"] += 1
+        if gc["win_ticks"] <= self._BEH_GC_TRANSIENT:   # discard transient (loss_ema устаканивается)
             return
+        gc["acc"] += float(self.loss_ema.get(cid, 0.0))
+        gc["acc_n"] += 1
+        if gc["win_ticks"] < self._BEH_GC_WINDOW:
+            return
+        phase = gc["phase"]
+        win_loss = gc["acc"] / max(1, gc["acc_n"])      # средний loss за окно
+        gc["samples"][phase].append(win_loss)
+        logger.info("brain-growth TISSUE-GC-WINDOW cid=%s role=%s phase=%s pair=%d "
+                    "loss=%.5f", cid, gc["role"], phase, gc["pairs_done"], win_loss)
+        new_phase = "restore" if phase == "ablate" else "ablate"
+        if new_phase == "ablate":
+            self._tissue_gc_ablate[cid] = gc["role"]    # маска вернулась (ablate)
+        else:
+            self._tissue_gc_ablate.pop(cid, None)       # маска снята (restore)
+        gc["phase"] = new_phase
+        gc["win_ticks"] = 0
+        gc["acc"] = 0.0
+        gc["acc_n"] = 0
+        if new_phase == "ablate":        # завершилась полная пара (ablate→restore→)
+            gc["pairs_done"] += 1
+            if gc["pairs_done"] >= self._TISSUE_GC_PAIRS:
+                self._resolve_tissue_gc(cid, gc)
+
+    def _resolve_tissue_gc(self, cid: str, gc: dict) -> None:
+        """Resolve ПАРНОЙ tissue-GC (Фрай 14.06): robust median+MAD по парным Δloss
+        (ablate − restore; >0 = удаление подняло loss = сайдкар durable). KEEP iff
+        median ≥ abs-floor И t ≥ t_keep (значимый durable вклад ВЫШЕ шумового пола).
+        Иначе PRUNE (немеряемый/нулевой = noise, Фрай). Сайдкар был soft-маскирован
+        → KEEP просто снимает маску; PRUNE убирает спек+объект."""
         role = gc["role"]
-        loss_before = float(gc["loss_before"])
-        loss_after = float(self.loss_ema.get(cid, loss_before))
-        rise = loss_after - loss_before          # >0 = удаление сайдкара подняло loss
-        durable = rise >= loss_before * self._growth_min_delta_frac
+        self._tissue_gc_ablate.pop(cid, None)            # снять маску (вклад вернулся)
+        a = gc["samples"]["ablate"]
+        r = gc["samples"]["restore"]
+        n = min(len(a), len(r))
+        diffs = [a[i] - r[i] for i in range(n)]          # ablate − restore loss (>0 = durable)
+        med, rsd, t = self._robust_paired(diffs)
+        mde = (self._TISSUE_GC_T_KEEP * rsd / (n ** 0.5)) if n > 0 else 1e9
+        durable = (med >= self._TISSUE_GC_ABS_FLOOR) and (t >= self._TISSUE_GC_T_KEEP)
         self._tissue_last_resolve[cid] = int(self._last_world_tick)
         self._tissue_gc_tested.setdefault(cid, set()).add(role)
+        self._tissue_gc_state.pop(cid, None)
         if durable:
-            self._grown_tissues.setdefault(cid, {})[role] = gc["tissue"]   # вернуть
-            # graduation-кандидаты (Stage 1): durable-verified этой сессии + их rise
-            # (graduation берёт max-rise). Только GC-KEEP попадают в кандидаты.
-            self._tissue_gc_keep_rise.setdefault(cid, {})[role] = float(rise)
-            logger.info("brain-growth TISSUE-GC-KEEP cid=%s role=%s rise=%.5f "
-                        "(%.1f%%) durable", cid, role, rise,
-                        100.0 * rise / max(1e-9, loss_before))
+            # graduation-кандидаты (Stage 1): durable-verified + paired-median (max-rise).
+            self._tissue_gc_keep_rise.setdefault(cid, {})[role] = float(med)
+            logger.info("brain-growth TISSUE-GC-KEEP cid=%s role=%s med=%.5f t=%.2f "
+                        "MDE=%.5f durable (paired)", cid, role, med, t, mde)
         else:
-            self._prune_grown_spec(cid, role)    # грон уже вне _grown_tissues
+            self._remove_grown_tissue(cid, role=role)    # убрать объект из _grown_tissues
+            self._prune_grown_spec(cid, role)            # убрать спек (restore не пересоздаст)
             self._tissue_kept = max(0, self._tissue_kept - 1)
             self._tissue_gc_pruned += 1
             (self._tissue_gc_keep_rise.get(cid) or {}).pop(role, None)
-            logger.info("brain-growth TISSUE-GC-PRUNE cid=%s role=%s rise=%.5f "
-                        "(noise-fit отпущен) pruned=%d kept=%d", cid, role, rise,
-                        self._tissue_gc_pruned, self._tissue_kept)
-        self._tissue_gc_state.pop(cid, None)
+            logger.info("brain-growth TISSUE-GC-PRUNE cid=%s role=%s med=%.5f t=%.2f "
+                        "(noise-fit/немеряемый отпущен) pruned=%d kept=%d", cid, role,
+                        med, t, self._tissue_gc_pruned, self._tissue_kept)
 
     def _cumulative_grad_health(self, cid: str, org) -> None:
         """CUMULATIVE-HEALTH-MONITOR (Фрай 11.06): непрерывный collective-health
@@ -7393,7 +7440,7 @@ class LocalColonyCompute:
         # один сайдкар «в стороне», ждём полный цикл, решаем durable/прун.
         gc = self._tissue_gc_state.get(cid)
         if gc is not None:
-            self._resolve_tissue_gc(cid, gc)
+            self._tissue_gc_step(cid, gc)
             return
         st = self._tissue_growth_state.get(cid)
         if st is None:
@@ -9961,25 +10008,25 @@ class LocalColonyCompute:
         ОТДЕЛЬНО от роста СВЯЗЕЙ (topo_active = рёбра→cerebellum). Сайдкары читают
         obs64, их выход добавляется во вход предиктора (улучшает прогноз), мотор
         изолирован. cid=None → агрегат по всем организмам.
-          tissue_grown_live   — ЖИВЫХ выросших тканей сейчас (вкл. 1 в GC-абляции)
+          tissue_grown_live   — ЖИВЫХ выросших тканей сейчас (сайдкар под paired-GC
+                                остаётся в _grown_tissues = soft-маска, уже учтён)
           tissue_kept         — закреплено durable (= live; обнуляемо GC-пруном)
           tissue_reverted     — отвергнуто при рождении (backoff: Δloss не значим)
           tissue_gc_pruned    — отпущено GC (noise-fit: вклад распался на цикле)
           tissue_propose_total— всего предложено за жизнь (монотонный)
           tissue_growing      — 1 если сейчас растит/dwell новую (in-flight)
-          tissue_gc_evaluating— 1 если сейчас GC-ре-оценка (leave-one-out dwell)
+          tissue_gc_evaluating— 1 если сейчас paired-GC ре-оценка идёт
           tissue_growth_enabled — флаг роста ON/OFF."""
         if cid is None:
+            # paired-GC сайдкар = soft-маска, остаётся в _grown_tissues → уже в live
+            # (НЕ held-aside, не +1 — иначе двойной счёт).
             live = sum(len(d or {}) for d in self._grown_tissues.values())
-            live += len(self._tissue_gc_state)        # held-aside в GC ещё живой
             growing = len(self._tissue_growth_state)
             evaluating = len(self._tissue_gc_state)
             graduated = sum(len(d or {}) for d in self._tissue_graduated.values())
             grad_watch = len(self._tissue_grad_state)
         else:
             live = len(self._grown_tissues.get(cid) or {})
-            if cid in self._tissue_gc_state:
-                live += 1
             growing = 1 if cid in self._tissue_growth_state else 0
             evaluating = 1 if cid in self._tissue_gc_state else 0
             graduated = len(self._tissue_graduated.get(cid) or {})
