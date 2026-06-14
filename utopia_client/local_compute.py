@@ -3518,16 +3518,26 @@ class LocalColonyCompute:
                     # PHASE C: труп = тот же EAT-floor что флора. on_corpse → рефлекс
                     # фичрит (детерм. EAT). post-kill commit: доедать тушу, не уходить.
                     _on_corpse = bool(_evp.get("on_corpse"))
-                    # CORPSE_DIAG триангуляция (1/100): on_corpse + nearest_corpse +
+                    # CORPSE_DIAG триангуляция: on_corpse + nearest_corpse +
                     # eating_target_kind — найти где рвётся corpse-eat (Адам убивает,
-                    # туши не ест). Зеркало EAT_DIAG Phase A.
+                    # туши не ест). Зеркало EAT_DIAG Phase A. ВАЖНО (0.13.98): 1/100 слишком
+                    # редко — пропускает post-kill окно (труп в obs живёт ~TTL тиков). Теперь
+                    # ВСЕГДА логируем когда есть ЛЮБОЙ corpse-сигнал (on_corpse ИЛИ
+                    # nearest_corpse непуст) + редкий heartbeat 1/200 для baseline.
                     self._corpsediag_n = getattr(self, "_corpsediag_n", 0) + 1
-                    if self._corpsediag_n % 100 == 0:
+                    _corpse_signal = _on_corpse or (_corpse_cid is not None)
+                    if _corpse_signal or self._corpsediag_n % 200 == 0:
+                        _cinfo = "N"
+                        if isinstance(_corpse_cid, dict):
+                            _cinfo = ("dist=%.1f ttl=%s er=%s kind=%s" % (
+                                float(_corpse_cid.get("dist", -1) or -1),
+                                _corpse_cid.get("ttl_remaining"),
+                                _corpse_cid.get("energy_remaining"),
+                                _corpse_cid.get("corpse_of_kind")))
                         logger.info(
-                            "CORPSE_DIAG cid=%s on_corpse=%d nearest_corpse=%s "
+                            "CORPSE_DIAG cid=%s on_corpse=%d nearest_corpse=[%s] "
                             "eat_kind=%s er=%.3f", cid, int(_on_corpse),
-                            "Y" if (_corpse_cid is not None) else "N",
-                            _evp.get("eating_target_kind"), _er)
+                            _cinfo, _evp.get("eating_target_kind"), _er)
                     if (_onf or _on_corpse) and (_hungry_for_med or _mid_eat):
                         self._on_food[cid] = 1
                     else:
