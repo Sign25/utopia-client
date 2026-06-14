@@ -486,6 +486,7 @@ class LocalColonyCompute:
         self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
         self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
         self._corpse_approach: dict = {}    # cid → MOVE-action к adjacent-туше (Phase C medium-fix, §3-STEP bypass)
+        self._forage_dir: dict = {}         # cid → MOVE-action к БЛИЖАЙШЕЙ видимой еде (anti-absorbing §3-floor, Фрай 14.06)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
@@ -3564,6 +3565,41 @@ class LocalColonyCompute:
                                     self._corpse_approach[cid] = 2 if _adc > 0 else 3
                         except (TypeError, ValueError):
                             pass
+                    # ANTI-ABSORBING §3-floor (Фрай 14.06): обобщение corpse-step до
+                    # ПОЛНОГО survival-floor. §3-paralysis НЕ должен абсорбировать — пока
+                    # ЛЮБАЯ еда видна, Адам ПОЛЗЁТ к ней СКВОЗЬ паралич (move-к-еде проходит
+                    # §3) → доходит → ест → energy↑ → паралич снят БЕЗ рестарта (recoverable
+                    # доказан). _forage_dir = детерм. шаг к БЛИЖАЙШЕЙ видимой еде (флора/труп/
+                    # дичь). Используется ТОЛЬКО в §3-paralysis (_maybe_force_stay); нормальный
+                    # форажинг = выбор мозга (floor не лезет в высшие функции).
+                    self._forage_dir.pop(cid, None)
+                    if _hungry_for_med:
+                        _flora_t = (_nf_cid.get("edible")
+                                    if isinstance(_nf_cid, dict) else None)
+                        if not isinstance(_flora_t, dict):
+                            _flora_t = _nf_cid if isinstance(_nf_cid, dict) else None
+                        _cands = [_flora_t, _corpse_cid]
+                        if self._hunting_enabled:
+                            _cands.append(_mp_cid)
+                        _best = None              # (dist, dr, dc)
+                        for _cand in _cands:
+                            if not isinstance(_cand, dict):
+                                continue
+                            try:
+                                _fdist = float(_cand.get("dist", -1) or -1)
+                                _fdr = float(_cand.get("dr", 0.0) or 0.0)
+                                _fdc = float(_cand.get("dc", 0.0) or 0.0)
+                            except (TypeError, ValueError):
+                                continue
+                            if _fdist > 0.0 and (_fdr != 0.0 or _fdc != 0.0):
+                                if _best is None or _fdist < _best[0]:
+                                    _best = (_fdist, _fdr, _fdc)
+                        if _best is not None:
+                            _, _bdr, _bdc = _best
+                            if abs(_bdr) >= abs(_bdc):
+                                self._forage_dir[cid] = 0 if _bdr < 0 else 1
+                            else:
+                                self._forage_dir[cid] = 2 if _bdc > 0 else 3
                     # EAT_REFLEX триангуляция (rate 1/100): почему рефлекс не фичрит.
                     self._eatdiag_n = getattr(self, "_eatdiag_n", 0) + 1
                     if self._eatdiag_n % 100 == 0:
@@ -8925,7 +8961,23 @@ class LocalColonyCompute:
                 # adjacent-мяса из паралича — ОДИН шаг на тушу (как eat-out/hunt-out).
                 # Иначе паралич запирает Адама в тайле рядом с несъеденными 55 energy.
                 _step_ok = (_act is not None and _act == self._corpse_approach.get(cid))
-                if not (_hunt_ok or _eat_ok or _step_ok):
+                if _hunt_ok or _eat_ok or _step_ok:
+                    return                       # survival-действие мотора проходит §3
+                # ANTI-ABSORBING §3-floor (Фрай 14.06): мотор НЕ выбрал survival-действие,
+                # НО еда видна → ФОРСИМ шаг к ближайшей еде (move-к-еде проходит §3 как
+                # полный survival-floor, обобщение corpse-step). Пока еда видна — Адам
+                # ползёт к ней сквозь паралич → НЕ absorbing (recoverable доказуем БЕЗ
+                # рестарта). Нет видимой еды → STAY (паралич держит высшие функции, но
+                # survival-floor гарантирован). Иерархия: eat/attack/step > forage-move.
+                _fd = self._forage_dir.get(cid)
+                if _fd is not None:
+                    out[cid] = {"action": int(_fd), "target_id": None}
+                    self._forage_floor_n = getattr(self, "_forage_floor_n", 0) + 1
+                    if self._forage_floor_n % 15 == 0:   # видеть само-выход из §3
+                        logger.info("FORAGE_FLOOR cid=%s fired #%d (§3-paralysis → ползёт "
+                                    "к еде, mv=%d) anti-absorbing", cid,
+                                    self._forage_floor_n, int(_fd))
+                else:
                     out[cid] = {"action": STAY, "target_id": None}
                 return
         try:

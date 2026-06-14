@@ -368,15 +368,55 @@ def test_paralysis_allows_corpse_step():
 
 
 def test_paralysis_forces_stay_step_wrong_dir():
-    # MOVE в параличе НЕ совпадающий с corpse_approach-флагом → STAY (узкий bypass)
+    # MOVE в параличе НЕ совпадающий с corpse_approach-флагом → forage-floor решает.
+    # Без _forage_dir → STAY (узкий bypass)
     import time as _t
     c = _c()
     c.biochem["a"] = types.SimpleNamespace(energy=0.0)
     c._corpse_approach["a"] = 2                          # флаг: EAST
     c._paralysis_until["a"] = _t.monotonic() + 5.0
-    out = {"a": {"action": 1, "target_id": None}}       # но action=SOUTH (не к туше)
+    out = {"a": {"action": 1, "target_id": None}}       # action=SOUTH (не к туше), еды нет
     c._maybe_force_stay("a", out)
-    assert out["a"]["action"] == 4                       # STAY (не corpse-step)
+    assert out["a"]["action"] == 4                       # STAY (нет corpse-step И нет forage)
+
+
+# ── anti-absorbing §3-floor: форажинг-к-еде сквозь паралич (Фрай 14.06) ──
+
+def test_paralysis_forages_when_food_visible():
+    # §3 НЕ absorbing: парализован + еда видна (_forage_dir) + мотор выбрал НЕ-survival →
+    # ФОРСИМ шаг к еде (ползёт сквозь паралич, не STAY).
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._forage_dir["a"] = 2                               # ближайшая еда на EAST
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 11, "target_id": None}}      # мотор: DIG (не-survival)
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 2                       # форс шаг к еде (анти-absorbing)
+
+
+def test_paralysis_stays_when_no_food_visible():
+    # парализован + еды НЕ видно (нет _forage_dir) + не-survival → STAY (floor держит)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 11, "target_id": None}}      # DIG, еды нет
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 4                       # STAY
+
+
+def test_paralysis_eat_priority_over_forage():
+    # на еде (EAT+on_food) И _forage_dir set → EAT выигрывает (ест, не уходит форажить)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._on_food["a"] = 1
+    c._forage_dir["a"] = 2                               # есть и дальняя еда
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 14, "target_id": None}}      # EAT (на туше под ногами)
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 14                      # ест тут, не уходит к дальней
 
 
 def _stub_biochem():
