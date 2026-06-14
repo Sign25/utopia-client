@@ -520,6 +520,7 @@ class LocalColonyCompute:
         # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
         # (max safety). Давление: прогноз «одолею?» = predictor → рост. GC-ось инверсия страха.
         self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
+        self._rhythm_enabled: bool = False  # client_flag rhythm (time_phase obs[68:72]; OFF dormant)
         self._predator_hunt: dict = {}      # cid → ACTION (ATTACK хищника — energy-gated combat)
         self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
@@ -6833,6 +6834,18 @@ class LocalColonyCompute:
         self._predator_hunt_enabled = bool(on)
         logger.info("set_predator_hunt: %s", on)
         return self._predator_hunt_enabled
+
+    def set_rhythm(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл РИТМ-аффорданс (Фрай 14.06, Phase-1). on=True:
+        ws_client инжектит циклическое время в obs[68:72] (day/year phase sin/cos) →
+        predictor видит ненулевой ритм-вход. on=False (kill-switch, dormant): инжект
+        молчит → obs[68:72]=0 → predictor[68:72]-вклад=0 → math-equivalent довходу 68
+        (input_proj-веса целы, просто умножаются на 0). Независимый client-rollback,
+        парный к server WORLD_ADAM_TIME_PHASE_OBS (флипать СИНХРОННО; success-gate =
+        RHYTHM_DIAG obs[68:72]≠0). SEASONAL_DAYLIGHT — Phase-2, отдельно."""
+        self._rhythm_enabled = bool(on)
+        logger.info("set_rhythm: %s", on)
+        return self._rhythm_enabled
 
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).

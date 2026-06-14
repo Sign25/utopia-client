@@ -1750,18 +1750,23 @@ class ColonyWSClient:
             # (skip_obs, как temperature). Контейнер: nested c["time_phase"] |
             # flat-поля на c (читаем оба — контракт контейнера подтвердить с
             # Хьюбертом при активации по RHYTHM_DIAG). None → no-op (dormant).
-            _rh = c.get("time_phase")
-            if not isinstance(_rh, dict):
-                if any(k in c for k in ("day_phase_sin", "day_phase_cos",
-                                        "year_phase_sin", "year_phase_cos")):
+            # GATE: client_flag rhythm (compute._rhythm_enabled) — независимый
+            # client-rollback, парный к server-флагу. OFF → НЕ инжектим → obs[68:72]=0
+            # → RHYTHM_DIAG честен (diag≠0 ⟺ predictor видит ритм). Флипать синхронно.
+            _rh = None
+            if getattr(self.compute, "_rhythm_enabled", False):
+                # nested-контейнер приоритетно, иначе собрать из flat-полей
+                _rh_nested = c.get("time_phase")
+                if isinstance(_rh_nested, dict):
+                    _rh = _rh_nested
+                elif any(k in c for k in ("day_phase_sin", "day_phase_cos",
+                                          "year_phase_sin", "year_phase_cos")):
                     _rh = {
                         "day_phase_sin": c.get("day_phase_sin", 0.0),
                         "day_phase_cos": c.get("day_phase_cos", 0.0),
                         "year_phase_sin": c.get("year_phase_sin", 0.0),
                         "year_phase_cos": c.get("year_phase_cos", 0.0),
                     }
-                else:
-                    _rh = None
             obs_arr = self._apply_rhythm_to_obs(obs_arr, _rh)
             obs_per_cid[cid_s] = obs_arr
             if _rh is not None:

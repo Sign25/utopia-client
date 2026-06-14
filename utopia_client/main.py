@@ -532,6 +532,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_behavioral_gc: bool | None = None
     applied_thermocomfort: bool | None = None
     applied_predator_hunt: bool | None = None
+    applied_rhythm: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -852,6 +853,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("predator_hunt → %s", target_predhunt)
                         except Exception as e:
                             logger.warning("set_predator_hunt failed: %s", e)
+
+                    # РИТМ-аффорданс Phase-1 (Фрай 14.06, project-rhythm-affordance):
+                    # client_flag rhythm=true → ws_client инжектит время в obs[68:72]
+                    # (day/year phase sin/cos) → predictor видит ненулевой ритм-вход.
+                    # Дефолт OFF (dormant, math-equivalent). Парный к server
+                    # WORLD_ADAM_TIME_PHASE_OBS (флипать синхронно). edge-detect.
+                    target_rhythm = bool(flags.get("rhythm", False))
+                    if target_rhythm != applied_rhythm \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_rhythm(target_rhythm)
+                            applied_rhythm = target_rhythm
+                            logger.info("rhythm → %s", target_rhythm)
+                        except Exception as e:
+                            logger.warning("set_rhythm failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +

@@ -203,6 +203,16 @@ def test_extract_rhythm_defaults_and_read():
     assert c._extract_rhythm(o).shape[0] == _RHYTHM_DIM
 
 
+# ── Тест 5b: client_flag set_rhythm (независимый rollback, predator-стиль) ─
+def test_set_rhythm_flag():
+    c = _compute()
+    assert c._rhythm_enabled is False           # дефолт OFF (dormant)
+    assert c.set_rhythm(True) is True
+    assert c._rhythm_enabled is True
+    assert c.set_rhythm(False) is False
+    assert c._rhythm_enabled is False
+
+
 # ── Тест 6: ws_client инжект ритма в obs[68:72] ──────────────────────────
 def test_ws_apply_rhythm_to_obs():
     from utopia_client.ws_client import ColonyWSClient
