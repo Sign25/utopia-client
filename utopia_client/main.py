@@ -530,6 +530,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_tissue_graduation: bool | None = None
     applied_behavioral_probe: str | None = None
     applied_behavioral_gc: bool | None = None
+    applied_thermocomfort: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -825,6 +826,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_gc → %s", target_beh_gc)
                         except Exception as e:
                             logger.warning("set_behavioral_gc failed: %s", e)
+
+                    # ТЕРМОКОМФОРТ v0.3-bio Phase 1 (Фрай 14.06, temperature.md): temp@
+                    # obs[35] бьёт по телу (холод→энергодрейн, жара→гидродрейн, k=φ⁻²).
+                    # Дефолт OFF (dormant). Мгновенный on/off; OFF=base-метаболизм. edge-detect.
+                    target_thermo = bool(flags.get("thermocomfort", False))
+                    if target_thermo != applied_thermocomfort \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_thermocomfort(target_thermo)
+                            applied_thermocomfort = target_thermo
+                            logger.info("thermocomfort → %s", target_thermo)
+                        except Exception as e:
+                            logger.warning("set_thermocomfort failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +

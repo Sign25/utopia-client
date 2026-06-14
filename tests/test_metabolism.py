@@ -514,6 +514,67 @@ def test_bmr_absent_no_drain():
     assert bc.energy == 500.0
 
 
+# ── ТЕРМОКОМФОРТ v0.3-bio Phase 1 (Фрай 14.06): temp@obs[35] бьёт по телу ──
+
+_THERMO_RATES = {"step_cost_per_tick": 0.0, "basal_drain_per_tick": 0.056,
+                 "thirst_per_tick": 2.0, "telomere_decay_per_tick": 0.0}
+
+
+def test_thermo_off_no_extra_drain():
+    # дефолт OFF (dormant): temp НЕ бьёт по телу (только base-метаболизм).
+    c, org, bc = _compute_with_org(energy=500.0, hydration=100.0)
+    c._single_organism = True
+    c._adam_temp["c1"] = -1.0                 # экстремальный холод, но флаг OFF
+    c._apply_metabolism("c1", dict(_THERMO_RATES))
+    assert round(bc.energy, 3) == 499.944      # только basal 0.056, БЕЗ thermal
+    assert not c._beh_thermal_cum             # ось не копит
+
+
+def test_thermo_cold_adds_energy_drain():
+    # ХОЛОД (T<0) + ON → энергодрейн ×(1+k·|T|) > basal-only. Ось копит.
+    c, org, bc = _compute_with_org(energy=500.0, hydration=100.0)
+    c._single_organism = True
+    c._thermocomfort_enabled = True
+    c._adam_temp["c1"] = -1.0
+    c._apply_metabolism("c1", dict(_THERMO_RATES))
+    assert bc.energy < 499.944                 # дренит БОЛЬШЕ basal-only (доп. thermal)
+    assert c._beh_thermal_cum["c1"] > 0.0      # термо-ось накопила cost
+    # k=φ⁻²: extra = 0.056·0.382·1 ≈ 0.0214 → energy ≈ 499.923
+    assert round(bc.energy, 3) == 499.923
+
+
+def test_thermo_heat_adds_hydration_drain():
+    # ЖАРА (T>0) + ON → гидродрейн ×(1+k·T) > thirst-only. Энергию НЕ трогает.
+    c, org, bc = _compute_with_org(energy=500.0, hydration=100.0)
+    c._single_organism = True
+    c._thermocomfort_enabled = True
+    c._adam_temp["c1"] = 1.0
+    c._apply_metabolism("c1", dict(_THERMO_RATES))
+    assert bc.hydration < 98.0                 # thirst 2.0 + thermal extra > 2.0
+    assert c._beh_thermal_cum["c1"] > 0.0
+    assert round(bc.energy, 3) == 499.944      # жара НЕ трогает energy (только basal)
+
+
+def test_thermo_neutral_no_extra():
+    # T=0 → нет thermal-drain даже при ON.
+    c, org, bc = _compute_with_org(energy=500.0, hydration=100.0)
+    c._single_organism = True
+    c._thermocomfort_enabled = True
+    c._adam_temp["c1"] = 0.0
+    c._apply_metabolism("c1", dict(_THERMO_RATES))
+    assert round(bc.energy, 3) == 499.944      # только basal
+    assert not c._beh_thermal_cum
+
+
+def test_set_thermocomfort_toggles():
+    c, org, bc = _compute_with_org(energy=500.0)
+    assert c._thermocomfort_enabled is False   # дефолт dormant
+    assert c.set_thermocomfort(True) is True
+    assert c._thermocomfort_enabled is True
+    assert c.set_thermocomfort(False) is False
+    assert c._thermocomfort_enabled is False
+
+
 def test_clamp_energy_nonnegative():
     c, org, bc = _compute_with_org(energy=10.0)
     _apply(c, "c1", {"step_cost_per_sec": 999.0,  # 999×1 ≫ energy → 0

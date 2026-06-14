@@ -591,6 +591,16 @@ class LocalColonyCompute:
         # → robust median+MAD + power-aware + SOFT→досветка держат. ШАБЛОН: каждый
         # новый аффорданс = wired-ось + её outcome-метрика в GC-сэмпл (Фрай).
         self._beh_damage_cum: dict = {}   # cid → монотонный Σ damage_taken (cost-of-encounter)
+        # ТЕРМОКОМФОРТ v0.3-bio Phase 1 (Фрай GO 14.06, temperature.md): temp@obs[35]
+        # бьёт по ТЕЛУ — холод(T<0)→энергодрейн ×(1+k·|T|), жара(T>0)→гидродрейн ×(1+k·T).
+        # Давление: прогноз temp = выживание → reducible (растит predictor) + новая ось
+        # neg_thermal_stress (растит graduated). recoverable-constraint (Фрай, §3-урок):
+        # drain МЯГКИЙ (k=φ⁻² старт), буфер дна (~180-600) поглощает, митигация (жара→
+        # water-seek, холод→forage) перекрывает. БЕЗ нового действия (BUILD-укрытие = P2).
+        self._thermocomfort_enabled: bool = False  # client_flag thermocomfort (OFF dormant)
+        self._THERMO_K: float = (1.0 / 1.6180339887) ** 2  # φ⁻²≈0.382 СТАРТ (калибр. вниз если §3↑)
+        self._beh_thermal_cum: dict = {}  # cid → монотонный Σ thermal-cost (ось, как _beh_damage_cum; selectable в P2/BUILD)
+        self._adam_temp: dict = {}        # cid → temp@obs[35] ∈[-1,1] (stash из obs-loop для metabolism)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
         # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
         # §3-abort НЕ ставил cooldown → дестабилизировавший узел сразу ре-eligible
@@ -1566,6 +1576,8 @@ class LocalColonyCompute:
         self._beh_income_cum.pop(cid, None)
         self._beh_damage_cum.pop(cid, None)   # fear-ось cost-of-encounter cleanup
         self._beh_meat_cum.pop(cid, None)     # hunt-ось meat-outcome cleanup
+        self._beh_thermal_cum.pop(cid, None)  # термо-ось cleanup
+        self._adam_temp.pop(cid, None)        # temp-stash cleanup
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -3494,6 +3506,10 @@ class LocalColonyCompute:
                                    if isinstance(_nf_cid, dict) else None)
                     _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
                     _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
+                    # ТЕРМОКОМФОРТ (Фрай 14.06): stash temp@obs[35] ∈[-1,1] для
+                    # _apply_metabolism (thermal-drain по знаку temp). Адам-only слот.
+                    if len(obs_arr) > 35:
+                        self._adam_temp[cid] = float(obs_arr[35])
                     if (self._hunting_enabled and _mp_cid is not None
                             and _hungry_for_med and _capable):
                         try:
@@ -6757,6 +6773,15 @@ class LocalColonyCompute:
         logger.info("set_behavioral_gc: %s", on)
         return self._behavioral_gc_enabled
 
+    def set_thermocomfort(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл ТЕРМОКОМФОРТ v0.3-bio Phase 1 (Фрай 14.06).
+        on=True: temp@obs[35] начинает бить по телу (холод→энергодрейн, жара→гидродрейн,
+        k=φ⁻²). on=False (kill-switch): drain отключается мгновенно (рестарт не нужен) —
+        тело возвращается к base-метаболизму. Rollback при §3-рецидиве / падении дна."""
+        self._thermocomfort_enabled = bool(on)
+        logger.info("set_thermocomfort: %s (k=%.3f)", on, self._THERMO_K)
+        return self._thermocomfort_enabled
+
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
         on=True: Адам→ВСЕЯДНЫЙ (diet_gene→φ⁻¹=0.618) → (а) server даёт kill-energy
@@ -6817,6 +6842,7 @@ class LocalColonyCompute:
             "income_cum": float(self._beh_income_cum.get(cid, 0.0)),
             "damage_cum": float(self._beh_damage_cum.get(cid, 0.0)),  # fear-ось (rate, neg)
             "meat_cum": float(self._beh_meat_cum.get(cid, 0.0)),      # hunt-ось (rate, pos)
+            "thermal_cum": float(self._beh_thermal_cum.get(cid, 0.0)),  # термо-ось (rate, neg; selectable P2/BUILD)
         }
 
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:
@@ -9406,6 +9432,32 @@ class LocalColonyCompute:
         except (TypeError, ValueError):
             return
         if bc is not None:
+            # ТЕРМОКОМФОРТ v0.3-bio Phase 1 (Фрай 14.06): temp@obs[35] бьёт по ТЕЛУ.
+            # холод (T<0) → энергодрейн (basal) ×(1+k·|T|); жара (T>0) → гидродрейн
+            # (thirst) ×(1+k·T). k=φ⁻²≈0.382. recoverable-constraint: drain МЯГКИЙ
+            # (max ×1.382 на экстремуме), буфер дна (~180-600) поглощает, митигация
+            # (жара→water-seek, холод→forage) перекрывает. Модифицируем basal/thirst
+            # ДО применения ниже. Ось neg_thermal (_beh_thermal_cum) копит ДОП-drain.
+            if self._thermocomfort_enabled:
+                _t = float(self._adam_temp.get(cid, 0.0))
+                _k = self._THERMO_K
+                _therm_extra = 0.0
+                if _t < 0.0 and basal > 0.0:           # ХОЛОД → энергодрейн вверх
+                    _be = basal * _k * (-_t)
+                    basal += _be
+                    _therm_extra += _be
+                if _t > 0.0 and thirst > 0.0:          # ЖАРА → гидродрейн вверх
+                    _te = thirst * _k * _t
+                    thirst += _te
+                    _therm_extra += _te
+                if _therm_extra > 0.0:
+                    self._beh_thermal_cum[cid] = (
+                        self._beh_thermal_cum.get(cid, 0.0) + _therm_extra)
+                    self._thermo_diag_n = getattr(self, "_thermo_diag_n", 0) + 1
+                    if self._thermo_diag_n % 200 == 0:
+                        logger.info("THERMO_DIAG cid=%s temp=%.3f extra=%.4f basal=%.3f "
+                                    "thirst=%.3f cum=%.1f", cid, _t, _therm_extra,
+                                    basal, thirst, self._beh_thermal_cum.get(cid, 0.0))
             if step_cost > 0.0:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
                 self._e_cost_sum += step_cost  # ENERGY_CALIB
