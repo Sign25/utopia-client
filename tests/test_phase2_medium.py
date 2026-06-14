@@ -313,6 +313,72 @@ def test_eat_reflex_blocked_by_predator():
     assert out["a"]["action"] == 1                     # хищник перебил рефлекс
 
 
+# ── corpse-approach: детерм. шаг на adjacent-тушу (Phase C medium-fix 14.06) ──
+
+def test_corpse_approach_steps_onto_adjacent():
+    # GAP-фикс: труп на dist=1 (соседний) + голоден + не-на-еде → детерм. шаг к нему
+    # (мотор уводил MOVE-elsewhere). dr<0 → NORTH(0).
+    c = _c()
+    c._corpse_approach["a"] = 0                         # obs-loop посчитал: шаг NORTH
+    out = {"a": {"action": 1, "target_id": None}}      # мотор: SOUTH (мимо мяса)
+    c._apply_corpse_approach("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 0                      # override → шаг на тушу
+
+
+def test_corpse_approach_noop_when_on_food():
+    # уже на туше (on_food) → approach молчит, eat-рефлекс владеет
+    c = _c()
+    c._on_food["a"] = 1
+    c._corpse_approach["a"] = 0
+    out = {"a": {"action": 14, "target_id": None}}      # рефлекс уже поставил EAT
+    c._apply_corpse_approach("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 14                     # не тронут
+
+
+def test_corpse_approach_noop_no_corpse():
+    # нет adjacent-трупа → не трогает
+    c = _c()
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_corpse_approach("a", out, [0.0] * 64)
+    assert out["a"]["action"] == 1
+
+
+def test_corpse_approach_blocked_by_predator():
+    # adjacent-труп, НО хищник (d_prox≥0.15) → НЕ лезет (FLEE > approach)
+    c = _c()
+    c._corpse_approach["a"] = 2
+    obs = [0.0] * 64
+    obs[61] = 0.5
+    out = {"a": {"action": 1, "target_id": None}}
+    c._apply_corpse_approach("a", out, obs)
+    assert out["a"]["action"] == 1                      # хищник перебил
+
+
+def test_paralysis_allows_corpse_step():
+    # §3-STEP bypass (medium-fix): парализован + adjacent-труп (флаг=move) → шаг проходит
+    # (голодающий ДОХОДИТ до мяса из паралича). Иначе заперт рядом с несъеденными 55.
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._corpse_approach["a"] = 2                          # шаг EAST к туше
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 2, "target_id": None}}       # approach уже поставил MOVE-EAST
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 2                       # шаг прошёл (не STAY)
+
+
+def test_paralysis_forces_stay_step_wrong_dir():
+    # MOVE в параличе НЕ совпадающий с corpse_approach-флагом → STAY (узкий bypass)
+    import time as _t
+    c = _c()
+    c.biochem["a"] = types.SimpleNamespace(energy=0.0)
+    c._corpse_approach["a"] = 2                          # флаг: EAST
+    c._paralysis_until["a"] = _t.monotonic() + 5.0
+    out = {"a": {"action": 1, "target_id": None}}       # но action=SOUTH (не к туше)
+    c._maybe_force_stay("a", out)
+    assert out["a"]["action"] == 4                       # STAY (не corpse-step)
+
+
 def _stub_biochem():
     # environment.biochemistry не в venv → handler early-return'ит. Стаб no-op
     # apply_* (+ should_force_stay) → handler исполняет kill-аккумулятор-логику.

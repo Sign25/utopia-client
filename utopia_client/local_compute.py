@@ -485,6 +485,7 @@ class LocalColonyCompute:
         self._hunt_pounce: dict = {}        # cid → 1 если в pounce-окне (entry speed_boost)
         self._hunt_contact: dict = {}       # cid → 1 если дичь ВПЛОТНУЮ (§3-ATTACK bypass)
         self._on_food: dict = {}            # cid → 1 если на флора-тайле (§3-EAT bypass, eating.md)
+        self._corpse_approach: dict = {}    # cid → MOVE-action к adjacent-туше (Phase C medium-fix, §3-STEP bypass)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
         # ОХОТА v0.1 (Фрай ТЗ hunting.md 11.06): Адам→всеядный (зеркало predator —
         # был жертвой, стал хищником). Адам УЖЕ навигирует к prey (DS prey-градиент
@@ -3542,6 +3543,27 @@ class LocalColonyCompute:
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
+                    # PHASE C medium-corpse fix (14.06): детерм. ШАГ-НА-ТУШУ для adjacent
+                    # трупа (0<dist≤1). GAP: corpse-nav shaping фичрит dist>1, eat-рефлекс
+                    # — on_corpse (dist=-1); на dist=1 (соседний тайл) НИ один не действует
+                    # → мотор (own=1.0) уводит → medium-туши (55 energy!) НЕ съедены → голод
+                    # (Адам пилил §3-paralysis ~1/мин рядом с несъеденным мясом). Шаг
+                    # детерминирован (как eat-рефлекс по философии); след. тик on_corpse=1 →
+                    # eat-рефлекс доест. Узко: голоден + adjacent + не-на-еде.
+                    self._corpse_approach.pop(cid, None)
+                    if (isinstance(_corpse_cid, dict) and _hungry_for_med
+                            and not self._on_food.get(cid)):
+                        try:
+                            _cd = float(_corpse_cid.get("dist", 99.0) or 99.0)
+                            _adr = float(_corpse_cid.get("dr", 0.0) or 0.0)
+                            _adc = float(_corpse_cid.get("dc", 0.0) or 0.0)
+                            if 0.0 < _cd <= 1.0 and (_adr != 0.0 or _adc != 0.0):
+                                if abs(_adr) >= abs(_adc):
+                                    self._corpse_approach[cid] = 0 if _adr < 0 else 1
+                                else:
+                                    self._corpse_approach[cid] = 2 if _adc > 0 else 3
+                        except (TypeError, ValueError):
+                            pass
                     # EAT_REFLEX триангуляция (rate 1/100): почему рефлекс не фичрит.
                     self._eatdiag_n = getattr(self, "_eatdiag_n", 0) + 1
                     if self._eatdiag_n % 100 == 0:
@@ -4113,6 +4135,7 @@ class LocalColonyCompute:
                 # потом override action для P40 actions_batch.
                 self._apply_biochem_mental_break(cid, world_tick)
                 self._apply_eat_reflex(cid, out, obs_per_cid.get(cid))
+                self._apply_corpse_approach(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
                 # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
                 # force-STAY). Раньше _stat_last_action писался при селекторе (выбор
@@ -8834,6 +8857,39 @@ class LocalColonyCompute:
             logger.info("EAT_REFLEX cid=%s fired #%d (on_food, d_prox=%.2f) → EAT override",
                         cid, self._eat_reflex_n, _dpx)
 
+    def _apply_corpse_approach(self, cid: str, out: dict, obs) -> None:
+        """ДЕТЕРМ. ШАГ-НА-ТУШУ для adjacent трупа (Phase C medium-fix 14.06).
+
+        GAP-фикс: corpse-nav shaping (dist>1) и eat-рефлекс (on_corpse, dist=-1) НЕ
+        покрывают dist=1 (соседний тайл) — мотор (own=1.0) уводит, medium-туши (55
+        energy) не съедены → Адам голодал рядом с мясом (§3-paralysis ~1/мин). Тут
+        ОДИН детерм. шаг на тайл трупа (как eat-рефлекс по философии: критич. floor =
+        override, НЕ shaping — Урок 1); след. тик on_corpse=1 → _apply_eat_reflex доест.
+
+        Иерархия: eat (на туше) > approach (соседняя) > мотор. predator-FLEE > approach
+        (d_prox-гейт). water-seek перебьёт позже при жажде. Узко: голоден + adjacent +
+        не-на-еде + safe. §3-синергия: _maybe_force_stay пропускает этот шаг сквозь
+        §3-paralysis (флаг _corpse_approach) → голодающий ДОХОДИТ до мяса из паралича.
+        """
+        if cid not in out or not self._single_organism:
+            return
+        if self._on_food.get(cid):            # уже на еде → eat-рефлекс владеет
+            return
+        _amv = self._corpse_approach.get(cid)
+        if _amv is None:
+            return
+        try:
+            _dpx = float(obs[61]) if (obs is not None and len(obs) > 61) else 0.0
+        except (TypeError, ValueError, IndexError):
+            _dpx = 0.0
+        if _dpx >= 0.15:                      # хищник близко → FLEE приоритет, не лезь
+            return
+        out[cid] = {"action": int(_amv), "target_id": None}   # шаг на тушу
+        self._corpse_step_n = getattr(self, "_corpse_step_n", 0) + 1
+        if self._corpse_step_n % 20 == 0:
+            logger.info("CORPSE_STEP cid=%s fired #%d (adjacent corpse, mv=%d) → step-onto",
+                        cid, self._corpse_step_n, int(_amv))
+
     def _maybe_force_stay(self, cid: str, out: dict) -> None:
         """Override action на STAY если биохимия требует.
 
@@ -8865,7 +8921,11 @@ class LocalColonyCompute:
                 _hunt_ok = (self._hunting_enabled and _act == 5
                             and self._hunt_contact.get(cid))
                 _eat_ok = (_act == 14 and self._on_food.get(cid))
-                if not (_hunt_ok or _eat_ok):
+                # §3-STEP bypass (Phase C medium-fix 14.06): голодающий ДОХОДИТ до
+                # adjacent-мяса из паралича — ОДИН шаг на тушу (как eat-out/hunt-out).
+                # Иначе паралич запирает Адама в тайле рядом с несъеденными 55 energy.
+                _step_ok = (_act is not None and _act == self._corpse_approach.get(cid))
+                if not (_hunt_ok or _eat_ok or _step_ok):
                     out[cid] = {"action": STAY, "target_id": None}
                 return
         try:
