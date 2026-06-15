@@ -7369,6 +7369,24 @@ class LocalColonyCompute:
                                 "year_sin=%.3f err=%s", cid, role, f,
                                 1 if self._world_is_night else 0, _yp,
                                 ("%.2f" % err) if err is not None else "—")
+                    # WATCH B КОНТРОЛИРУЕМЫЙ (Фрай): forecast при day_phase=день vs ночь,
+                    # year_phase ФИКС → если близки, дневной выход сезонно-полезен (мотор
+                    # gate-2 читает днём). Только зрелые (trained≥grace). |diff| мал=ок.
+                    if self._beh_forecast_trained.get(cid, {}).get(role, 0) \
+                            >= self._BEH_GRACE_NIGHTS:
+                        try:
+                            _xd = obs72.detach().clone()
+                            _xn = obs72.detach().clone()
+                            _xd[0, 68] = 0.0; _xd[0, 69] = 1.0    # day_phase «полдень»
+                            _xn[0, 68] = 0.0; _xn[0, 69] = -1.0   # day_phase «полночь»
+                            with torch.no_grad():
+                                _fd = float(head(t({"input": _xd})["output"]).reshape(()).item())
+                                _fn = float(head(t({"input": _xn})["output"]).reshape(()).item())
+                            logger.info("WATCHB_DIAG cid=%s role=%s fc_day=%.2f fc_night=%.2f "
+                                        "|diff|=%.3f year_sin=%.3f (мал=сезонно-keyed)",
+                                        cid, role, _fd, _fn, abs(_fd - _fn), _yp)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug("beh-forecast infer %s/%s: %s", cid, role, e)
 
