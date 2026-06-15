@@ -3542,6 +3542,13 @@ class LocalColonyCompute:
                         self._tissue_growth_step(cid)
                     except Exception as e:
                         logger.warning("tissue-growth step %s: %s", cid, e)
+                # Путь 2: НЕЗАВИСИМАЯ петля рост-от-поведения (свой флаг, НЕ завязана
+                # на tissue_growth + не starve'ится predictor-GC). gate-1/gate-2 внутри.
+                if self._behavioral_growth_enabled and self._single_organism:
+                    try:
+                        self._behavioral_growth_step(cid)
+                    except Exception as e:
+                        logger.warning("behavioral-growth step %s: %s", cid, e)
 
                 # Phase 7 — REINFORCE update от прошлого тика. Сначала
                 # SFNN S4 (14.05.2026): motor обучается локальным правилом
@@ -7252,6 +7259,32 @@ class LocalColonyCompute:
                     cid, role, ax["key"], int(ax["input_dim"]))
         return True
 
+    def _behavioral_growth_step(self, cid: str) -> None:
+        """Путь 2: НЕЗАВИСИМАЯ петля рост-от-поведения (Фрай 15.06). Вынесена из
+        predictor `_tissue_growth_step` — там её starve'или ранние-return (predictor-GC/
+        graduation-dwell) + была завязка на tissue_growth_enabled (births=0 при активации).
+        Свой флаг (behavioral_growth), свои §3/health-гейты внутри под-методов. Один
+        эксперимент за вызов. gate-1 mint; gate-2 graduation/head-GC."""
+        if not self._behavioral_growth_enabled:
+            return
+        org = self.organisms.get(cid)
+        if org is None:
+            return
+        # gate-2 head-GC активный шаг (dwell — один эксперимент за раз)
+        _hgc = self._beh_head_gc_state.get(cid)
+        if _hgc is not None:
+            self._beh_head_gc_step(cid, _hgc)
+            return
+        # gate-1 mint (свои §3/cooldown/pool-гейты внутри)
+        if self._maybe_behavioral_mint(cid, org):
+            return
+        # gate-2 graduation (свои §3/health-гейты внутри)
+        if self._maybe_behavioral_graduate(cid, org):
+            return
+        # gate-2 запустить head-GC retention-селектор на graduated-голове
+        if self._behavioral_graduation_enabled and self._beh_graduated.get(cid):
+            self._maybe_start_beh_head_gc(cid, org)
+
     def _maybe_behavioral_mint(self, cid: str, org) -> bool:
         """S2 self-limiting behavioral-mint loop (Фрай #3 — ни одного незащищённого
         mint). Гейты: флаг + §3-абс-гейт (paralysis>0 стоп) + Fib-cooldown +
@@ -8213,28 +8246,6 @@ class LocalColonyCompute:
             # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
             # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
             if self._maybe_start_tissue_gc(cid):
-                return
-            # BEHAVIORAL-MINT (Путь 2 S2, Фрай 15.06) — рост-от-поведения, отдельный
-            # путь/флаг. Наследует §3-гейт+health+rate-limit этой ветки. Гейтится
-            # _behavioral_growth_enabled (dormant default). Сайдкар в _beh_grown_tissues
-            # (НЕ predictor-сайдкар) → не конфликтует с propose ниже. Одна за вызов.
-            if self._maybe_behavioral_mint(cid, org):
-                return
-            # S4b gate-2: активный head-GC (paired ablate на neg_dark_loss) — первым,
-            # как tissue-GC dwell (один эксперимент за раз, мотор-сигнал чистый).
-            _hgc = self._beh_head_gc_state.get(cid)
-            if _hgc is not None:
-                self._beh_head_gc_step(cid, _hgc)
-                return
-            # S4 gate-2: behavioral graduation (zero-init мотор-голова лучшего
-            # форкастера). Отдельный флаг (касание мотора). Наследует §3/health.
-            if self._maybe_behavioral_graduate(cid, org):
-                return
-            # S4b gate-2: запустить head-GC retention-селектор на graduated-голове
-            # (если есть, не в cooldown). Поведенческий отбор — реальный тест.
-            if self._behavioral_graduation_enabled \
-                    and self._beh_graduated.get(cid) \
-                    and self._maybe_start_beh_head_gc(cid, org):
                 return
             # noise-robust плато (доля near-floor ≥ φ⁻¹), устойчив к всплескам погоды.
             if self._intrinsic_plateaued(cid):

@@ -443,6 +443,27 @@ def test_beh_motor_reinforce_learns():
     c._beh_motor_reinforce("c0", role, (to, None, base), advantage=1.0)
 
 
+# ── Независимая петля _behavioral_growth_step (фикс births=0) ────────────
+def test_behavioral_growth_step_dormant():
+    c = _c()
+    c.organisms["c0"] = object()
+    assert c._behavioral_growth_enabled is False
+    c._behavioral_growth_step("c0")                       # флаг OFF → no-op, без краша
+    c.set_behavioral_growth(True)
+    c._behavioral_growth_step("ghost")                    # org None → no-op
+
+
+def test_behavioral_growth_step_reaches_mint():
+    """Петля независима от tissue_growth/predictor-GC → mint достигается."""
+    c = _c()
+    _skip_if_no_core(c)
+    c.set_behavioral_growth(True)
+    c.organisms["c0"] = object()
+    c._beh_axis_hist["c0"] = {"rhythm": [20.] * 8}        # poor
+    c._behavioral_growth_step("c0")
+    assert c._beh_grown_tissues.get("c0")                 # mint сработал через петлю
+
+
 # ── S4b: retention-СЕЛЕКТОР (GC-ablation на neg_dark_loss, без core) ──────
 def test_head_gc_start_sets_ablate_mask():
     c = _c()
