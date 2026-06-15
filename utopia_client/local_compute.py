@@ -7297,6 +7297,18 @@ class LocalColonyCompute:
                     o = t({"input": obs72.detach()})["output"]
                     f = float(head(o).reshape(()).item())
                 self._beh_forecast_live.setdefault(cid, {})[role] = f
+                # FORECAST_DIAG (WATCH B, Фрай): forecast + is_night + year_phase →
+                # сверить, что skill от СЕЗОННОГО канала (forecast днём≈ночью при фикс
+                # year_phase), не от внутрисуточной фазы. Throttled.
+                self._fc_diag_n = getattr(self, "_fc_diag_n", 0) + 1
+                if self._fc_diag_n % 600 == 1:
+                    _ow = obs72.detach().reshape(-1)
+                    _yp = (float(_ow[70]) if _ow.shape[0] > 71 else 0.0)  # year_phase_sin
+                    err = self._beh_forecast_err.get(cid, {}).get(role)
+                    logger.info("FORECAST_DIAG cid=%s role=%s fc=%.2f night=%d "
+                                "year_sin=%.3f err=%s", cid, role, f,
+                                1 if self._world_is_night else 0, _yp,
+                                ("%.2f" % err) if err is not None else "—")
             except Exception as e:
                 logger.debug("beh-forecast infer %s/%s: %s", cid, role, e)
 
