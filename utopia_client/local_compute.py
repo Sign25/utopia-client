@@ -6925,6 +6925,12 @@ class LocalColonyCompute:
             self._beh_dark_loss_cum[cid] = (
                 self._beh_dark_loss_cum.get(cid, 0.0) + drop)
             self._dark_win_e0.pop(cid, None)
+            # DARK_LOSS_DIAG: per-окно drop + кумулятив — для калибровки S2-порога
+            # _dark_loss_poor mechanism-first (Фрай: «норма vs poor покажет Адам»).
+            self._dark_win_n = getattr(self, "_dark_win_n", 0) + 1
+            logger.info("DARK_LOSS_DIAG cid=%s night_win=%d drop=%.1f (e0=%.1f→e1=%.1f) "
+                        "cum=%.1f", cid, self._dark_win_n, drop, float(e0), e,
+                        self._beh_dark_loss_cum[cid])
 
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
