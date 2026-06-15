@@ -534,6 +534,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_predator_hunt: bool | None = None
     applied_rhythm: bool | None = None
     applied_beh_growth: bool | None = None
+    applied_beh_grad: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -883,6 +884,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_growth → %s", target_beh_growth)
                         except Exception as e:
                             logger.warning("set_behavioral_growth failed: %s", e)
+
+                    # gate-2 (Путь 2 S4, Фрай 15.06): graduation behavioral-ткани в
+                    # мотор-граф = касание поведения Адама. ОТДЕЛЬНЫЙ гейт от gate-1,
+                    # отдельный go Фрай+Шеф. Дефолт OFF (dormant). edge-detect.
+                    target_beh_grad = bool(flags.get("behavioral_graduation", False))
+                    if target_beh_grad != applied_beh_grad \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_behavioral_graduation(target_beh_grad)
+                            applied_beh_grad = target_beh_grad
+                            logger.info("behavioral_graduation → %s", target_beh_grad)
+                        except Exception as e:
+                            logger.warning("set_behavioral_graduation failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +

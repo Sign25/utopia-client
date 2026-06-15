@@ -642,6 +642,49 @@ class LocalColonyCompute:
         self._beh_dark_loss_cum: dict = {}   # cid → монотонный Σ energy-drop за is_night-окна (ритм-ось, как _beh_damage_cum)
         self._world_is_night: bool = False   # глобальный is_night (ws_client стащивает из world_cache)
         self._dark_win_e0: dict = {}         # cid → energy на входе в текущее is_night-окно (None=день)
+        # S2 behavioral-mint (Фрай 15.06): рождение ткани от _axis_poor. Сайдкары в
+        # ОТДЕЛЬНОМ dict (не _grown_tissues) → не свапаются predictor-GC, не идут в
+        # pred_input. Self-limiting: флаг + §3-гейт + Fib-cooldown + one-at-a-time/ось.
+        self._beh_grown_tissues: dict = {}   # cid → {role: tissue} (behavioral-сайдкары, obs72)
+        self._beh_grown_axis: dict = {}      # cid → {role: axis_key}
+        self._beh_axis_hist: dict = {}       # cid → {axis_key: [последние window-delta]}
+        self._beh_mint_count: int = 0        # монотонный счётчик ролей (behN)
+        self._beh_mint_last: dict = {}       # cid → world_tick последнего behavioral-mint (cooldown)
+        self._BEH_MINT_COOLDOWN: int = 233   # Fib — тиков между mint (зеркало _tissue_growth_cooldown)
+        self._BEH_POOL_CAP: int = 3          # Fib — кап сайдкаров/ось (мягкий pool-bound, Фрай)
+        # S3 претренинг-форкаст (gate-1, Фрай 15.06): ткань инертно ФОРКАСТИТ dark-loss
+        # (predict-ahead: вход obs72@night-start, таргет drop@close). Inference per-tick
+        # (живой форкаст днём для будущего форедж-ahead мотора), тренинг разреженный
+        # (per-night пара). forecast-err EMA = skill (для gate-2 приоритета + pool-cull).
+        # НЕ селектор (Фрай) — тёплый старт; реальная retention поведенческая на gate-2.
+        self._behavioral_graduation_enabled: bool = False  # client_flag gate-2 (graduation, OFF dormant)
+        self._beh_forecast_head: dict = {}   # cid → {role: nn.Linear(64→1)} readout dark-loss
+        self._beh_forecast_opt: dict = {}    # cid → {role: optimizer (tissue+head)}
+        self._beh_forecast_err: dict = {}    # cid → {role: EMA |forecast−drop|} (skill, ↓лучше)
+        self._beh_forecast_age: dict = {}    # cid → {role: tick рождения} (тай-брейк cull)
+        self._beh_forecast_live: dict = {}   # cid → {role: последний живой форкаст} (для gate-2 мотора)
+        self._beh_forecast_input: dict = {}  # cid → obs72@night-start (вход тренинг-пары)
+        self._last_obs72: dict = {}          # cid → последний obs72-тензор (для forecast-инференса)
+        # S4 gate-2 graduation (Фрай 15.06 Опция A): zero-init bolt-on мотор-голова
+        # Linear(64→N_ACTIONS) от forecast-представления ткани. zero-init → NO-OP на
+        # флипе (поведение Адама не дёргается), влияние растёт ПО ЗАСЛУГЕ под REINFORCE
+        # (energy-награда кредитует forage-ahead). Снятие головы = база мотора бит-в-бит
+        # (revert/cull/kill-switch). Роли: REINFORCE=шейпер, neg_dark_loss-GC=селектор
+        # (сонаправлены для ритма). Касание мотора → gate-2 OFF до go Фрай+Шеф.
+        self._beh_motor_head: dict = {}      # cid → {role: nn.Linear(64→N_ACTIONS)} zero-init
+        self._beh_motor_opt: dict = {}       # cid → {role: REINFORCE opt (голова)}
+        self._beh_graduated: dict = {}       # cid → {role: tissue} graduated (мотор-связаны)
+        self._beh_motor_ctx: dict = {}       # cid → {role: (tissue_out, base_logits)} REINFORCE prev
+        self._beh_motor_baseline: dict = {}  # cid → бегущая средняя advantage (variance-reduction)
+        self._beh_grad_count: int = 0
+        # S4b retention-СЕЛЕКТОР (Фрай 15.06): paired GC-ablation graduated-головы на
+        # neg_dark_loss. ablate (голова→0) vs restore: если ДЕЙСТВИЕ снижает dark-loss
+        # → ablate-окна имеют БОЛЬШЕ dark-loss → KEEP; иначе CULL (revert, база бит-в-бит).
+        # Сезонная честность: resolve только после ≥1 полного года (winter в обеих фазах).
+        self._beh_motor_ablate: dict = {}    # cid → role замаскированной головы (ablate-фаза)
+        self._beh_head_gc_state: dict = {}   # cid → state машины (phase/окна/сэмплы dark-loss)
+        self._beh_head_gc_last: dict = {}    # cid → world_tick последнего resolve (cooldown)
+        self._BEH_HEAD_GC_YEAR_TICKS: int = 6388  # ≥1 год (Хьюберт year_length) до resolve
         self._register_default_beh_axes()    # регистрируем ритм (первая ось)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
         # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
@@ -1623,6 +1666,18 @@ class LocalColonyCompute:
         self._beh_predkill_cum.pop(cid, None) # predator-hunt ось cleanup
         self._beh_dark_loss_cum.pop(cid, None)  # ритм-ось cleanup
         self._dark_win_e0.pop(cid, None)      # ритм-ось night-окно cleanup
+        self._beh_grown_tissues.pop(cid, None)  # S2 behavioral-сайдкары cleanup
+        self._beh_grown_axis.pop(cid, None)
+        self._beh_axis_hist.pop(cid, None)
+        self._beh_mint_last.pop(cid, None)
+        for dd in (self._beh_forecast_head, self._beh_forecast_opt,  # S3 forecast cleanup
+                   self._beh_forecast_err, self._beh_forecast_age,
+                   self._beh_forecast_live, self._beh_forecast_input, self._last_obs72,
+                   self._beh_motor_head, self._beh_motor_opt,  # S4 graduation cleanup
+                   self._beh_graduated, self._beh_motor_ctx, self._beh_motor_baseline,
+                   self._beh_motor_ablate, self._beh_head_gc_state,  # S4b head-GC cleanup
+                   self._beh_head_gc_last):
+            dd.pop(cid, None)
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -3425,6 +3480,11 @@ class LocalColonyCompute:
                     obs72 = np.concatenate([obs64, so, rh]).astype(np.float32)
                     pred_input = torch.from_numpy(obs72).to(
                         self.device).unsqueeze(0)
+                    # S3 рост-от-поведения: стащить obs72 + per-tick forecast-инференс
+                    # (живой dark-loss форкаст для gate-2 мотора). Gate-1-инертно.
+                    if self._behavioral_growth_enabled:
+                        self._last_obs72[cid] = pred_input.detach()
+                        self._beh_forecast_infer(cid, pred_input)
 
                 # Вариант A: hook на cerebellum (один раз/cid) — ДО forward,
                 # чтобы organism.forward (ниже) наполнил _cerebellum_out[cid].
@@ -3870,6 +3930,7 @@ class LocalColonyCompute:
                         else max(0.0, 1.0 - float(self._bias_scale)))
                 _so_this_ctx = None
                 _it_this_ctx = None
+                _beh_this_ctx = {}                # S4 behavioral мотор-головы ctx (роль→ctx)
                 if motor_delta is not None and _own > 0.0:
                     _base_dbg = logits[0, :N_ACTIONS].detach().clone()  # LOGIT_DEBUG: post-shaping, pre-motor
                     action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
@@ -3889,6 +3950,28 @@ class LocalColonyCompute:
                             _so_this_ctx = [_so4t, None, _base]  # action ниже
                         except Exception as e:
                             logger.debug("self_obs head bias %s: %s", cid, e)
+                    # S4 gate-2 (Опция A): graduated behavioral мотор-головы — zero-init
+                    # bias логитов от forecast-представления ткани (tissue(obs72)→head).
+                    # zero-init → NO-OP на старте, растёт под REINFORCE (ниже). ctx/роль
+                    # для REINFORCE-ротации. Gate-2 OFF → блок не исполняется (мотор чист).
+                    if self._behavioral_graduation_enabled and self._beh_graduated.get(cid):
+                        _o72b = self._last_obs72.get(cid)
+                        _bheads = self._beh_motor_head.get(cid, {})
+                        _abl = self._beh_motor_ablate.get(cid)   # S4b GC ablate-маска
+                        if _o72b is not None:
+                            for _br, _bt in list(self._beh_graduated[cid].items()):
+                                _bh = _bheads.get(_br)
+                                if _bh is None or _br == _abl:    # ablated → вклад=0
+                                    continue
+                                try:
+                                    with torch.no_grad():
+                                        _bto = _bt({"input": _o72b})["output"]
+                                        _bbias = _bh(_bto).reshape(-1)
+                                    _bbase = action_slice.detach()
+                                    action_slice = action_slice + _bbias
+                                    _beh_this_ctx[_br] = [_bto.detach(), None, _bbase]
+                                except Exception as e:
+                                    logger.debug("beh-motor bias %s/%s: %s", cid, _br, e)
                     # Направление (б): insula-temp модуляция (sharpen/flatten,
                     # НЕ меняет направление). action_slice / T_mod до select.
                     action_slice, _it_this_ctx = self._apply_insula_temp(
@@ -3963,6 +4046,8 @@ class LocalColonyCompute:
                     action = int(selector.select(logits_eff, n_actions=N_ACTIONS))
                 if _so_this_ctx is not None:
                     _so_this_ctx[1] = action
+                for _bc in _beh_this_ctx.values():     # S4 behavioral ctx: action для REINFORCE
+                    _bc[1] = action
                 out[cid] = {"action": action, "target_id": None}
                 self._stat_last_action[cid] = int(action)  # /stats active_eat_rate
                 # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
@@ -4153,6 +4238,21 @@ class LocalColonyCompute:
                             self._insula_temp_reinforce(
                                 cid, self._it_ctx.get(cid), r_imm_total)
                             self._it_ctx[cid] = _it_this_ctx
+                        # S4 gate-2: REINFORCE behavioral мотор-головы (шейпер по
+                        # energy-награде → forage-ahead). Та же ротация на ПРЕДЫДУЩИЙ
+                        # ctx; advantage = r − baseline (общая для голов cid). Gate-2
+                        # OFF → _beh_motor_head пуст → no-op.
+                        if self._behavioral_graduation_enabled \
+                                and self._beh_motor_head.get(cid):
+                            _bb = self._beh_motor_baseline.get(cid, 0.0)
+                            _badv = r_imm_total - _bb
+                            self._beh_motor_baseline[cid] = (
+                                0.99 * _bb + 0.01 * r_imm_total)
+                            _prev = self._beh_motor_ctx.get(cid, {})
+                            for _br in list(self._beh_motor_head.get(cid, {}).keys()):
+                                self._beh_motor_reinforce(
+                                    cid, _br, _prev.get(_br), _badv)
+                            self._beh_motor_ctx[cid] = _beh_this_ctx
                         # Phase 5d (NEOL): TD-модулятор η для reward_output.
                         # td = β − EMA(β, α=0.01), mult = 1 + clip(td, ±0.5).
                         # Если S2.E off (нет beta → td=0.0) → mult=1.0 (no-op).
@@ -6874,35 +6974,397 @@ class LocalColonyCompute:
 
     # ── Рост-от-поведения (Путь 2, Фрай 15.06): реестр осей + флаг + метрика ──
     def register_beh_axis(self, key: str, cum_dim: str,
-                          input_dim: int = _BRAIN_INPUT_DIM, sign: int = -1) -> dict:
-        """Зарегистрировать поведенческую ось роста (axis-agnostic). key — имя оси;
+                          input_dim: int = _BRAIN_INPUT_DIM, sign: int = -1,
+                          poor_win_thresh: float = 8.0,
+                          poor_frac: float = _PHI_CONST ** -2,
+                          hist_n: int = 8) -> dict:
+        """Зарегистрировать поведенческую ось роста (axis-agnostic, S2). key — имя;
         cum_dim — verdict-dim в _beh_gc_sample (outcome-метрика); input_dim — окно
-        входа, что должен читать сайдкар оси (ритм→72, т.к. ритм@[68:72]); sign —
-        знак метрики (−1: cost-накопитель, ablate↑→keep). Возвращает дескриптор."""
+        входа сайдкара оси (ритм→72, т.к. ритм@[68:72]); sign — знак (−1: cost,
+        ablate↑→keep). MINT-предикат (axis-параметричный): окно «costly» если его
+        delta > poor_win_thresh; ось «poor» если доля costly за hist_n окон ≥
+        poor_frac. Возвращает дескриптор."""
         d = {"key": str(key), "cum_dim": str(cum_dim),
-             "input_dim": int(input_dim), "sign": int(sign)}
+             "input_dim": int(input_dim), "sign": int(sign),
+             "poor_win_thresh": float(poor_win_thresh),
+             "poor_frac": float(poor_frac), "hist_n": int(hist_n)}
         self._beh_axes[str(key)] = d
         return d
 
     def _register_default_beh_axes(self) -> None:
         """Штатные оси роста-от-поведения. РИТМ = первая: forage-перед-зимней-ночью,
         метрика neg_dark_loss (energy-drop за is_night-окно), сайдкар читает obs72
-        (ритм@[68:72]). Будущие (fatigue/histamine/...) = ещё register_beh_axis,
-        не пересборка машинерии."""
+        (ритм@[68:72]). Пороги ЗАЛОЧЕНЫ из replay-калибровки (Фрай 15.06, прогон по
+        139 записанным ночам): costly-ночь >8 (Fib, в долине над winter-mean 6.4),
+        poor = ≥φ⁻² (эфф. 4/8) ночей costly за hist_n=8 — срабатывает в зиму (12×),
+        молчит летом (0). Будущие (fatigue/histamine) = ещё register_beh_axis."""
         self.register_beh_axis(
             key="rhythm", cum_dim="dark_loss_cum",
-            input_dim=_BRAIN_INPUT_DIM, sign=-1)
+            input_dim=_BRAIN_INPUT_DIM, sign=-1,
+            poor_win_thresh=8.0, poor_frac=_PHI_CONST ** -2, hist_n=8)
 
     def set_behavioral_growth(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл РОСТ-ОТ-ПОВЕДЕНИЯ (Путь 2, Фрай 15.06). on=True:
         behavioral-mint может родить ткань от плохой verdict-dim оси (neg_dark_loss),
         удержать по ablation (neg_dark_loss↑ при ablate), graduate в мотор-граф.
         on=False (kill-switch, dormant): рождения/ретеншн/graduation behavioral-пути
-        НЕ идут; predictor-путь и обученность Адама не задеты. Метрики (_beh_*_cum)
-        копятся всегда (пассивная наблюдаемость). Симметрично predictor-страховкам."""
+        НЕ идут + ВСЕ behavioral-сайдкары снимаются (рост не персистит при OFF);
+        predictor-путь и обученность Адама не задеты. Метрики (_beh_*_cum) копятся
+        всегда (пассивная наблюдаемость). Симметрично predictor-страховкам."""
         self._behavioral_growth_enabled = bool(on)
+        if not on:
+            # kill-switch: снять все behavioral-сайдкары + их forecast-состояние
+            # (inert, motor-isolated → снятие безопасно; веса не персистим). Метрики/
+            # история остаются. gate-2 graduation тоже гасим (нечего выпускать).
+            n = sum(len(d) for d in self._beh_grown_tissues.values())
+            self._revert_behavioral_graduations()   # мастер-стоп: снять и мотор-головы
+            for d in (self._beh_grown_tissues, self._beh_grown_axis,
+                      self._beh_forecast_head, self._beh_forecast_opt,
+                      self._beh_forecast_err, self._beh_forecast_age,
+                      self._beh_forecast_live):
+                d.clear()
+            if n:
+                logger.info("set_behavioral_growth OFF: снято %d behavioral-сайдкаров", n)
         logger.info("set_behavioral_growth: %s", on)
         return self._behavioral_growth_enabled
+
+    def set_behavioral_graduation(self, on: bool) -> bool:
+        """Канал client_flags gate-2 (Путь 2 S4, Фрай 15.06): вкл/выкл GRADUATION
+        behavioral-ткани в мотор-граф = момент, когда поведение Адама МОЖЕТ
+        измениться (касание мотора, ради защиты которого выбрали Путь 2). on=True:
+        лучший форкастер (по skill) выпускается + поведенческая ablation-retention
+        на neg_dark_loss = ПЕРВИЧНЫЙ селектор. on=False (kill-switch): revert всех
+        graduated behavioral-узлов в сайдкары (мотор-изоляция восстановлена). ОТДЕЛЬНЫЙ
+        гейт от gate-1 (behavioral_growth): сначала валидируем инертную половину
+        (births/cull/§3) живьём, потом включаем касание Адама. go Фрая + Шефа."""
+        self._behavioral_graduation_enabled = bool(on)
+        if not on:
+            self._revert_behavioral_graduations()    # S4: вернуть выпускников (no-op до S4)
+        logger.info("set_behavioral_graduation: %s", on)
+        return self._behavioral_graduation_enabled
+
+    def _revert_behavioral_graduations(self) -> None:
+        """gate-2 kill-switch (Опция A): снять ВСЕ behavioral мотор-головы → база
+        мотора бит-в-бит (bolt-on голова, мгновенно-съёмная; zero-init или выученная —
+        снятие убирает весь её вклад). Ткани остаются в _beh_grown_tissues (сайдкары).
+        Рутинный cull использует _revert_behavioral_node (тот же revert на одну роль)."""
+        n = sum(len(d) for d in self._beh_motor_head.values())
+        for dd in (self._beh_motor_head, self._beh_motor_opt, self._beh_graduated,
+                   self._beh_motor_ctx, self._beh_motor_ablate, self._beh_head_gc_state):
+            dd.clear()
+        if n:
+            logger.info("behavioral graduation revert: снято %d мотор-голов "
+                        "(база мотора восстановлена бит-в-бит)", n)
+
+    def _revert_behavioral_node(self, cid: str, role: str) -> None:
+        """Снять ОДНУ behavioral мотор-голову (cull/revert): её вклад в мотор исчезает,
+        база бит-в-бит. Ткань остаётся сайдкаром (может ре-graduate'иться)."""
+        for dd in (self._beh_motor_head, self._beh_motor_opt, self._beh_graduated,
+                   self._beh_motor_ctx):
+            sub = dd.get(cid)
+            if isinstance(sub, dict):
+                sub.pop(role, None)
+
+    def _maybe_behavioral_graduate(self, cid: str, org) -> bool:
+        """S4 gate-2 (Опция A): выпустить ЛУЧШЕГО форкастера (min forecast-err, бьёт
+        baseline) zero-init мотор-головой Linear(64→N_ACTIONS). zero-init → NO-OP на
+        старте (мотор не дёргается), влияние растёт под REINFORCE. Гейты: gate-2 флаг
+        + §3-абс + health + one-at-a-time (один graduated/cid). Приоритет = skill
+        (Фрай: forecast-skill = приоритет graduation, НЕ куллер). True если выпустил."""
+        if not self._behavioral_graduation_enabled:
+            return False
+        if int(self._paralysis_window_n) > 0:
+            return False
+        bc = self.biochem.get(cid)
+        e = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
+        if e < self._GRAD_HEALTH_ENERGY:
+            return False
+        if self._beh_graduated.get(cid):              # one-at-a-time graduated
+            return False
+        sidecars = self._beh_grown_tissues.get(cid) or {}
+        errs = self._beh_forecast_err.get(cid) or {}
+        axmap = self._beh_grown_axis.get(cid) or {}
+        hist = self._beh_axis_hist.get(cid) or {}
+        best, best_err = None, None
+        for role in sidecars:
+            err = errs.get(role)
+            if err is None:                           # не тренировался — не зрел
+                continue
+            h = hist.get(axmap.get(role, ""), [])
+            baseline = (sum(h) / len(h)) if h else 0.0
+            if baseline > 0 and err >= baseline:      # не лучше тривиального — не выпускаем
+                continue
+            if best_err is None or err < best_err:    # приоритет = лучший skill
+                best, best_err = role, err
+        if best is None:
+            return False
+        torch = self._torch
+        try:
+            head = torch.nn.Linear(_SELF_OBS_OFFSET, N_ACTIONS).to(self.device)
+            with torch.no_grad():
+                head.weight.zero_(); head.bias.zero_()   # zero-init → NO-OP на флипе
+            self._beh_motor_head.setdefault(cid, {})[best] = head
+            self._beh_motor_opt.setdefault(cid, {})[best] = torch.optim.Adam(
+                head.parameters(), lr=1e-3)
+            self._beh_graduated.setdefault(cid, {})[best] = sidecars[best]
+            self._beh_grad_count += 1
+        except Exception as e:
+            logger.warning("beh-graduate %s/%s: %s", cid, best, e)
+            return False
+        logger.info("brain-growth BEH-GRADUATE cid=%s role=%s axis=%s (zero-init "
+                    "мотор-голова, forecast-err=%.2f, NO-OP старт → растёт по заслуге)",
+                    cid, best, axmap.get(best, "?"), best_err)
+        return True
+
+    def _beh_motor_reinforce(self, cid: str, role: str, ctx, advantage: float) -> None:
+        """REINFORCE-шаг behavioral мотор-головы (зеркало _self_obs_head_reinforce).
+        ctx=(tissue_out, action, base_logits). loss = −logπ[action]·adv, π=softmax(
+        base + head(tissue_out)); base detached (вклад остального мотора). Голова
+        учится мапить forecast-представление → действие под energy-наградой (шейпер)."""
+        head = self._beh_motor_head.get(cid, {}).get(role)
+        opt = self._beh_motor_opt.get(cid, {}).get(role)
+        if head is None or opt is None or ctx is None:
+            return
+        torch = self._torch
+        to, action, base = ctx
+        if action is None:
+            return
+        try:
+            import torch.nn.functional as F
+            bias = head(to)                            # grad через голову
+            final = base + bias
+            logp = F.log_softmax(final, dim=-1).reshape(-1)[int(action)]
+            loss = -logp * float(advantage)
+            opt.zero_grad(); loss.backward(); opt.step()
+        except Exception as e:
+            logger.debug("beh-motor reinforce %s/%s: %s", cid, role, e)
+
+    def _maybe_start_beh_head_gc(self, cid: str, org) -> bool:
+        """S4b: запустить paired GC-ablation на graduated-голове (retention-СЕЛЕКТОР
+        на neg_dark_loss). Гейты: gate-2 + health + нет недавнего §3 + cooldown.
+        Старт в ablate-фазе (маска голову→0). True если начат."""
+        bc = self.biochem.get(cid)
+        e = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
+        if e < self._GRAD_HEALTH_ENERGY:
+            return False
+        if (self._last_world_tick - self._last_paralysis_tick.get(cid, -10**9)) \
+                < self._BEH_GC_NO_PAR_TICKS:
+            return False
+        last = self._beh_head_gc_last.get(cid)
+        if last is not None and (self._last_world_tick - last) < self._BEH_GC_KEEP_COOLDOWN:
+            return False
+        grad = self._beh_graduated.get(cid) or {}
+        if not grad:
+            return False
+        role = next(iter(grad))
+        self._beh_motor_ablate[cid] = role                # старт: ablate (голова→0)
+        self._beh_head_gc_state[cid] = {
+            "role": role, "phase": "ablate", "pairs_done": 0,
+            "win_ticks": 0, "win0_dark": float(self._beh_dark_loss_cum.get(cid, 0.0)),
+            "gc_start": int(self._last_world_tick),
+            "samples": {"ablate": [], "restore": []},
+        }
+        logger.info("brain-growth BEH-HEAD-GC-START cid=%s role=%s (paired ablate→0 на "
+                    "neg_dark_loss, ≥1 год до resolve, сезонно-честно)", cid, role)
+        return True
+
+    def _beh_head_gc_step(self, cid: str, st: dict) -> None:
+        """S4b тик paired GC: копим dark-loss за окно, на закрытии → сэмпл фазы, toggle
+        маску. Resolve после ≥_BEH_GC_PAIRS пар И ≥1 полного года (winter в обеих фазах)."""
+        st["win_ticks"] += 1
+        if st["win_ticks"] < self._BEH_GC_WINDOW:
+            return
+        cum = float(self._beh_dark_loss_cum.get(cid, 0.0))
+        win_dark = max(0.0, cum - st["win0_dark"])        # dark-loss накоплен за окно
+        st["samples"][st["phase"]].append(win_dark)
+        st["win0_dark"] = cum
+        st["win_ticks"] = 0
+        new_phase = "restore" if st["phase"] == "ablate" else "ablate"
+        if new_phase == "ablate":
+            self._beh_motor_ablate[cid] = st["role"]      # маска вернулась (ablate)
+            st["pairs_done"] += 1
+        else:
+            self._beh_motor_ablate.pop(cid, None)         # маска снята (restore)
+        st["phase"] = new_phase
+        year_ok = (self._last_world_tick - st["gc_start"]) >= self._BEH_HEAD_GC_YEAR_TICKS
+        if st["pairs_done"] >= self._BEH_GC_PAIRS and year_ok:
+            self._resolve_beh_head_gc(cid, st)
+
+    def _resolve_beh_head_gc(self, cid: str, st: dict) -> None:
+        """S4b resolve: парный diff (ablate−restore dark-loss; >0 = голова-ДЕЙСТВИЕ
+        снижает dark-loss = полезна). KEEP iff median ≥ floor И значимо (t). Иначе
+        CULL → revert головы (база мотора бит-в-бит). ПЕРВИЧНЫЙ селектор (поведенческий)."""
+        role = st["role"]
+        self._beh_motor_ablate.pop(cid, None)             # снять маску (вклад вернулся)
+        self._beh_head_gc_state.pop(cid, None)
+        self._beh_head_gc_last[cid] = int(self._last_world_tick)
+        a = st["samples"]["ablate"]
+        r = st["samples"]["restore"]
+        n = min(len(a), len(r))
+        diffs = [a[i] - r[i] for i in range(n)]           # ablate−restore (>0 = полезна)
+        med, rsd, t = self._robust_paired(diffs)
+        keep = (med >= self._TISSUE_GC_ABS_FLOOR) and (t >= self._BEH_GC_T_KEEP)
+        if keep:
+            logger.info("brain-growth BEH-HEAD-GC-KEEP cid=%s role=%s med=%.2f t=%.2f "
+                        "(голова снижает dark-loss — поведенческая польза)", cid, role, med, t)
+        else:
+            self._revert_behavioral_node(cid, role)       # CULL: снять голову (база бит-в-бит)
+            logger.info("brain-growth BEH-HEAD-GC-CULL cid=%s role=%s med=%.2f t=%.2f "
+                        "(не снижает dark-loss — revert, мотор чист)", cid, role, med, t)
+
+    def _propose_behavioral_tissue(self, cid: str, ax: dict) -> bool:
+        """S2 behavioral-mint: родить сайдкар для оси ax. В ОТДЕЛЬНОМ
+        _beh_grown_tissues (НЕ predictor-сайдкар: не в pred_input, не свапается
+        tissue-GC). Вход расширен до ax.input_dim (obs72) через preserve [I_64|0]
+        (component 3, Фрай: zero-init ритм-колонок → math-equivalent obs64-сайдкару
+        на старте, ритм-вклад растёт с 0). Inert до graduation (S4); ретеншн по
+        neg_dark_loss — S3. True если создан."""
+        org = self.organisms.get(cid)
+        if org is None:
+            return False
+        self._beh_mint_count += 1
+        role = f"beh{self._beh_mint_count}"
+        n_embd = int(self._TISSUE_GROWTH_N_EMBD)
+        tissue = self._make_higher_tissue(role, data_dim=64, n_embd=n_embd)
+        if tissue is None:
+            return False
+        self._upgrade_tissue_input_dim(tissue, int(ax["input_dim"]))  # 64→input_dim [I|0]
+        self._beh_grown_tissues.setdefault(cid, {})[role] = tissue
+        self._beh_grown_axis.setdefault(cid, {})[role] = ax["key"]
+        self._beh_mint_last[cid] = int(self._last_world_tick)
+        # S3 претренинг-форкаст: readout Linear(64→1) на dark-loss + opt (tissue+head).
+        # zero-init head → форкаст≈0 на старте (нейтрально), учится на night-парах.
+        torch = self._torch
+        try:
+            head = torch.nn.Linear(_SELF_OBS_OFFSET, 1).to(self.device)
+            with torch.no_grad():
+                head.weight.zero_(); head.bias.zero_()
+            self._beh_forecast_head.setdefault(cid, {})[role] = head
+            self._beh_forecast_opt.setdefault(cid, {})[role] = torch.optim.Adam(
+                list(tissue.parameters()) + list(head.parameters()), lr=1e-3)
+            self._beh_forecast_err.setdefault(cid, {})[role] = None
+            self._beh_forecast_age.setdefault(cid, {})[role] = int(self._last_world_tick)
+            self._beh_forecast_live.setdefault(cid, {})[role] = 0.0
+        except Exception as e:
+            logger.warning("beh-mint forecast head %s/%s: %s", cid, role, e)
+        logger.info("brain-growth BEH-MINT cid=%s role=%s axis=%s (behavioral-сайдкар "
+                    "obs%d, forecast-readout, motor-isolated, inert до graduation)",
+                    cid, role, ax["key"], int(ax["input_dim"]))
+        return True
+
+    def _maybe_behavioral_mint(self, cid: str, org) -> bool:
+        """S2 self-limiting behavioral-mint loop (Фрай #3 — ни одного незащищённого
+        mint). Гейты: флаг + §3-абс-гейт (paralysis>0 стоп) + Fib-cooldown +
+        one-at-a-time/ось. Для КАЖДОЙ зарегистрированной оси (axis-agnostic): poor
+        + нет живого сайдкара этой оси → propose. Одна за вызов. True если родил."""
+        if not self._behavioral_growth_enabled:
+            return False
+        if int(self._paralysis_window_n) > 0:        # абсолютный §3-гейт
+            return False
+        last = self._beh_mint_last.get(cid)
+        if last is not None and \
+                (self._last_world_tick - last) < self._BEH_MINT_COOLDOWN:
+            return False                              # Fib-cooldown между mint
+        self._beh_pool_cull(cid)                      # мягкий pool-bound до mint
+        axis_counts = {}
+        for k in (self._beh_grown_axis.get(cid) or {}).values():
+            axis_counts[k] = axis_counts.get(k, 0) + 1
+        for key, ax in self._beh_axes.items():
+            if axis_counts.get(key, 0) >= self._BEH_POOL_CAP:  # пул оси полон
+                continue
+            if self._axis_poor(cid, ax):
+                return self._propose_behavioral_tissue(cid, ax)
+        return False
+
+    def _beh_forecast_infer(self, cid: str, obs72) -> None:
+        """S3 (A) per-tick ИНФЕРЕНС: живой форкаст dark-loss на текущем obs72 для
+        каждого behavioral-сайдкара → _beh_forecast_live (gate-2 мотор читает днём).
+        Без grad (инференс). Сезонный сигнал (year_phase≈const внутри суток) делает
+        «зима→дорого» доступным и днём. Gate-1-инертно: НЕ трогает мотор/predictor."""
+        if not self._behavioral_growth_enabled:
+            return
+        d = self._beh_grown_tissues.get(cid)
+        if not d or obs72 is None:
+            return
+        torch = self._torch
+        heads = self._beh_forecast_head.get(cid, {})
+        for role, t in list(d.items()):
+            head = heads.get(role)
+            if head is None:
+                continue
+            try:
+                with torch.no_grad():
+                    o = t({"input": obs72.detach()})["output"]
+                    f = float(head(o).reshape(()).item())
+                self._beh_forecast_live.setdefault(cid, {})[role] = f
+            except Exception as e:
+                logger.debug("beh-forecast infer %s/%s: %s", cid, role, e)
+
+    def _beh_forecast_train(self, cid: str, drop: float) -> None:
+        """S3 разреженный ТРЕНИНГ (predict-ahead): на закрытии ночи обучаем пару
+        (obs72@night-start, drop@close) — MSE форкаста к реализованному drop. Растит
+        forecast-skill (sign-кодированный таргет: cum-метрика). Обновляет err-EMA
+        (skill). НЕ селектор (Фрай) — тёплый старт; gate-2 retention поведенческая."""
+        if not self._behavioral_growth_enabled:
+            return
+        x = self._beh_forecast_input.get(cid)
+        d = self._beh_grown_tissues.get(cid)
+        if x is None or not d:
+            return
+        torch = self._torch
+        import torch.nn.functional as F
+        heads = self._beh_forecast_head.get(cid, {})
+        opts = self._beh_forecast_opt.get(cid, {})
+        tgt = torch.tensor([[float(drop)]], device=self.device)
+        for role, t in list(d.items()):
+            head, opt = heads.get(role), opts.get(role)
+            if head is None or opt is None:
+                continue
+            try:
+                t.train()
+                with torch.enable_grad():
+                    o = t({"input": x.detach()})["output"]
+                    f = head(o)
+                    loss = F.mse_loss(f, tgt)
+                    opt.zero_grad(); loss.backward(); opt.step()
+                err = abs(float(f.detach().reshape(()).item()) - float(drop))
+                prev = self._beh_forecast_err.get(cid, {}).get(role)
+                self._beh_forecast_err.setdefault(cid, {})[role] = (
+                    err if prev is None else (1 - _EMA_ALPHA) * prev + _EMA_ALPHA * err)
+            except Exception as e:
+                logger.debug("beh-forecast train %s/%s: %s", cid, role, e)
+
+    def _beh_pool_cull(self, cid: str) -> None:
+        """S3 мягкий pool-bound (Фрай): cull заведомо МЁРТВЫХ форкастеров (err-EMA ≥
+        baseline = mean-drop оси → прогноз не лучше тривиального). НЕ make-or-break
+        селектор (реальный отбор поведенческий на gate-2) — лишь освобождает пул от
+        шумовых. Требует ≥1 тренинг (err измерен). Tie-break не нужен (порог-cull)."""
+        d = self._beh_grown_tissues.get(cid)
+        if not d:
+            return
+        errs = self._beh_forecast_err.get(cid, {})
+        axmap = self._beh_grown_axis.get(cid, {})
+        hist = self._beh_axis_hist.get(cid, {})
+        for role in list(d.keys()):
+            err = errs.get(role)
+            if err is None:
+                continue                              # ещё не тренировался — не трогаем
+            h = hist.get(axmap.get(role, ""), [])
+            baseline = (sum(h) / len(h)) if h else 0.0
+            if baseline > 0 and err >= baseline:      # мёртвый форкастер
+                self._remove_behavioral_tissue(cid, role)
+                logger.info("brain-growth BEH-CULL cid=%s role=%s (forecast-err=%.1f ≥ "
+                            "baseline mean-drop=%.1f, мёртвый) ", cid, role, err, baseline)
+
+    def _remove_behavioral_tissue(self, cid: str, role: str) -> None:
+        """Убрать behavioral-сайдкар + всё его forecast-состояние (cull/kill-switch)."""
+        for dd in (self._beh_grown_tissues, self._beh_grown_axis,
+                   self._beh_forecast_head, self._beh_forecast_opt,
+                   self._beh_forecast_err, self._beh_forecast_age,
+                   self._beh_forecast_live):
+            sub = dd.get(cid)
+            if isinstance(sub, dict):
+                sub.pop(role, None)
 
     def _update_dark_loss(self, cid: str) -> None:
         """Метрика neg_dark_loss (ритм-ось, Фрай 15.06): energy-drop за is_night-окно.
@@ -6920,17 +7382,50 @@ class LocalColonyCompute:
         e0 = self._dark_win_e0.get(cid)
         if night and e0 is None:
             self._dark_win_e0[cid] = e               # вошли в ночь — старт окна
+            # S3 predict-ahead: захват obs72 на ПОРОГЕ ночи = вход тренинг-пары
+            # (ткань прогнозирует «во сколько эта ночь обойдётся»).
+            if self._behavioral_growth_enabled:
+                x = self._last_obs72.get(cid)
+                if x is not None:
+                    self._beh_forecast_input[cid] = x
         elif (not night) and e0 is not None:
             drop = max(0.0, float(e0) - e)            # вышли — net-cost за ночь
             self._beh_dark_loss_cum[cid] = (
                 self._beh_dark_loss_cum.get(cid, 0.0) + drop)
             self._dark_win_e0.pop(cid, None)
+            self._beh_forecast_train(cid, drop)       # S3 разреженный тренинг пары
             # DARK_LOSS_DIAG: per-окно drop + кумулятив — для калибровки S2-порога
             # _dark_loss_poor mechanism-first (Фрай: «норма vs poor покажет Адам»).
             self._dark_win_n = getattr(self, "_dark_win_n", 0) + 1
             logger.info("DARK_LOSS_DIAG cid=%s night_win=%d drop=%.1f (e0=%.1f→e1=%.1f) "
                         "cum=%.1f", cid, self._dark_win_n, drop, float(e0), e,
                         self._beh_dark_loss_cum[cid])
+            self._record_axis_window(cid, "rhythm", drop)  # окно ритм-оси → mint-история
+
+    def _record_axis_window(self, cid: str, axis_key: str, delta: float) -> None:
+        """Записать window-delta оси в rolling-историю для mint-предиката (S2). Для
+        ритма окно = ночь, delta = ночной drop. Держим последние hist_n окон."""
+        ax = self._beh_axes.get(axis_key)
+        if ax is None:
+            return
+        h = self._beh_axis_hist.setdefault(cid, {}).setdefault(axis_key, [])
+        h.append(float(delta))
+        n = int(ax["hist_n"])
+        if len(h) > n:
+            del h[:-n]                       # держим только последние hist_n
+
+    def _axis_poor(self, cid: str, ax: dict) -> bool:
+        """MINT-предикат (axis-параметричный, БАЙТ-В-БАЙТ replay-калибровка Фрай 15.06):
+        ось «poor» если доля costly-окон (delta > poor_win_thresh) за последние
+        hist_n окон ≥ poor_frac. Требует ≥hist_n сэмплов (иначе False — не родим
+        на холодную). Логика идентична replay: flags=delta>thresh, sum/n≥frac."""
+        h = self._beh_axis_hist.get(cid, {}).get(ax["key"])
+        n = int(ax["hist_n"])
+        if not h or len(h) < n:
+            return False
+        recent = h[-n:]
+        costly = sum(1 for d in recent if d > ax["poor_win_thresh"])
+        return (costly / n) >= ax["poor_frac"]
 
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
@@ -7694,6 +8189,28 @@ class LocalColonyCompute:
             # GC сначала (Фрай 10.06): ре-оценить живые сайдкары на полном погодном
             # цикле, фазовые отпустить. Между sweep'ами (отдых) — рост новых durable.
             if self._maybe_start_tissue_gc(cid):
+                return
+            # BEHAVIORAL-MINT (Путь 2 S2, Фрай 15.06) — рост-от-поведения, отдельный
+            # путь/флаг. Наследует §3-гейт+health+rate-limit этой ветки. Гейтится
+            # _behavioral_growth_enabled (dormant default). Сайдкар в _beh_grown_tissues
+            # (НЕ predictor-сайдкар) → не конфликтует с propose ниже. Одна за вызов.
+            if self._maybe_behavioral_mint(cid, org):
+                return
+            # S4b gate-2: активный head-GC (paired ablate на neg_dark_loss) — первым,
+            # как tissue-GC dwell (один эксперимент за раз, мотор-сигнал чистый).
+            _hgc = self._beh_head_gc_state.get(cid)
+            if _hgc is not None:
+                self._beh_head_gc_step(cid, _hgc)
+                return
+            # S4 gate-2: behavioral graduation (zero-init мотор-голова лучшего
+            # форкастера). Отдельный флаг (касание мотора). Наследует §3/health.
+            if self._maybe_behavioral_graduate(cid, org):
+                return
+            # S4b gate-2: запустить head-GC retention-селектор на graduated-голове
+            # (если есть, не в cooldown). Поведенческий отбор — реальный тест.
+            if self._behavioral_graduation_enabled \
+                    and self._beh_graduated.get(cid) \
+                    and self._maybe_start_beh_head_gc(cid, org):
                 return
             # noise-robust плато (доля near-floor ≥ φ⁻¹), устойчив к всплескам погоды.
             if self._intrinsic_plateaued(cid):
