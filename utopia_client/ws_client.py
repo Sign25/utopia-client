@@ -2760,6 +2760,14 @@ class ColonyWSClient:
         Phase emas (03.05.2026): per-creature Phase 1/2/6 метрики для owned."""
         if self.compute is None:
             return None
+        # Ритм-ось (Путь 2, Фрай 15.06): is_night → compute (client-authoritative из
+        # world_cache) для метрики neg_dark_loss. Глобальный (мир один), Адам owned.
+        _wc = getattr(self, "world_cache", None)
+        if _wc is not None:
+            try:
+                self.compute._world_is_night = bool(_wc.is_night)
+            except Exception:
+                pass
         actions = self.compute.handle_tick(
             obs_per_cid, events_per_cid=events_per_cid,
             intero_per_cid=intero_per_cid, world_tick=world_tick,

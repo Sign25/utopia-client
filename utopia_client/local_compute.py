@@ -625,6 +625,24 @@ class LocalColonyCompute:
         self._THERMO_K: float = (1.0 / 1.6180339887) ** 2  # φ⁻²≈0.382 СТАРТ (калибр. вниз если §3↑)
         self._beh_thermal_cum: dict = {}  # cid → монотонный Σ thermal-cost (ось, как _beh_damage_cum; selectable в P2/BUILD)
         self._adam_temp: dict = {}        # cid → temp@obs[35] ∈[-1,1] (stash из obs-loop для metabolism)
+        # ── Рост-от-ПОВЕДЕНИЯ (Путь 2, Фрай go 15.06): axis-agnostic ──────────
+        # Predictor-forecast-born ткани (temperature) растут от REDUCIBLE prediction-
+        # loss. Чисто-ПОВЕДЕНЧЕСКАЯ ось (ритм: forage-перед-зимней-ночью) даёт
+        # ИРРЕДУЦИБЕЛЬНЫЙ predictor-loss (winter sensor-шум, доказано Phase-2) →
+        # существующая воронка (mint=intrinsic-plateau, keep=loss_ema-Δ, sidecar
+        # читает obs64) её НЕ родит/удержит/покажет ритм. Новый режим: рождение+
+        # ретеншн от behavioral verdict-dim, graduation в мотор-граф (base motor
+        # ЧИСТЫЙ — путь только через graduation, не миграция мотора). ОБЩИЙ: ось =
+        # регистрация {key, cum_dim, input_dim, sign}, не хардкод (ритм = ПЕРВАЯ;
+        # fatigue/histamine позже = ещё регистрация). Весь режим за флагом, default
+        # OFF, deploy dormant (симметрично страховкам predictor-пути). Таксономия
+        # рождения: predictor-forecast-born vs behavioral-outcome-born.
+        self._behavioral_growth_enabled: bool = False  # client_flag behavioral_growth (OFF dormant)
+        self._beh_axes: dict = {}            # key → axis-дескриптор (registry, axis-agnostic)
+        self._beh_dark_loss_cum: dict = {}   # cid → монотонный Σ energy-drop за is_night-окна (ритм-ось, как _beh_damage_cum)
+        self._world_is_night: bool = False   # глобальный is_night (ws_client стащивает из world_cache)
+        self._dark_win_e0: dict = {}         # cid → energy на входе в текущее is_night-окно (None=день)
+        self._register_default_beh_axes()    # регистрируем ритм (первая ось)
         self._beh_gc_rejected: dict = {}  # cid → {role: tick} prune-cooldown (не re-GC сразу)
         # ABORT-COOLDOWN escalating Fib (Фрай 11.06, инцидент 52%-паралич спираль):
         # §3-abort НЕ ставил cooldown → дестабилизировавший узел сразу ре-eligible
@@ -1603,6 +1621,8 @@ class LocalColonyCompute:
         self._beh_thermal_cum.pop(cid, None)  # термо-ось cleanup
         self._adam_temp.pop(cid, None)        # temp-stash cleanup
         self._beh_predkill_cum.pop(cid, None) # predator-hunt ось cleanup
+        self._beh_dark_loss_cum.pop(cid, None)  # ритм-ось cleanup
+        self._dark_win_e0.pop(cid, None)      # ритм-ось night-окно cleanup
         self._beh_gc_rejected.pop(cid, None)
         self._beh_gc_keep_cd.pop(cid, None)
         self._beh_gc_abort_count.pop(cid, None)   # §3-abort escalating cooldown
@@ -4229,6 +4249,11 @@ class LocalColonyCompute:
                              if events_per_cid is not None else None)
                 self._apply_biochem_events(cid, _bc_event)
                 self._apply_biochem_decay(cid)
+                # Ритм-ось метрика (Путь 2, Фрай 15.06): energy-drop за is_night-окно
+                # → _beh_dark_loss_cum. Пассивно (копится всегда, наблюдаемость);
+                # рост-от-поведения гейтит _behavioral_growth_enabled. Точка фазово
+                # консистентна (тот же момент каждый тик → e0/e1 сопоставимы).
+                self._update_dark_loss(cid)
                 # §3 триггер 2 (Хьюберт 2b0f3a2 / Фрай): death_suppressed от P40
                 # (chokepoint suppress'нул PvP/age/...) → paralysis, ДАЖЕ если
                 # energy>0 (отдельный вход, не через energy≤0). Reason — для лога.
@@ -6847,6 +6872,60 @@ class LocalColonyCompute:
         logger.info("set_rhythm: %s", on)
         return self._rhythm_enabled
 
+    # ── Рост-от-поведения (Путь 2, Фрай 15.06): реестр осей + флаг + метрика ──
+    def register_beh_axis(self, key: str, cum_dim: str,
+                          input_dim: int = _BRAIN_INPUT_DIM, sign: int = -1) -> dict:
+        """Зарегистрировать поведенческую ось роста (axis-agnostic). key — имя оси;
+        cum_dim — verdict-dim в _beh_gc_sample (outcome-метрика); input_dim — окно
+        входа, что должен читать сайдкар оси (ритм→72, т.к. ритм@[68:72]); sign —
+        знак метрики (−1: cost-накопитель, ablate↑→keep). Возвращает дескриптор."""
+        d = {"key": str(key), "cum_dim": str(cum_dim),
+             "input_dim": int(input_dim), "sign": int(sign)}
+        self._beh_axes[str(key)] = d
+        return d
+
+    def _register_default_beh_axes(self) -> None:
+        """Штатные оси роста-от-поведения. РИТМ = первая: forage-перед-зимней-ночью,
+        метрика neg_dark_loss (energy-drop за is_night-окно), сайдкар читает obs72
+        (ритм@[68:72]). Будущие (fatigue/histamine/...) = ещё register_beh_axis,
+        не пересборка машинерии."""
+        self.register_beh_axis(
+            key="rhythm", cum_dim="dark_loss_cum",
+            input_dim=_BRAIN_INPUT_DIM, sign=-1)
+
+    def set_behavioral_growth(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл РОСТ-ОТ-ПОВЕДЕНИЯ (Путь 2, Фрай 15.06). on=True:
+        behavioral-mint может родить ткань от плохой verdict-dim оси (neg_dark_loss),
+        удержать по ablation (neg_dark_loss↑ при ablate), graduate в мотор-граф.
+        on=False (kill-switch, dormant): рождения/ретеншн/graduation behavioral-пути
+        НЕ идут; predictor-путь и обученность Адама не задеты. Метрики (_beh_*_cum)
+        копятся всегда (пассивная наблюдаемость). Симметрично predictor-страховкам."""
+        self._behavioral_growth_enabled = bool(on)
+        logger.info("set_behavioral_growth: %s", on)
+        return self._behavioral_growth_enabled
+
+    def _update_dark_loss(self, cid: str) -> None:
+        """Метрика neg_dark_loss (ритм-ось, Фрай 15.06): energy-drop за is_night-окно.
+        Вход в ночь → запоминаем energy (e0); выход из ночи → накапливаем max(0,e0−e1)
+        в _beh_dark_loss_cum (монотонный Σ cost, как _beh_damage_cum; paired-GC меряет
+        window-delta). Высокий запас перед ночью → меньший drop → ниже rate → ось
+        «здорова»; forage-перед-ночью платит. Чисто client: is_night из world_cache
+        (ws_client стащил в _world_is_night), energy из biochem. Пассивно (не влияет
+        на поведение) — копится всегда, рост гейтит _behavioral_growth_enabled."""
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return
+        e = float(getattr(bc, "energy", 0.0) or 0.0)
+        night = bool(self._world_is_night)
+        e0 = self._dark_win_e0.get(cid)
+        if night and e0 is None:
+            self._dark_win_e0[cid] = e               # вошли в ночь — старт окна
+        elif (not night) and e0 is not None:
+            drop = max(0.0, float(e0) - e)            # вышли — net-cost за ночь
+            self._beh_dark_loss_cum[cid] = (
+                self._beh_dark_loss_cum.get(cid, 0.0) + drop)
+            self._dark_win_e0.pop(cid, None)
+
     def set_hunting(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл аффорданс ОХОТА (Фрай hunting.md v0.1).
         on=True: Адам→ВСЕЯДНЫЙ (diet_gene→φ⁻¹=0.618) → (а) server даёт kill-energy
@@ -6909,6 +6988,7 @@ class LocalColonyCompute:
             "meat_cum": float(self._beh_meat_cum.get(cid, 0.0)),      # hunt-ось (rate, pos)
             "thermal_cum": float(self._beh_thermal_cum.get(cid, 0.0)),  # термо-ось (rate, neg; selectable P2/BUILD)
             "predkill_cum": float(self._beh_predkill_cum.get(cid, 0.0)),  # predator-hunt ось (инверсия страха, pos)
+            "dark_loss_cum": float(self._beh_dark_loss_cum.get(cid, 0.0)),  # ритм-ось (rate, neg; energy-drop за is_night-окно)
         }
 
     def _maybe_start_behavioral_gc(self, cid: str, org) -> bool:

@@ -533,6 +533,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_thermocomfort: bool | None = None
     applied_predator_hunt: bool | None = None
     applied_rhythm: bool | None = None
+    applied_beh_growth: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -868,6 +869,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("rhythm → %s", target_rhythm)
                         except Exception as e:
                             logger.warning("set_rhythm failed: %s", e)
+
+                    # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
+                    # behavioral_growth=true → behavioral-mint/retention/graduation
+                    # (axis-agnostic, ритм = первая ось). Дефолт OFF (dormant). Активация
+                    # на живом Адаме = гейт Фрай+Шеф (как вход в мозг). edge-detect.
+                    target_beh_growth = bool(flags.get("behavioral_growth", False))
+                    if target_beh_growth != applied_beh_growth \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_behavioral_growth(target_beh_growth)
+                            applied_beh_growth = target_beh_growth
+                            logger.info("behavioral_growth → %s", target_beh_growth)
+                        except Exception as e:
+                            logger.warning("set_behavioral_growth failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +
