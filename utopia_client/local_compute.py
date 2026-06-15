@@ -7269,6 +7269,18 @@ class LocalColonyCompute:
         axis_counts = {}
         for k in (self._beh_grown_axis.get(cid) or {}).values():
             axis_counts[k] = axis_counts.get(k, 0) + 1
+        # BEH_MINT_DIAG: достигается ли mint + история + poor-вердикт (диагностика
+        # «почему births=0»). Throttled. Снять после причины.
+        self._bm_diag_n = getattr(self, "_bm_diag_n", 0) + 1
+        if self._bm_diag_n % 300 == 1:
+            _axr = self._beh_axes.get("rhythm", {})
+            _hh = self._beh_axis_hist.get(cid, {}).get("rhythm", [])
+            _nn = int(_axr.get("hist_n", 8))
+            _cst = sum(1 for d in _hh[-_nn:] if d > _axr.get("poor_win_thresh", 8.0))
+            logger.info("BEH_MINT_DIAG cid=%s reached hist=%d costly=%d/%d poor=%s "
+                        "pool=%d", cid, len(_hh), _cst, _nn,
+                        self._axis_poor(cid, _axr) if _axr else "—",
+                        axis_counts.get("rhythm", 0))
         for key, ax in self._beh_axes.items():
             if axis_counts.get(key, 0) >= self._BEH_POOL_CAP:  # пул оси полон
                 continue
