@@ -648,6 +648,12 @@ class LocalColonyCompute:
         self._beh_grown_tissues: dict = {}   # cid → {role: tissue} (behavioral-сайдкары, obs72)
         self._beh_grown_axis: dict = {}      # cid → {role: axis_key}
         self._beh_axis_hist: dict = {}       # cid → {axis_key: [последние window-delta]}
+        # baseline = ГЛОБАЛЬНЫЙ running mean всех window-delta (Фрай 15.06: шип=replay
+        # байт-в-байт — replay использовал mean ВСЕХ drops, не last-hist_n окно).
+        self._beh_axis_drop_sum: dict = {}   # cid → {axis_key: Σ всех drops}
+        self._beh_axis_drop_n: dict = {}     # cid → {axis_key: число drops}
+        self._beh_forecast_trained: dict = {}  # cid → {role: число тренинг-ночей (grace)}
+        self._BEH_GRACE_NIGHTS: int = 34     # Fib ≥1 год (~27 ночей) до cull/graduate-eligible
         self._beh_mint_count: int = 0        # монотонный счётчик ролей (behN)
         self._beh_mint_last: dict = {}       # cid → world_tick последнего behavioral-mint (cooldown)
         self._BEH_MINT_COOLDOWN: int = 233   # Fib — тиков между mint (зеркало _tissue_growth_cooldown)
@@ -1669,6 +1675,9 @@ class LocalColonyCompute:
         self._beh_grown_tissues.pop(cid, None)  # S2 behavioral-сайдкары cleanup
         self._beh_grown_axis.pop(cid, None)
         self._beh_axis_hist.pop(cid, None)
+        self._beh_axis_drop_sum.pop(cid, None)
+        self._beh_axis_drop_n.pop(cid, None)
+        self._beh_forecast_trained.pop(cid, None)
         self._beh_mint_last.pop(cid, None)
         for dd in (self._beh_forecast_head, self._beh_forecast_opt,  # S3 forecast cleanup
                    self._beh_forecast_err, self._beh_forecast_age,
@@ -7028,7 +7037,7 @@ class LocalColonyCompute:
             for d in (self._beh_grown_tissues, self._beh_grown_axis,
                       self._beh_forecast_head, self._beh_forecast_opt,
                       self._beh_forecast_err, self._beh_forecast_age,
-                      self._beh_forecast_live):
+                      self._beh_forecast_live, self._beh_forecast_trained):
                 d.clear()
             if n:
                 logger.info("set_behavioral_growth OFF: снято %d behavioral-сайдкаров", n)
@@ -7091,15 +7100,20 @@ class LocalColonyCompute:
         sidecars = self._beh_grown_tissues.get(cid) or {}
         errs = self._beh_forecast_err.get(cid) or {}
         axmap = self._beh_grown_axis.get(cid) or {}
-        hist = self._beh_axis_hist.get(cid) or {}
+        trained = self._beh_forecast_trained.get(cid) or {}
+        phi = _PHI_CONST
         best, best_err = None, None
         for role in sidecars:
             err = errs.get(role)
             if err is None:                           # не тренировался — не зрел
                 continue
-            h = hist.get(axmap.get(role, ""), [])
-            baseline = (sum(h) / len(h)) if h else 0.0
-            if baseline > 0 and err >= baseline:      # не лучше тривиального — не выпускаем
+            if trained.get(role, 0) < self._BEH_GRACE_NIGHTS:  # GRACE: не созрел (≥1 год)
+                continue
+            baseline = self._beh_axis_baseline(cid, axmap.get(role, ""))  # global (=replay)
+            # НЕ выпускаем CLEARLY-DEAD (err ≥ φ×baseline). Зрелый форкастер лишь
+            # МАРЖИНАЛЬНО бьёт baseline (шум доминирует, replay) — берём «наименее
+            # плохого» НЕ-мёртвого; поведенческая retention (gate-2) — честный арбитр.
+            if baseline > 0 and err >= phi * baseline:
                 continue
             if best_err is None or err < best_err:    # приоритет = лучший skill
                 best, best_err = role, err
@@ -7252,6 +7266,7 @@ class LocalColonyCompute:
             self._beh_forecast_err.setdefault(cid, {})[role] = None
             self._beh_forecast_age.setdefault(cid, {})[role] = int(self._last_world_tick)
             self._beh_forecast_live.setdefault(cid, {})[role] = 0.0
+            self._beh_forecast_trained.setdefault(cid, {})[role] = 0  # grace-счётчик
         except Exception as e:
             logger.warning("beh-mint forecast head %s/%s: %s", cid, role, e)
         logger.info("brain-growth BEH-MINT cid=%s role=%s axis=%s (behavioral-сайдкар "
@@ -7388,6 +7403,8 @@ class LocalColonyCompute:
                 prev = self._beh_forecast_err.get(cid, {}).get(role)
                 self._beh_forecast_err.setdefault(cid, {})[role] = (
                     err if prev is None else (1 - _EMA_ALPHA) * prev + _EMA_ALPHA * err)
+                self._beh_forecast_trained.setdefault(cid, {})[role] = \
+                    self._beh_forecast_trained.get(cid, {}).get(role, 0) + 1  # grace
             except Exception as e:
                 logger.debug("beh-forecast train %s/%s: %s", cid, role, e)
 
@@ -7401,24 +7418,30 @@ class LocalColonyCompute:
             return
         errs = self._beh_forecast_err.get(cid, {})
         axmap = self._beh_grown_axis.get(cid, {})
-        hist = self._beh_axis_hist.get(cid, {})
+        trained = self._beh_forecast_trained.get(cid, {})
+        phi = _PHI_CONST
         for role in list(d.keys()):
             err = errs.get(role)
             if err is None:
                 continue                              # ещё не тренировался — не трогаем
-            h = hist.get(axmap.get(role, ""), [])
-            baseline = (sum(h) / len(h)) if h else 0.0
-            if baseline > 0 and err >= baseline:      # мёртвый форкастер
+            # GRACE (Фрай 15.06, maturation-replay): не cull'им пока не созрел на ≥1
+            # год (видит зиму И лето) — иначе режем младенца до обучения сезону.
+            if trained.get(role, 0) < self._BEH_GRACE_NIGHTS:
+                continue
+            baseline = self._beh_axis_baseline(cid, axmap.get(role, ""))  # global mean (=replay)
+            # CLEARLY-DEAD порог = φ×baseline (Фрай: строгий ≥baseline резал 59% зрелых
+            # на марже = тайный селектор; φ×baseline режет только реально-мёртвых 2%).
+            if baseline > 0 and err >= phi * baseline:
                 self._remove_behavioral_tissue(cid, role)
                 logger.info("brain-growth BEH-CULL cid=%s role=%s (forecast-err=%.1f ≥ "
-                            "baseline mean-drop=%.1f, мёртвый) ", cid, role, err, baseline)
+                            "φ×baseline=%.1f, clearly-dead) ", cid, role, err, phi * baseline)
 
     def _remove_behavioral_tissue(self, cid: str, role: str) -> None:
         """Убрать behavioral-сайдкар + всё его forecast-состояние (cull/kill-switch)."""
         for dd in (self._beh_grown_tissues, self._beh_grown_axis,
                    self._beh_forecast_head, self._beh_forecast_opt,
                    self._beh_forecast_err, self._beh_forecast_age,
-                   self._beh_forecast_live):
+                   self._beh_forecast_live, self._beh_forecast_trained):
             sub = dd.get(cid)
             if isinstance(sub, dict):
                 sub.pop(role, None)
@@ -7470,6 +7493,18 @@ class LocalColonyCompute:
         n = int(ax["hist_n"])
         if len(h) > n:
             del h[:-n]                       # держим только последние hist_n
+        # ГЛОБАЛЬНЫЙ running mean (baseline для cull/graduate, = replay-определение)
+        self._beh_axis_drop_sum.setdefault(cid, {})[axis_key] = \
+            self._beh_axis_drop_sum.get(cid, {}).get(axis_key, 0.0) + float(delta)
+        self._beh_axis_drop_n.setdefault(cid, {})[axis_key] = \
+            self._beh_axis_drop_n.get(cid, {}).get(axis_key, 0) + 1
+
+    def _beh_axis_baseline(self, cid: str, axis_key: str) -> float:
+        """baseline = ГЛОБАЛЬНЫЙ running mean всех drops оси (Фрай: шип=replay). 0 если нет."""
+        nn = self._beh_axis_drop_n.get(cid, {}).get(axis_key, 0)
+        if nn <= 0:
+            return 0.0
+        return self._beh_axis_drop_sum.get(cid, {}).get(axis_key, 0.0) / nn
 
     def _axis_poor(self, cid: str, ax: dict) -> bool:
         """MINT-предикат (axis-параметричный, БАЙТ-В-БАЙТ replay-калибровка Фрай 15.06):

@@ -267,25 +267,52 @@ def test_gates_independent():
 
 
 # ── S3: pool-cull мёртвого форкастера (логика, без core) ─────────────────
-def test_pool_cull_dead_forecaster():
+def _set_baseline(c, cid, axis, mean, n=40):
+    """global baseline = drop_sum/drop_n = mean (Фрай: шип=replay-определение)."""
+    c._beh_axis_drop_sum.setdefault(cid, {})[axis] = float(mean) * n
+    c._beh_axis_drop_n.setdefault(cid, {})[axis] = n
+
+
+def test_pool_cull_clearly_dead_phi_margin():
+    """grace созрел + err ≥ φ×baseline (clearly-dead) → cull; маржинальный выживает."""
     c = _c()
     c._beh_grown_tissues["c0"] = {"beh1": object(), "beh2": object()}
     c._beh_grown_axis["c0"] = {"beh1": "rhythm", "beh2": "rhythm"}
-    c._beh_axis_hist["c0"] = {"rhythm": [2.0, 2.0, 2.0]}   # baseline mean-drop=2
-    c._beh_forecast_err["c0"] = {"beh1": 10.0, "beh2": 1.0}  # beh1 мёртв≥2, beh2 жив<2
+    _set_baseline(c, "c0", "rhythm", 4.0)                  # global baseline=4 → φ×=6.47
+    c._beh_forecast_trained["c0"] = {"beh1": 34, "beh2": 34}  # созрели (≥grace)
+    c._beh_forecast_err["c0"] = {"beh1": 10.0, "beh2": 5.0}   # beh1 dead(≥6.47), beh2 маржа(<6.47)
     c._beh_pool_cull("c0")
-    assert "beh1" not in c._beh_grown_tissues["c0"]        # мёртвый снят
-    assert "beh2" in c._beh_grown_tissues["c0"]            # живой остался
+    assert "beh1" not in c._beh_grown_tissues["c0"]        # clearly-dead снят
+    assert "beh2" in c._beh_grown_tissues["c0"]            # маржинальный ВЫЖИЛ (warm-start)
+
+
+def test_pool_cull_grace_protects_young():
+    """Незрелый форкастер (trained<grace) НЕ cull'ится даже с высокой err."""
+    c = _c()
+    c._beh_grown_tissues["c0"] = {"beh1": object()}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    c._beh_forecast_trained["c0"] = {"beh1": 10}          # <grace 34 — младенец
+    c._beh_forecast_err["c0"] = {"beh1": 99.0}            # высокая err, но grace защищает
+    c._beh_pool_cull("c0")
+    assert "beh1" in c._beh_grown_tissues["c0"]           # не тронут до созревания
 
 
 def test_pool_cull_skips_untrained():
     c = _c()
     c._beh_grown_tissues["c0"] = {"beh1": object()}
     c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
-    c._beh_axis_hist["c0"] = {"rhythm": [5.0]}
-    c._beh_forecast_err["c0"] = {"beh1": None}             # ещё не тренился
+    _set_baseline(c, "c0", "rhythm", 5.0)
+    c._beh_forecast_err["c0"] = {"beh1": None}             # ещё не тренился (err=None)
     c._beh_pool_cull("c0")
     assert "beh1" in c._beh_grown_tissues["c0"]            # нетренированного не трогаем
+
+
+def test_axis_baseline_global_mean():
+    c = _c()
+    _set_baseline(c, "c0", "rhythm", 3.9, n=100)
+    assert abs(c._beh_axis_baseline("c0", "rhythm") - 3.9) < 1e-6
+    assert c._beh_axis_baseline("c0", "missing") == 0.0
 
 
 # ── S3: forecast pipeline (guarded — нужен core.tissue) ──────────────────
@@ -350,16 +377,31 @@ def test_graduate_gated_paralysis():
     assert c._maybe_behavioral_graduate("c0", None) is False
 
 
-def test_graduate_skips_unfit_forecaster():
+def test_graduate_skips_clearly_dead_forecaster():
     c = _c()
     c.set_behavioral_graduation(True)
     c.organisms["c0"] = object()
     c.biochem["c0"] = types.SimpleNamespace(energy=999.0)
     c._beh_grown_tissues["c0"] = {"beh1": object()}
-    c._beh_forecast_err["c0"] = {"beh1": 20.0}            # err ≥ baseline → не зрел
+    c._beh_forecast_err["c0"] = {"beh1": 20.0}            # err ≥ φ×baseline → clearly-dead
     c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
-    c._beh_axis_hist["c0"] = {"rhythm": [5.] * 8}          # baseline=5
-    assert c._maybe_behavioral_graduate("c0", None) is False  # не лучше тривиального
+    c._beh_forecast_trained["c0"] = {"beh1": 34}          # созрел
+    _set_baseline(c, "c0", "rhythm", 4.0)                 # φ×4=6.47, err20≥ → не выпускаем
+    assert c._maybe_behavioral_graduate("c0", None) is False
+
+
+def test_graduate_skips_immature_forecaster():
+    """Зрелость (grace): незрелый форкастер НЕ выпускается даже с хорошей err."""
+    c = _c()
+    c.set_behavioral_graduation(True)
+    c.organisms["c0"] = object()
+    c.biochem["c0"] = types.SimpleNamespace(energy=999.0)
+    c._beh_grown_tissues["c0"] = {"beh1": object()}
+    c._beh_forecast_err["c0"] = {"beh1": 1.0}             # хорошая err
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
+    c._beh_forecast_trained["c0"] = {"beh1": 10}          # <grace 34 — незрел
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is False  # grace держит
 
 
 def test_revert_behavioral_node():
@@ -406,7 +448,9 @@ def test_graduate_creates_zero_init_motor_head():
     c._beh_axis_hist["c0"] = {"rhythm": [10.] * 8}
     c._propose_behavioral_tissue("c0", c._beh_axes["rhythm"])
     role = next(iter(c._beh_grown_tissues["c0"]))
-    c._beh_forecast_err["c0"][role] = 1.0                  # бьёт baseline 10
+    c._beh_forecast_err["c0"][role] = 1.0                  # хороший skill
+    c._beh_forecast_trained["c0"][role] = 34              # созрел (grace)
+    _set_baseline(c, "c0", "rhythm", 4.0)                 # err1 < φ×4 → не-мёртв, выпускаем
     assert c._maybe_behavioral_graduate("c0", None) is True
     assert role in c._beh_graduated["c0"]
     head = c._beh_motor_head["c0"][role]
@@ -432,6 +476,8 @@ def test_beh_motor_reinforce_learns():
     c._propose_behavioral_tissue("c0", c._beh_axes["rhythm"])
     role = next(iter(c._beh_grown_tissues["c0"]))
     c._beh_forecast_err["c0"][role] = 1.0
+    c._beh_forecast_trained["c0"][role] = 34             # созрел (grace)
+    _set_baseline(c, "c0", "rhythm", 4.0)
     c._maybe_behavioral_graduate("c0", None)
     head = c._beh_motor_head["c0"][role]
     w0 = head.weight.detach().clone()
