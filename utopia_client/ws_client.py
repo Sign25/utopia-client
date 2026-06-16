@@ -2515,6 +2515,15 @@ class ColonyWSClient:
             # жаждущий → water-seek в приоритете (уже оверрайднул), не трогаем
             if float(getattr(bc, "hydration", 100.0)) < self._WATER_SEEK_HYDRATION:
                 continue
+            # YIELD-TO-EAT (Фрай 16.06): уже на съедобной флоре (серверный
+            # on_flora → compute._on_food → eat-reflex владеет EAT) → food-seek
+            # НЕ перебивает. Иначе client berry_pos рассинхронен с server
+            # on_flora → food-seek перетирал легитимный EAT на MOVE-к-ягоде →
+            # укус не стартовал (EAT_PROGRESS kind=None) → голод среди ягод в
+            # режиме energy<450 (где food-seek активен). Тот же сигнал, что
+            # eat-reflex → десинк снят одним guard'ом.
+            if getattr(compute, "_on_food", {}).get(cid):
+                continue
             n_hungry += 1
             rc = pos.get(cid)
             if rc is None or rc[0] is None:
