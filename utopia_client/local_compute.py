@@ -9047,6 +9047,31 @@ class LocalColonyCompute:
             return False, 0
         return True, max(0, round(remaining * 30.0))
 
+    def set_life_support(self, on: bool) -> bool:
+        """Разовое LIFE-SUPPORT (Фрай 16.06, благословлено): спасение из §3-absorbing-
+        капкана. Инъекция energy+hydration ВЫШЕ §3-порога с ЗАПАСОМ + снятие
+        paralysis-дедлайна + death-флага → рефлексы выпьют/поедят (ресурсы вплотную,
+        Хьюберт сделал зону). Edge (флип True → один впрыск), потом флаг сбросить.
+        max() не понижает. Оправданное вмешательство (разрыв absorbing-капкана)."""
+        if not on:
+            return False
+        E = _CLIENT_MAX_ENERGY * (_PHI_CONST ** -1)    # ~809: выше §3 с запасом
+        n = 0
+        for cid, bc in list(self.biochem.items()):
+            try:
+                bc.energy = max(float(getattr(bc, "energy", 0.0) or 0.0), E)
+                if hasattr(bc, "hydration"):
+                    bc.hydration = max(float(getattr(bc, "hydration", 0.0) or 0.0), 99.0)
+                self._paralysis_until.pop(cid, None)   # снять §3-паралич немедленно
+                self._dead_cids.discard(cid)           # снять death-флаг (на всякий)
+                n += 1
+                logger.warning("LIFE_SUPPORT cid=%s energy→%.0f hydration→99 §3-снят "
+                               "(спасение absorbing-капкана, Фрай)", cid, bc.energy)
+            except Exception as e:
+                logger.warning("life_support %s: %s", cid, e)
+        logger.warning("set_life_support: впрыснуто %d организмам", n)
+        return True
+
     def _enter_paralysis(self, cid: str, reason: str) -> None:
         """Войти в паралич (единая точка для обоих триггеров: energy≤0 и
         death_suppressed от P40). Idempotent: повторный вызов в активном

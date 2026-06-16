@@ -535,6 +535,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_rhythm: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
+    applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -897,6 +898,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_graduation → %s", target_beh_grad)
                         except Exception as e:
                             logger.warning("set_behavioral_graduation failed: %s", e)
+
+                    # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
+                    # False→True → один впрыск energy+hydration. Сбросить флаг после.
+                    target_life = bool(flags.get("life_support", False))
+                    if target_life and target_life != applied_life \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_life_support(True)
+                            logger.warning("life_support впрыснут (edge)")
+                        except Exception as e:
+                            logger.warning("set_life_support failed: %s", e)
+                    applied_life = target_life
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +
