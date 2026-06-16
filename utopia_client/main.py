@@ -533,6 +533,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_thermocomfort: bool | None = None
     applied_predator_hunt: bool | None = None
     applied_rhythm: bool | None = None
+    applied_social: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -871,6 +872,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("rhythm → %s", target_rhythm)
                         except Exception as e:
                             logger.warning("set_rhythm failed: %s", e)
+
+                    # social_signals этап A (Фрай 16.06): tribe-радар obs[72:76].
+                    # Дефолт OFF (dormant, math-equivalent довходу 72). Парный к
+                    # server WORLD_ADAM_TRIBE_SIGNALS + WORLD_ELDER_PROACTIVE_DANGER
+                    # (флипать синхронно, joint-go). edge-detect.
+                    target_social = bool(flags.get("social_signals", False))
+                    if target_social != applied_social \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_social_signals(target_social)
+                            applied_social = target_social
+                            logger.info("social_signals → %s", target_social)
+                        except Exception as e:
+                            logger.warning("set_social_signals failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

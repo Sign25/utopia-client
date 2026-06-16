@@ -222,9 +222,9 @@ def test_mint_creates_obs72_sidecar_math_equiv():
     assert len(grown) == 1
     role = next(iter(grown))
     t = grown[role]
-    assert int(t.data_dim) == 72                     # component 3: читает obs72
-    # math-equivalence: ритм-колонки input_proj = 0 (zero-init [I_64|0])
-    assert torch.count_nonzero(t.input_proj.weight[:, 68:72]) == 0
+    assert int(t.data_dim) == _BRAIN_INPUT_DIM        # component 3: читает obs76
+    # math-equivalence: ритм+social-колонки input_proj = 0 (zero-init [I_64|0])
+    assert torch.count_nonzero(t.input_proj.weight[:, 68:_BRAIN_INPUT_DIM]) == 0
     assert c._beh_grown_axis["c0"][role] == "rhythm"
     # one-at-a-time + cooldown: повторный вызов не родит вторую
     assert c._maybe_behavioral_mint("c0", None) is False
@@ -328,8 +328,8 @@ def test_forecast_pipeline_obs72():
     role = next(iter(c._beh_grown_tissues["c0"]))
     head = c._beh_forecast_head["c0"][role]
     assert int(torch.count_nonzero(head.weight)) == 0     # zero-init readout
-    # per-tick инференс: obs72 → живой форкаст
-    obs72 = torch.randn(1, 72)
+    # per-tick инференс: obs76 → живой форкаст
+    obs72 = torch.randn(1, _BRAIN_INPUT_DIM)
     c._beh_forecast_infer("c0", obs72)
     assert role in c._beh_forecast_live["c0"]
     # разреженный тренинг пары (obs72@night-start, drop=15)

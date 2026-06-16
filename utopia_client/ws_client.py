@@ -1654,6 +1654,31 @@ class ColonyWSClient:
             pass
         return obs_arr
 
+    @staticmethod
+    def _apply_social_to_obs(obs_arr, social):
+        """social_signals этап A (Фрай 16.06): 4 направленных tribe-канала → obs[72:76]
+        (STATE_DIM-хвост [64:80]: P40 zeros, designated internal, client-free).
+        social = dict {food_ns, food_ew, danger_ns, danger_ew} ∈[-1,1] (контракт
+        Хьюберт WORLD_ADAM_TRIBE_SIGNALS; payload-ключ tribe_signals, Адаму отд.
+        полем — skip_obs, как temperature@35). None/не-dict → no-op (dormant, флаг
+        OFF). Паддим до 80 если obs уже <76 (контракт np[80]). Зеркалит
+        _apply_rhythm_to_obs. Мутирует/возвращает obs_arr (паддинг → НОВЫЙ массив)."""
+        if not isinstance(social, dict) or obs_arr is None:
+            return obs_arr
+        import numpy as np
+        try:
+            if obs_arr.shape[0] < 76:
+                _pad = np.zeros(80, dtype=obs_arr.dtype)
+                _pad[:obs_arr.shape[0]] = obs_arr
+                obs_arr = _pad
+            obs_arr[72] = float(social.get("food_ns", 0.0) or 0.0)
+            obs_arr[73] = float(social.get("food_ew", 0.0) or 0.0)
+            obs_arr[74] = float(social.get("danger_ns", 0.0) or 0.0)
+            obs_arr[75] = float(social.get("danger_ew", 0.0) or 0.0)
+        except (IndexError, TypeError, ValueError):
+            pass
+        return obs_arr
+
     def _collect_obs_batch(
         self, creatures: list
     ) -> tuple[dict, dict, dict]:
@@ -1780,6 +1805,40 @@ class ColonyWSClient:
                             float(obs_arr[70]), float(obs_arr[71]),
                             c.get("daytime_fraction"),
                             "time_phase" if isinstance(c.get("time_phase"), dict)
+                            else "flat")
+                    except Exception:
+                        pass
+            # social_signals этап A (Фрай 16.06): tribe-радар Старших → obs[72:76]
+            # (STATE_DIM-хвост, client-free). Хьюберт шлёт payload-ключом tribe_signals
+            # {food_ns,food_ew,danger_ns,danger_ew} ∈[-1,1] под WORLD_ADAM_TRIBE_SIGNALS
+            # (отд. полем — skip_obs, как temperature). GATE: client_flag social_signals
+            # (compute._social_enabled) — независимый rollback, парный к server-флагу +
+            # WORLD_ELDER_PROACTIVE_DANGER. OFF → НЕ инжектим → obs[72:76]=0 →
+            # math-equivalent довходу 72. Флипать СИНХРОННО (joint-go Хьюберта+Фрая).
+            _soc = None
+            if getattr(self.compute, "_social_enabled", False):
+                _soc_nested = c.get("tribe_signals")
+                if isinstance(_soc_nested, dict):
+                    _soc = _soc_nested
+                elif any(k in c for k in ("food_ns", "food_ew",
+                                          "danger_ns", "danger_ew")):
+                    _soc = {
+                        "food_ns": c.get("food_ns", 0.0),
+                        "food_ew": c.get("food_ew", 0.0),
+                        "danger_ns": c.get("danger_ns", 0.0),
+                        "danger_ew": c.get("danger_ew", 0.0),
+                    }
+            if _soc is not None:
+                obs_arr = self._apply_social_to_obs(obs_arr, _soc)
+                obs_per_cid[cid_s] = obs_arr
+                self._social_diag_n = getattr(self, "_social_diag_n", 0) + 1
+                if self._social_diag_n % 600 == 1:
+                    try:
+                        logger.info(
+                            "SOCIAL_DIAG cid=%s obs[72:76]=[%.3f,%.3f,%.3f,%.3f] "
+                            "src=%s", cid_s, float(obs_arr[72]), float(obs_arr[73]),
+                            float(obs_arr[74]), float(obs_arr[75]),
+                            "tribe_signals" if isinstance(c.get("tribe_signals"), dict)
                             else "flat")
                     except Exception:
                         pass

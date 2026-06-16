@@ -64,7 +64,9 @@ def test_constants_layout():
     assert _SELF_OBS_OFFSET == 64
     assert _RHYTHM_OFFSET == 68          # строго после self4, в хвосте
     assert _RHYTHM_DIM == 4              # day sin/cos + year sin/cos
-    assert _BRAIN_INPUT_DIM == 72
+    # 16.06: social_signals расширил хвост 72→76 (rhythm [68:72] остался на месте,
+    # social [72:76] добавлен). _BRAIN_INPUT_DIM теперь 76 — ритм-колонки целы.
+    assert _BRAIN_INPUT_DIM == 76
 
 
 # ── Тест 1: первое расширение 64→72 = [I_64|0], проекция = identity ───────
@@ -114,7 +116,7 @@ def test_preserve_expansion_68_to_72_identical():
     assert torch.count_nonzero(
         pred.input_proj.weight[:, _RHYTHM_OFFSET:_RHYTHM_OFFSET + _RHYTHM_DIM]) == 0
     # math-equivalence: проекция [obs68 | rhythm=0] == проекция_68(obs68)
-    x72 = torch.cat([x68, torch.zeros(_RHYTHM_DIM)])
+    x72 = torch.cat([x68, torch.zeros(_BRAIN_INPUT_DIM - 68)])  # rhythm4+social4=0
     with torch.no_grad():
         proj72 = _proj(pred, x72)
     assert torch.allclose(proj68, proj72, atol=1e-6), \
@@ -145,7 +147,7 @@ def test_load_transition_68_saved_to_72():
     assert torch.allclose(loaded.input_proj.bias, b68, atol=0)
     assert torch.count_nonzero(
         loaded.input_proj.weight[:, _RHYTHM_OFFSET:_RHYTHM_OFFSET + _RHYTHM_DIM]) == 0
-    x72 = torch.cat([x68, torch.zeros(_RHYTHM_DIM)])
+    x72 = torch.cat([x68, torch.zeros(_BRAIN_INPUT_DIM - 68)])  # rhythm4+social4=0
     with torch.no_grad():
         proj_loaded = _proj(loaded, x72)
     assert torch.allclose(proj_src, proj_loaded, atol=1e-6)
@@ -247,7 +249,9 @@ def test_predictor_train_step_72_dormant():
             rng.standard_normal(64).astype(np.float32)).unsqueeze(0)
         so = torch.zeros(1, _SELF_OBS_DIM)
         rh = torch.zeros(1, _RHYTHM_DIM)                 # ритм дормантен
-        obs72 = torch.cat([obs64, so, rh], dim=1)
+        soc = torch.zeros(1, _BRAIN_INPUT_DIM - _SELF_OBS_OFFSET
+                          - _SELF_OBS_DIM - _RHYTHM_DIM)  # social дормантен
+        obs72 = torch.cat([obs64, so, rh, soc], dim=1)
         c._predictor_train_step("c0", obs64, obs72)
     assert len(c.pred_loss_history["c0"]) >= 1           # ≥1 train-шаг прошёл
     assert int(c.predictor["c0"].data_dim) == _BRAIN_INPUT_DIM

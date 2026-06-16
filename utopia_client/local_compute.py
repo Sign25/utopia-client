@@ -69,7 +69,16 @@ _SELF_OBS_DIM = 4
 # obs[68:72]=0 → input_proj[:,68:72]=0 → math-equivalent довходу 68).
 _RHYTHM_OFFSET = _SELF_OBS_OFFSET + _SELF_OBS_DIM   # 68
 _RHYTHM_DIM = 4
-_BRAIN_INPUT_DIM = _SELF_OBS_OFFSET + _SELF_OBS_DIM + _RHYTHM_DIM  # 72 — окно чтения мозга
+# social_signals этап A (Фрай 16.06): tribe-радар Старших — 4 направленных канала.
+#   obs[72] = tribe_food_NS    obs[73] = tribe_food_EW
+#   obs[74] = tribe_danger_NS  obs[75] = tribe_danger_EW
+# Все ∈[-1,1] (канон world.py:2957-2963; payload-ключ tribe_signals от Хьюберта,
+# инжект ws_client как temperature — skip_obs Адама). Default zeros = dormant
+# (флаг OFF → obs[72:76]=0 → input_proj[:,72:76]=0 → math-equivalent довходу 72).
+# Зеркало ритм-расширения 68→72. target/output/мотор НЕ трогаем — только вход.
+_SOCIAL_OFFSET = _RHYTHM_OFFSET + _RHYTHM_DIM       # 72
+_SOCIAL_DIM = 4
+_BRAIN_INPUT_DIM = _SOCIAL_OFFSET + _SOCIAL_DIM     # 76 — окно чтения мозга
 
 # Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
 # temperature-модуляция СУЩЕСТВУЮЩЕЙ motor-политики. НЕ отдельный actor.
@@ -521,6 +530,7 @@ class LocalColonyCompute:
         # (max safety). Давление: прогноз «одолею?» = predictor → рост. GC-ось инверсия страха.
         self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
         self._rhythm_enabled: bool = False  # client_flag rhythm (time_phase obs[68:72]; OFF dormant)
+        self._social_enabled: bool = False  # client_flag social_signals (tribe-радар obs[72:76]; OFF dormant)
         self._predator_hunt: dict = {}      # cid → ACTION (ATTACK хищника — energy-gated combat)
         self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
@@ -3474,19 +3484,21 @@ class LocalColonyCompute:
                 obs64 = obs_arr[:64]
                 obs_tensor = torch.from_numpy(obs64).to(self.device).unsqueeze(0)
 
-                # Track 2 (этап 4) + ритм (Фрай 14.06): вход predictor = obs72
-                # (env64 | self-observable4 [64:68] | rhythm4 [68:72]) ЕСЛИ predictor
-                # расширен. target остаётся obs64 — мозг СВОИМ состоянием + временем
-                # моделирует мир (Phase 6 самосознание / serotonin-ось). Прочие ткани
-                # (forward/hebbian/motor) на obs64. [I|0]+preserve-init → на старте
-                # obs72→obs64 (math-equivalence: self4/rhythm4 колонки=0), доучивается.
+                # Track 2 (этап 4) + ритм (Фрай 14.06) + social (Фрай 16.06): вход
+                # predictor = obs76 (env64 | self-observable4 [64:68] | rhythm4 [68:72]
+                # | social4 [72:76]) ЕСЛИ predictor расширен. target остаётся obs64 —
+                # мозг СВОИМ состоянием + временем + tribe-радаром моделирует мир.
+                # Прочие ткани (forward/hebbian/motor) на obs64. [I|0]+preserve-init →
+                # на старте obs76→obs64 (math-equivalence: self4/rhythm4/social4=0),
+                # доучивается.
                 _pred = self.predictor.get(cid)
                 pred_input = obs_tensor
                 if _pred is not None and int(
                         getattr(_pred, "data_dim", _SELF_OBS_OFFSET)) == _BRAIN_INPUT_DIM:
                     so = self._build_self_observable(cid)          # self4 [64:68]
                     rh = self._extract_rhythm(obs_arr)             # rhythm4 [68:72]
-                    obs72 = np.concatenate([obs64, so, rh]).astype(np.float32)
+                    soc = self._extract_social(obs_arr)            # social4 [72:76]
+                    obs72 = np.concatenate([obs64, so, rh, soc]).astype(np.float32)
                     pred_input = torch.from_numpy(obs72).to(
                         self.device).unsqueeze(0)
                     # S3 рост-от-поведения: стащить obs72 + per-tick forecast-инференс
@@ -6988,6 +7000,19 @@ class LocalColonyCompute:
         logger.info("set_rhythm: %s", on)
         return self._rhythm_enabled
 
+    def set_social_signals(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл social_signals этап A (Фрай 16.06, perception).
+        on=True: ws_client инжектит tribe-радар Старших в obs[72:76] (FOOD/DANGER
+        NS/EW градиенты) → predictor видит ненулевой социальный вход. on=False
+        (kill-switch, dormant): инжект молчит → obs[72:76]=0 → predictor[72:76]-вклад=0
+        → math-equivalent довходу 72 (input_proj-веса целы, ×0). Независимый
+        client-rollback, парный к server WORLD_ADAM_TRIBE_SIGNALS (+ WORLD_ELDER_
+        PROACTIVE_DANGER для эмиссии) — флипать СИНХРОННО (joint-go Хьюберта+Фрая;
+        success-gate = SOCIAL_DIAG obs[72:76]≠0). Инертно: мотор/graduation НЕ трогаем."""
+        self._social_enabled = bool(on)
+        logger.info("set_social_signals: %s", on)
+        return self._social_enabled
+
     # ── Рост-от-поведения (Путь 2, Фрай 15.06): реестр осей + флаг + метрика ──
     def register_beh_axis(self, key: str, cum_dim: str,
                           input_dim: int = _BRAIN_INPUT_DIM, sign: int = -1,
@@ -8448,6 +8473,24 @@ class LocalColonyCompute:
                     and obs_arr.shape[0] >= _RHYTHM_OFFSET + _RHYTHM_DIM):
                 return obs_arr[
                     _RHYTHM_OFFSET:_RHYTHM_OFFSET + _RHYTHM_DIM].astype(np.float32)
+        except Exception:
+            pass
+        return z
+
+    def _extract_social(self, obs_arr) -> "np.ndarray":
+        """social_signals этап A (Фрай 16.06): 4 направленных tribe-канала
+        obs[72:76] = tribe FOOD NS/EW + DANGER NS/EW ∈[-1,1] (канон
+        world.py:2957-2963 → payload tribe_signals от Хьюберта). Живут в
+        STATE_DIM[64:80] (designated internal, P40 zeros, client-free), инжектятся
+        ws_client'ом из payload (WORLD_ADAM_TRIBE_SIGNALS, skip_obs → отд. поле,
+        как temperature@35). Default zeros (dormant): флаг OFF / obs узок → нули →
+        predictor[72:76]=0 → math-equivalent входу 72. Зеркалит _extract_rhythm."""
+        z = np.zeros(_SOCIAL_DIM, dtype=np.float32)
+        try:
+            if (obs_arr is not None
+                    and obs_arr.shape[0] >= _SOCIAL_OFFSET + _SOCIAL_DIM):
+                return obs_arr[
+                    _SOCIAL_OFFSET:_SOCIAL_OFFSET + _SOCIAL_DIM].astype(np.float32)
         except Exception:
             pass
         return z
