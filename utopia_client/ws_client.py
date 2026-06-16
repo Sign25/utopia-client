@@ -1809,7 +1809,7 @@ class ColonyWSClient:
                     except Exception:
                         pass
             # social_signals этап A (Фрай 16.06): tribe-радар Старших → obs[72:76]
-            # (STATE_DIM-хвост, client-free). Хьюберт шлёт payload-ключом tribe_signals
+            # (STATE_DIM-хвост, client-free). Хьюберт шлёт payload-ключом tribe_signal
             # {food_ns,food_ew,danger_ns,danger_ew} ∈[-1,1] под WORLD_ADAM_TRIBE_SIGNALS
             # (отд. полем — skip_obs, как temperature). GATE: client_flag social_signals
             # (compute._social_enabled) — независимый rollback, парный к server-флагу +
@@ -1817,7 +1817,11 @@ class ColonyWSClient:
             # math-equivalent довходу 72. Флипать СИНХРОННО (joint-go Хьюберта+Фрая).
             _soc = None
             if getattr(self.compute, "_social_enabled", False):
-                _soc_nested = c.get("tribe_signals")
+                # tribe_signal (sing.) = канон сервера a12f4cf; tribe_signals (plur.)
+                # — fallback на ранний контракт. Затем flat-поля. Зеркало weather-nested.
+                _soc_nested = c.get("tribe_signal")
+                if not isinstance(_soc_nested, dict):
+                    _soc_nested = c.get("tribe_signals")
                 if isinstance(_soc_nested, dict):
                     _soc = _soc_nested
                 elif any(k in c for k in ("food_ns", "food_ew",
@@ -1838,7 +1842,8 @@ class ColonyWSClient:
                             "SOCIAL_DIAG cid=%s obs[72:76]=[%.3f,%.3f,%.3f,%.3f] "
                             "src=%s", cid_s, float(obs_arr[72]), float(obs_arr[73]),
                             float(obs_arr[74]), float(obs_arr[75]),
-                            "tribe_signals" if isinstance(c.get("tribe_signals"), dict)
+                            "tribe_signal" if isinstance(c.get("tribe_signal"), dict)
+                            else "tribe_signals" if isinstance(c.get("tribe_signals"), dict)
                             else "flat")
                     except Exception:
                         pass
