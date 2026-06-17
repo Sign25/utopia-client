@@ -322,7 +322,15 @@ def _try_self_update(api: UtopiaAPI) -> bool:
     поверх установочной директории и сделать execv. Возвращает True если
     обновление прошло (этот процесс уже не вернётся; код ниже не выполнится).
     """
-    info = api.get_client_info()
+    # Канал версий (Шеф 17.06): alpha (ПК Шефа, передовое) / beta (VPS, эталон) /
+    # gamma (позже). Из config.json "channel" (дефолт alpha = текущие клиенты).
+    # Клиент тянет версию СВОЕГО канала → alpha и beta самообновляются независимо.
+    try:
+        from .config import load_config
+        _channel = (load_config().get("channel") or "alpha")
+    except Exception:
+        _channel = "alpha"
+    info = api.get_client_info(channel=_channel)
     if not info:
         return False
     remote_ver = str(info.get("version") or "")
@@ -344,7 +352,7 @@ def _try_self_update(api: UtopiaAPI) -> bool:
     fd, tmp_path = tempfile.mkstemp(prefix="utopia_client_", suffix=".zip")
     os.close(fd)
     try:
-        if not api.download_client_zip(tmp_path):
+        if not api.download_client_zip(tmp_path, channel=_channel):
             return False
         # Установочный каталог = parent(parent(__file__)) для main.py.
         pkg_dir = Path(__file__).resolve().parent  # …/utopia_client

@@ -141,9 +141,16 @@ class UtopiaAPI:
             logger.warning("push_log_tail error: %s", e)
             return False
 
-    def get_client_info(self) -> dict | None:
-        """Метаданные актуальной версии клиента: {version, sha256, size, ...}."""
+    def get_client_info(self, channel: str | None = None) -> dict | None:
+        """Метаданные актуальной версии клиента: {version, sha256, size, ...}.
+
+        channel (alpha/beta/gamma, схема версий Шефа 17.06): клиент шлёт свой канал
+        → сервер отдаёт версию ДЛЯ КАНАЛА (alpha=передовое/main HEAD, beta=
+        promoted-эталон, gamma=позже). None → backward-compat (как alpha). Сервер
+        игнорит неизвестный param до реализации per-channel (routes_client.py, Хьюберт)."""
         url = f"{self.server}/api/client/info"
+        if channel:
+            url += f"?channel={channel}"
         try:
             r = requests.get(url, timeout=self.timeout)
             if r.status_code == 200:
@@ -154,9 +161,12 @@ class UtopiaAPI:
             logger.warning("get_client_info error: %s", e)
             return None
 
-    def download_client_zip(self, dest_path: str) -> bool:
-        """Скачать актуальный client zip в файл. Для self-update."""
+    def download_client_zip(self, dest_path: str, channel: str | None = None) -> bool:
+        """Скачать актуальный client zip в файл. Для self-update. channel = канал
+        версий (alpha/beta/gamma) — zip ДЛЯ КАНАЛА (парный к get_client_info)."""
         url = f"{self.server}/api/client/download"
+        if channel:
+            url += f"?channel={channel}"
         try:
             with requests.get(url, stream=True, timeout=120) as r:
                 r.raise_for_status()
