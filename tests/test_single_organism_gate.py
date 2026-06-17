@@ -101,7 +101,7 @@ def test_self_observable_predictor_integration():
     """Интеграция Track 2: enable → predictor train с obs68/target-obs64 dim-корректен."""
     import numpy as np
     import torch
-    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.local_compute import LocalColonyCompute, _BRAIN_INPUT_DIM
     c = LocalColonyCompute(device="cpu")
     cid = "adam"
     c.predictor[cid] = c._make_predictor_tissue()
@@ -111,15 +111,17 @@ def test_self_observable_predictor_integration():
     c.trace_norm_ema[cid] = 0.0
     c.reward_var_ema[cid] = 0.0
     assert c._enable_self_observable(cid) is True
-    assert int(c.predictor[cid].data_dim) == 68
+    # _BRAIN_INPUT_DIM мигрировал 68→72→76 (self4|rhythm4|social4); predictor расширен.
+    assert int(c.predictor[cid].data_dim) == _BRAIN_INPUT_DIM
     obs64 = torch.randn(1, 64)
-    so = c._build_self_observable(cid)                    # [4]
-    obs68 = torch.from_numpy(
-        np.concatenate([obs64.numpy().reshape(-1), so]).astype(np.float32)
+    so = c._build_self_observable(cid)                    # [4] self
+    tail = np.zeros(_BRAIN_INPUT_DIM - 64 - len(so), dtype=np.float32)  # rhythm4+social4=0
+    obs_in = torch.from_numpy(
+        np.concatenate([obs64.numpy().reshape(-1), so, tail]).astype(np.float32)
     ).unsqueeze(0)
-    assert obs68.shape == (1, 68)
-    c._predictor_train_step(cid, obs64, obs68)            # шаг 1: сохранит prev
-    intr = c._predictor_train_step(cid, obs64, obs68)     # шаг 2: forward(obs68)→64
+    assert obs_in.shape == (1, _BRAIN_INPUT_DIM)
+    c._predictor_train_step(cid, obs64, obs_in)           # шаг 1: сохранит prev
+    intr = c._predictor_train_step(cid, obs64, obs_in)    # шаг 2: forward→64
     assert isinstance(intr, float)                        # dim-согласовано, не упало
 
 
@@ -127,20 +129,20 @@ def test_load_predictor_sd_robust_to_obs68():
     """Restart-robustness: сохранённый расширенный predictor (data_dim=68, input_proj)
     грузится в свежий 64-predictor через upgrade-before-load."""
     import torch
-    from utopia_client.local_compute import LocalColonyCompute
+    from utopia_client.local_compute import LocalColonyCompute, _BRAIN_INPUT_DIM
     c = LocalColonyCompute(device="cpu")
     cid = "adam"
-    # «Сохранённый» расширенный predictor
+    # «Сохранённый» расширенный predictor (68-saved, до-ритмовый .pt)
     saved = c._make_predictor_tissue()
     c.predictor[cid] = saved
     assert c._upgrade_tissue_input_dim(saved, 68) is True
     sd = saved.state_dict()
     assert any(str(k).startswith("input_proj") for k in sd.keys())  # есть input_proj
-    # Свежий 64-predictor + robust load
+    # Свежий 64-predictor + robust load (load-transition: 68-saved → preserve-expand)
     c.predictor[cid] = c._make_predictor_tissue()
     assert int(c.predictor[cid].data_dim) == 64
-    c._load_predictor_sd(cid, sd)                  # должен upgrade + load
-    assert int(c.predictor[cid].data_dim) == 68    # расширен под сохранённый
+    c._load_predictor_sd(cid, sd)                  # должен upgrade + load + preserve-expand
+    assert int(c.predictor[cid].data_dim) == _BRAIN_INPUT_DIM   # до текущего brain-input
     # prev_obs чистится при enable (нет stale-mismatch)
     c.prev_obs[cid] = torch.randn(1, 64)
     c.predictor[cid] = c._make_predictor_tissue()

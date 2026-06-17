@@ -79,6 +79,15 @@ _RHYTHM_DIM = 4
 _SOCIAL_OFFSET = _RHYTHM_OFFSET + _RHYTHM_DIM       # 72
 _SOCIAL_DIM = 4
 _BRAIN_INPUT_DIM = _SOCIAL_OFFSET + _SOCIAL_DIM     # 76 — окно чтения мозга
+# social danger-подканалы (для forecast-born триггера): [74]=danger_ns, [75]=danger_ew.
+_SOCIAL_DANGER = (74, 76)
+# predator-каналы env (авторитет server/tick/obs.py:697-699): [59]=pred_grad_ns,
+# [60]=pred_grad_ew, [61]=nearest_pred_dist. ЦЕЛЬ forecast-loss для social
+# forecast-born метрики (Фрай §7): снижает ли social-DANGER ошибку прогноза хищника.
+_PREDATOR_OBS = (59, 62)                            # obs[59:62]
+_SOCIAL_PROBE_FLOOR = 0.005          # abs-floor Δ на predator-MSE (старт как tissue-GC; финал — Фрай)
+_SOCIAL_PROBE_MIN_EPISODES = 21      # Fib — мин. DANGER-окон до вердикта forecast-born
+_SOCIAL_PROBE_T = 2.0                # |t| порог устойчивости (робастный, ~t_keep)
 
 # Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
 # temperature-модуляция СУЩЕСТВУЮЩЕЙ motor-политики. НЕ отдельный actor.
@@ -531,6 +540,12 @@ class LocalColonyCompute:
         self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
         self._rhythm_enabled: bool = False  # client_flag rhythm (time_phase obs[68:72]; OFF dormant)
         self._social_enabled: bool = False  # client_flag social_signals (tribe-радар obs[72:76]; OFF dormant)
+        # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
+        # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
+        self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
+        self._social_probe_diffs: dict = {}       # cid → list[Δ] (loss_zeroed − loss_full)
+        self._social_probe_episodes: dict = {}    # cid → счётчик DANGER-окон (эпизодов)
+        self._social_probe_in_window: dict = {}   # cid → bool (для границ эпизода)
         self._predator_hunt: dict = {}      # cid → ACTION (ATTACK хищника — energy-gated combat)
         self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
@@ -3543,6 +3558,12 @@ class LocalColonyCompute:
                     if _gc is not None and int(_gc.shape[-1]) == int(pred_input.shape[-1]):
                         pred_input = pred_input + _gc
 
+                # social forecast-born probe (Фрай §7) — READ-ONLY, ДО train-step:
+                # prev_obs[cid]=obs76_{t-1} (вход), obs_tensor=obs64_t (таргет). Probe
+                # snapshot/restore'ит состояние → реальный forward ниже не затронут.
+                if self._social_probe_enabled:
+                    self._social_forecast_probe(
+                        cid, self.prev_obs.get(cid), obs_tensor)
                 # Phase 1 — predictor supervised step + Phase 2 intrinsic.
                 # Идёт ДО motor REINFORCE update, чтобы intrinsic подмешать
                 # в r_imm_total как baseline-сигнал.
@@ -8494,6 +8515,88 @@ class LocalColonyCompute:
         except Exception:
             pass
         return z
+
+    def _social_forecast_probe(self, cid: str, prev, target) -> None:
+        """social forecast-born метрика (Фрай §7) — READ-ONLY paired-ablation.
+        На тике с реальным DANGER у Адама (prev[74:76]≠0): forecast-loss predictor'а
+        на predator-каналах obs[59:62], full-obs vs social-zeroed (obs[72:76]=0), с
+        ОДНОГО состояния — snapshot membrane (_cell_states) → forward full → restore →
+        forward zeroed → restore оригинал. Реальный predictor НЕ затронут (probe
+        восстанавливает состояние; настоящий forward идёт в _predictor_train_step ниже
+        из того же prev). Δ = loss(zeroed) − loss(full). Δ>0 = social снижает ошибку
+        прогноза хищника. Накопление ≥21 DANGER-окон → робастный median+MAD vs abs-floor.
+        Кросс-лок с signal_emission_log Хьюберта (ground-truth) при прогоне. Гейт —
+        client_flag social_forecast_probe (OFF, zero-cost). Мотор/мозг НЕ трогаем."""
+        if not self._social_probe_enabled:
+            return
+        pred = self.predictor.get(cid)
+        if pred is None or prev is None or target is None:
+            return
+        torch = self._torch
+        try:
+            if (int(prev.shape[-1]) < _BRAIN_INPUT_DIM
+                    or int(target.shape[-1]) < _PREDATOR_OBS[1]):
+                return
+            dlo, dhi = _SOCIAL_DANGER
+            danger = float(prev[0, dlo:dhi].abs().sum().item()) > 0.0
+            # граница эпизода: вход в DANGER-окно = новый эпизод
+            if danger and not self._social_probe_in_window.get(cid, False):
+                self._social_probe_episodes[cid] = (
+                    self._social_probe_episodes.get(cid, 0) + 1)
+            self._social_probe_in_window[cid] = danger
+            if not danger:
+                return
+            cs = getattr(pred, "_cell_states", None)
+            if cs is None:
+                return
+            import torch.nn.functional as F
+            plo, phi = _PREDATOR_OBS
+            saved = {k: v.clone() for k, v in cs.items()}
+            with torch.no_grad():
+                out_full = pred({"input": prev})["output"]
+                pred._cell_states = {k: v.clone() for k, v in saved.items()}  # restore
+                prev_zero = prev.clone()
+                prev_zero[:, _SOCIAL_OFFSET:_SOCIAL_OFFSET + _SOCIAL_DIM] = 0.0
+                out_zero = pred({"input": prev_zero})["output"]
+                pred._cell_states = saved             # restore оригинал → probe read-only
+                tgt = target.detach()
+                loss_full = float(F.mse_loss(out_full[:, plo:phi], tgt[:, plo:phi]).item())
+                loss_zero = float(F.mse_loss(out_zero[:, plo:phi], tgt[:, plo:phi]).item())
+            diff = loss_zero - loss_full
+            self._social_probe_diffs.setdefault(cid, []).append(diff)
+            eps = self._social_probe_episodes.get(cid, 0)
+            diffs = self._social_probe_diffs.get(cid, [])
+            self._social_probe_diag_n = getattr(self, "_social_probe_diag_n", 0) + 1
+            if self._social_probe_diag_n % 50 == 1:
+                if eps >= _SOCIAL_PROBE_MIN_EPISODES and len(diffs) >= 8:
+                    med, rsd, t = self._robust_paired(diffs)
+                    born = (med > _SOCIAL_PROBE_FLOOR and t is not None
+                            and abs(float(t)) >= _SOCIAL_PROBE_T)
+                    logger.info("SOCIAL_FORECAST_PROBE cid=%s episodes=%d n=%d Δmed=%.5f "
+                                "rsd=%.5f t=%s floor=%.5f forecast_born=%s", cid, eps,
+                                len(diffs), med, rsd,
+                                ("%.2f" % t if t is not None else "n/a"),
+                                _SOCIAL_PROBE_FLOOR, born)
+                else:
+                    logger.info("SOCIAL_FORECAST_PROBE cid=%s episodes=%d/%d n=%d "
+                                "(накопление) lastΔ=%.5f", cid, eps,
+                                _SOCIAL_PROBE_MIN_EPISODES, len(diffs), diff)
+        except Exception as e:
+            logger.debug("social_forecast_probe %s: %s", cid, e)
+
+    def set_social_forecast_probe(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл social forecast-born probe (Фрай §7). READ-ONLY
+        (snapshot/restore predictor, Адама НЕ меняет). on=True: на DANGER-окнах копит
+        paired Δ forecast-loss (full vs social-zeroed) на predator-каналах. on=False:
+        zero-cost (probe не вызывается). Парный к server WORLD_SIGNAL_EMISSION_LOG
+        (Хьюберт — ground-truth lock). Сброс накопления при выключении."""
+        self._social_probe_enabled = bool(on)
+        if not on:
+            self._social_probe_diffs.clear()
+            self._social_probe_episodes.clear()
+            self._social_probe_in_window.clear()
+        logger.info("set_social_forecast_probe: %s", on)
+        return self._social_probe_enabled
 
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.

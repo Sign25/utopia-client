@@ -534,6 +534,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_predator_hunt: bool | None = None
     applied_rhythm: bool | None = None
     applied_social: bool | None = None
+    applied_social_probe: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -886,6 +887,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("social_signals → %s", target_social)
                         except Exception as e:
                             logger.warning("set_social_signals failed: %s", e)
+
+                    # social forecast-born probe (Фрай §7): read-only paired-ablation
+                    # forecast-loss на predator-каналах. Дефолт OFF (zero-cost). Парный
+                    # к server WORLD_SIGNAL_EMISSION_LOG (Хьюберт ground-truth). edge.
+                    target_sprobe = bool(flags.get("social_forecast_probe", False))
+                    if target_sprobe != applied_social_probe \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_social_forecast_probe(target_sprobe)
+                            applied_social_probe = target_sprobe
+                            logger.info("social_forecast_probe → %s", target_sprobe)
+                        except Exception as e:
+                            logger.warning("set_social_forecast_probe failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation
