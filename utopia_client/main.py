@@ -543,6 +543,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_rhythm: bool | None = None
     applied_social: bool | None = None
     applied_social_probe: bool | None = None
+    applied_signal_emit: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -895,6 +896,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("social_signals → %s", target_social)
                         except Exception as e:
                             logger.warning("set_social_signals failed: %s", e)
+
+                    # social этап B ОБМАН (Фрай v0.6): signal_emit — снять penalty
+                    # SIGNAL_DANGER (Адам эмитит ложный DANGER). МОТОР-касание, deploy
+                    # DORMANT, flip по «да» Шефа синхронно с server-билдом Хьюберта
+                    # (joint-flip B). edge-detect.
+                    target_emit = bool(flags.get("signal_emit", False))
+                    if target_emit != applied_signal_emit \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_signal_emit(target_emit)
+                            applied_signal_emit = target_emit
+                            logger.info("signal_emit → %s", target_emit)
+                        except Exception as e:
+                            logger.warning("set_signal_emit failed: %s", e)
 
                     # social forecast-born probe (Фрай §7): read-only paired-ablation
                     # forecast-loss на predator-каналах. Дефолт OFF (zero-cost). Парный

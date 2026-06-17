@@ -540,6 +540,7 @@ class LocalColonyCompute:
         self._predator_hunt_enabled: bool = False  # client_flag predator_hunt (OFF dormant)
         self._rhythm_enabled: bool = False  # client_flag rhythm (time_phase obs[68:72]; OFF dormant)
         self._social_enabled: bool = False  # client_flag social_signals (tribe-радар obs[72:76]; OFF dormant)
+        self._signal_emit_enabled: bool = False  # client_flag signal_emit (этап B обман: снять penalty SIGNAL_DANGER; OFF dormant, МОТОР-касание)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -5788,7 +5789,15 @@ class LocalColonyCompute:
             # Структурные φ-штрафы (постоянные).
             logits[4] -= 1.0                 # STAY
             logits[6] -= 1.0 / (PHI * PHI)   # SIGNAL_FOOD
-            logits[7] -= 1.0 / (PHI * PHI)   # SIGNAL_DANGER
+            # SIGNAL_DANGER (action 7): структурный φ-штраф СНИМАЕТСЯ на этапе B
+            # (обман, Фрай v0.6) — Адам получает действие эмиссии ложного DANGER
+            # (→ Старшие уходят → еда свободна → ест; выгода ЭМЕРДЖЕНТНА). Гейт
+            # client_flag signal_emit (default OFF = штраф держит, текущее поведение).
+            # МОТОР-касание: flip только по «да» Шефа, синхронно с билдом Хьюберта.
+            # §3-non-absorbing: эмиссия НЕ survival-bypass → под §3 перебивается на
+            # forage/STAY (не запирает). spam-контроль = мониторинг после flip.
+            if not self._signal_emit_enabled:
+                logits[7] -= 1.0 / (PHI * PHI)   # SIGNAL_DANGER (penalty, dormant-этап)
             logits[8] -= 1.0 / PHI           # SHARE
             logits[9] -= 1.0                 # REPRODUCE (через mate_pairs, не action)
             logits[11] -= 1.0                # DIG
@@ -7033,6 +7042,18 @@ class LocalColonyCompute:
         self._social_enabled = bool(on)
         logger.info("set_social_signals: %s", on)
         return self._social_enabled
+
+    def set_signal_emit(self, on: bool) -> bool:
+        """Канал client_flags: этап B ОБМАН (Фрай v0.6). on=True: снимает структурный
+        φ-штраф с logits[7] (SIGNAL_DANGER) → Адам ПОЛУЧАЕТ действие эмиссии ложного
+        DANGER (→ Старшие уходят билдом Хьюберта → еда свободна → ест; выгода
+        ЭМЕРДЖЕНТНА из мира, НЕ спец-награда). on=False (kill-switch, dormant): штраф
+        держит, эмиссия подавлена (текущее поведение). МОТОР-касание (меняет политику)
+        → flip ТОЛЬКО по «да» Шефа, синхронно с server-билдом Хьюберта (joint-flip B).
+        §3-non-absorbing: эмиссия не survival-bypass → под §3 перебивается forage/STAY."""
+        self._signal_emit_enabled = bool(on)
+        logger.info("set_signal_emit: %s", on)
+        return self._signal_emit_enabled
 
     # ── Рост-от-поведения (Путь 2, Фрай 15.06): реестр осей + флаг + метрика ──
     def register_beh_axis(self, key: str, cum_dim: str,
