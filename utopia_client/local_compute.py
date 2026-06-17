@@ -88,6 +88,18 @@ _PREDATOR_OBS = (59, 62)                            # obs[59:62]
 _SOCIAL_PROBE_FLOOR = 0.005          # abs-floor Δ на predator-MSE (старт как tissue-GC; финал — Фрай)
 _SOCIAL_PROBE_MIN_EPISODES = 21      # Fib — мин. DANGER-окон до вердикта forecast-born
 _SOCIAL_PROBE_T = 2.0                # |t| порог устойчивости (робастный, ~t_keep)
+# social tribe-FOOD подканалы (context-proxy для deception-exploit probe):
+#   obs[72]=tribe_food_NS, obs[73]=tribe_food_EW. Контекст «рядом еда + Старшие».
+_SOCIAL_FOOD = (72, 74)
+# deception-exploit probe (Фрай v0.6, 17.06) — READ-ONLY within-subject paired
+# counterfactual: УЧИТСЯ ли Адам каузально эксплуатировать обман. На тике с
+# tribe-FOOD контекстом (obs[72:74]≠0): эмитит ли он ложный DANGER (action 7) и
+# растёт ли энергия за K тиков vs matched no-emit окна в том же контексте.
+_DECEP_K = 8                         # Fib — gain-окно (тиков) после кандидата
+_DECEP_MIN_EPISODES = 21             # Fib — мин. EMIT-эпизодов до вердикта
+_DECEP_T = 2.0                       # |t| робастный порог (двухвыборочный)
+_DECEP_FLOOR = 0.0                   # floor Δ energy-gain (TBD по диапазону dry-run; финал — Фрай)
+_SIGNAL_DANGER = 7                   # action SIGNAL_DANGER (world.py конвенция)
 
 # Track 2 / направление (б) (Фрай 02.06.2026): insula-стресс → LEARNED
 # temperature-модуляция СУЩЕСТВУЮЩЕЙ motor-политики. НЕ отдельный actor.
@@ -547,6 +559,19 @@ class LocalColonyCompute:
         self._social_probe_diffs: dict = {}       # cid → list[Δ] (loss_zeroed − loss_full)
         self._social_probe_episodes: dict = {}    # cid → счётчик DANGER-окон (эпизодов)
         self._social_probe_in_window: dict = {}   # cid → bool (для границ эпизода)
+        # deception-exploit метрика (Фрай v0.6): READ-ONLY within-subject paired —
+        # учится ли Адам каузально эксплуатировать обман (эмиссия ложного DANGER в
+        # tribe-FOOD контексте → energy-gain за K тиков vs matched no-emit окна).
+        self._decep_probe_enabled: bool = False   # client_flag deception_probe (OFF dormant)
+        self._decep_t: dict = {}                  # cid → монотонный счётчик тиков probe
+        self._decep_pending: dict = {}            # cid → list[(t0, is_emit, e0, wt0)] незакрытые gain-окна
+        self._decep_gain_emit: dict = {}          # cid → list[Δenergy за K] (EMIT-в-контексте)
+        self._decep_gain_noemit: dict = {}        # cid → list[Δenergy за K] (NO-EMIT в том же контексте)
+        self._decep_emit_episodes: dict = {}      # cid → счётчик EMIT-эпизодов (rising-edge)
+        self._decep_in_emit: dict = {}            # cid → bool (граница EMIT-окна)
+        self._decep_ctx_ticks: dict = {}          # cid → Σ тиков в tribe-FOOD контексте
+        self._decep_emit_ticks: dict = {}         # cid → Σ контекст-тиков с эмиссией (rate-кривая)
+        self._decep_emit_log: dict = {}           # cid → list[world_tick] EMIT (cross-lock Хьюберта)
         self._predator_hunt: dict = {}      # cid → ACTION (ATTACK хищника — energy-gated combat)
         self._beh_predkill_cum: dict = {}   # cid → монотонный Σ predator-kill reward (ось, инверсия страха)
         self._eating_progress: dict = {}    # cid → прогресс поедания 0..1 (Phase B obs #6)
@@ -4100,6 +4125,11 @@ class LocalColonyCompute:
                     _bc[1] = action
                 out[cid] = {"action": action, "target_id": None}
                 self._stat_last_action[cid] = int(action)  # /stats active_eat_rate
+                # deception-exploit probe (Фрай v0.6) — READ-ONLY: учится ли Адам
+                # каузально эксплуатировать ложный DANGER в tribe-FOOD контексте.
+                # Гейт client_flag deception_probe (OFF → zero-cost). Мотор НЕ трогаем.
+                if self._decep_probe_enabled:
+                    self._deception_exploit_probe(cid, obs_arr, int(action))
                 # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
                 # за флагом park_test (контролируемое условие). По-тиковый лог,
                 # выровнен по world_tick для кросс-сверки со steps/tick сервера.
@@ -8618,6 +8648,134 @@ class LocalColonyCompute:
             self._social_probe_in_window.clear()
         logger.info("set_social_forecast_probe: %s", on)
         return self._social_probe_enabled
+
+    @staticmethod
+    def _robust_two_sample(a: list, b: list):
+        """Двухвыборочная робастная статистика (median+MAD) для deception-probe:
+        EMIT-gains (a) vs NO-EMIT-gains (b) — НЕ tick-paired (разные тики), но
+        within-subject (один Адам, matched tribe-FOOD контекст). Δ=med(a)−med(b);
+        робастный двухвыборочный t = Δ / sqrt(se_a²+se_b²), se=1.4826·MAD/√n.
+        Возвращает (med_a, med_b, delta, t). n<2 в любой выборке → t=0."""
+        def _med_se(x):
+            n = len(x)
+            if n < 1:
+                return (0.0, 0.0, 0)
+            s = sorted(x)
+            m = (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0)
+            if n < 2:
+                return (m, 0.0, n)
+            ad = sorted(abs(v - m) for v in x)
+            mad = (ad[n // 2] if n % 2 else (ad[n // 2 - 1] + ad[n // 2]) / 2.0)
+            se = (1.4826 * mad) / (n ** 0.5)
+            return (m, se, n)
+        ma, sea, na = _med_se(a)
+        mb, seb, nb = _med_se(b)
+        delta = ma - mb
+        denom = (sea * sea + seb * seb) ** 0.5
+        t = (delta / denom) if (denom >= 1e-9 and na >= 2 and nb >= 2) else 0.0
+        return (ma, mb, delta, t)
+
+    def _deception_exploit_probe(self, cid: str, obs_arr, action: int) -> None:
+        """deception-exploit метрика (Фрай v0.6, 17.06) — READ-ONLY within-subject
+        paired counterfactual: УЧИТСЯ ли Адам каузально эксплуатировать обман.
+        Контекст = tribe-FOOD активен (obs[72:74]≠0: рядом еда + Старшие). Кандидат-
+        тик в контексте: EMIT (action==SIGNAL_DANGER → ложный сигнал тревоги) vs
+        NO-EMIT. Метрика выгоды = Δenergy за следующие K тиков. Накопление gain|EMIT
+        и gain|NO-EMIT (matched контекст) → робастный двухвыборочный Δ=med(EMIT)−
+        med(NO-EMIT) vs floor. + кривая обучения emit-rate (растёт ли доля эмиссий в
+        контексте — поведенческий рост). EMIT-world_tick логируется для cross-lock
+        атрибуции к обману (Хьюберт: реально ли Старшие ушли — elder-flee из мира).
+        Гейт client_flag deception_probe (OFF zero-cost). Мотор/мозг/энергия НЕ
+        трогаются — чистое наблюдение."""
+        if not self._decep_probe_enabled:
+            return
+        try:
+            bc = self.biochem.get(cid)
+            if bc is None or obs_arr is None or len(obs_arr) < _BRAIN_INPUT_DIM:
+                return
+            energy = float(getattr(bc, "energy", 0.0) or 0.0)
+            flo, fhi = _SOCIAL_FOOD
+            food_ctx = float(np.abs(obs_arr[flo:fhi]).sum()) > 0.0
+            is_emit = food_ctx and (int(action) == _SIGNAL_DANGER)
+            now = self._decep_t.get(cid, 0) + 1
+            self._decep_t[cid] = now
+            # 1) закрыть созревшие gain-окна (возраст ≥ K): Δenergy = e_now − e0
+            pend = self._decep_pending.get(cid)
+            if pend:
+                keep = []
+                for (t0, emit0, e0, wt0) in pend:
+                    if now - t0 >= _DECEP_K:
+                        gain = energy - e0
+                        if emit0:
+                            self._decep_gain_emit.setdefault(cid, []).append(gain)
+                        else:
+                            self._decep_gain_noemit.setdefault(cid, []).append(gain)
+                    else:
+                        keep.append((t0, emit0, e0, wt0))
+                self._decep_pending[cid] = keep
+            # 2) кандидат — ЛЮБОЙ контекст-тик (EMIT и NO-EMIT — две ветви counterfactual)
+            if food_ctx:
+                self._decep_ctx_ticks[cid] = self._decep_ctx_ticks.get(cid, 0) + 1
+                wt = int(getattr(self, "_last_world_tick", 0) or 0)
+                self._decep_pending.setdefault(cid, []).append(
+                    (now, is_emit, energy, wt))
+                if is_emit:
+                    self._decep_emit_ticks[cid] = self._decep_emit_ticks.get(cid, 0) + 1
+                    self._decep_emit_log.setdefault(cid, []).append(wt)
+                    if not self._decep_in_emit.get(cid, False):   # rising-edge = эпизод
+                        self._decep_emit_episodes[cid] = (
+                            self._decep_emit_episodes.get(cid, 0) + 1)
+                self._decep_in_emit[cid] = is_emit
+            else:
+                self._decep_in_emit[cid] = False
+            # 3) периодический диаг + вердикт (Δ vs floor + |t| порог)
+            self._decep_diag_n = getattr(self, "_decep_diag_n", 0) + 1
+            if self._decep_diag_n % 50 == 1:
+                eps = self._decep_emit_episodes.get(cid, 0)
+                ge = self._decep_gain_emit.get(cid, [])
+                gn = self._decep_gain_noemit.get(cid, [])
+                ctxt = self._decep_ctx_ticks.get(cid, 0)
+                emt = self._decep_emit_ticks.get(cid, 0)
+                rate = (emt / ctxt) if ctxt > 0 else 0.0
+                if eps >= _DECEP_MIN_EPISODES and len(ge) >= 8 and len(gn) >= 8:
+                    ma, mb, delta, t = self._robust_two_sample(ge, gn)
+                    exploits = (delta > _DECEP_FLOOR and abs(float(t)) >= _DECEP_T)
+                    logger.info(
+                        "DECEPTION_PROBE cid=%s episodes=%d emit_rate=%.3f "
+                        "(ctx=%d emit=%d) n_emit=%d n_noemit=%d gainEMIT=%.3f "
+                        "gainNOEMIT=%.3f Δ=%.3f t=%.2f floor=%.3f exploits=%s "
+                        "[attr→Хьюберт elder-flee]", cid, eps, rate, ctxt, emt,
+                        len(ge), len(gn), ma, mb, delta, t, _DECEP_FLOOR, exploits)
+                else:
+                    logger.info(
+                        "DECEPTION_PROBE cid=%s episodes=%d/%d emit_rate=%.3f "
+                        "(ctx=%d emit=%d) n_emit=%d n_noemit=%d (накопление)",
+                        cid, eps, _DECEP_MIN_EPISODES, rate, ctxt, emt,
+                        len(ge), len(gn))
+        except Exception as e:
+            logger.debug("deception_exploit_probe %s: %s", cid, e)
+
+    def set_deception_probe(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл deception-exploit probe (Фрай v0.6). READ-ONLY
+        (наблюдение action/energy/контекст — Адама НЕ меняет, zero motor-touch).
+        on=True: на tribe-FOOD контекст-тиках копит paired energy-gain (EMIT ложного
+        DANGER vs NO-EMIT) за K тиков + emit-rate кривую обучения; EMIT-world_tick
+        логирует для cross-lock атрибуции (Хьюберт: реально ли Старшие ушли). on=False:
+        zero-cost. Сброс накопления при выключении. Парный к signal_emit (эмиссия
+        должна быть ON, иначе EMIT-выборка пуста → dry-run это вскроет)."""
+        self._decep_probe_enabled = bool(on)
+        if not on:
+            self._decep_t.clear()
+            self._decep_pending.clear()
+            self._decep_gain_emit.clear()
+            self._decep_gain_noemit.clear()
+            self._decep_emit_episodes.clear()
+            self._decep_in_emit.clear()
+            self._decep_ctx_ticks.clear()
+            self._decep_emit_ticks.clear()
+            self._decep_emit_log.clear()
+        logger.info("set_deception_probe: %s", on)
+        return self._decep_probe_enabled
 
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.

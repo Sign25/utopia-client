@@ -544,6 +544,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_social: bool | None = None
     applied_social_probe: bool | None = None
     applied_signal_emit: bool | None = None
+    applied_decep_probe: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -923,6 +924,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("social_forecast_probe → %s", target_sprobe)
                         except Exception as e:
                             logger.warning("set_social_forecast_probe failed: %s", e)
+
+                    # deception-exploit probe (Фрай v0.6): read-only within-subject
+                    # paired — учится ли Адам каузально эксплуатировать ложный DANGER
+                    # в tribe-FOOD контексте (energy-gain за K vs matched no-emit).
+                    # Дефолт OFF (zero-cost). Парный signal_emit + cross-lock Хьюберта
+                    # (elder-flee атрибуция). edge.
+                    target_dprobe = bool(flags.get("deception_probe", False))
+                    if target_dprobe != applied_decep_probe \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_deception_probe(target_dprobe)
+                            applied_decep_probe = target_dprobe
+                            logger.info("deception_probe → %s", target_dprobe)
+                        except Exception as e:
+                            logger.warning("set_deception_probe failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation
