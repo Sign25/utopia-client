@@ -174,20 +174,28 @@ def test_shape_life_reader_keys_on_hp():
     assert float(lo_hp[12]) > float(hi_hp[12])   # BUILD от HP (ЖИЗНЬ), не сытости
 
 
-def test_decay_step_hp_mirror_parity():
-    """math-equiv (client-половина HARD GATE): общий server decay_step ставит
-    hp=energy + НЕ перетирает max_hp=1309 (guard max_hp<=0 ложен на дефолте 1309).
-    Зеркало Хьюбертова tests/test_stamina_1a. Требует environment (skip в dev-venv)."""
+def test_decay_step_is_adam_split():
+    """math-equiv + lockstep 1b (90fe1c1): общая decay_step is_adam-условна —
+    для Адама (is_adam=True) hp НЕ зеркалится (живёт сам: _energy_ratios/metabolism,
+    разъезд на 1b.1); для system (is_adam=False) hp=energy зеркало (одношкальны).
+    max_hp guard-skip (дефолт 1309). energy-траектория цела. Требует environment."""
     decay_step = pytest.importorskip("environment.biochemistry").decay_step
     from utopia_client.biochemistry import _FakeWorld
-    for e in (137.0, 500.0, 999.0):
-        bc = ClientCreatureBiochem()
-        bc.energy = e
-        bc.hp = 0.0                       # decay_step должен отзеркалить ←energy
-        decay_step(bc, _FakeWorld())
-        assert bc.hp == pytest.approx(e)  # hp == energy (зеркало)
-        assert bc.max_hp == 1309.0        # guard-skip → паритет с server, не 100
-        assert bc.energy == pytest.approx(e)  # energy-траектория НЕ тронута
+    # Адам (is_adam=True по умолчанию): decay_step НЕ трогает hp (skip — lockstep)
+    bc = ClientCreatureBiochem()
+    bc.energy = 500.0
+    bc.hp = 0.0
+    decay_step(bc, _FakeWorld())
+    assert bc.hp == 0.0                    # НЕ зеркалится (is_adam skip → hp независим)
+    assert bc.max_hp == 1309.0            # guard-skip
+    assert bc.energy == pytest.approx(500.0)  # energy цела
+    # system (is_adam=False): зеркалит hp=energy (одношкальный)
+    bc2 = ClientCreatureBiochem()
+    bc2.is_adam = False
+    bc2.energy = 500.0
+    bc2.hp = 0.0
+    decay_step(bc2, _FakeWorld())
+    assert bc2.hp == pytest.approx(500.0)  # зеркало (system одношкальный)
 
 
 def test_shape_action_logits_hp_ratio_fallback():

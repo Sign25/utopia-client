@@ -549,6 +549,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_er_norm: bool | None = None
     applied_decay_norm: bool | None = None
     applied_hp_auth: bool | None = None
+    applied_hp_paralysis: bool | None = None
+    applied_hp_death: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -999,6 +1001,30 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("hp_authoritative → %s", target_hpa)
                         except Exception as e:
                             logger.warning("set_hp_authoritative failed: %s", e)
+
+                    # stamina 1b.2a (§18): hp≤порог → §3-paralysis (overlap energy-§3
+                    # guardrail) + passive_water + §3-recovery+hp. Дефолт OFF. edge.
+                    target_hpp = bool(flags.get("hp_paralysis", False))
+                    if target_hpp != applied_hp_paralysis \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_hp_paralysis(target_hpp)
+                            applied_hp_paralysis = target_hpp
+                            logger.info("hp_paralysis → %s", target_hpp)
+                        except Exception as e:
+                            logger.warning("set_hp_paralysis failed: %s", e)
+
+                    # stamina 1b.2b (§18, риск-пик): energy-§3 снят → hp единственный
+                    # §3-триггер (guardrail убран). ТОЛЬКО после живого 1b.2a-✓. edge.
+                    target_hpd = bool(flags.get("hp_death", False))
+                    if target_hpd != applied_hp_death \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_hp_death(target_hpd)
+                            applied_hp_death = target_hpd
+                            logger.info("hp_death → %s", target_hpd)
+                        except Exception as e:
+                            logger.warning("set_hp_death failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

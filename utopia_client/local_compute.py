@@ -250,6 +250,13 @@ _CLIENT_MAX_ENERGY = 1309.0      # mirror cfg.max_energy default (_gather_intero
 _HP_NEED_DRAIN = _PHI ** 3       # ≈4.236 — дренаж hp/тик на нужду=0
 _HP_HEAL = _PHI ** 2             # ≈2.618 — лечение hp/тик при нуждах в норме
 _HP_NEED_NORM = 1.0              # порог «нужда в норме» для лечения (TBD 1b.1; >0 минимум)
+# stamina шаг 1b.2 (Фрай/Хьюберт §18.6/18.11): hp → §3-триггер (death-equiv для
+# immortal-Адама = §3-paralysis). 1b.2a hp-§3-триггер + energy-§3 overlap (guardrail);
+# 1b.2b energy-§3 снят. + passive_water-backstop (водная absorbing-дыра §18.11) +
+# §3-recovery +hp/+hydration. φ-калибровка (старт, тюн по живому 1b.2a-дипу).
+_HP_S3_THRESHOLD = _CLIENT_MAX_ENERGY / (_PHI ** 7)   # ≈45 — hp-порог §3-paralysis (max_hp/φ⁷)
+_RECOVERY_HP = _CLIENT_MAX_ENERGY / (_PHI ** 6)       # ≈73 — hp-грант на §3-recovery (выше порога)
+_PASSIVE_WATER = _PHI ** 2       # ≈2.618 — hydration-income/тик в параличе (зеркало passive_flora, §3-non-absorbing страховка; ТОЛЬКО paralyzed+is_adam)
 _CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
 _CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
@@ -584,6 +591,12 @@ class LocalColonyCompute:
         # БЕЗ риска смерти. 1b.2 (death→hp) — отдельный флаг/«да» Шефа. LOCKSTEP:
         # Хьюберт снимает creature.hp=energy из decay_step per-creature (is_adam).
         self._hp_authoritative_enabled: bool = False  # client_flag hp_authoritative (OFF dormant)
+        # stamina 1b.2 (Фрай/Хьюберт §18.6/18.11) — death-переход на hp (для Адама =
+        # §3-paralysis-триггер, immortal). 1b.2a: hp≤порог → §3 ДОБАВЛЯЕТСЯ к energy≤0
+        # (overlap-guardrail) + passive_water-backstop + §3-recovery +hp. 1b.2b:
+        # energy-§3 СНЯТ (hp единственный). LOCKSTEP server (frozen-ветка + system).
+        self._hp_paralysis_enabled: bool = False  # client_flag hp_paralysis (1b.2a, OFF dormant)
+        self._hp_death_enabled: bool = False      # client_flag hp_death (1b.2b, OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -8900,6 +8913,28 @@ class LocalColonyCompute:
         logger.info("set_hp_authoritative: %s", on)
         return self._hp_authoritative_enabled
 
+    def set_hp_paralysis(self, on: bool) -> bool:
+        """Канал client_flags: stamina 1b.2a (Фрай/Хьюберт §18). ON → hp≤max_hp/φ⁷
+        (≈45) ДОБАВЛЯЕТСЯ как §3-paralysis-триггер РЯДОМ с energy≤0 (overlap-guardrail,
+        Адам immortal обоими) + passive_water-backstop в параличе (is_adam+paralyzed →
+        hydration-income φ², закрывает водную absorbing-дыру §18.11) + §3-recovery
+        грант +hp/+hydration. death-check ОСТАЁТСЯ energy≤0 (1b.2a guardrail). Live
+        замер hp-§3→water-seek/passive_water→heal→recover non-spiral ПОД guardrail
+        (Хьюберт загоняет hp в §3). OFF → инертно. kill-switch. LOCKSTEP server."""
+        self._hp_paralysis_enabled = bool(on)
+        logger.info("set_hp_paralysis: %s", on)
+        return self._hp_paralysis_enabled
+
+    def set_hp_death(self, on: bool) -> bool:
+        """Канал client_flags: stamina 1b.2b (Фрай/Хьюберт §18, риск-пик). ON →
+        energy-§3-триггер СНЯТ → hp ЕДИНСТВЕННЫЙ §3-paralysis-триггер (energy-guardrail
+        убран). ТОЛЬКО после живого 1b.2a-✓ (hp-§3 non-spiral подтверждён). Отдельное
+        «да» Шефа. OFF → 1b.2a (overlap) держится. kill-switch. LOCKSTEP server
+        (death=hp + frozen)."""
+        self._hp_death_enabled = bool(on)
+        logger.info("set_hp_death: %s", on)
+        return self._hp_death_enabled
+
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
 
@@ -9538,6 +9573,17 @@ class LocalColonyCompute:
         self._last_paralysis_tick[cid] = int(self._last_world_tick)  # энерго-гейт GC
         logger.info("paralysis start cid=%s reason=%s -> STAY %.1fs (NOT death)",
                     cid, reason, _PARALYSIS_SEC)
+
+    def _s3_trigger(self, bc) -> bool:
+        """§3-paralysis-триггер Адама (stamina §18 split). default: energy≤0.
+        1b.2a (hp_paralysis): energy≤0 ИЛИ hp≤порог (overlap-guardrail). 1b.2b
+        (hp_death): hp≤порог ТОЛЬКО (energy-§3 снят → hp единственный)."""
+        e = float(getattr(bc, "energy", 1.0))
+        hp = float(getattr(bc, "hp", 1e9))
+        hp_trig = ((self._hp_paralysis_enabled or self._hp_death_enabled)
+                   and hp <= _HP_S3_THRESHOLD)
+        energy_trig = (e <= 0.0) and not self._hp_death_enabled  # 1b.2b снимает energy
+        return energy_trig or hp_trig
 
     # ── Colony Ownership Migration §5.2: projection_batch ────────────────
 
@@ -10893,10 +10939,30 @@ class LocalColonyCompute:
             if bc is not None:
                 now_m = time.monotonic()
                 until = self._paralysis_until.get(cid)
+                # 1b.2 passive_water-backstop (§18.11): ВО ВРЕМЯ паралича is_adam →
+                # hydration-income (зеркало passive_flora) → водная нужда восстан. →
+                # heal разблокирован → выход. Закрывает absorbing-дыру (force-STAY
+                # вдали от воды, нет passive_water). ТОЛЬКО paralyzed (§3-страховка,
+                # не баланс). water-seek (вода-близко) + passive_water (вода-далеко).
+                if (until is not None and now_m < until
+                        and (self._hp_paralysis_enabled or self._hp_death_enabled)
+                        and getattr(bc, "is_adam", True)):
+                    _maxh = float(getattr(bc, "max_hydration", 100.0))
+                    bc.hydration = min(
+                        _maxh, float(getattr(bc, "hydration", 0.0)) + _PASSIVE_WATER)
+                    self._passive_water_sum = getattr(
+                        self, "_passive_water_sum", 0.0) + _PASSIVE_WATER
                 if until is not None and now_m >= until:
                     # Конец паралича → recovery-грант (ЭНЕРГИЯ, не время).
                     self._paralysis_until.pop(cid, None)
                     bc.energy = float(self._recovery_energy)
+                    # 1b.2 (§18.6): recovery грант ТАКЖЕ +hp/+hydration (climb из
+                    # hp-§3-зоны + разблок heal). Полная передышка для hp-оси.
+                    if self._hp_paralysis_enabled or self._hp_death_enabled:
+                        bc.hp = max(float(getattr(bc, "hp", 0.0)), float(_RECOVERY_HP))
+                        _maxh = float(getattr(bc, "max_hydration", 100.0))
+                        bc.hydration = max(
+                            float(getattr(bc, "hydration", 0.0)), min(_maxh, 30.0))
                     self._paralysis_window_n += 1  # §3.5-ledger: грант искажает Δ
                     self._stat_recovery_count += 1  # /stats Блок 3
                     # Фрай-инвариант (genuine response → recoverable, НЕ absorbing):
@@ -10935,10 +11001,15 @@ class LocalColonyCompute:
                         pass
                     logger.info("paralysis recovery cid=%s -> energy=%.1f "
                                 "(+стресс-relief)", cid, self._recovery_energy)
-                elif until is None and float(getattr(bc, "energy", 1.0)) <= 0.0:
-                    # Триггер 1: голод (energy≤0). Триггер 2 (death_suppressed
-                    # от P40, energy-независим) — в handle_tick.
-                    self._enter_paralysis(cid, "starved")
+                elif until is None and self._s3_trigger(bc):
+                    # Триггер 1: голод (energy≤0) ИЛИ (1b.2) hp≤порог. Триггер 2
+                    # (death_suppressed от P40) — в handle_tick. _s3_trigger гейтит
+                    # energy vs hp по флагам hp_paralysis/hp_death (§18 split).
+                    _why = ("hp_low" if (self._hp_paralysis_enabled
+                            or self._hp_death_enabled)
+                            and float(getattr(bc, "hp", 1e9)) <= _HP_S3_THRESHOLD
+                            else "starved")
+                    self._enter_paralysis(cid, _why)
         else:
             # Death-check (колониальный режим): голод (energy<=0) + старость
             # (telomere AGONY) + инфекция (severity>=1.0). Жажда/инфекция грызут
