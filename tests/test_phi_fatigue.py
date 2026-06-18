@@ -51,21 +51,36 @@ def test_default_off_and_setter():
 
 
 def test_apply_action_fatigue_accumulates():
-    """GAP закрыт: _apply_action_fatigue копит fatigue от действия (re-use)."""
-    pytest.importorskip("environment.biochemistry")
+    """GAP закрыт: _apply_action_fatigue копит fatigue от действия (client-φ-лестница,
+    БЕЗ neurocore-re-use). ATTACK = b×φ³ ≈ 0.847 (b=0.2)."""
+    from utopia_client.local_compute import _FATIGUE_B_DEFAULT
+    import math
+    phi = 1.6180339887498949
     c, bc = _compute(fatigue=0.0)
-    c._apply_action_fatigue("c0", 5)            # ATTACK
+    c._apply_action_fatigue("c0", 5)            # ATTACK = b·φ³
     assert bc.fatigue > 0.0                      # накопилось (раньше было 0 всегда)
+    assert math.isclose(bc.fatigue, _FATIGUE_B_DEFAULT * phi ** 3, rel_tol=1e-6)
 
 
-def test_action_fatigue_ladder_ordering():
-    """ATTACK (схватка, φ³b) копит ≥ движения (b) — φ-лестница (и legacy 0.5≥0.2)."""
-    pytest.importorskip("environment.biochemistry")
-    c1, bc1 = _compute(fatigue=0.0)
-    c1._apply_action_fatigue("c0", 5)            # ATTACK
-    c2, bc2 = _compute(fatigue=0.0)
-    c2._apply_action_fatigue("c0", 0)            # move N
-    assert bc1.fatigue >= bc2.fatigue            # схватка ≥ движение
+def test_action_fatigue_phi_ladder():
+    """φ-лестница тиров: ATTACK(φ³b) > рывки(φ²b) > координация(φb) > move(b) > STAY(0)."""
+    def _fat(act):
+        c, bc = _compute(fatigue=0.0)
+        c._apply_action_fatigue("c0", act)
+        return bc.fatigue
+    f_stay, f_move, f_coord, f_burst, f_atk = (
+        _fat(4), _fat(0), _fat(6), _fat(11), _fat(5))   # STAY/move/SIGNAL/DIG/ATTACK
+    assert f_stay == 0.0                         # STAY = recovery (0 расход)
+    assert f_atk > f_burst > f_coord > f_move > 0.0   # строгая φ-лестница
+
+
+def test_fatigue_b_tunable():
+    """b агильно tunable (DB fatigue_b, replay-pressure): delta = b×тир."""
+    c, bc = _compute(fatigue=0.0)
+    c.set_fatigue_b(0.5)                          # поднять b (давление)
+    c._apply_action_fatigue("c0", 0)             # move = b
+    assert bc.fatigue == pytest.approx(0.5)      # delta = b×1.0
+    assert c.set_fatigue_b(10.0) == 5.0          # клемп [0,5]
 
 
 def test_stamina_drain_to_hp_when_exhausted():

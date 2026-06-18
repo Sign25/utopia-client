@@ -555,6 +555,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_force_water_far: bool | None = None
     applied_phi_fatigue: bool | None = None
     applied_intero_obs: bool | None = None
+    applied_fatigue_b: float | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -1068,6 +1069,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("phi_fatigue → %s", target_phf)
                         except Exception as e:
                             logger.warning("set_phi_fatigue failed: %s", e)
+
+                    # φ-расход база b (float, агильный replay-pressure-тюн Фрая,
+                    # DB-tunable без redeploy). Дефолт 0.2. edge.
+                    target_fb = float(flags.get("fatigue_b", 0.2))
+                    if target_fb != applied_fatigue_b \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_fatigue_b(target_fb)
+                            applied_fatigue_b = target_fb
+                            logger.info("fatigue_b → %.3f", target_fb)
+                        except Exception as e:
+                            logger.warning("set_fatigue_b failed: %s", e)
 
                     # obs O2 (stamina §19.2/§20): выносливость+HP в obs[76:78]
                     # (восприятие). Миграция 76→78 авто (preserve-expand). INERT
