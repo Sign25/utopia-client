@@ -563,6 +563,12 @@ class LocalColonyCompute:
         # (голод-онсет 618→809). ОТДЕЛЬНЫЙ флаг от four_scale (тот уже ON) → свой
         # валидируемый флип + kill-switch. measure-first (§3=0+гистограмма действий).
         self._er_norm_enabled: bool = False      # client_flag er_norm_1309 (OFF dormant)
+        # stamina 1a-norm.2 (issue #22, Фрай §17): client decay_step нормирует биохимию
+        # по BiochemTickContext.max_energy=100 (PRE-EXISTING) → cortisol/serotonin-пороги
+        # в ×13 не там, где server (/1309). ON → decay-ctx max_energy=1309 (паритет).
+        # Сдвигает 4 порога (cortisol-голод 30→392 и др) → больше стресса. catatonic
+        # RECOVERABLE (decay cortisol×0.98 доминирует, fixed-point ~10<80). measure-first.
+        self._decay_norm_enabled: bool = False   # client_flag decay_norm_1309 (OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -8847,6 +8853,19 @@ class LocalColonyCompute:
         logger.info("set_er_norm: %s", on)
         return self._er_norm_enabled
 
+    def set_decay_norm(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл stamina 1a-norm.2 (issue #22, Фрай §17). ON →
+        client `decay_step` нормирует биохимию по max_energy=1309 (паритет server)
+        вместо PRE-EXISTING /100 → cortisol/serotonin-пороги встают на server-канон
+        (cortisol-голод energy<392 вместо <30, и др). Больше стресса (Адам был
+        НЕ-дострессирован). catatonic RECOVERABLE (decay cortisol×0.98 доминирует →
+        fixed-point ~10<80, выход; §3-доктрина соблюдена). Сдвиг ЧИСТО client (server
+        уже 1309). OFF (default) → /100 (инертно). kill-switch. Гл. метрика окна —
+        mental_break(catatonic)+§3+serotonin(ритм-ось). Отдельное окно (не бандл)."""
+        self._decay_norm_enabled = bool(on)
+        logger.info("set_decay_norm: %s", on)
+        return self._decay_norm_enabled
+
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
 
@@ -11088,7 +11107,7 @@ class LocalColonyCompute:
             return
         try:
             from environment.biochemistry import decay_step  # type: ignore
-            from .biochemistry import _FakeWorld
+            from .biochemistry import _FakeWorld, BiochemTickContext
         except Exception as e:
             logger.debug("biochem decay import failed cid=%s: %s", cid, e)
             return
@@ -11107,7 +11126,11 @@ class LocalColonyCompute:
             except Exception:
                 pass
         try:
-            decay_step(bc, _FakeWorld())
+            # 1a-norm.2 (§17, issue #22): под decay_norm_1309 — decay-ctx max_energy=
+            # 1309 (паритет server) вместо дефолтного 100. OFF → дефолт (инертно).
+            _ctx = (BiochemTickContext(max_energy=_CLIENT_MAX_ENERGY)
+                    if self._decay_norm_enabled else None)
+            decay_step(bc, _FakeWorld(_ctx))
         except Exception as e:
             logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
         # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox → adrenaline спайк ПОСЛЕ

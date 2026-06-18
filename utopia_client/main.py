@@ -547,6 +547,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_decep_probe: bool | None = None
     applied_four_scale: bool | None = None
     applied_er_norm: bool | None = None
+    applied_decay_norm: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -969,6 +970,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("er_norm_1309 → %s", target_ern)
                         except Exception as e:
                             logger.warning("set_er_norm failed: %s", e)
+
+                    # stamina 1a-norm.2 (issue #22, Фрай §17): client decay-ctx
+                    # max_energy 100→1309 (паритет cortisol/serotonin-нормировки).
+                    # ОТДЕЛЬНЫЙ флаг, своё окно, kill-switch. Дефолт OFF. catatonic
+                    # recoverable (×0.98 decay). edge.
+                    target_dn = bool(flags.get("decay_norm_1309", False))
+                    if target_dn != applied_decay_norm \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_decay_norm(target_dn)
+                            applied_decay_norm = target_dn
+                            logger.info("decay_norm_1309 → %s", target_dn)
+                        except Exception as e:
+                            logger.warning("set_decay_norm failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation
