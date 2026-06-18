@@ -602,6 +602,11 @@ class LocalColonyCompute:
         # (client-authoritative, server skip active-owned). Закрывает водную
         # absorbing-дыру (вода-далеко+force-STAY). Флипаю вместе с hp_paralysis (1b.2a).
         self._passive_water_enabled: bool = False  # client_flag passive_water_drinking (OFF dormant)
+        # VALIDATION-ONLY (Фрай 18.06, live-bar a'): force_water_far — отключает
+        # water-seek-навигацию + drink-income → thirst дренит hyd→0 (вода-недостижима)
+        # → φ³ hp-дренаж → hp→§3 → passive_water ЕДИНСТВЕННЫЙ recovery-путь → живой
+        # тест absorbing-closure (non-spiral?). Обратимо, ТОЛЬКО на 1b.2a-валидацию.
+        self._force_water_far_enabled: bool = False  # client_flag force_water_far (OFF)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -8952,6 +8957,17 @@ class LocalColonyCompute:
         logger.info("set_passive_water: %s", on)
         return self._passive_water_enabled
 
+    def set_force_water_far(self, on: bool) -> bool:
+        """Канал client_flags: VALIDATION-ONLY (Фрай live-bar a', §18). ON →
+        вода-НЕДОСТИЖИМА: water-seek-навигация OFF + drink-income (delta_hydration)
+        НЕ применяется → thirst дренит hyd→0 → φ³ hp-дренаж → hp→§3 → passive_water
+        ЕДИНСТВЕННЫЙ recovery-путь (изолирует absorbing-closure). Живой тест
+        non-spiral под energy-guardrail (immortal). Обратимо, ТОЛЬКО на тест. passive_
+        water (paralysis backstop) НЕ затронут → его и валидируем. kill-switch."""
+        self._force_water_far_enabled = bool(on)
+        logger.info("set_force_water_far: %s", on)
+        return self._force_water_far_enabled
+
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
 
@@ -10638,6 +10654,12 @@ class LocalColonyCompute:
             if "delta_hydration" in event:
                 self._hydration_active.add(cid)
                 delta_h = float(event.get("delta_hydration", 0.0) or 0.0)
+                # VALIDATION force_water_far (Фрай a'): вода-недостижима → drink-income
+                # ПОДАВЛЕН (положительный delta_h не применяется) → hyd только дренит →
+                # hp→§3 → passive_water изолированно валидируется. Отрицательный
+                # (потеря) пропускаем как есть. ТОЛЬКО на тест, обратимо.
+                if self._force_water_far_enabled and delta_h > 0.0:
+                    delta_h = 0.0
                 if delta_h > 0.0:
                     self._hyd_drink_sum += delta_h  # calib: income питья
                 if delta_h != 0.0:

@@ -552,6 +552,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_hp_paralysis: bool | None = None
     applied_hp_death: bool | None = None
     applied_passive_water: bool | None = None
+    applied_force_water_far: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -1039,6 +1040,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("passive_water_drinking → %s", target_pw)
                         except Exception as e:
                             logger.warning("set_passive_water failed: %s", e)
+
+                    # VALIDATION-ONLY force_water_far (Фрай live-bar a'): вода-
+                    # недостижима (water-seek+drink OFF) → изолирует passive_water в
+                    # hp-§3. Обратимо, ТОЛЬКО на тест. Дефолт OFF. edge.
+                    target_fwf = bool(flags.get("force_water_far", False))
+                    if target_fwf != applied_force_water_far \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_force_water_far(target_fwf)
+                            applied_force_water_far = target_fwf
+                            logger.info("force_water_far → %s", target_fwf)
+                        except Exception as e:
+                            logger.warning("set_force_water_far failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

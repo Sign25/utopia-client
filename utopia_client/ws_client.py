@@ -2369,10 +2369,16 @@ class ColonyWSClient:
             # «минимум врождённого». Не клобберит как food: фаирит ТОЛЬКО при жажде
             # (hydration<30, _apply_water_seek), не каждый тик. Зеркало masked-фуража:
             # вода была подпёрта water-halo, Адам пить активно не умел.
-            try:
-                self._apply_water_seek(creatures, creatures_out)
-            except Exception as e:
-                logger.warning("water-seek override failed: %r", e)
+            # VALIDATION force_water_far (Фрай a'): water-seek-навигация OFF →
+            # вода-недостижима → hyd дренит к 0 → hp→§3 → passive_water изолированно.
+            # ТОЛЬКО на 1b.2a-тест, обратимо.
+            _fwf = (self.compute is not None
+                    and getattr(self.compute, "_force_water_far_enabled", False))
+            if not _fwf:
+                try:
+                    self._apply_water_seek(creatures, creatures_out)
+                except Exception as e:
+                    logger.warning("water-seek override failed: %r", e)
             self._seek_gate_n = getattr(self, "_seek_gate_n", 0) + 1
             if self._seek_gate_n % 200 == 1:
                 logger.info("SEEK_GATE single_organism → food-seek OFF, "
