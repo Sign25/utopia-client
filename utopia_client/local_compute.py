@@ -9027,6 +9027,16 @@ class LocalColonyCompute:
         (fatigue только decay, как сейчас). LOCKSTEP server (ACTION_FATIGUE_GLUCOSE
         φ-лестница Хьюберт). Стейджинг-валидация как 1b. kill-switch."""
         self._phi_fatigue_enabled = bool(on)
+        # LOCKSTEP (Хьюберт 19e76f6): module-global в environment.biochemistry →
+        # apply_action_taken выбирает ACTION_FATIGUE_PHI (ON) vs ACTION_FATIGUE_GLUCOSE
+        # (OFF). Re-use единый источник (φ GLOBAL, не is_adam). degrade-gracefully: если
+        # client neurocore старый (нет set_phi_fatigue) → ImportError → арбитрарный dict
+        # (GAP закрыт, но не φ — нужен neurocore-update до 19e76f6).
+        try:
+            from environment.biochemistry import set_phi_fatigue as _bm_set_phi  # type: ignore
+            _bm_set_phi(bool(on))
+        except Exception as e:
+            logger.debug("biochem set_phi_fatigue lockstep n/a (старый neurocore?): %s", e)
         logger.info("set_phi_fatigue: %s", on)
         return self._phi_fatigue_enabled
 
