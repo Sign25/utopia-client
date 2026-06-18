@@ -545,6 +545,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_social_probe: bool | None = None
     applied_signal_emit: bool | None = None
     applied_decep_probe: bool | None = None
+    applied_four_scale: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -939,6 +940,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("deception_probe → %s", target_dprobe)
                         except Exception as e:
                             logger.warning("set_deception_probe failed: %s", e)
+
+                    # stamina 4-шкальная модель, шаг 1a (Фрай/Хьюберт §15): HP-бак
+                    # зеркалом energy + er /1000→/1309 + классификация читателей
+                    # energy_ratio (ГОЛОД→сытость / ЖИЗНЬ→hp). Дефолт OFF (dormant,
+                    # бит-в-бит старое). LOCKSTEP с server (Хьюберт). kill-switch. edge.
+                    target_4s = bool(flags.get("four_scale", False))
+                    if target_4s != applied_four_scale \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_four_scale(target_4s)
+                            applied_four_scale = target_4s
+                            logger.info("four_scale → %s", target_4s)
+                        except Exception as e:
+                            logger.warning("set_four_scale failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

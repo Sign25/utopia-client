@@ -110,6 +110,11 @@ class ClientCreatureBiochem:
     # energy=500: matched genesis P40 WorldConfig.initial_energy. Раньше
     # было 100 (default) → reproduce_threshold=500 недостижим. Phase 4 fix 0.11.2.
     energy: float = 500.0
+    # stamina 4-шкальная модель, шаг 1a (Фрай/Хьюберт §15, lockstep с server
+    # CreatureState.hp world.py:853): HP-бак. На 1a hp = energy ЗЕРКАЛО (dormant,
+    # бит-в-бит; разъезд в 1b: death/damage пишут hp). Единый max=1309 (см.
+    # _CLIENT_MAX_ENERGY). Калибровка baseline/max (§8) — позже.
+    hp: float = 500.0
     hydration: float = 100.0
     infected: bool = False
     infection_severity: float = 0.0
@@ -136,6 +141,7 @@ class ClientCreatureBiochem:
             "glucose": round(self.glucose, 2),
             "fatigue": round(self.fatigue, 2),
             "histamine": round(self.histamine, 2),
+            "hp": round(self.hp, 2),         # stamina 1a (зеркало energy)
             "mental_break": self.mental_break,
         }
 

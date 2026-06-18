@@ -553,6 +553,11 @@ class LocalColonyCompute:
         self._rhythm_enabled: bool = False  # client_flag rhythm (time_phase obs[68:72]; OFF dormant)
         self._social_enabled: bool = False  # client_flag social_signals (tribe-радар obs[72:76]; OFF dormant)
         self._signal_emit_enabled: bool = False  # client_flag signal_emit (этап B обман: снять penalty SIGNAL_DANGER; OFF dormant, МОТОР-касание)
+        # stamina 4-шкальная модель, шаг 1a (Фрай/Хьюберт §15, lockstep): HP-бак
+        # зеркалом energy + er /1000→/1309 (§12.5) + классификация читателей
+        # energy_ratio (ГОЛОД→сытость / ЖИЗНЬ→hp). OFF (dormant) → бит-в-бит старое
+        # (er=/1000). Разъезд hp от energy — в 1b (death/damage). kill-switch.
+        self._four_scale_enabled: bool = False   # client_flag four_scale (OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -3647,8 +3652,10 @@ class LocalColonyCompute:
                     _diet = float((self.traits.get(cid) or {}).get(
                         "diet_gene", 0.5) or 0.5)
                     _bc2 = self.biochem.get(cid)
-                    _er = (float(getattr(_bc2, "energy", 500.0)) / 1000.0
-                           if _bc2 is not None else 0.5)
+                    # stamina 1a (§15): (сытость_ratio, hp_ratio). DORMANT → оба
+                    # =energy/1000 (бит-в-бит). _er = сытость-алиас (логи + ГОЛОД-сайты).
+                    _er_sat, _er_hp = self._energy_ratios(cid)
+                    _er = _er_sat
                     _nf_cid = ((nearest_flora_per_cid or {}).get(cid)
                                if nearest_flora_per_cid is not None else None)
                     # obs[62/63] инжект CLIENT-SIDE из nearest_flora-поля (Фрай 05.06):
@@ -3689,8 +3696,8 @@ class LocalColonyCompute:
                     # PREDATOR-HUNT (Фрай 14.06): nearest_predator {hp_ratio,attackable,dr,dc}
                     _pred_cid = (_nf_cid.get("predator_hunt")
                                  if isinstance(_nf_cid, dict) else None)
-                    _hungry_for_med = _er < (1.0 / _PHI)           # < φ⁻¹≈0.618
-                    _capable = _er > (1.0 / _PHI) ** 5             # ~φ⁻⁵≈0.090: не при смерти
+                    _hungry_for_med = _er_sat < (1.0 / _PHI)       # ГОЛОД→сытость; < φ⁻¹≈0.618
+                    _capable = _er_hp > (1.0 / _PHI) ** 5          # ЖИЗНЬ→hp; ~φ⁻⁵≈0.090: не при смерти
                     # ТЕРМОКОМФОРТ (Фрай 14.06): stash temp@obs[35] ∈[-1,1] для
                     # _apply_metabolism (thermal-drain по знаку temp). Адам-only слот.
                     if len(obs_arr) > 35:
@@ -3743,7 +3750,7 @@ class LocalColonyCompute:
                     # быстрый дренаж energy → er<0.5 → FLEE раньше; hp=energy, урон в energy).
                     self._predator_hunt.pop(cid, None)
                     if (self._predator_hunt_enabled and isinstance(_pred_cid, dict)
-                            and _er >= 0.5 and bool(_pred_cid.get("attackable"))):
+                            and _er_hp >= 0.5 and bool(_pred_cid.get("attackable"))):  # ЖИЗНЬ→hp (combat-survival floor)
                         self._predator_hunt[cid] = 5   # ATTACK (energy-gated, любой hp_ratio)
                     # §3-CONTACT-HUNT (Шеф/Хьюберт 12.06): дичь ВПЛОТНУЮ (medium
                     # dist≤1 ИЛИ small-prey prox≥0.5) + голод + hunting → флаг для
@@ -3972,7 +3979,8 @@ class LocalColonyCompute:
                                     "abandon_dir=%d", cid, _nfk, _sn, _abandon_dir)
                     else:
                         self._arrival_stuck_n[cid] = 0
-                    self._shape_action_logits(logits[0], obs_arr, _diet, _er,
+                    self._shape_action_logits(logits[0], obs_arr, _diet, _er_sat,
+                                              hp_ratio=_er_hp,  # stamina 1a: ЖИЗНЬ-сайты внутри
                                               nearest_flora=_nf_cid,
                                               recent_yield=_staying,
                                               on_flora=_onf,
@@ -5585,7 +5593,8 @@ class LocalColonyCompute:
                              just_hit: bool = False,
                              camp_break: bool = False,
                              flora_abandon_dir: "Optional[int]" = None,
-                             medium_prey=None, corpse=None) -> None:
+                             medium_prey=None, corpse=None,
+                             hp_ratio: "Optional[float]" = None) -> None:
         """Phase 4 Body Migration (01.06.2026): контекстный шейпинг логитов
         действия — порт server `_decide_action` (phase_a.py:668-765). Без него
         логиты org.forward однородны → ActionSelector коллапсирует в move (0-3),
@@ -5603,6 +5612,9 @@ class LocalColonyCompute:
         """
         try:
             n = len(obs_arr)
+            # stamina 1a (§15): ЖИЗНЬ-сайты внутри читают hp_ratio; ГОЛОД — energy_ratio
+            # (=сытость). hp_ratio None (legacy-вызов) → fallback energy_ratio (бит-в-бит).
+            _hpr = hp_ratio if hp_ratio is not None else energy_ratio
             BS = float(self._bias_scale)  # curriculum (порт server _bias_scale)
             # DIRECTION-сила (Фрай 03.06): под single_organism развязана от
             # bias_scale (который =0 зануляло прекондишн) → инстинкт-приор всегда on,
@@ -5888,7 +5900,7 @@ class LocalColonyCompute:
                             logits[5] += 2.0 * PHI * DS   # доминантный ATTACK (контакт, даже er=0)
                             logits[0] *= 0.4; logits[1] *= 0.4
                             logits[2] *= 0.4; logits[3] *= 0.4
-                        elif energy_ratio > _pinv ** 5:   # погоня только если способен
+                        elif _hpr > _pinv ** 5:   # погоня только если способен (ЖИЗНЬ→hp)
                             _wm = (2.0 + 4.0 * diet) * DS * PHI  # ровная φ-погоня
                             if _mdr < 0:
                                 logits[0] += _wm          # NORTH
@@ -5904,8 +5916,8 @@ class LocalColonyCompute:
             logits[10] -= 0.3 * BS           # FLEE базовый штраф
             if d_prox > 0.15:
                 logits[10] += 3.0 * BS * min(d_prox, 1.0)  # FLEE у хищника
-            if energy_ratio < 0.3:
-                logits[12] += 1.0 * BS       # BUILD при низкой энергии (оборона)
+            if _hpr < 0.3:                    # ЖИЗНЬ→hp (оборона при слабости)
+                logits[12] += 1.0 * BS       # BUILD при низком HP (оборона)
             # ИЗОЛИРУЮЩИЙ ТЕСТ override-мотора (Фрай 06.06): на on-flora тиках
             # STAY выигрывает БЕЗУСЛОВНО — паркуем (перебивает структурный −1.0
             # и все градиенты, включая хищника: тест короткий, §3/halo держат).
@@ -8776,6 +8788,39 @@ class LocalColonyCompute:
             self._decep_emit_log.clear()
         logger.info("set_deception_probe: %s", on)
         return self._decep_probe_enabled
+
+    def _energy_ratios(self, cid: str) -> tuple:
+        """stamina шаг 1a (Фрай/Хьюберт §15) — (сытость_ratio, hp_ratio).
+
+        DORMANT (`four_scale` OFF) → ОБА = `energy/1000` (legacy `er`, бит-в-бит
+        старое поведение — HARD GATE). ON (1a) → сытость=`energy/1309`,
+        hp=`hp/1309`, где `hp = energy` ЗЕРКАЛО (поле живёт для паритета server
+        CreatureState.hp + scaffolding 1b). На 1a НЕТ независимой hp-динамики →
+        mirror здесь; 1b СНИМЕТ mirror (death/damage пишут hp) → ratio разойдётся.
+        Единый max=1309=`_CLIENT_MAX_ENERGY` (§12.5 фикс рассинхрона er/1000 vs
+        insula/1309). bc None → (0.5,0.5) (старый дефолт _er)."""
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return (0.5, 0.5)
+        e = float(getattr(bc, "energy", 500.0) or 0.0)
+        if not self._four_scale_enabled:
+            leg = e / 1000.0                 # legacy er (dormant)
+            return (leg, leg)
+        bc.hp = e                            # 1a: hp=energy зеркало (1b снимет)
+        sat = e / _CLIENT_MAX_ENERGY
+        hp = float(getattr(bc, "hp", e) or 0.0) / _CLIENT_MAX_ENERGY
+        return (sat, hp)
+
+    def set_four_scale(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл stamina 4-шкальную модель, шаг 1a (Фрай/
+        Хьюберт §15). ON → er-читатели на /1309, ГОЛОД→сытость_ratio / ЖИЗНЬ→
+        hp_ratio (hp=energy зеркало на 1a → значения равны, поведение по split
+        не меняется; меняется только нормировка /1000→/1309, §12.5). OFF (dormant,
+        default) → бит-в-бит старое (er=/1000). LOCKSTEP с server hp-зеркалом
+        (Хьюберт). kill-switch. Разъезд hp/energy + death→HP — шаг 1b."""
+        self._four_scale_enabled = bool(on)
+        logger.info("set_four_scale: %s", on)
+        return self._four_scale_enabled
 
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
