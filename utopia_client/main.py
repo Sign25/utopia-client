@@ -551,6 +551,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_hp_auth: bool | None = None
     applied_hp_paralysis: bool | None = None
     applied_hp_death: bool | None = None
+    applied_passive_water: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -1025,6 +1026,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("hp_death → %s", target_hpd)
                         except Exception as e:
                             logger.warning("set_hp_death failed: %s", e)
+
+                    # passive_water-backstop (§18.11 closure, имя=server WorldConfig
+                    # passive_water_drinking): hydration-income в параличе (active-Адам).
+                    # Флипается с hp_paralysis (1b.2a). Дефолт OFF. edge.
+                    target_pw = bool(flags.get("passive_water_drinking", False))
+                    if target_pw != applied_passive_water \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_passive_water(target_pw)
+                            applied_passive_water = target_pw
+                            logger.info("passive_water_drinking → %s", target_pw)
+                        except Exception as e:
+                            logger.warning("set_passive_water failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

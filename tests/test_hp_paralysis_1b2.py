@@ -95,10 +95,11 @@ def test_hp_low_enters_paralysis():
 
 
 def test_passive_water_during_paralysis():
-    """В параличе (hp_paralysis) is_adam → passive_water влил hydration (закрытие
-    absorbing-дыры §18.11: вода-далеко тоже восстанавливается)."""
+    """В параличе (passive_water_drinking) is_adam → passive_water влил hydration
+    (закрытие absorbing-дыры §18.11: вода-далеко тоже восстанавливается). Флаг
+    passive_water_drinking (имя зеркалит server, Хьюберт)."""
     c, bc = _compute(energy=100.0, hydration=0.0, hp=500.0)
-    c.set_hp_paralysis(True)
+    c.set_passive_water(True)                              # флаг passive_water_drinking
     c._paralysis_until["c0"] = time.monotonic() + 100.0   # в параличе (не истёк)
     c._apply_metabolism("c0", _rates())
     assert bc.hydration == pytest.approx(_PASSIVE_WATER)  # вода восстановилась (была 0)
@@ -118,8 +119,16 @@ def test_recovery_grant_lifts_hp():
 
 
 def test_passive_water_off_when_dormant():
-    """Флаги OFF → passive_water НЕ льёт (инертно)."""
+    """passive_water_drinking OFF → passive_water НЕ льёт (инертно), даже в параличе."""
     c, bc = _compute(energy=100.0, hydration=0.0, hp=500.0)
     c._paralysis_until["c0"] = time.monotonic() + 100.0
     c._apply_metabolism("c0", _rates())
     assert bc.hydration == 0.0                             # нет passive_water (dormant)
+
+
+def test_passive_water_flag_setter():
+    c = LocalColonyCompute(device="cpu")
+    assert c._passive_water_enabled is False
+    assert c.set_passive_water(True) is True
+    assert c._passive_water_enabled is True
+    assert c.set_passive_water(False) is False
