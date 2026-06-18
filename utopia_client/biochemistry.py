@@ -121,6 +121,10 @@ class ClientCreatureBiochem:
     # НЕ перетрёт → паритет с server max_hp=1309 (=_CLIENT_MAX_ENERGY).
     hp: float = 500.0
     max_hp: float = 1309.0
+    # stamina 1b.1 lockstep (Фрай/Хьюберт §18.6): общая decay_step снимает зеркало
+    # creature.hp=energy ПЕР-CREATURE по is_adam (для Адама hp authoritative; system
+    # одношкальны → зеркало остаётся). Client тикает ТОЛЬКО Адама → is_adam=True.
+    is_adam: bool = True
     hydration: float = 100.0
     infected: bool = False
     infection_severity: float = 0.0

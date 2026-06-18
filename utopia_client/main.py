@@ -548,6 +548,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_four_scale: bool | None = None
     applied_er_norm: bool | None = None
     applied_decay_norm: bool | None = None
+    applied_hp_auth: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -984,6 +985,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("decay_norm_1309 → %s", target_dn)
                         except Exception as e:
                             logger.warning("set_decay_norm failed: %s", e)
+
+                    # stamina 1b.1 (Фрай/Хьюберт §18): hp оживает (authoritative) —
+                    # снять зеркало + урон/дренаж/лечение→hp. death/§3 ещё на energy
+                    # (guardrail). ОТДЕЛЬНЫЙ флаг (1b.2 death→hp — свой). Дефолт OFF.
+                    # LOCKSTEP с server decay_step is_adam. kill-switch. edge.
+                    target_hpa = bool(flags.get("hp_authoritative", False))
+                    if target_hpa != applied_hp_auth \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_hp_authoritative(target_hpa)
+                            applied_hp_auth = target_hpa
+                            logger.info("hp_authoritative → %s", target_hpa)
+                        except Exception as e:
+                            logger.warning("set_hp_authoritative failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

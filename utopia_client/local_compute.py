@@ -241,6 +241,15 @@ _INSULA_DATA_DIM = 71
 # — нормировки совпадают ТОЧЬ-В-ТОЧЬ (incl. raw-camel quirk slot[1]), иначе insula
 # получит сдвиг распределения входа.
 _CLIENT_MAX_ENERGY = 1309.0      # mirror cfg.max_energy default (_gather_interoception)
+# stamina шаг 1b.1 (Фрай/Хьюберт §18): hp = AUTHORITATIVE шкала жизни. φ-калибровка
+# (старт, тюн по 1b.1-телеметрии §8): дренаж нужд→hp φ³≈4.236/тик на КАЖДУЮ нужду=0
+# (обобщение dehydration); лечение φ²≈2.618/тик при ВСЕХ активных нуждах>норма
+# (медленнее дренажа → равновесие в пользу жизни). Дренеры 1b = сытость(energy)+вода
+# (hydration); выносливость-дренаж INERT до φ-расход (§18.7). На 1b.1 death/§3 ЕЩЁ на
+# energy (guardrail) → hp оживает БЕЗ риска смерти (живой recoverable-замер).
+_HP_NEED_DRAIN = _PHI ** 3       # ≈4.236 — дренаж hp/тик на нужду=0
+_HP_HEAL = _PHI ** 2             # ≈2.618 — лечение hp/тик при нуждах в норме
+_HP_NEED_NORM = 1.0              # порог «нужда в норме» для лечения (TBD 1b.1; >0 минимум)
 _CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
 _CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
 # Phase S2.D default_mode: floor ∈ [0, 0.01] — мягкая добавка к Δsurprise.
@@ -569,6 +578,12 @@ class LocalColonyCompute:
         # Сдвигает 4 порога (cortisol-голод 30→392 и др) → больше стресса. catatonic
         # RECOVERABLE (decay cortisol×0.98 доминирует, fixed-point ~10<80). measure-first.
         self._decay_norm_enabled: bool = False   # client_flag decay_norm_1309 (OFF dormant)
+        # stamina шаг 1b.1 (Фрай/Хьюберт §18): hp оживает (AUTHORITATIVE) — снять
+        # hp=energy зеркало + урон→hp + дренаж нужд(сытость/вода)→hp + лечение.
+        # death/§3 ЕЩЁ на energy (guardrail) → живой recoverable-замер hp под хищником
+        # БЕЗ риска смерти. 1b.2 (death→hp) — отдельный флаг/«да» Шефа. LOCKSTEP:
+        # Хьюберт снимает creature.hp=energy из decay_step per-creature (is_adam).
+        self._hp_authoritative_enabled: bool = False  # client_flag hp_authoritative (OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -8819,7 +8834,11 @@ class LocalColonyCompute:
         if not self._four_scale_enabled:
             leg = e / 1000.0                 # legacy er (dormant)
             return (leg, leg)
-        bc.hp = e                            # 1a: hp=energy зеркало (1b снимет)
+        # 1b.1 (§18): hp оживает (AUTHORITATIVE) → СНЯТЬ зеркало под hp_authoritative.
+        # OFF → hp=energy зеркало (1a/1b.1-dormant). ON → hp живёт сам (урон/дренаж/
+        # лечение в _apply_metabolism); НЕ зеркалим, _er_hp видит живой hp (разъезд).
+        if not self._hp_authoritative_enabled:
+            bc.hp = e                        # зеркало (dormant); 1b.1-ON снимает
         # 1a-norm (§16.1): er-нормировка /1000→/1309 ТОЛЬКО под er_norm_1309.
         # φ-пороги в читателях ОСТАЮТСЯ φ → абсолютные триггеры сдвигаются (голод
         # 618→809). OFF → /1000 (инертно, как 1a). Сдвиг чисто client (server уже 1309).
@@ -8865,6 +8884,21 @@ class LocalColonyCompute:
         self._decay_norm_enabled = bool(on)
         logger.info("set_decay_norm: %s", on)
         return self._decay_norm_enabled
+
+    def set_hp_authoritative(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл stamina 1b.1 (Фрай/Хьюберт §18, САМЫЙ рисковый
+        шаг). ON → hp = AUTHORITATIVE: снять hp=energy зеркало (`_energy_ratios`) +
+        урон хищника→hp (не energy) + дренаж нужд(сытость/вода)=0→hp φ³ + лечение φ²
+        при нуждах в норме. ЖИЗНЬ-читатели (_er_hp) видят живой hp (разъезд от
+        сытости). ⚠️ death/§3 ОСТАЮТСЯ на energy (guardrail) — 1b.1 оживляет hp БЕЗ
+        риска смерти (живой recoverable-замер под хищником). 1b.2 (death→hp, снятие
+        guardrail) — ОТДЕЛЬНЫЙ флаг + «да» Шефа. Выносливость-дренаж INERT до
+        φ-расход (§18.7). LOCKSTEP: Хьюберт снимает creature.hp=energy из decay_step
+        per-creature (is_adam) — иначе зеркало перетрёт hp. OFF (default) → инертно.
+        kill-switch. Метрики: hp-траектория (спираль vs лечится), §3=0."""
+        self._hp_authoritative_enabled = bool(on)
+        logger.info("set_hp_authoritative: %s", on)
+        return self._hp_authoritative_enabled
 
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.
@@ -9540,6 +9574,11 @@ class LocalColonyCompute:
                 if bc is not None:
                     proj["energy"] = float(getattr(bc, "energy", 0.0))
                     proj["hydration"] = float(getattr(bc, "hydration", 0.0))
+                    # stamina 1b.1 (§18): hp/max_hp client-authoritative → P40
+                    # frozen-fallback применяет CreatureState.hp. На 1a/1b.1-dormant
+                    # hp=energy зеркало; 1b.1-ON — живой hp. P40 принимает как chem.
+                    proj["hp"] = float(getattr(bc, "hp", 0.0))
+                    proj["max_hp"] = float(getattr(bc, "max_hp", _CLIENT_MAX_ENERGY))
                     # Infection (01.06.2026, Фрай): client-authoritative →
                     # P40 зеркалит (как energy/hydration). Тик/death — клиент.
                     proj["infected"] = bool(getattr(bc, "infected", False))
@@ -10744,13 +10783,18 @@ class LocalColonyCompute:
                 bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - basal)
                 self._e_cost_sum += basal
                 self._metab_basal_sum = getattr(self, "_metab_basal_sum", 0.0) + basal
-            # DAMAGE-канал: применяем predator-урон к авторитетной energy
-            # (per-client-tick, §3.5). Идёт в _e_cost_sum → ENERGY_CALIB net
-            # учитывает урон. §3 ловит energy≤0 → паралич, не смерть.
+            # DAMAGE-канал: predator-урон. 1b.1 (§18): под hp_authoritative урон → HP
+            # (не energy/сытость) — physical-integrity мишень (§1.1). OFF → legacy
+            # (energy, §3 ловит energy≤0). На 1b.1 death/§3 ещё на energy → урон в hp
+            # НЕ убивает (живой замер). Идёт в _e_cost_sum только когда в energy.
             if _dmg > 0.0:
-                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - _dmg)
-                self._e_cost_sum += _dmg
-                self._dmg_sum += _dmg
+                if self._hp_authoritative_enabled:
+                    bc.hp = max(0.0, float(getattr(bc, "hp", 0.0)) - _dmg)
+                    self._hp_dmg_sum = getattr(self, "_hp_dmg_sum", 0.0) + _dmg
+                else:
+                    bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - _dmg)
+                    self._e_cost_sum += _dmg
+                    self._dmg_sum += _dmg
             # Glucose→energy конверсия (Фрай 04.06): излишек glucose (>baseline 50,
             # от плотной еды) → energy. Делает экономику выигрываемой при хорошей
             # добыче. glucose потребляется, но не ниже baseline. rate=0 → no-op.
@@ -10786,6 +10830,38 @@ class LocalColonyCompute:
                 if drain > 0.0:
                     bc.energy = max(
                         0.0, float(getattr(bc, "energy", 0.0)) - drain)
+            # 1b.1 (§18): ДРЕНАЖ нужд→hp + ЛЕЧЕНИЕ (hp оживает). Дренеры = сытость
+            # (energy) + вода (hydration); выносливость INERT до φ-расход (§18.7).
+            # Нужда=0 → дренаж φ³/тик на каждую; ВСЕ активные нужды>норма → лечение
+            # φ²/тик (медленнее → равновесие в пользу жизни). death/§3 на energy
+            # (guardrail) → hp вниз НЕ убивает на 1b.1 (живой recoverable-замер).
+            # Идёт ПОСЛЕ всех energy/hydration-правок (значения нужд финальны).
+            if self._hp_authoritative_enabled:
+                _e_need = float(getattr(bc, "energy", 0.0))
+                _h_need = float(getattr(bc, "hydration", 0.0))
+                _need_drain = 0.0
+                if _e_need <= 0.0:                       # сытость=0
+                    _need_drain += _HP_NEED_DRAIN
+                if _h_need <= 0.0:                       # вода=0
+                    _need_drain += _HP_NEED_DRAIN
+                _max_hp = float(getattr(bc, "max_hp", _CLIENT_MAX_ENERGY))
+                if _need_drain > 0.0:
+                    bc.hp = max(0.0, float(getattr(bc, "hp", 0.0)) - _need_drain * dt)
+                    self._hp_drain_sum = getattr(self, "_hp_drain_sum", 0.0) + _need_drain * dt
+                elif _e_need > _HP_NEED_NORM and _h_need > _HP_NEED_NORM:
+                    _heal = _HP_HEAL * dt                # все активные нужды в норме
+                    bc.hp = min(_max_hp, float(getattr(bc, "hp", 0.0)) + _heal)
+                    self._hp_heal_sum = getattr(self, "_hp_heal_sum", 0.0) + _heal
+                # HP_DIAG (1b.1 окно): hp-траектория (спираль vs лечится)
+                self._hp_diag_n = getattr(self, "_hp_diag_n", 0) + 1
+                if self._hp_diag_n % 50 == 1:
+                    logger.info(
+                        "HP_DIAG cid=%s hp=%.1f/%.0f e=%.1f hyd=%.1f drain=%.2f "
+                        "heal=%.2f dmg_cum=%.1f", cid, float(getattr(bc, "hp", 0.0)),
+                        _max_hp, _e_need, _h_need, _need_drain * dt,
+                        (_HP_HEAL * dt if _need_drain <= 0.0 and _e_need > _HP_NEED_NORM
+                         and _h_need > _HP_NEED_NORM else 0.0),
+                        getattr(self, "_hp_dmg_sum", 0.0))
         if org is not None and tel_decay > 0.0:
             try:
                 org.telomere = max(0.0, min(
