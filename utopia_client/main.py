@@ -553,6 +553,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_hp_death: bool | None = None
     applied_passive_water: bool | None = None
     applied_force_water_far: bool | None = None
+    applied_phi_fatigue: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -1053,6 +1054,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("force_water_far → %s", target_fwf)
                         except Exception as e:
                             logger.warning("set_force_water_far failed: %s", e)
+
+                    # stamina φ-расход (Фрай §19, АКТИВНЫЙ): fatigue копится от
+                    # действий (apply_action_taken φ-лестница) → выносливость=0→hp-дренаж.
+                    # Закрывает GAP (Адам не уставал). Дефолт OFF. LOCKSTEP server. edge.
+                    target_phf = bool(flags.get("phi_fatigue", False))
+                    if target_phf != applied_phi_fatigue \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_phi_fatigue(target_phf)
+                            applied_phi_fatigue = target_phf
+                            logger.info("phi_fatigue → %s", target_phf)
+                        except Exception as e:
+                            logger.warning("set_phi_fatigue failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation
