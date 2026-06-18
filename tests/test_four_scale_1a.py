@@ -26,6 +26,8 @@ from utopia_client.local_compute import (  # noqa: E402
 )
 from utopia_client.biochemistry import ClientCreatureBiochem  # noqa: E402
 
+assert _CLIENT_MAX_ENERGY == 1309.0      # паритет server max_hp/max_energy
+
 
 def _compute_with_energy(e):
     c = LocalColonyCompute(device="cpu")
@@ -42,10 +44,13 @@ def test_default_off():
 
 
 def test_hp_field_default_mirrors_energy():
-    """ClientCreatureBiochem.hp дефолт = energy дефолт (зеркало с рождения)."""
+    """ClientCreatureBiochem.hp дефолт = energy дефолт; max_hp=1309 (паритет server,
+    guard-skip в decay_step). Оба в snapshot."""
     bc = ClientCreatureBiochem()
     assert bc.hp == bc.energy == 500.0
-    assert "hp" in bc.as_snapshot()
+    assert bc.max_hp == 1309.0
+    snap = bc.as_snapshot()
+    assert "hp" in snap and "max_hp" in snap
 
 
 def test_off_bitexact_legacy():
@@ -55,14 +60,15 @@ def test_off_bitexact_legacy():
     assert sat == hp == pytest.approx(618.0 / 1000.0)
 
 
-def test_on_unified_1309_and_equal():
-    """ON (1a): оба ratio = energy/1309 и РАВНЫ (hp=energy зеркало)."""
+def test_on_bitidentical_and_equal():
+    """ON (1a, dormant): оба ratio = energy/1000 (бит-в-бит OFF) и РАВНЫ (hp=energy).
+    HARD GATE: флип four_scale ИНЕРТЕН (§12.5 re-source 1309 — net-zero, отдельно)."""
     c = _compute_with_energy(809.0)
+    off_sat, off_hp = c._energy_ratios("c0")
     c.set_four_scale(True)
-    sat, hp = c._energy_ratios("c0")
-    assert sat == pytest.approx(809.0 / _CLIENT_MAX_ENERGY)
-    assert hp == pytest.approx(809.0 / _CLIENT_MAX_ENERGY)
-    assert sat == hp                     # нет разъезда на 1a
+    on_sat, on_hp = c._energy_ratios("c0")
+    assert on_sat == pytest.approx(809.0 / 1000.0)
+    assert on_sat == on_hp == off_sat == off_hp      # инертно: ON≡OFF, sat≡hp
 
 
 def test_on_mirrors_hp_field():
@@ -74,14 +80,14 @@ def test_on_mirrors_hp_field():
     assert c.biochem["c0"].hp == 742.0
 
 
-def test_normalization_shift_off_to_on():
-    """§12.5: OFF=/1000, ON=/1309 — фикс рассинхрона (значение РАЗНОЕ, ожидаемо)."""
-    c = _compute_with_energy(1000.0)
-    off_sat, _ = c._energy_ratios("c0")
-    assert off_sat == pytest.approx(1.0)             # 1000/1000
-    c.set_four_scale(True)
-    on_sat, _ = c._energy_ratios("c0")
-    assert on_sat == pytest.approx(1000.0 / 1309.0)  # ≈0.764 (выровнено на server-канон)
+def test_flip_inert_bitexact():
+    """§14.2/HARD GATE: для диапазона энергий флип four_scale НЕ меняет ratio."""
+    for e in (50.0, 200.0, 618.0, 809.0, 1000.0, 1309.0):
+        c = _compute_with_energy(e)
+        off = c._energy_ratios("c0")
+        c.set_four_scale(True)
+        on = c._energy_ratios("c0")
+        assert on == off, f"флип сдвинул ratio при energy={e}: {off}→{on}"
 
 
 def test_no_biochem_default():
@@ -98,6 +104,22 @@ def test_flag_setter():
     assert c._four_scale_enabled is True
     assert c.set_four_scale(False) is False
     assert c._four_scale_enabled is False
+
+
+def test_decay_step_hp_mirror_parity():
+    """math-equiv (client-половина HARD GATE): общий server decay_step ставит
+    hp=energy + НЕ перетирает max_hp=1309 (guard max_hp<=0 ложен на дефолте 1309).
+    Зеркало Хьюбертова tests/test_stamina_1a. Требует environment (skip в dev-venv)."""
+    decay_step = pytest.importorskip("environment.biochemistry").decay_step
+    from utopia_client.biochemistry import _FakeWorld
+    for e in (137.0, 500.0, 999.0):
+        bc = ClientCreatureBiochem()
+        bc.energy = e
+        bc.hp = 0.0                       # decay_step должен отзеркалить ←energy
+        decay_step(bc, _FakeWorld())
+        assert bc.hp == pytest.approx(e)  # hp == energy (зеркало)
+        assert bc.max_hp == 1309.0        # guard-skip → паритет с server, не 100
+        assert bc.energy == pytest.approx(e)  # energy-траектория НЕ тронута
 
 
 def test_shape_action_logits_hp_ratio_fallback():

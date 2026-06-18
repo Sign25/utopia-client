@@ -111,10 +111,16 @@ class ClientCreatureBiochem:
     # было 100 (default) → reproduce_threshold=500 недостижим. Phase 4 fix 0.11.2.
     energy: float = 500.0
     # stamina 4-шкальная модель, шаг 1a (Фрай/Хьюберт §15, lockstep с server
-    # CreatureState.hp world.py:853): HP-бак. На 1a hp = energy ЗЕРКАЛО (dormant,
-    # бит-в-бит; разъезд в 1b: death/damage пишут hp). Единый max=1309 (см.
-    # _CLIENT_MAX_ENERGY). Калибровка baseline/max (§8) — позже.
+    # CreatureState.hp/max_hp): HP-бак. На 1a hp = energy ЗЕРКАЛО (dormant,
+    # бит-в-бит; разъезд в 1b: death/damage пишут hp). server decay_step
+    # (environment/biochemistry.py:459+) ставит creature.hp=energy всегда +
+    # creature.max_hp=max_energy ТОЛЬКО если max_hp<=0. Поля ОБЯЗАТЕЛЬНЫ — иначе
+    # новый decay_step упадёт на dataclass. max_hp дефолт=1309 (НЕ 0): client
+    # decay-ctx _FakeWorld max_energy=100 (менять нельзя — сломает бит-в-бит
+    # decay-нормировку), потому дефолт 1309 → guard max_hp<=0 ложен → decay_step
+    # НЕ перетрёт → паритет с server max_hp=1309 (=_CLIENT_MAX_ENERGY).
     hp: float = 500.0
+    max_hp: float = 1309.0
     hydration: float = 100.0
     infected: bool = False
     infection_severity: float = 0.0
@@ -141,7 +147,8 @@ class ClientCreatureBiochem:
             "glucose": round(self.glucose, 2),
             "fatigue": round(self.fatigue, 2),
             "histamine": round(self.histamine, 2),
-            "hp": round(self.hp, 2),         # stamina 1a (зеркало energy)
+            "hp": round(self.hp, 2),          # stamina 1a (зеркало energy)
+            "max_hp": round(self.max_hp, 2),  # stamina 1a (=1309, паритет server)
             "mental_break": self.mental_break,
         }
 

@@ -8792,13 +8792,16 @@ class LocalColonyCompute:
     def _energy_ratios(self, cid: str) -> tuple:
         """stamina шаг 1a (Фрай/Хьюберт §15) — (сытость_ratio, hp_ratio).
 
-        DORMANT (`four_scale` OFF) → ОБА = `energy/1000` (legacy `er`, бит-в-бит
-        старое поведение — HARD GATE). ON (1a) → сытость=`energy/1309`,
-        hp=`hp/1309`, где `hp = energy` ЗЕРКАЛО (поле живёт для паритета server
-        CreatureState.hp + scaffolding 1b). На 1a НЕТ независимой hp-динамики →
-        mirror здесь; 1b СНИМЕТ mirror (death/damage пишут hp) → ratio разойдётся.
-        Единый max=1309=`_CLIENT_MAX_ENERGY` (§12.5 фикс рассинхрона er/1000 vs
-        insula/1309). bc None → (0.5,0.5) (старый дефолт _er)."""
+        HARD GATE 1a = DORMANT/бит-в-бит (Фрай §14.2 «значения равны → переключение
+        безопасно, затем дать ratio разойтись в 1b/1c»). Поэтому нормировка /1000
+        (legacy эвристик-шкала, под неё настроены φ-пороги) на ОБА пути → флип
+        four_scale ИНЕРТЕН по поведению. ON отличается только тем, что hp_ratio
+        читает поле `hp` (на 1a = energy ЗЕРКАЛО, mirror здесь — read-time инвариант
+        hp==energy; 1b СНИМЕТ mirror → death/damage разведут ratio). §12.5 унификация
+        er на _CLIENT_MAX_ENERGY=1309 — NET-ZERO (со-масштаб φ-порогов ×1000/1309 =
+        те же energy-триггеры) → косметика; держу /1000 для провабельной инертности,
+        re-source 1309 — отдельным шагом по подтверждению Хьюберта (косметика vs
+        реальный сдвиг на 809-триггеры). bc None → (0.5,0.5) (старый дефолт _er)."""
         bc = self.biochem.get(cid)
         if bc is None:
             return (0.5, 0.5)
@@ -8807,17 +8810,17 @@ class LocalColonyCompute:
             leg = e / 1000.0                 # legacy er (dormant)
             return (leg, leg)
         bc.hp = e                            # 1a: hp=energy зеркало (1b снимет)
-        sat = e / _CLIENT_MAX_ENERGY
-        hp = float(getattr(bc, "hp", e) or 0.0) / _CLIENT_MAX_ENERGY
+        sat = e / 1000.0
+        hp = float(getattr(bc, "hp", e) or 0.0) / 1000.0   # hp==energy на 1a → равно sat
         return (sat, hp)
 
     def set_four_scale(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл stamina 4-шкальную модель, шаг 1a (Фрай/
-        Хьюберт §15). ON → er-читатели на /1309, ГОЛОД→сытость_ratio / ЖИЗНЬ→
-        hp_ratio (hp=energy зеркало на 1a → значения равны, поведение по split
-        не меняется; меняется только нормировка /1000→/1309, §12.5). OFF (dormant,
-        default) → бит-в-бит старое (er=/1000). LOCKSTEP с server hp-зеркалом
-        (Хьюберт). kill-switch. Разъезд hp/energy + death→HP — шаг 1b."""
+        Хьюберт §15). ON → читатели energy_ratio классифицированы ГОЛОД→сытость_ratio
+        / ЖИЗНЬ→hp_ratio (hp=energy зеркало на 1a → значения РАВНЫ → флип ИНЕРТЕН по
+        поведению, HARD GATE бит-в-бит; разъезд hp/energy + death→HP — шаг 1b). OFF
+        (dormant, default) → старый путь. LOCKSTEP с server hp-зеркалом (Хьюберт).
+        kill-switch. §12.5 (er→/1309) — net-zero, отдельным шагом."""
         self._four_scale_enabled = bool(on)
         logger.info("set_four_scale: %s", on)
         return self._four_scale_enabled
