@@ -106,6 +106,23 @@ def test_flag_setter():
     assert c._four_scale_enabled is False
 
 
+def test_shape_life_reader_keys_on_hp():
+    """1a.2 lock: ЖИЗНЬ-ридер defensive-BUILD (logits[12]) реагирует на hp_ratio,
+    НЕ на сытость. Низкий hp + высокая сытость → BUILD растёт; высокий hp + низкая
+    сытость → BUILD НЕ растёт (порог hp<0.3). Готовность к разъезду 1b (hp≠сытость).
+    На 1a hp==energy → оба пути совпадают, но routing уже на hp."""
+    import numpy as np
+    import torch
+    c = LocalColonyCompute(device="cpu")
+    c._bias_scale = 1.0
+    obs = np.zeros(64, dtype=np.float32)
+    lo_hp = torch.zeros(16)
+    c._shape_action_logits(lo_hp, obs, 0.3, 0.9, hp_ratio=0.2)   # сыт, HP НИЗКИЙ
+    hi_hp = torch.zeros(16)
+    c._shape_action_logits(hi_hp, obs, 0.3, 0.2, hp_ratio=0.9)   # голоден, HP высокий
+    assert float(lo_hp[12]) > float(hi_hp[12])   # BUILD от HP (ЖИЗНЬ), не сытости
+
+
 def test_decay_step_hp_mirror_parity():
     """math-equiv (client-половина HARD GATE): общий server decay_step ставит
     hp=energy + НЕ перетирает max_hp=1309 (guard max_hp<=0 ложен на дефолте 1309).
