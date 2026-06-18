@@ -558,6 +558,11 @@ class LocalColonyCompute:
         # energy_ratio (ГОЛОД→сытость / ЖИЗНЬ→hp). OFF (dormant) → бит-в-бит старое
         # (er=/1000). Разъезд hp от energy — в 1b (death/damage). kill-switch.
         self._four_scale_enabled: bool = False   # client_flag four_scale (OFF dormant)
+        # stamina 1a-norm (Фрай/Хьюберт §16, первый НЕ-инертный сдвиг): er-нормировка
+        # /1000→/1309 (истинный max) → φ-пороги становятся φ от реального max
+        # (голод-онсет 618→809). ОТДЕЛЬНЫЙ флаг от four_scale (тот уже ON) → свой
+        # валидируемый флип + kill-switch. measure-first (§3=0+гистограмма действий).
+        self._er_norm_enabled: bool = False      # client_flag er_norm_1309 (OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -8797,11 +8802,10 @@ class LocalColonyCompute:
         (legacy эвристик-шкала, под неё настроены φ-пороги) на ОБА пути → флип
         four_scale ИНЕРТЕН по поведению. ON отличается только тем, что hp_ratio
         читает поле `hp` (на 1a = energy ЗЕРКАЛО, mirror здесь — read-time инвариант
-        hp==energy; 1b СНИМЕТ mirror → death/damage разведут ratio). §12.5 унификация
-        er на _CLIENT_MAX_ENERGY=1309 — NET-ZERO (со-масштаб φ-порогов ×1000/1309 =
-        те же energy-триггеры) → косметика; держу /1000 для провабельной инертности,
-        re-source 1309 — отдельным шагом по подтверждению Хьюберта (косметика vs
-        реальный сдвиг на 809-триггеры). bc None → (0.5,0.5) (старый дефолт _er)."""
+        hp==energy; 1b СНИМЕТ mirror → death/damage разведут ratio). **1a-norm (§16):
+        нормировка /1000→/1309 под `er_norm_1309` (φ-пороги ОСТАЮТСЯ φ → голод-онсет
+        618→809, осознанный сдвиг (B), measure-first). er_norm OFF → /1000 (инертно).**
+        bc None → (0.5,0.5) (старый дефолт _er)."""
         bc = self.biochem.get(cid)
         if bc is None:
             return (0.5, 0.5)
@@ -8810,8 +8814,12 @@ class LocalColonyCompute:
             leg = e / 1000.0                 # legacy er (dormant)
             return (leg, leg)
         bc.hp = e                            # 1a: hp=energy зеркало (1b снимет)
-        sat = e / 1000.0
-        hp = float(getattr(bc, "hp", e) or 0.0) / 1000.0   # hp==energy на 1a → равно sat
+        # 1a-norm (§16.1): er-нормировка /1000→/1309 ТОЛЬКО под er_norm_1309.
+        # φ-пороги в читателях ОСТАЮТСЯ φ → абсолютные триггеры сдвигаются (голод
+        # 618→809). OFF → /1000 (инертно, как 1a). Сдвиг чисто client (server уже 1309).
+        norm = _CLIENT_MAX_ENERGY if self._er_norm_enabled else 1000.0
+        sat = e / norm
+        hp = float(getattr(bc, "hp", e) or 0.0) / norm     # hp==energy на 1a → равно sat
         return (sat, hp)
 
     def set_four_scale(self, on: bool) -> bool:
@@ -8824,6 +8832,20 @@ class LocalColonyCompute:
         self._four_scale_enabled = bool(on)
         logger.info("set_four_scale: %s", on)
         return self._four_scale_enabled
+
+    def set_er_norm(self, on: bool) -> bool:
+        """Канал client_flags: вкл/выкл stamina 1a-norm (Фрай/Хьюберт §16, первый
+        НЕ-инертный сдвиг). ON → `_energy_ratios` нормирует er на _CLIENT_MAX_ENERGY
+        (1309) вместо 1000; φ-пороги читателей ОСТАЮТСЯ φ → абсолютные триггеры
+        сдвигаются (голод-онсет 618→809, Адам поддерживает больший резерв → §3-риск
+        скорее ↓; но голод-давление на охоту может ослабнуть — measure-first). ⚠️
+        ТРЕБУЕТ four_scale=ON (er_norm действует в four_scale-ON ветке). Сдвиг ЧИСТО
+        client (server уже канон 1309). OFF (default) → /1000 (инертно). kill-switch.
+        Phase M: флип → окно §3=0 + гистограмма действий. issue #22 (cortisol /100) —
+        ОТДЕЛЬНО (1a-norm.2), НЕ бандл (measure-first одна переменная)."""
+        self._er_norm_enabled = bool(on)
+        logger.info("set_er_norm: %s", on)
+        return self._er_norm_enabled
 
     def _build_client_intero(self, cid: str):
         """§3.2: client-authoritative интероцепция [7] из self.biochem.

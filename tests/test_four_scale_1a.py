@@ -106,6 +106,57 @@ def test_flag_setter():
     assert c._four_scale_enabled is False
 
 
+def test_er_norm_default_off():
+    c = LocalColonyCompute(device="cpu")
+    assert c._er_norm_enabled is False
+
+
+def test_er_norm_off_keeps_1000():
+    """1a-norm OFF (dormant): four_scale ON но er_norm OFF → /1000 (инертно, как 1a)."""
+    c = _compute_with_energy(700.0)
+    c.set_four_scale(True)
+    sat, hp = c._energy_ratios("c0")
+    assert sat == hp == pytest.approx(700.0 / 1000.0)
+
+
+def test_er_norm_on_shifts_to_1309():
+    """1a-norm ON: er=/1309 → φ⁻¹-голод-триггер сдвигается 618→809 (§16.1 B)."""
+    c = _compute_with_energy(700.0)
+    c.set_four_scale(True)
+    c.set_er_norm(True)
+    sat, hp = c._energy_ratios("c0")
+    assert sat == hp == pytest.approx(700.0 / _CLIENT_MAX_ENERGY)
+    # голод-онсет: e=700 при /1000 = 0.70 (сыт, >φ⁻¹); при /1309 = 0.535 (<φ⁻¹ → голоден)
+    PHI_INV = 1.0 / 1.6180339887
+    assert (700.0 / 1000.0) > PHI_INV       # старо: сыт
+    assert (700.0 / _CLIENT_MAX_ENERGY) < PHI_INV   # ново: голоден (онсет раньше)
+
+
+def test_er_norm_trigger_shift_618_to_809():
+    """Точный сдвиг голод-порога: φ⁻¹·1000≈618 → φ⁻¹·1309≈809."""
+    PHI_INV = 1.0 / 1.6180339887
+    # старый абсолютный триггер (e где sat==φ⁻¹): 1000·φ⁻¹
+    assert 1000.0 * PHI_INV == pytest.approx(618.0, abs=1.0)
+    # новый: 1309·φ⁻¹
+    assert _CLIENT_MAX_ENERGY * PHI_INV == pytest.approx(809.0, abs=1.0)
+
+
+def test_er_norm_requires_four_scale():
+    """er_norm действует только в four_scale-ON ветке (four_scale OFF → полный legacy)."""
+    c = _compute_with_energy(700.0)
+    c.set_er_norm(True)                  # er_norm ON, но four_scale OFF
+    sat, hp = c._energy_ratios("c0")
+    assert sat == hp == pytest.approx(700.0 / 1000.0)   # legacy /1000 (four_scale gate)
+
+
+def test_er_norm_flag_setter():
+    c = LocalColonyCompute(device="cpu")
+    assert c.set_er_norm(True) is True
+    assert c._er_norm_enabled is True
+    assert c.set_er_norm(False) is False
+    assert c._er_norm_enabled is False
+
+
 def test_shape_life_reader_keys_on_hp():
     """1a.2 lock: ЖИЗНЬ-ридер defensive-BUILD (logits[12]) реагирует на hp_ratio,
     НЕ на сытость. Низкий hp + высокая сытость → BUILD растёт; высокий hp + низкая

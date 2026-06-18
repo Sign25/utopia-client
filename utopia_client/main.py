@@ -546,6 +546,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_signal_emit: bool | None = None
     applied_decep_probe: bool | None = None
     applied_four_scale: bool | None = None
+    applied_er_norm: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -954,6 +955,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("four_scale → %s", target_4s)
                         except Exception as e:
                             logger.warning("set_four_scale failed: %s", e)
+
+                    # stamina 1a-norm (Фрай/Хьюберт §16, первый НЕ-инертный сдвиг):
+                    # er-нормировка /1000→/1309 (голод-онсет 618→809). ОТДЕЛЬНЫЙ флаг
+                    # от four_scale (тот уже ON) → свой валидируемый Phase-M флип +
+                    # kill-switch. Дефолт OFF (dormant). measure-first. edge.
+                    target_ern = bool(flags.get("er_norm_1309", False))
+                    if target_ern != applied_er_norm \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_er_norm(target_ern)
+                            applied_er_norm = target_ern
+                            logger.info("er_norm_1309 → %s", target_ern)
+                        except Exception as e:
+                            logger.warning("set_er_norm failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation
