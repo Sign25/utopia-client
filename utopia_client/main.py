@@ -554,6 +554,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_passive_water: bool | None = None
     applied_force_water_far: bool | None = None
     applied_phi_fatigue: bool | None = None
+    applied_intero_obs: bool | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_life: bool | None = None
@@ -1067,6 +1068,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("phi_fatigue → %s", target_phf)
                         except Exception as e:
                             logger.warning("set_phi_fatigue failed: %s", e)
+
+                    # obs O2 (stamina §19.2/§20): выносливость+HP в obs[76:78]
+                    # (восприятие). Миграция 76→78 авто (preserve-expand). INERT
+                    # (OFF→obs[76:78]=0). Дефолт OFF. edge.
+                    target_io = bool(flags.get("intero_obs", False))
+                    if target_io != applied_intero_obs \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_intero_obs(target_io)
+                            applied_intero_obs = target_io
+                            logger.info("intero_obs → %s", target_io)
+                        except Exception as e:
+                            logger.warning("set_intero_obs failed: %s", e)
 
                     # РОСТ-ОТ-ПОВЕДЕНИЯ Путь 2 (Фрай 15.06, project-rhythm-affordance):
                     # behavioral_growth=true → behavioral-mint/retention/graduation

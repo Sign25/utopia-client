@@ -64,9 +64,9 @@ def test_constants_layout():
     assert _SELF_OBS_OFFSET == 64
     assert _RHYTHM_OFFSET == 68          # строго после self4, в хвосте
     assert _RHYTHM_DIM == 4              # day sin/cos + year sin/cos
-    # 16.06: social_signals расширил хвост 72→76 (rhythm [68:72] остался на месте,
-    # social [72:76] добавлен). _BRAIN_INPUT_DIM теперь 76 — ритм-колонки целы.
-    assert _BRAIN_INPUT_DIM == 76
+    # 16.06: social_signals 72→76; 18.06: obs O2 (выносливость/HP) 76→78. rhythm
+    # [68:72] остался на месте. _BRAIN_INPUT_DIM теперь 78 — ритм-колонки целы.
+    assert _BRAIN_INPUT_DIM == 78
 
 
 # ── Тест 1: первое расширение 64→72 = [I_64|0], проекция = identity ───────

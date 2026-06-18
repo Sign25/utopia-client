@@ -42,6 +42,9 @@ from utopia_client.local_compute import (                # noqa: E402
 )
 
 _RHYTHM_END = _RHYTHM_OFFSET + _RHYTHM_DIM               # 72 — довходовой dim
+_SOCIAL_END = _SOCIAL_OFFSET + _SOCIAL_DIM               # 76 — пост-social dim (18.06:
+#   intero (obs O2) расширил _BRAIN_INPUT_DIM 76→78; social-миграция теперь до 76
+#   (промежуточный), 78 — финал. Тесты 72→76 таргетят _SOCIAL_END, не _BRAIN_INPUT_DIM.
 
 
 def _compute():
@@ -63,7 +66,8 @@ def _pred_or_skip(c):
 def test_constants_layout():
     assert _SOCIAL_OFFSET == 72          # строго после rhythm4, в хвосте
     assert _SOCIAL_DIM == 4              # food NS/EW + danger NS/EW
-    assert _BRAIN_INPUT_DIM == 76
+    assert _SOCIAL_END == 76             # пост-social dim (промежуточный)
+    assert _BRAIN_INPUT_DIM == 78        # финал (18.06: +intero obs O2 [76:78])
     assert _SOCIAL_OFFSET == _RHYTHM_END  # social начинается ровно где ритм кончился
 
 
@@ -83,9 +87,9 @@ def test_preserve_expansion_72_to_76_identical():
     x72 = torch.randn(_RHYTHM_END)
     with torch.no_grad():
         proj72 = F.linear(x72.unsqueeze(0), w72, b72).reshape(-1)   # эталон
-    # 72→76 ПРЕЗЕРВ
-    assert c._upgrade_tissue_input_dim(pred, _BRAIN_INPUT_DIM) is True
-    assert int(pred.data_dim) == _BRAIN_INPUT_DIM
+    # 72→76 ПРЕЗЕРВ (таргет _SOCIAL_END=76, промежуточный; финал 78 — отд. тест intero)
+    assert c._upgrade_tissue_input_dim(pred, _SOCIAL_END) is True
+    assert int(pred.data_dim) == _SOCIAL_END
     # выученные 72 колонки целы ТОЧНО, social-колонки [72:76] = 0, bias цел
     assert torch.allclose(pred.input_proj.weight[:, :_RHYTHM_END], w72, atol=0), \
         "preserve обнулил/исказил выученные колонки = brain-reset"
@@ -121,11 +125,13 @@ def test_load_transition_72_saved_to_76():
     assert int(loaded.data_dim) == _BRAIN_INPUT_DIM
     assert torch.allclose(loaded.input_proj.weight[:, :_RHYTHM_END], w72, atol=0)
     assert torch.allclose(loaded.input_proj.bias, b72, atol=0)
+    # 72-saved грузится + расширяется до ФИНАЛА _BRAIN_INPUT_DIM (78): хвост
+    # [72:78] (social4+intero2) = 0 → проекция [x72|zeros] идентична довходу 72.
     assert torch.count_nonzero(
-        loaded.input_proj.weight[:, _SOCIAL_OFFSET:_SOCIAL_OFFSET + _SOCIAL_DIM]) == 0
-    x76 = torch.cat([x72, torch.zeros(_SOCIAL_DIM)])
+        loaded.input_proj.weight[:, _SOCIAL_OFFSET:_BRAIN_INPUT_DIM]) == 0
+    x_full = torch.cat([x72, torch.zeros(_BRAIN_INPUT_DIM - _RHYTHM_END)])
     with torch.no_grad():
-        proj_loaded = _proj(loaded, x76)
+        proj_loaded = _proj(loaded, x_full)
     assert torch.allclose(proj_src, proj_loaded, atol=1e-6)
 
 

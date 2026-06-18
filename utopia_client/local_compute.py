@@ -78,7 +78,14 @@ _RHYTHM_DIM = 4
 # Зеркало ритм-расширения 68→72. target/output/мотор НЕ трогаем — только вход.
 _SOCIAL_OFFSET = _RHYTHM_OFFSET + _RHYTHM_DIM       # 72
 _SOCIAL_DIM = 4
-_BRAIN_INPUT_DIM = _SOCIAL_OFFSET + _SOCIAL_DIM     # 76 — окно чтения мозга
+# obs O2 (stamina §19.2/§20, Фрай GO): интероцепция тела — выносливость + HP.
+#   obs[76] = выносливость_norm (1−fatigue/100)   obs[77] = hp_norm (hp/max_hp)
+# OWNED (client-биохимия) → строятся client-side (_build_intero_obs), НЕ из P40-obs.
+# Default zeros = dormant (флаг intero_obs OFF → obs[76:78]=0 → predictor[76:78]=0 →
+# math-equivalent довходу 76). Зеркало social-миграции 72→76. Резерв [78:80] свободен.
+_INTERO_OFFSET = _SOCIAL_OFFSET + _SOCIAL_DIM       # 76
+_INTERO_DIM = 2
+_BRAIN_INPUT_DIM = _INTERO_OFFSET + _INTERO_DIM     # 78 — окно чтения мозга
 # social danger-подканалы (для forecast-born триггера): [74]=danger_ns, [75]=danger_ew.
 _SOCIAL_DANGER = (74, 76)
 # predator-каналы env (авторитет server/tick/obs.py:697-699): [59]=pred_grad_ns,
@@ -615,6 +622,10 @@ class LocalColonyCompute:
         # выносливость=0(fatigue=max)→дренаж hp φ³. SELF-recovering (§3=force-STAY=
         # отдых, passive-backstop не нужен). Стейджинг как 1b. LOCKSTEP server.
         self._phi_fatigue_enabled: bool = False  # client_flag phi_fatigue (OFF dormant)
+        # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
+        # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
+        # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
+        self._intero_obs_enabled: bool = False  # client_flag intero_obs (OFF dormant)
         # social forecast-born метрика (Фрай §7): paired-ablation forecast-loss на
         # predator-каналах. READ-ONLY probe (snapshot/restore, Адама НЕ меняет).
         self._social_probe_enabled: bool = False  # client_flag social_forecast_probe (OFF)
@@ -3601,7 +3612,8 @@ class LocalColonyCompute:
                     so = self._build_self_observable(cid)          # self4 [64:68]
                     rh = self._extract_rhythm(obs_arr)             # rhythm4 [68:72]
                     soc = self._extract_social(obs_arr)            # social4 [72:76]
-                    obs72 = np.concatenate([obs64, so, rh, soc]).astype(np.float32)
+                    intero = self._build_intero_obs(cid)          # intero2 [76:78] (obs O2)
+                    obs72 = np.concatenate([obs64, so, rh, soc, intero]).astype(np.float32)
                     pred_input = torch.from_numpy(obs72).to(
                         self.device).unsqueeze(0)
                     # S3 рост-от-поведения: стащить obs72 + per-tick forecast-инференс
@@ -8642,6 +8654,29 @@ class LocalColonyCompute:
             pass
         return z
 
+    def _build_intero_obs(self, cid: str) -> "np.ndarray":
+        """obs O2 (stamina §19.2/§20): 2 интероцептивных канала obs[76:78] —
+        выносливость + HP (тело ощущает себя). OWNED (client-биохимия) → строится
+        client-side (как _build_self_observable, НЕ из P40-obs). obs[76]=выносливость
+        _norm (1−fatigue/100 ∈[0,1], 1=полон сил), obs[77]=hp_norm (hp/max_hp).
+        Флаг intero_obs OFF → ZEROS (dormant → predictor[76:78]=0 → math-equivalent
+        входу 76). ON → значения (восприятие активно). Зеркало _extract_social."""
+        z = np.zeros(_INTERO_DIM, dtype=np.float32)
+        if not self._intero_obs_enabled:
+            return z
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return z
+        try:
+            fat = float(getattr(bc, "fatigue", 0.0) or 0.0)
+            hp = float(getattr(bc, "hp", 0.0) or 0.0)
+            max_hp = float(getattr(bc, "max_hp", _CLIENT_MAX_ENERGY) or _CLIENT_MAX_ENERGY)
+            stam = max(0.0, min(1.0, 1.0 - fat / _FATIGUE_MAX))   # выносливость ∈[0,1]
+            hp_n = max(0.0, min(1.0, hp / max_hp if max_hp > 0 else 0.0))
+            return np.array([stam, hp_n], dtype=np.float32)
+        except Exception:
+            return z
+
     def _social_forecast_probe(self, cid: str, prev, target) -> None:
         """social forecast-born метрика (Фрай §7) — READ-ONLY paired-ablation.
         На тике с реальным DANGER у Адама (prev[74:76]≠0): forecast-loss predictor'а
@@ -8994,6 +9029,17 @@ class LocalColonyCompute:
         self._phi_fatigue_enabled = bool(on)
         logger.info("set_phi_fatigue: %s", on)
         return self._phi_fatigue_enabled
+
+    def set_intero_obs(self, on: bool) -> bool:
+        """Канал client_flags: obs O2 (stamina §19.2/§20). ON → obs[76:78] несёт
+        выносливость+HP (восприятие тела) → predictor видит → ткани Островковая/Покой.
+        OFF (default) → obs[76:78]=0 (dormant, math-equivalent довходу 76). Миграция
+        76→78 автоматическая (preserve-expand [I|0], math-equiv HARD GATE как social
+        72→76). Флип = perception-only (контракт-касание, как social-A). Ответ-rest —
+        активация (шаг 4, Path 2). kill-switch."""
+        self._intero_obs_enabled = bool(on)
+        logger.info("set_intero_obs: %s", on)
+        return self._intero_obs_enabled
 
     def _apply_action_fatigue(self, cid: str, action: int) -> None:
         """stamina φ-расход (Фрай §19): копит fatigue от ВЫБРАННОГО действия через
