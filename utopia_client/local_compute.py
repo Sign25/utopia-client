@@ -7211,17 +7211,21 @@ class LocalColonyCompute:
                           input_dim: int = _BRAIN_INPUT_DIM, sign: int = -1,
                           poor_win_thresh: float = 8.0,
                           poor_frac: float = _PHI_CONST ** -2,
-                          hist_n: int = 8) -> dict:
+                          hist_n: int = 8,
+                          grace_nights: int = None) -> dict:
         """Зарегистрировать поведенческую ось роста (axis-agnostic, S2). key — имя;
         cum_dim — verdict-dim в _beh_gc_sample (outcome-метрика); input_dim — окно
         входа сайдкара оси (ритм→72, т.к. ритм@[68:72]); sign — знак (−1: cost,
         ablate↑→keep). MINT-предикат (axis-параметричный): окно «costly» если его
         delta > poor_win_thresh; ось «poor» если доля costly за hist_n окон ≥
-        poor_frac. Возвращает дескриптор."""
+        poor_frac. grace_nights — порог зрелости форкастера для graduation (None →
+        глобальный _BEH_GRACE_NIGHTS=34; PER-AXIS override: stamina=3 bootstrap-рано,
+        Фрай 19.06 «graduate на транзиенте»). Возвращает дескриптор."""
         d = {"key": str(key), "cum_dim": str(cum_dim),
              "input_dim": int(input_dim), "sign": int(sign),
              "poor_win_thresh": float(poor_win_thresh),
-             "poor_frac": float(poor_frac), "hist_n": int(hist_n)}
+             "poor_frac": float(poor_frac), "hist_n": int(hist_n),
+             "grace_nights": (int(grace_nights) if grace_nights is not None else None)}
         self._beh_axes[str(key)] = d
         return d
 
@@ -7240,10 +7244,14 @@ class LocalColonyCompute:
         # cost = fatigue-интеграл над exhaustion-онсетом за rolling-N окно (cum_dim B).
         # sign=-1 (poor=высокая стоимость, снижать); poor_frac=φ⁻² (как ритм); poor_win
         # Fib-старт (тюн вживую). Мотор-ответ (gate-2): STAY-при-усталости → осцилляция.
+        # grace_nights=3 (Fib): graduate РАНО на транзиенте (Фрай 19.06 — пин даёт
+        # насыщенные сэмплы, маржинальная ценность ≈0; форкастер видел подъём-через-85 =
+        # bootstrap-достаточно; closed-loop дообучит С мотором). rhythm остаётся на 34.
         self.register_beh_axis(
             key="stamina", cum_dim="stamina_cost_cum",
             input_dim=_BRAIN_INPUT_DIM, sign=-1,
-            poor_win_thresh=_STAMINA_POOR_WIN, poor_frac=_PHI_CONST ** -2, hist_n=8)
+            poor_win_thresh=_STAMINA_POOR_WIN, poor_frac=_PHI_CONST ** -2, hist_n=8,
+            grace_nights=3)
 
     def set_behavioral_growth(self, on: bool) -> bool:
         """Канал client_flags: вкл/выкл РОСТ-ОТ-ПОВЕДЕНИЯ (Путь 2, Фрай 15.06). on=True:
@@ -7328,21 +7336,34 @@ class LocalColonyCompute:
         axmap = self._beh_grown_axis.get(cid) or {}
         trained = self._beh_forecast_trained.get(cid) or {}
         phi = _PHI_CONST
-        best, best_err = None, None
+        best, best_err, best_poor = None, None, False
         for role in sidecars:
             err = errs.get(role)
             if err is None:                           # не тренировался — не зрел
                 continue
-            if trained.get(role, 0) < self._BEH_GRACE_NIGHTS:  # GRACE: не созрел (≥1 год)
+            axk = axmap.get(role, "")
+            ax = self._beh_axes.get(axk, {})
+            grace_thr = ax.get("grace_nights")        # PER-AXIS grace (None → глобальный)
+            if grace_thr is None:
+                grace_thr = self._BEH_GRACE_NIGHTS
+            if trained.get(role, 0) < grace_thr:      # GRACE: не созрел (stamina=3, rhythm=34)
                 continue
-            baseline = self._beh_axis_baseline(cid, axmap.get(role, ""))  # global (=replay)
+            baseline = self._beh_axis_baseline(cid, axk)  # global (=replay)
             # НЕ выпускаем CLEARLY-DEAD (err ≥ φ×baseline). Зрелый форкастер лишь
             # МАРЖИНАЛЬНО бьёт baseline (шум доминирует, replay) — берём «наименее
             # плохого» НЕ-мёртвого; поведенческая retention (gate-2) — честный арбитр.
             if baseline > 0 and err >= phi * baseline:
                 continue
-            if best_err is None or err < best_err:    # приоритет = лучший skill
-                best, best_err = role, err
+            # ПРИОРИТЕТ (Фрай 19.06 вариант a): poor-ось (под АКТИВНЫМ давлением =
+            # degenerate сейчас, нужен ответ) > skill. Гарантирует graduate ИМЕННО
+            # пинящей оси (stamina под re-пином), не зрелого rhythm в штиль. Среди
+            # равного poor-статуса — лучший skill (min err = существующее поведение).
+            poor = bool(self._axis_poor(cid, ax)) if ax else False
+            better = (best is None
+                      or (poor and not best_poor)
+                      or (poor == best_poor and err < best_err))
+            if better:
+                best, best_err, best_poor = role, err, poor
         if best is None:
             return False
         torch = self._torch

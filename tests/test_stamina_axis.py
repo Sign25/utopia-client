@@ -190,3 +190,90 @@ def test_forecast_train_default_axis_rhythm_backcompat():
     c._beh_forecast_input["c0"] = torch.randn(1, _BRAIN_INPUT_DIM)  # FLAT (старый формат)
     c._beh_forecast_train("c0", 15.0)                # default axis_key="rhythm"
     assert c._beh_forecast_err["c0"][role] is not None   # isinstance-fallback работает
+
+
+# ── gate-2: per-axis grace + poor-приоритет graduation (Фрай 19.06) ──────
+def _set_baseline(c, cid, axis, mean, n=40):
+    c._beh_axis_drop_sum.setdefault(cid, {})[axis] = float(mean) * n
+    c._beh_axis_drop_n.setdefault(cid, {})[axis] = n
+
+
+def _grad_ready(c, cid="c0"):
+    c.set_behavioral_graduation(True)
+    c.organisms[cid] = object()
+    c.biochem[cid] = types.SimpleNamespace(energy=999.0)  # ≥_GRAD_HEALTH_ENERGY
+
+
+def test_stamina_grace_nights_in_descriptor():
+    c = _c()
+    assert c._beh_axes["stamina"]["grace_nights"] == 3     # bootstrap-рано (транзиент)
+    assert c._beh_axes["rhythm"]["grace_nights"] is None    # → глобальный 34
+
+
+def test_graduate_stamina_at_low_grace():
+    """stamina grace_nights=3 → созревает на 3 окнах (vs глобальные 34)."""
+    c = _c()
+    _grad_ready(c)
+    c._beh_grown_tissues["c0"] = {"beh7": object()}
+    c._beh_forecast_err["c0"] = {"beh7": 1.0}
+    c._beh_grown_axis["c0"] = {"beh7": "stamina"}
+    c._beh_forecast_trained["c0"] = {"beh7": 3}            # =grace_nights stamina
+    _set_baseline(c, "c0", "stamina", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is True
+    assert "beh7" in c._beh_graduated["c0"]
+
+
+def test_graduate_stamina_blocked_below_grace():
+    c = _c()
+    _grad_ready(c)
+    c._beh_grown_tissues["c0"] = {"beh7": object()}
+    c._beh_forecast_err["c0"] = {"beh7": 1.0}
+    c._beh_grown_axis["c0"] = {"beh7": "stamina"}
+    c._beh_forecast_trained["c0"] = {"beh7": 2}            # <3 → не созрел
+    _set_baseline(c, "c0", "stamina", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is False
+
+
+def test_graduate_rhythm_still_needs_global_grace():
+    """rhythm grace_nights=None → глобальный 34 (per-axis НЕ ослабил ритм)."""
+    c = _c()
+    _grad_ready(c)
+    c._beh_grown_tissues["c0"] = {"beh1": object()}
+    c._beh_forecast_err["c0"] = {"beh1": 1.0}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
+    c._beh_forecast_trained["c0"] = {"beh1": 3}           # <34 → ритм НЕ созрел
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is False
+
+
+def test_graduate_poor_axis_priority():
+    """Вариант a (Фрай): poor-ось (stamina под давлением) graduate'ит ПОПЕРЁД зрелого
+    rhythm с ЛУЧШЕЙ skill (не poor). Гарантия: лечим ось, что болит (расшибаем пин)."""
+    c = _c()
+    _grad_ready(c)
+    c._beh_grown_tissues["c0"] = {"beh1": object(), "beh7": object()}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm", "beh7": "stamina"}
+    c._beh_forecast_err["c0"] = {"beh1": 0.5, "beh7": 2.0}  # rhythm skill ЛУЧШЕ
+    c._beh_forecast_trained["c0"] = {"beh1": 34, "beh7": 3}  # оба созрелы (per-axis)
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    _set_baseline(c, "c0", "stamina", 4.0)
+    # stamina POOR (costly-окна >233), rhythm НЕ poor (штиль)
+    c._beh_axis_hist["c0"] = {"stamina": [3483.0] * 8, "rhythm": [0.0] * 8}
+    assert c._maybe_behavioral_graduate("c0", None) is True
+    assert "beh7" in c._beh_graduated.get("c0", {})        # stamina, НЕ rhythm
+    assert "beh1" not in c._beh_graduated.get("c0", {})
+
+
+def test_graduate_skill_tiebreak_when_neither_poor():
+    """Равный poor-статус (оба НЕ poor) → лучший skill (существующее поведение цело)."""
+    c = _c()
+    _grad_ready(c)
+    c._beh_grown_tissues["c0"] = {"beh1": object(), "beh7": object()}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm", "beh7": "stamina"}
+    c._beh_forecast_err["c0"] = {"beh1": 0.5, "beh7": 2.0}
+    c._beh_forecast_trained["c0"] = {"beh1": 34, "beh7": 3}
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    _set_baseline(c, "c0", "stamina", 4.0)
+    c._beh_axis_hist["c0"] = {"stamina": [0.0] * 8, "rhythm": [0.0] * 8}  # оба НЕ poor
+    assert c._maybe_behavioral_graduate("c0", None) is True
+    assert "beh1" in c._beh_graduated.get("c0", {})        # лучший skill (rhythm 0.5)
