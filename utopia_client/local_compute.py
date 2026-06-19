@@ -746,7 +746,8 @@ class LocalColonyCompute:
         self._GRAD_REVERT_HALT: int = 3       # Fib-лимит → halt выпуска
         self._grad_halted: bool = False       # стоп до re-flip tissue_graduation
         self._grad_health_streak: dict = {}   # cid → тиков подряд здоров
-        self._GRAD_HEALTH_ENERGY: float = 618.0   # φ⁻¹·max_energy 1000
+        self._GRAD_HEALTH_ENERGY: float = 618.0   # φ⁻¹·max_energy 1000 (rhythm/прочие оси)
+        self._GRAD_HEALTH_STAMINA: float = 309.0  # φ⁻³·max(1309) — СНИЖЕННЫЙ graduation-гейт ДЛЯ stamina-target (Фрай 19.06): рефлекс-exhaustion fat=85 крашит energy <618 ДО созревания форкастера (deadlock); 309 даёт graduate в умеренной exhaustion → rest-response чинит → energy восстанавливается. Только stamina (grad_target_axis), rhythm=618.
         self._GRAD_HEALTH_TICKS: int = 89     # Fib — стабильность перед выпуском
         self._GRAD_COLLAPSE_WIN: int = 13     # Fib — rolling-mean окно collapse-детектора
         # §10.3 STAGE 3 BEHAVIORAL-GC (Фрай go 10.06): парный interleaved
@@ -7356,7 +7357,13 @@ class LocalColonyCompute:
             return False
         bc = self.biochem.get(cid)
         e = float(getattr(bc, "energy", 0.0)) if bc is not None else 0.0
-        if e < self._GRAD_HEALTH_ENERGY:
+        # graduation-health-гейт: СНИЖЕННЫЙ (309) для stamina-target (Фрай 19.06) —
+        # рефлекс-exhaustion крашит energy <618 до созревания форкастера (deadlock);
+        # 309 даёт graduate в умеренной exhaustion → rest-response чинит. rhythm/прочие=618.
+        _health_gate = (self._GRAD_HEALTH_STAMINA
+                        if self._beh_grad_target_axis == "stamina"
+                        else self._GRAD_HEALTH_ENERGY)
+        if e < _health_gate:
             return False
         if self._beh_graduated.get(cid):              # one-at-a-time graduated
             return False

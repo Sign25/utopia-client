@@ -326,3 +326,54 @@ def test_graduate_target_axis_overrides_skill():
     assert c._maybe_behavioral_graduate("c0", None) is True
     assert "beh7" in c._beh_graduated.get("c0", {})          # stamina (таргет), НЕ rhythm
     assert "beh1" not in c._beh_graduated.get("c0", {})
+
+
+# ── сниженный graduation-health-гейт для stamina (309 vs 618, Фрай 19.06) ──
+def test_graduate_stamina_lowered_health_gate():
+    """stamina-target → гейт 309 (не 618): graduate в умеренной exhaustion (energy
+    309-618). Решает deadlock (рефлекс-exhaustion fat=85 крашит energy <618)."""
+    import types as _t
+    c = _c()
+    c.set_behavioral_graduation(True)
+    c.organisms["c0"] = object()
+    c.biochem["c0"] = _t.SimpleNamespace(energy=400.0)        # между 309 и 618
+    c.set_grad_target_axis("stamina")
+    c._beh_grown_tissues["c0"] = {"beh7": object()}
+    c._beh_forecast_err["c0"] = {"beh7": 1.0}
+    c._beh_grown_axis["c0"] = {"beh7": "stamina"}
+    c._beh_forecast_trained["c0"] = {"beh7": 3}
+    _set_baseline(c, "c0", "stamina", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is True   # гейт=309 → graduate@400
+    assert "beh7" in c._beh_graduated.get("c0", {})
+
+
+def test_graduate_blocked_below_stamina_gate():
+    """energy<309 даже для stamina → blocked (минимум здоровья сохранён)."""
+    import types as _t
+    c = _c()
+    c.set_behavioral_graduation(True)
+    c.organisms["c0"] = object()
+    c.biochem["c0"] = _t.SimpleNamespace(energy=200.0)        # <309
+    c.set_grad_target_axis("stamina")
+    c._beh_grown_tissues["c0"] = {"beh7": object()}
+    c._beh_forecast_err["c0"] = {"beh7": 1.0}
+    c._beh_grown_axis["c0"] = {"beh7": "stamina"}
+    c._beh_forecast_trained["c0"] = {"beh7": 3}
+    _set_baseline(c, "c0", "stamina", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is False  # <309 → blocked
+
+
+def test_graduate_rhythm_keeps_618_gate():
+    """rhythm (НЕ stamina-target) → гейт остаётся 618 (energy 400<618 → blocked)."""
+    import types as _t
+    c = _c()
+    c.set_behavioral_graduation(True)
+    c.organisms["c0"] = object()
+    c.biochem["c0"] = _t.SimpleNamespace(energy=400.0)
+    # grad_target_axis НЕ stamina (None) → гейт 618
+    c._beh_grown_tissues["c0"] = {"beh1": object()}
+    c._beh_forecast_err["c0"] = {"beh1": 1.0}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm"}
+    c._beh_forecast_trained["c0"] = {"beh1": 34}
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    assert c._maybe_behavioral_graduate("c0", None) is False  # гейт=618 > 400 → blocked
