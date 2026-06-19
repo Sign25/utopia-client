@@ -559,6 +559,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_grad_target: str | None = "__unset__"   # grad_target_axis (sentinel ≠ None)
+    applied_s3_forage: bool | None = None            # §3-редизайн паралич→фураж
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1136,6 +1137,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("grad_target_axis → %s", target_grad_axis)
                         except Exception as e:
                             logger.warning("set_grad_target_axis failed: %s", e)
+
+                    # s3_forage (§3-редизайн паралич→фураж, Фрай 19.06): голод НЕ
+                    # парализует → §3 random-walk-поиск вместо STAY (non-absorbing).
+                    # lockstep server _S3_FORAGE. OFF dormant → bit-identical. edge-detect.
+                    target_s3f = bool(flags.get("s3_forage", False))
+                    if target_s3f != applied_s3_forage \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_s3_forage(target_s3f)
+                            applied_s3_forage = target_s3f
+                            logger.info("s3_forage → %s", target_s3f)
+                        except Exception as e:
+                            logger.warning("set_s3_forage failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.
