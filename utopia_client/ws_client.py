@@ -2996,6 +2996,18 @@ class ColonyWSClient:
         for cid in list(compute.organisms.keys()):
             last = self._cid_last_seen_tick.get(cid)
             if last is None or last < threshold:
+                # owned-guard (brain-durable, 19.06): persistent owned Адам (is_adam)
+                # НИКОГДА не авто-GC — мозг client-side, remove_creature стёр бы ткани +
+                # форкастеры (beh-сайдкары). Защищает при ЛЮБОМ feed-gap: admin_reseed
+                # (атомарный swap), projection-pause, broker-outage. Архитектурно:
+                # Адам persistent по контракту, не подлежит stale-cleanup.
+                bc = getattr(compute, "biochem", {}).get(cid)
+                if bc is not None and bool(getattr(bc, "is_adam", False)):
+                    logger.info(
+                        "CID-GC owned-guard: persistent Адам cid=%s stale на %d тиков "
+                        "— НЕ удаляем (мозг durable, brain-persist)",
+                        cid, threshold - int(last or 0))
+                    continue
                 orphans.append(cid)
         if not orphans:
             return []

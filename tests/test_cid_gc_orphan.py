@@ -134,3 +134,29 @@ def test_gc_noop_without_compute(ws: ColonyWSClient) -> None:
     assert ws.compute is None
     ws._gc_orphan_cids(world_tick=10_000_000)
     assert ws._cid_gc_total == 0
+
+
+def test_gc_owned_guard_keeps_stale_adam(ws: ColonyWSClient) -> None:
+    """owned-guard (brain-durable): persistent Адам (is_adam) НЕ удаляется даже
+    stale — мозг client-side, remove_creature стёр бы ткани+форкастеры. Защищает
+    при feed-gap (admin_reseed/projection-pause). Non-owned ghost удаляется штатно."""
+    import types
+
+    fake = _FakeCompute()
+    fake.add("adam")
+    fake.add("ghost")
+    fake.biochem = {                                   # type: ignore[attr-defined]
+        "adam": types.SimpleNamespace(is_adam=True),
+        "ghost": types.SimpleNamespace(is_adam=False),
+    }
+    ws.compute = fake  # type: ignore[assignment]
+    ws._cid_last_seen_tick["adam"] = 100               # оба STALE
+    ws._cid_last_seen_tick["ghost"] = 100
+    world_tick = 100 + STALE_CID_TICKS + 50
+
+    ws._gc_orphan_cids(world_tick)
+
+    assert fake.removed == ["ghost"]                   # ghost удалён
+    assert "adam" in fake.organisms                    # Адам СОХРАНЁН (guard)
+    assert "adam" in ws._cid_last_seen_tick            # last_seen Адама цел
+    assert ws._cid_gc_total == 1                        # только ghost в счёте
