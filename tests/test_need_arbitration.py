@@ -1,8 +1,9 @@
 """φ-арбитраж голод↔жажда (Хьюберт 19.06): single-Адам фиксировался на ОДНОМ драйве —
 water-seek=рефлекс-backstop (всегда обслуживался), food-seek=OFF (еда без backstop) →
 XOR-асимметрия, необслуженный драйв уходит в 0 → §3. Фикс: симметричный анти­ципаторный
-арбитраж — обслужить МЕНЬШИЙ-относительный (energy/max_e vs hydration/max_h), sticky-latch
-+ φ-deadband гистерезис, «не гнать один в 0». Флаг need_arbitration (OFF dormant).
+арбитраж — обслужить МЕНЬШИЙ драйв по СЫРЫМ energy vs hydration (max_energy=1309 >> рабочий
+диапазон Адама → нормировка вечно выбирала food → hyd→0; сырое = модель «energy И hyd >30»),
+sticky-latch + Fib-deadband гистерезис, «не гнать один в 0». Флаг need_arbitration (OFF dormant).
 
 Конвенция Мира: NORTH=0→(-1,0), SOUTH=1→(+1,0), EAST=2→(0,+1), WEST=3→(0,-1).
 """
@@ -74,7 +75,7 @@ def test_setter_default_off():
 # ── оба драйва сыты (выше onset φ⁻¹) → брейн ведёт, арбитраж молчит ────────
 
 def test_both_satisfied_no_override():
-    c = _compute_with(energy=700, hyd=70)   # e_rel=0.70, h_rel=0.70 ≥ 0.618
+    c = _compute_with(energy=70, hyd=70)    # оба ≥ onset 55 (сырое) → брейн ведёт
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[(10, 12, 2)],
                           creature_pos={"c1": (10, 10)}))
     cli.compute = c
@@ -87,7 +88,7 @@ def test_both_satisfied_no_override():
 # ── меньший-относительный = голод → food-seek-навигация ────────────────────
 
 def test_hunger_lower_seeks_food():
-    c = _compute_with(energy=100, hyd=90)    # e_rel=0.10 << h_rel=0.90 → food
+    c = _compute_with(energy=20, hyd=90)     # energy 20 < hyd 90 (сырое) → food
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[(10, 12, 2)],
                           creature_pos={"c1": (10, 10)}))   # berry восточнее
     cli.compute = c
@@ -100,7 +101,7 @@ def test_hunger_lower_seeks_food():
 # ── меньший-относительный = жажда → water-seek-навигация ───────────────────
 
 def test_thirst_lower_seeks_water():
-    c = _compute_with(energy=900, hyd=10)    # e_rel=0.90 >> h_rel=0.10 → water
+    c = _compute_with(energy=90, hyd=20)     # hyd 20 < energy 90 (сырое) → water
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[(10, 12, 2)],
                           creature_pos={"c1": (10, 10)}))   # вода восточнее
     cli.compute = c
@@ -113,7 +114,7 @@ def test_thirst_lower_seeks_water():
 # ── yield-to-consume: у ресурса нужного драйва → не оверрайдим ─────────────
 
 def test_yield_to_drink_near_water():
-    c = _compute_with(energy=900, hyd=10)    # жажда-winner
+    c = _compute_with(energy=90, hyd=20)     # жажда-winner (hyd 20 < energy 90)
     cli = _client(_FakeWC(20, water_cells=[(10, 11)], flora=[],
                           creature_pos={"c1": (10, 10)}))   # вода — сосед
     cli.compute = c
@@ -123,7 +124,7 @@ def test_yield_to_drink_near_water():
 
 
 def test_yield_to_eat_on_berry():
-    c = _compute_with(energy=100, hyd=90)    # голод-winner
+    c = _compute_with(energy=20, hyd=90)     # голод-winner (energy 20 < hyd 90)
     cli = _client(_FakeWC(20, water_cells=[], flora=[(10, 10, 2)],
                           creature_pos={"c1": (10, 10)}))   # на berry
     cli.compute = c
@@ -136,30 +137,30 @@ def test_yield_to_eat_on_berry():
 
 def test_hysteresis_keeps_target_within_deadband():
     # 1-й тик: голод чуть ниже → latch=food
-    c = _compute_with(energy=100, hyd=120)   # e_rel=0.10, h_rel=0.12 → food
+    c = _compute_with(energy=40, hyd=44)     # energy 40 < hyd 44 → food
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[(10, 12, 2)],
                           creature_pos={"c1": (10, 10)}))
     cli.compute = c
     co = [{"cid": "c1", "action": 1}]
     cli._apply_need_arbitration([{"cid": "c1"}], co)
     assert cli._need_arb_target["c1"] == "food"
-    # 2-й тик: жажда теперь чуть НИЖЕ (h_rel=0.09 < e_rel=0.10), но в пределах
-    # deadband (φ⁻⁷≈0.0344): 0.09 ≥ 0.10−0.0344 → ДЕРЖИМ food (без thrash)
-    c.biochem["c1"].hydration = 9.0
+    # 2-й тик: жажда теперь чуть НИЖЕ (hyd=38 < energy=40), но в пределах deadband
+    # (Fib 8): 38 ≥ 40−8=32 → ДЕРЖИМ food (без thrash)
+    c.biochem["c1"].hydration = 38.0
     co2 = [{"cid": "c1", "action": 1}]
     cli._apply_need_arbitration([{"cid": "c1"}], co2)
     assert cli._need_arb_target["c1"] == "food"            # гистерезис держит
 
 
 def test_hysteresis_switches_when_clearly_more_urgent():
-    c = _compute_with(energy=100, hyd=120)   # latch=food
+    c = _compute_with(energy=40, hyd=44)     # latch=food
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[(10, 12, 2)],
                           creature_pos={"c1": (10, 10)}))
     cli.compute = c
     cli._apply_need_arbitration([{"cid": "c1"}], [{"cid": "c1", "action": 1}])
     assert cli._need_arb_target["c1"] == "food"
-    # жажда обвалилась ниже deadband: h_rel=0.05 < e_rel(0.10)−0.0344=0.0656 → switch
-    c.biochem["c1"].hydration = 5.0
+    # жажда обвалилась ниже deadband: hyd=30 < energy(40)−8=32 → switch
+    c.biochem["c1"].hydration = 30.0
     co = [{"cid": "c1", "action": 1}]
     cli._apply_need_arbitration([{"cid": "c1"}], co)
     assert cli._need_arb_target["c1"] == "water"           # переключился
@@ -180,7 +181,7 @@ def test_food_life_critical_when_energy_critical():
 
 
 def test_water_life_critical_when_hydration_critical():
-    c = _compute_with(energy=900, hyd=10)    # hyd ≤15 критично, жажда-winner
+    c = _compute_with(energy=90, hyd=10)     # hyd ≤15 критично, жажда-winner
     cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[],
                           creature_pos={"c1": (10, 10)}))
     cli.compute = c
@@ -191,12 +192,14 @@ def test_water_life_critical_when_hydration_critical():
 
 
 def test_no_life_critical_when_moderate():
-    # голод-winner, но energy=300 >89 (не критично) → life_critical False
-    c = _compute_with(energy=300, hyd=95)
-    cli = _client(_FakeWC(20, water_cells=[], flora=[(10, 12, 2)],
+    # жажда-winner умеренная: hyd=40 (>15 не критично), energy=158 высокая →
+    # арбитраж ведёт к воде, но life_critical False (hyd выше критич. порога 15)
+    c = _compute_with(energy=158, hyd=40)
+    cli = _client(_FakeWC(20, water_cells=[(10, 16)], flora=[],
                           creature_pos={"c1": (10, 10)}))
     cli.compute = c
     co = [{"cid": "c1", "action": 1}]
     cli._apply_need_arbitration([{"cid": "c1"}], co)
-    assert co[0]["action"] == 2
+    assert cli._need_arb_target["c1"] == "water"
+    assert co[0]["action"] == 2                            # EAST → к воде
     assert co[0]["life_critical"] is False

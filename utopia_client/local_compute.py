@@ -665,9 +665,10 @@ class LocalColonyCompute:
         # φ-арбитраж голод↔жажда (Хьюберт 19.06): single-Адам фиксировался на ОДНОМ
         # драйве — water-seek=рефлекс-backstop (всегда обслуживался), food-seek=OFF (еда
         # без backstop) → XOR-асимметрия, необслуженный драйв уходит в 0 → §3. ON →
-        # симметричный анти­ципаторный арбитраж в ws_client: обслужить МЕНЬШИЙ-относительный
-        # (energy/max_e vs hydration/max_h), sticky-latch + φ-deadband гистерезис, «не
-        # гнать один в 0». Заменяет water-seek-only. OFF dormant → bit-identical. kill-switch.
+        # симметричный анти­ципаторный арбитраж в ws_client: обслужить МЕНЬШИЙ драйв по
+        # СЫРЫМ energy vs hydration (нормировка /max_energy=1309 биасила в food → hyd→0),
+        # sticky-latch + Fib-deadband гистерезис, «не гнать один в 0». Заменяет water-seek-
+        # only. OFF dormant → bit-identical. kill-switch.
         self._need_arbitration_enabled: bool = False  # client_flag need_arbitration (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
@@ -10881,8 +10882,8 @@ class LocalColonyCompute:
 
     def set_need_arbitration(self, on: bool) -> bool:
         """Канал client_flags need_arbitration (φ-арбитраж голод↔жажда, Хьюберт 19.06).
-        ON: single-Адам обслуживает МЕНЬШИЙ-относительный драйв (energy/max_e vs
-        hydration/max_h) — симметрично, sticky-latch + φ-deadband гистерезис, «не гнать
+        ON: single-Адам обслуживает МЕНЬШИЙ драйв по СЫРЫМ energy vs hydration (нормировка
+        /max_energy=1309 биасила в food → hyd→0) — sticky-latch + Fib-deadband, «не гнать
         один в 0». Заменяет несимметричную water-seek-only (food-seek был OFF → XOR-
         фиксация → необслуженный драйв→0→§3). OFF (dormant, default): water-seek-only
         (bit-identical). Анти­ципаторный баланс ВЫШЕ §3-кризиса (§3-фураж покрывает аварию).

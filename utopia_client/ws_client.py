@@ -2474,13 +2474,16 @@ class ColonyWSClient:
     _FRUIT_KINDS = frozenset({3, 4, 5, 6})         # FloraType FRUIT_APPLE..DATE
     # φ-арбитраж голод↔жажда (Хьюберт 19.06): single-Адам обслуживал ОДИН драйв
     # (water-seek=рефлекс ON / food-seek=OFF) → XOR-фиксация, второй в 0 → §3.
-    # Симметричный анти­ципаторный арбитраж: обслужить МЕНЬШИЙ-относительный
-    # (energy/max_e vs hydration/max_h). onset φ⁻¹: оба ≥ onset → молчим, брейн ведёт.
-    _NEED_ARB_ONSET = 0.6180339887498949            # φ⁻¹: min(e_rel,h_rel)<onset → арбитраж
-    # sticky-latch гистерезис: переключаем цель только если ДРУГОЙ драйв срочнее на
-    # margin (иначе thrash при близких rel → ходьба food↔water → оба краш). φ⁻⁷ малый,
-    # отзывчивый (≈0.0344) — переключит ДО ухода в 0, но не дёргает на equal-jitter.
-    _NEED_ARB_DEADBAND = 1.618033988749895 ** -7    # ≈0.0344 φ-гистерезис против thrash
+    # Симметричный анти­ципаторный арбитраж: обслужить МЕНЬШИЙ драйв по СЫРЫМ
+    # значениям energy vs hydration (НЕ нормируем: max_energy=1309 >> рабочий диапазон
+    # Адама ~40-160 → energy/max_e ВСЕГДА выглядел катастрофически мал vs hyd/100 →
+    # вечный 'food'-латч, hyd→0. Сырое сравнение = модель Хьюберта «energy И hyd >30»:
+    # обе на ~[0,100+], 0=смерть, ближе к 0 = срочнее). Fib-единицы.
+    _NEED_ARB_ONSET = 55.0          # Fib: min(energy,hyd)<onset → арбитраж (иначе брейн)
+    # sticky-latch гистерезис: переключаем цель только если ДРУГОЙ драйв ниже текущего
+    # на margin (иначе thrash при близких → ходьба food↔water → оба краш). Fib 8 —
+    # мал, отзывчив: переключит ДО ухода в 0, но не дёргает на equal-jitter.
+    _NEED_ARB_DEADBAND = 8.0        # Fib: switch если другой < текущего − deadband (сырое)
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -2851,10 +2854,12 @@ class ColonyWSClient:
 
     def _apply_need_arbitration(self, creatures, creatures_out) -> None:
         """φ-арбитраж голод↔жажда single-Адама (Хьюберт 19.06). Симметрично обслуживает
-        МЕНЬШИЙ-относительный драйв (e_rel=energy/max_e vs h_rel=hyd/max_h): sticky-latch
-        цели + φ-deadband гистерезис → не thrash, «не гнать один в 0». Заменяет
-        несимметричную пару (water-seek рефлекс ON / food-seek OFF), дававшую XOR-
-        фиксацию (необслуженный драйв→0→§3). Оба ≥ onset (φ⁻¹) → молчим, брейн ведёт.
+        МЕНЬШИЙ драйв по СЫРЫМ energy vs hydration (НЕ нормируем: max_energy=1309 >>
+        рабочий диапазон Адама → energy/max_e вечно мал vs hyd/100 → 'food'-латч, hyd→0;
+        сырое = модель Хьюберта «energy И hyd >30»): sticky-latch цели + Fib-deadband
+        гистерезис → не thrash, «не гнать один в 0». Заменяет несимметричную пару
+        (water-seek рефлекс ON / food-seek OFF), дававшую XOR-фиксацию (необслуженный
+        драйв→0→§3). Оба ≥ onset (Fib 55) → молчим, брейн ведёт.
         yield-to-consume: у ресурса нужного драйва (вода рядом / на берри / on_food) НЕ
         оверрайдим — income/eat-рефлекс сам кормит. life_critical при критике драйва →
         bypass §3-force-STAY (ползёт к ресурсу). Анти­ципаторный баланс ВЫШЕ §3-кризиса."""
@@ -2894,22 +2899,19 @@ class ColonyWSClient:
                 continue
             energy = float(getattr(bc, "energy", 0.0) or 0.0)
             hyd = float(getattr(bc, "hydration", 100.0) or 0.0)
-            max_e = float(getattr(bc, "max_energy", 1309.0) or 1309.0)
-            max_h = float(getattr(bc, "max_hydration", 100.0) or 100.0)
-            e_rel = energy / max(1.0, max_e)
-            h_rel = hyd / max(1.0, max_h)
-            # оба драйва выше onset (φ⁻¹) → арбитраж молчит, брейн ведёт сам
-            if min(e_rel, h_rel) >= self._NEED_ARB_ONSET:
+            # СЫРОЕ сравнение (не нормируем — см. константы): оба драйва выше onset
+            # (Fib 55) → арбитраж молчит, брейн ведёт сам (баланс ВЫШЕ кризиса)
+            if min(energy, hyd) >= self._NEED_ARB_ONSET:
                 self._need_arb_target.pop(cid, None)
                 continue
-            # цель = МЕНЬШИЙ-относительный; sticky-latch + φ-deadband против thrash
-            want = "food" if e_rel <= h_rel else "water"
+            # цель = МЕНЬШИЙ сырой драйв; sticky-latch + Fib-deadband против thrash
+            want = "food" if energy <= hyd else "water"
             prev = self._need_arb_target.get(cid)
             if prev is not None and prev != want:
-                cur_rel = e_rel if prev == "food" else h_rel
-                oth_rel = h_rel if prev == "food" else e_rel
-                # держим прежнюю цель, пока другой драйв не станет срочнее на deadband
-                if oth_rel >= cur_rel - self._NEED_ARB_DEADBAND:
+                cur_val = energy if prev == "food" else hyd
+                oth_val = hyd if prev == "food" else energy
+                # держим прежнюю цель, пока другой драйв не станет ниже на deadband
+                if oth_val >= cur_val - self._NEED_ARB_DEADBAND:
                     want = prev
             self._need_arb_target[cid] = want
             rc = pos.get(cid)
