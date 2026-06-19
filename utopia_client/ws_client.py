@@ -2374,7 +2374,19 @@ class ColonyWSClient:
             # ТОЛЬКО на 1b.2a-тест, обратимо.
             _fwf = (self.compute is not None
                     and getattr(self.compute, "_force_water_far_enabled", False))
-            if not _fwf:
+            _arb_on = (self.compute is not None
+                       and getattr(self.compute,
+                                   "_need_arbitration_enabled", False))
+            if _arb_on and not _fwf:
+                # φ-арбитраж голод↔жажда (Хьюберт 19.06): заменяет несимметричную
+                # water-seek-only (food без backstop → XOR-фиксация → §3). Обслуживает
+                # МЕНЬШИЙ-относительный драйв, sticky-latch гистерезис. force_water_far
+                # (validation-mode) перебивает → legacy water-seek-only для теста.
+                try:
+                    self._apply_need_arbitration(creatures, creatures_out)
+                except Exception as e:
+                    logger.warning("need-arbitration override failed: %r", e)
+            elif not _fwf:
                 try:
                     self._apply_water_seek(creatures, creatures_out)
                 except Exception as e:
@@ -2382,7 +2394,8 @@ class ColonyWSClient:
             self._seek_gate_n = getattr(self, "_seek_gate_n", 0) + 1
             if self._seek_gate_n % 200 == 1:
                 logger.info("SEEK_GATE single_organism → food-seek OFF, "
-                            "WATER-seek ON (Гидратация, Фрай 08.06)")
+                            "WATER-seek ON (Гидратация, Фрай 08.06); "
+                            "need_arbitration=%s", _arb_on)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -2459,6 +2472,15 @@ class ColonyWSClient:
     _BERRY_ENERGY = 1.618033988749895              # φ ≈ 1.618 (BERRY=2)
     _TREE_FRUIT_ENERGY = 1.618033988749895 ** 3    # φ³ ≈ 4.236 (FRUIT=3-6)
     _FRUIT_KINDS = frozenset({3, 4, 5, 6})         # FloraType FRUIT_APPLE..DATE
+    # φ-арбитраж голод↔жажда (Хьюберт 19.06): single-Адам обслуживал ОДИН драйв
+    # (water-seek=рефлекс ON / food-seek=OFF) → XOR-фиксация, второй в 0 → §3.
+    # Симметричный анти­ципаторный арбитраж: обслужить МЕНЬШИЙ-относительный
+    # (energy/max_e vs hydration/max_h). onset φ⁻¹: оба ≥ onset → молчим, брейн ведёт.
+    _NEED_ARB_ONSET = 0.6180339887498949            # φ⁻¹: min(e_rel,h_rel)<onset → арбитраж
+    # sticky-latch гистерезис: переключаем цель только если ДРУГОЙ драйв срочнее на
+    # margin (иначе thrash при близких rel → ходьба food↔water → оба краш). φ⁻⁷ малый,
+    # отзывчивый (≈0.0344) — переключит ДО ухода в 0, но не дёргает на equal-jitter.
+    _NEED_ARB_DEADBAND = 1.618033988749895 ** -7    # ≈0.0344 φ-гистерезис против thrash
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -2826,6 +2848,113 @@ class ColonyWSClient:
                 "WATER_SEEK_DIAG creatures=%d with_pos=%d thirsty=%d "
                 "near_water=%d seek_override=%d", len(creatures_out), len(pos),
                 n_thirsty, n_near, n_seek)
+
+    def _apply_need_arbitration(self, creatures, creatures_out) -> None:
+        """φ-арбитраж голод↔жажда single-Адама (Хьюберт 19.06). Симметрично обслуживает
+        МЕНЬШИЙ-относительный драйв (e_rel=energy/max_e vs h_rel=hyd/max_h): sticky-latch
+        цели + φ-deadband гистерезис → не thrash, «не гнать один в 0». Заменяет
+        несимметричную пару (water-seek рефлекс ON / food-seek OFF), дававшую XOR-
+        фиксацию (необслуженный драйв→0→§3). Оба ≥ onset (φ⁻¹) → молчим, брейн ведёт.
+        yield-to-consume: у ресурса нужного драйва (вода рядом / на берри / on_food) НЕ
+        оверрайдим — income/eat-рефлекс сам кормит. life_critical при критике драйва →
+        bypass §3-force-STAY (ползёт к ресурсу). Анти­ципаторный баланс ВЫШЕ §3-кризиса."""
+        compute = self.compute
+        if compute is None:
+            return
+        biochem = getattr(compute, "biochem", None)
+        if not biochem:
+            return
+        pos = {}
+        for c in creatures:
+            cid = c.get("cid")
+            if cid is None:
+                continue
+            rc = self._resolve_pos(cid, c)
+            if rc is not None:
+                pos[str(cid)] = rc  # (row, col)
+        cache = getattr(self, "world_cache", None)
+        berry_pos = set()
+        if cache is not None:
+            try:
+                berry_pos = {(int(r), int(c)) for (r, c, k) in cache.flora
+                             if int(k) in self._BERRY_FRUIT_KINDS}
+            except Exception:
+                berry_pos = set()
+        if not hasattr(self, "_need_arb_target"):
+            self._need_arb_target = {}   # cid → "food"|"water" sticky-latch
+        if not hasattr(self, "_need_arb_pos"):
+            self._need_arb_pos = {}
+        if not hasattr(self, "_need_arb_stuck"):
+            self._need_arb_stuck = {}
+        n_arb = 0
+        for entry in creatures_out:
+            cid = entry.get("cid")
+            bc = biochem.get(cid) if cid else None
+            if bc is None:
+                continue
+            energy = float(getattr(bc, "energy", 0.0) or 0.0)
+            hyd = float(getattr(bc, "hydration", 100.0) or 0.0)
+            max_e = float(getattr(bc, "max_energy", 1309.0) or 1309.0)
+            max_h = float(getattr(bc, "max_hydration", 100.0) or 100.0)
+            e_rel = energy / max(1.0, max_e)
+            h_rel = hyd / max(1.0, max_h)
+            # оба драйва выше onset (φ⁻¹) → арбитраж молчит, брейн ведёт сам
+            if min(e_rel, h_rel) >= self._NEED_ARB_ONSET:
+                self._need_arb_target.pop(cid, None)
+                continue
+            # цель = МЕНЬШИЙ-относительный; sticky-latch + φ-deadband против thrash
+            want = "food" if e_rel <= h_rel else "water"
+            prev = self._need_arb_target.get(cid)
+            if prev is not None and prev != want:
+                cur_rel = e_rel if prev == "food" else h_rel
+                oth_rel = h_rel if prev == "food" else e_rel
+                # держим прежнюю цель, пока другой драйв не станет срочнее на deadband
+                if oth_rel >= cur_rel - self._NEED_ARB_DEADBAND:
+                    want = prev
+            self._need_arb_target[cid] = want
+            rc = pos.get(cid)
+            if rc is None or rc[0] is None:
+                continue
+            r0, c0 = rc[0], rc[1]
+            # yield-to-consume: у ресурса нужного драйва → не оверрайдим (income/eat сам)
+            if want == "water":
+                if self._near_water(r0, c0):
+                    self._need_arb_stuck[cid] = 0
+                    self._need_arb_pos[cid] = rc
+                    continue
+                d = self._water_seek_action(r0, c0)
+            else:  # food
+                if (r0, c0) in berry_pos or \
+                        getattr(compute, "_on_food", {}).get(cid):
+                    self._need_arb_stuck[cid] = 0
+                    self._need_arb_pos[cid] = rc
+                    continue
+                d = self._food_seek_action(r0, c0, berry_pos)
+            # стук-детект + ротация-исследование (зеркало water/food-seek robustness):
+            # нет прогресса (pos застрял) ИЛИ ресурса нет в радиусе → ротация 4 сторон.
+            if self._need_arb_pos.get(cid) == rc:
+                self._need_arb_stuck[cid] = self._need_arb_stuck.get(cid, 0) + 1
+            else:
+                self._need_arb_stuck[cid] = 0
+            self._need_arb_pos[cid] = rc
+            _sn = self._need_arb_stuck.get(cid, 0)
+            if d is None or _sn >= 13:
+                d = [0, 2, 1, 3][(_sn // 5) % 4]   # N, E, S, W ротация → выход
+            entry["action"] = int(d)
+            # life_critical → P40 обходит §3-force-STAY (ползёт к ресурсу в параличе)
+            crit = (hyd <= self._HYDRATION_CRITICAL) if want == "water" \
+                else (energy <= self._ENERGY_CRITICAL)
+            entry["life_critical"] = bool(crit)
+            n_arb += 1
+        if n_arb:
+            self._need_arb_overrides = getattr(
+                self, "_need_arb_overrides", 0) + n_arb
+        self._need_arb_diag = getattr(self, "_need_arb_diag", 0) + 1
+        if self._need_arb_diag >= 200:
+            self._need_arb_diag = 0
+            logger.info("NEED_ARB_DIAG overrides=%d targets=%r berry_pos=%d",
+                        getattr(self, "_need_arb_overrides", 0),
+                        dict(self._need_arb_target), len(berry_pos))
 
     def _run_tick_and_build(self, obs_per_cid, events_per_cid,
                             intero_per_cid, world_tick, rates_per_cid=None,

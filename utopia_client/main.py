@@ -561,6 +561,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_grad_target: str | None = "__unset__"   # grad_target_axis (sentinel ≠ None)
     applied_s3_forage: bool | None = None            # §3-редизайн паралич→фураж
     applied_nav_repellent: bool | None = None        # нав-репеллent (policy-пин)
+    applied_need_arbitration: bool | None = None     # φ-арбитраж голод↔жажда
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1164,6 +1165,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("nav_repellent → %s", target_navr)
                         except Exception as e:
                             logger.warning("set_nav_repellent failed: %s", e)
+
+                    # need_arbitration (φ-арбитраж голод↔жажда, Хьюберт 19.06): single-
+                    # Адам обслуживает МЕНЬШИЙ-относительный драйв (energy vs hydration) —
+                    # заменяет несимметричную water-seek-only (food без backstop → XOR-
+                    # фиксация → §3). OFF dormant → bit-identical. edge-detect.
+                    target_arb = bool(flags.get("need_arbitration", False))
+                    if target_arb != applied_need_arbitration \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_need_arbitration(target_arb)
+                            applied_need_arbitration = target_arb
+                            logger.info("need_arbitration → %s", target_arb)
+                        except Exception as e:
+                            logger.warning("set_need_arbitration failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.
