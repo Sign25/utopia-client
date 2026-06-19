@@ -9187,6 +9187,20 @@ class LocalColonyCompute:
         bc = self.biochem.get(cid)
         if bc is None:
             return
+        # ВАРИАНТ 1 (Фрай 19.06, баг-фикс-2): fatigue = ВОЛЕВАЯ exertion (цена ВЫБОРА
+        # действовать). В §3-параличе / exhaustion / catatonic Адам действует
+        # НЕДОБРОВОЛЬНО (survival-reflex/force-STAY, в т.ч. FORAGE_FLOOR crawl=STEP) →
+        # НЕ копим fatigue → decay доминирует → recovery. Это РЕФЛЕКТОРНАЯ негативная ОС
+        # (exhaustion→force-STAY→не-копит→decay→выход→act→tire = осцилляция НА РЕФЛЕКСЕ).
+        # Закрывает absorbing-дыру (frozen-pin: crawl/exhaustion-STAY копили fatigue
+        # несмотря на «отдых»). Разделение: energy=метаболизм (crawl тратит) vs
+        # fatigue=волевое-усилие (недобровольный рефлекс НЕ копит). §3-non-absorbing цела.
+        _mb = str(getattr(bc, "mental_break", "") or "")
+        if _mb in ("exhaustion", "catatonic"):
+            return
+        _par = self._paralysis_until.get(cid)
+        if _par is not None and time.monotonic() < float(_par):
+            return
         try:
             tier = _FATIGUE_PHI_TIER.get(int(action))
             if tier is None or tier <= 0.0:        # STAY/неизв. → 0 (recovery через decay)

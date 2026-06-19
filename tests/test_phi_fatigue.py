@@ -83,6 +83,45 @@ def test_fatigue_b_tunable():
     assert c.set_fatigue_b(10.0) == 5.0          # клемп [0,5]
 
 
+# ── ВАРИАНТ 1 incapacitation-гейт (Фрай 19.06): недобровольное действие НЕ копит ──
+def test_no_fatigue_during_exhaustion_mb():
+    """exhaustion mental_break → Адам force-STAYed (недобровольно) → move-crawl НЕ
+    копит fatigue → decay доминирует → recovery (рефлекс-осцилляция). Закрывает
+    frozen-pin (раньше crawl/exhaustion-STAY копили → absorbing)."""
+    c, bc = _compute(fatigue=90.0)
+    bc.mental_break = "exhaustion"
+    c.set_fatigue_b(0.2)
+    c._apply_action_fatigue("c0", 0)             # «хочет» move, но exhaustion-force-STAY
+    assert bc.fatigue == 90.0                     # НЕ копилось (недобровольно)
+
+
+def test_no_fatigue_during_catatonic_mb():
+    c, bc = _compute(fatigue=50.0)
+    bc.mental_break = "catatonic"
+    c.set_fatigue_b(0.2)
+    c._apply_action_fatigue("c0", 5)             # ATTACK выбран, но catatonic-force-STAY
+    assert bc.fatigue == 50.0                     # НЕ копилось
+
+
+def test_no_fatigue_during_s3_paralysis():
+    """§3-paralysis (в т.ч. FORAGE_FLOOR crawl=STEP) → недобровольно → НЕ копит."""
+    import time as _time
+    c, bc = _compute(fatigue=70.0)
+    c.set_fatigue_b(0.2)
+    c._paralysis_until["c0"] = _time.monotonic() + 10.0   # в параличе
+    c._apply_action_fatigue("c0", 0)             # forage-floor crawl (move)
+    assert bc.fatigue == 70.0                     # НЕ копилось (incapacitated)
+
+
+def test_fatigue_accumulates_when_voluntary():
+    """Без инкапаситации (mb=normal, не паралич) → ВОЛЕВОЕ действие копит штатно."""
+    c, bc = _compute(fatigue=10.0)
+    bc.mental_break = ""                          # normal
+    c.set_fatigue_b(0.2)
+    c._apply_action_fatigue("c0", 0)             # move волевой
+    assert bc.fatigue == pytest.approx(10.2)      # копилось (b×1.0)
+
+
 def test_stamina_drain_to_hp_when_exhausted():
     """phi_fatigue ON + выносливость=0 (fatigue=max) → дренаж hp φ³ (3-я нужда)."""
     c, bc = _compute(energy=500.0, hydration=100.0, hp=500.0, fatigue=_FATIGUE_MAX)
