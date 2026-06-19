@@ -277,3 +277,32 @@ def test_graduate_skill_tiebreak_when_neither_poor():
     c._beh_axis_hist["c0"] = {"stamina": [0.0] * 8, "rhythm": [0.0] * 8}  # оба НЕ poor
     assert c._maybe_behavioral_graduate("c0", None) is True
     assert "beh1" in c._beh_graduated.get("c0", {})        # лучший skill (rhythm 0.5)
+
+
+# ── target-graduation (Фрай 19.06): incap-гейт vs poor-приоритет конфликт-фикс ──
+def test_grad_target_axis_setter():
+    c = _c()
+    assert c._beh_grad_target_axis is None
+    assert c.set_grad_target_axis("stamina") == "stamina"
+    assert c._beh_grad_target_axis == "stamina"
+    assert c.set_grad_target_axis(None) is None
+    assert c.set_grad_target_axis("") is None               # пусто → None (штатно)
+
+
+def test_graduate_target_axis_overrides_skill():
+    """ВОСПРОИЗВОДИТ live-провал: rhythm лучше skill + НИ ОДНА не poor (incap-гейт
+    держит stamina не-poor → poor-приоритет НЕ помог бы). Без таргета graduate брал
+    бы rhythm (best-skill). grad_target_axis=stamina → graduate ИМЕННО stamina."""
+    c = _c()
+    _grad_ready(c)
+    c.set_grad_target_axis("stamina")
+    c._beh_grown_tissues["c0"] = {"beh1": object(), "beh7": object()}
+    c._beh_grown_axis["c0"] = {"beh1": "rhythm", "beh7": "stamina"}
+    c._beh_forecast_err["c0"] = {"beh1": 0.5, "beh7": 2.0}   # rhythm skill ЛУЧШЕ
+    c._beh_forecast_trained["c0"] = {"beh1": 34, "beh7": 3}  # оба созрелы
+    _set_baseline(c, "c0", "rhythm", 4.0)
+    _set_baseline(c, "c0", "stamina", 4.0)
+    c._beh_axis_hist["c0"] = {"stamina": [0.0] * 8, "rhythm": [0.0] * 8}  # НИ ОДНА не poor
+    assert c._maybe_behavioral_graduate("c0", None) is True
+    assert "beh7" in c._beh_graduated.get("c0", {})          # stamina (таргет), НЕ rhythm
+    assert "beh1" not in c._beh_graduated.get("c0", {})

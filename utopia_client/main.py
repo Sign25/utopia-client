@@ -558,6 +558,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_fatigue_b: float | None = None
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
+    applied_grad_target: str | None = "__unset__"   # grad_target_axis (sentinel ≠ None)
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1121,6 +1122,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("behavioral_graduation → %s", target_beh_grad)
                         except Exception as e:
                             logger.warning("set_behavioral_graduation failed: %s", e)
+
+                    # grad_target_axis (Фрай 19.06): таргет-graduation ОДНОЙ оси —
+                    # incap-гейт держит fat у 85 → stamina не poor → poor-приоритет не
+                    # firе → best-global брал бы зрелый rhythm. Явный таргет → graduate
+                    # ИМЕННО stamina. None → штатно. edge-detect (sentinel init).
+                    target_grad_axis = flags.get("grad_target_axis", None)
+                    if target_grad_axis != applied_grad_target \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_grad_target_axis(target_grad_axis)
+                            applied_grad_target = target_grad_axis
+                            logger.info("grad_target_axis → %s", target_grad_axis)
+                        except Exception as e:
+                            logger.warning("set_grad_target_axis failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

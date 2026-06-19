@@ -815,6 +815,7 @@ class LocalColonyCompute:
         # (per-night пара). forecast-err EMA = skill (для gate-2 приоритета + pool-cull).
         # НЕ селектор (Фрай) — тёплый старт; реальная retention поведенческая на gate-2.
         self._behavioral_graduation_enabled: bool = False  # client_flag gate-2 (graduation, OFF dormant)
+        self._beh_grad_target_axis = None    # client_flag grad_target_axis: graduate ТОЛЬКО эту ось (None=штатно poor/best-skill)
         self._beh_forecast_head: dict = {}   # cid → {role: nn.Linear(64→1)} readout dark-loss
         self._beh_forecast_opt: dict = {}    # cid → {role: optimizer (tissue+head)}
         self._beh_forecast_err: dict = {}    # cid → {role: EMA |forecast−drop|} (skill, ↓лучше)
@@ -7301,6 +7302,17 @@ class LocalColonyCompute:
         logger.info("set_behavioral_graduation: %s", on)
         return self._behavioral_graduation_enabled
 
+    def set_grad_target_axis(self, axis):
+        """Канал client_flags (grad_target_axis): таргет-graduation ОДНОЙ оси (Фрай
+        19.06). При активации gate-2 ДЛЯ конкретной оси (напр. stamina) graduate
+        рассматривает ТОЛЬКО её сайдкары (best-skill среди них), игнор остальных.
+        Нужно т.к. incap-гейт держит fat у 85 → stamina не poor → poor-приоритет не
+        firе → best-global брал бы зрелый rhythm. axis=str → таргет; None/'' → штатно
+        (poor-приоритет + best-skill глобально). Снять после graduate целевой оси."""
+        self._beh_grad_target_axis = (str(axis) if axis else None)
+        logger.info("set_grad_target_axis: %s", self._beh_grad_target_axis)
+        return self._beh_grad_target_axis
+
     def _revert_behavioral_graduations(self) -> None:
         """gate-2 kill-switch (Опция A): снять ВСЕ behavioral мотор-головы → база
         мотора бит-в-бит (bolt-on голова, мгновенно-съёмная; zero-init или выученная —
@@ -7350,6 +7362,13 @@ class LocalColonyCompute:
             if err is None:                           # не тренировался — не зрел
                 continue
             axk = axmap.get(role, "")
+            # ТАРГЕТ-graduation (Фрай 19.06): при активации gate-2 ДЛЯ конкретной оси
+            # таргетим её сайдкары явно. Нужно т.к. incap-гейт держит fat у 85 → stamina
+            # cost≈0 → НЕ poor → poor-приоритет НЕ firе → best-skill брал бы зрелый rhythm
+            # (конфликт poor-приоритет vs incap-гейт). grad_target_axis set → рассматриваем
+            # ТОЛЬКО эту ось (best-skill среди её сайдкаров). None → штатно (poor/best-skill).
+            if self._beh_grad_target_axis and axk != self._beh_grad_target_axis:
+                continue
             ax = self._beh_axes.get(axk, {})
             grace_thr = ax.get("grace_nights")        # PER-AXIS grace (None → глобальный)
             if grace_thr is None:
