@@ -29,6 +29,7 @@ from utopia_client.local_compute import (  # noqa: E402
     LocalColonyCompute,
     _BRAIN_INPUT_DIM,
     _STAMINA_EXHAUSTION_ONSET,
+    _STAMINA_COST_ONSET,
     _STAMINA_WIN_N,
     _STAMINA_POOR_WIN,
 )
@@ -67,32 +68,50 @@ def test_stamina_axis_registered():
 
 
 def test_onset_matches_neurocore_contract():
-    """Порог = neurocore MENTAL_BREAK_EXHAUSTION_FATIGUE_MIN (контракт-матч, не прокси)."""
+    """EXHAUSTION-онсет = neurocore MENTAL_BREAK_EXHAUSTION_FATIGUE_MIN (рефлекс/incap)."""
     assert _STAMINA_EXHAUSTION_ONSET == 85.0
+
+
+def test_cost_onset_below_exhaustion_anticipatory():
+    """COST-онсет(55 F10) < EXHAUSTION(85): cost копится в антиципаторной зоне [55,85]
+    → решает catch-22 (incap-гейт держит fat у 85; cost-онсет<85 → cost>0 на равновесии
+    → форкастер минтит + учит getting-tired зону, rest упреждает коллапс)."""
+    assert _STAMINA_COST_ONSET == 55.0
+    assert _STAMINA_COST_ONSET < _STAMINA_EXHAUSTION_ONSET
+    c = _c()
+    c._phi_fatigue_enabled = True
+    _bc(c, fatigue=85.0)                              # рефлекс-равновесие fat=85
+    for _ in range(_STAMINA_WIN_N):
+        c._update_stamina_cost("c0")
+    # на равновесии fat=85: cost=(85−55)=30/тик → window>0 (БЫЛО ≈0 при онсете=85 =
+    # catch-22). Это сигнал для минта форкастера.
+    assert c._beh_stamina_cost_cum["c0"] == pytest.approx(
+        _STAMINA_WIN_N * (85.0 - _STAMINA_COST_ONSET))
 
 
 # ── Метрика: fatigue-интеграл над онсетом за rolling-N окно ───────────────
 def test_stamina_cost_accumulates_over_window():
     c = _c()
     c._phi_fatigue_enabled = True
-    bc = _bc(c, fatigue=100.0)                        # excess = 100−85 = 15/тик
+    bc = _bc(c, fatigue=100.0)                        # excess = 100−55(cost-онсет) = 45/тик
     # N−1 тиков: окно НЕ закрыто, cum ещё 0
     for _ in range(_STAMINA_WIN_N - 1):
         c._update_stamina_cost("c0")
     assert c._beh_stamina_cost_cum.get("c0", 0.0) == 0.0
     assert c._stam_win_ticks["c0"] == _STAMINA_WIN_N - 1
-    # N-й тик → закрытие: cost = N×15, cum += cost, окно reset
+    # N-й тик → закрытие: cost = N×45, cum += cost, окно reset
     c._update_stamina_cost("c0")
-    assert abs(c._beh_stamina_cost_cum["c0"] - _STAMINA_WIN_N * 15.0) < 1e-6
+    assert abs(c._beh_stamina_cost_cum["c0"]
+               - _STAMINA_WIN_N * (100.0 - _STAMINA_COST_ONSET)) < 1e-6
     assert c._stam_win_ticks["c0"] == 0              # окно сброшено
     assert c._stam_win_cost["c0"] == 0.0
 
 
 def test_stamina_cost_zero_below_onset():
-    """fatigue ≤ онсет → excess=0 → cost не копится (нет exhaustion = нет давления)."""
+    """fatigue ≤ COST-онсет(55) → excess=0 → cost не копится (ниже антиципаторной зоны)."""
     c = _c()
     c._phi_fatigue_enabled = True
-    _bc(c, fatigue=_STAMINA_EXHAUSTION_ONSET - 5.0)  # 80 < 85
+    _bc(c, fatigue=_STAMINA_COST_ONSET - 5.0)        # 50 < 55 cost-онсет
     for _ in range(_STAMINA_WIN_N):
         c._update_stamina_cost("c0")
     assert c._beh_stamina_cost_cum.get("c0", 0.0) == 0.0
@@ -120,10 +139,11 @@ def test_stamina_window_resets_and_continues():
     """После закрытия окна — новое окно копит заново (rolling)."""
     c = _c()
     c._phi_fatigue_enabled = True
-    _bc(c, fatigue=95.0)                             # excess 10/тик
+    _bc(c, fatigue=95.0)                             # excess = 95−55 = 40/тик
     for _ in range(_STAMINA_WIN_N * 2):             # 2 полных окна
         c._update_stamina_cost("c0")
-    assert abs(c._beh_stamina_cost_cum["c0"] - 2 * _STAMINA_WIN_N * 10.0) < 1e-6
+    assert abs(c._beh_stamina_cost_cum["c0"]
+               - 2 * _STAMINA_WIN_N * (95.0 - _STAMINA_COST_ONSET)) < 1e-6
 
 
 # ── Метрика пассивна (копится без флага роста, наблюдаемость) ─────────────
