@@ -560,6 +560,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_beh_grad: bool | None = None
     applied_grad_target: str | None = "__unset__"   # grad_target_axis (sentinel ≠ None)
     applied_s3_forage: bool | None = None            # §3-редизайн паралич→фураж
+    applied_nav_repellent: bool | None = None        # нав-репеллent (policy-пин)
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1150,6 +1151,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("s3_forage → %s", target_s3f)
                         except Exception as e:
                             logger.warning("set_s3_forage failed: %s", e)
+
+                    # nav_repellent (Фрай 19.06): policy-пин active-Адама — move в стену
+                    # (water/rock) редиректит на проходимое. server-bounce не покрывает
+                    # client-auth Адама. OFF dormant → bit-identical. edge-detect.
+                    target_navr = bool(flags.get("nav_repellent", False))
+                    if target_navr != applied_nav_repellent \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_nav_repellent(target_navr)
+                            applied_nav_repellent = target_navr
+                            logger.info("nav_repellent → %s", target_navr)
+                        except Exception as e:
+                            logger.warning("set_nav_repellent failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

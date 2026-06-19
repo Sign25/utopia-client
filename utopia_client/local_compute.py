@@ -287,6 +287,11 @@ _STAMINA_EXHAUSTION_ONSET = 85.0   # = neurocore MENTAL_BREAK_EXHAUSTION_FATIGUE
 _STAMINA_COST_ONSET = 55.0         # F10 (Фибоначчи, ≈85·φ⁻¹=52.5) — COST-онсет (АНТИЦИПАТОРНЫЙ, Фрай 19.06): cost=Σmax(0,fat−55). РАЗДЕЛЁН с exhaustion(85): incap-гейт держит fat у 85 → если cost-онсет=85 → cost≈0 → форкастер не минтит (catch-22). cost-онсет<exhaustion → cost копится на равновесии → МИНТ + форкастер учит getting-tired зону [55,85] → rest-response отдыхает АНТИЦИПАТОРНО (fat осциллирует ниже 85 ≈55-70). Семантически вернее (упреждение коллапса, не НА коллапсе).
 _STAMINA_WIN_N = 233               # Fib — тиков на rolling-окно (= погодный sin-цикл, как _BEH_GC_WINDOW; Фрай OPEN-2 A, N replay-тюн)
 _STAMINA_POOR_WIN = 233.0          # Fib-старт — costly-окно если cost > порога (тюн вживую по STAMINA_COST_DIAG, как ритм 8.0 из replay)
+# нав-репеллент (Фрай 19.06): move-action → obs wall-канал соседа (water/rock=blocked).
+# obs[0:32]=8 соседей × [empty/food/WALL/poison] (observation_client _NEIGHBOR_OFFSETS);
+# WALL=idx2/сосед. move 0=N(-1,0)=сосед0→obs2, 1=S(1,0)=сосед4→obs18, 2=E(0,1)=сосед2→
+# obs10, 3=W(0,-1)=сосед6→obs26. Подтверждено client nav-hit (action 0=N/1=S/2=E/3=W).
+_MOVE_WALL_OBS = {0: 2, 1: 18, 2: 10, 3: 26}   # move-action → obs-индекс wall-канала
 _PASSIVE_WATER = _PHI ** -1      # ≈0.618 — hydration-income/тик в параличе (Хьюберт: thirst≈step_cost·φ≈0.236 → net +0.382, net-positive не сталл, вода 0→норма за ~30-50т; зеркало passive_flora, §3-non-absorbing страховка; paralyzed+is_adam, флаг passive_water_drinking)
 _CLIENT_MAX_AGE = 17711.0        # mirror base_max_age (Fib)
 _CLIENT_DEFAULT_CAMEL = 10.0     # mirror server getattr(creature,'camel',10)
@@ -652,6 +657,11 @@ class LocalColonyCompute:
         # server _S3_FORAGE (Хьюберт a201399). OFF dormant → bit-identical (STAY-fallback).
         self._s3_forage_enabled: bool = False    # client_flag s3_forage (OFF dormant)
         self._s3_search_state: dict = {}         # cid → (dir, tick) персист random-walk-поиска
+        # нав-репеллент (Фрай 19.06): policy-пин active-Адама (move в стену water/rock →
+        # server move-no-op → застрял; server-bounce не покрывает client-auth Адама).
+        # ON → выбранный move в стену (obs wall-канал) редиректит на проходимое. OFF
+        # dormant → bit-identical. Закрывает рекуррентные «замер» на краях/terrain.
+        self._nav_repellent_enabled: bool = False  # client_flag nav_repellent (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -4609,6 +4619,11 @@ class LocalColonyCompute:
                 # через er<0.5-гейт (вне окна молчит). Перед force_stay (§3 er≈0 < 0.5 → не overlap).
                 self._apply_predator_hunt(cid, out, obs_per_cid.get(cid))
                 self._maybe_force_stay(cid, out)
+                # нав-репеллент (Фрай 19.06): ПОСЛЕ override-цепочки — если ФИНАЛЬНЫЙ
+                # move ведёт в стену (water/rock) → редирект на проходимое (policy-пин
+                # active-Адама; server-bounce его не покрывает). До _fa (fatigue на
+                # редиректнутом move). Гейт nav_repellent.
+                self._apply_nav_repellent(cid, out, obs_per_cid.get(cid))
                 # active_eat/stats — ФИНАЛЬНОЕ действие ПОСЛЕ override-цепочки (рефлекс/
                 # force-STAY). Раньше _stat_last_action писался при селекторе (выбор
                 # мотора) → рефлекс-EAT не отражался (телеметрия слепа к override).
@@ -10845,6 +10860,52 @@ class LocalColonyCompute:
         self._s3_forage_enabled = bool(on)
         logger.info("set_s3_forage: %s", on)
         return self._s3_forage_enabled
+
+    def set_nav_repellent(self, on: bool) -> bool:
+        """Канал client_flags nav_repellent (Фрай 19.06): нав-репеллент policy-пина.
+        ON → выбранный move в стену (water/rock, obs wall-канал) редиректит на
+        проходимое направление → Адам не застревает у препятствий/краёв. OFF (dormant):
+        bit-identical. Закрывает рекуррентные «замер» active-Адама (server-bounce его
+        не покрывает — client-auth pos). kill-switch."""
+        self._nav_repellent_enabled = bool(on)
+        logger.info("set_nav_repellent: %s", on)
+        return self._nav_repellent_enabled
+
+    def _apply_nav_repellent(self, cid: str, out: dict, obs) -> None:
+        """Нав-репеллент: выбранный move ведёт в стену (water/rock; obs wall-канал
+        соседа) → редирект на проходимое направление (перебор N/S/E/W). Закрывает
+        policy-пин (Адам толкает в препятствие → server move-no-op → застрял; active-
+        Адам client-auth → server-bounce не покрывает). Все 4 стены (заперт) → оставляем
+        (редкость; §3/server разрулят). obs[i*4+2]=wall соседа i; _MOVE_WALL_OBS-маппинг.
+        Гейт nav_repellent. Вызов ПОСЛЕ override-цепочки (на финальном действии)."""
+        if not self._nav_repellent_enabled or obs is None:
+            return
+        od = out.get(cid)
+        if od is None:
+            return
+        act = od.get("action")
+        if act is None:
+            return
+        widx = _MOVE_WALL_OBS.get(int(act))
+        if widx is None or len(obs) <= widx:
+            return                               # не move-действие / obs мал
+        try:
+            if float(obs[widx]) < 0.5:
+                return                           # выбранное направление проходимо
+            # blocked → ищем проходимое (N/S/E/W порядок)
+            for alt in (0, 1, 2, 3):
+                awidx = _MOVE_WALL_OBS[alt]
+                if len(obs) > awidx and float(obs[awidx]) < 0.5:
+                    out[cid] = {"action": int(alt), "target_id": None}
+                    self._nav_repel_n = getattr(self, "_nav_repel_n", 0) + 1
+                    if self._nav_repel_n % 15 == 0:
+                        logger.info("NAV_REPELLENT cid=%s #%d (move %d→стена → редирект "
+                                    "%d проходимо) anti-pin", cid, self._nav_repel_n,
+                                    int(act), int(alt))
+                    return
+            # все 4 направления — стены (заперт): оставляем (редкость)
+        except (TypeError, ValueError, IndexError) as e:
+            logger.debug("nav_repellent %s: %s", cid, e)
 
     def _apply_biochem_events(self, cid: str, event: "Optional[dict]") -> None:
         """Apply event-driven biochem deltas из per-cid event_dict.
