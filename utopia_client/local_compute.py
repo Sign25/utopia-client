@@ -4237,12 +4237,14 @@ class LocalColonyCompute:
                 # Гейт client_flag deception_probe (OFF → zero-cost). Мотор НЕ трогаем.
                 if self._decep_probe_enabled:
                     self._deception_exploit_probe(cid, obs_arr, int(action))
-                # stamina φ-расход (Фрай §19): копим fatigue от ВЫБРАННОГО действия
-                # (re-use apply_action_taken → ACTION_FATIGUE_GLUCOSE φ-лестница).
-                # Закрывает GAP (apply_action_taken не звался → Адам не уставал).
-                # Гейт phi_fatigue (OFF → fatigue только decay, инертно). LOCKSTEP server.
-                if self._phi_fatigue_enabled:
-                    self._apply_action_fatigue(cid, int(action))
+                # stamina φ-расход (Фрай §19): копим fatigue от ИСПОЛНЕННОГО действия —
+                # перенесено НИЖЕ (после _maybe_force_stay/exhaustion-mb override, на _fa
+                # @ финал override-цепочки). БАГ-ФИКС (19.06, Шеф нашёл frozen-deadlock):
+                # раньше копил по ВЫБРАННОМУ (action) ДО force-STAY → в §3-параличе Адам
+                # «хотел» move → fatigue копился как move, НО реально STAY → fatigue вечно
+                # 100 → выносливость=0 → exhaustion → energy-крэш → §3 → deadlock. На
+                # ИСПОЛНЕННОМ: паралич/exhaustion=force-STAY(tier 0)→decay→recovery (само-
+                # корректно, §3=отдых-доктрина цела).
                 # STAY_PROBE (Фрай 06.06, совместная тик-в-тик проба с Хьюбертом):
                 # за флагом park_test (контролируемое условие). По-тиковый лог,
                 # выровнен по world_tick для кросс-сверки со steps/tick сервера.
@@ -4602,6 +4604,12 @@ class LocalColonyCompute:
                 _fa = (out.get(cid) or {}).get("action")
                 if _fa is not None:
                     self._stat_last_action[cid] = int(_fa)
+                    # stamina φ-расход на ИСПОЛНЕННОМ действии (баг-фикс 19.06): после
+                    # ВСЕЙ override-цепочки (eat-reflex/hunt/predator/force-STAY/exhaustion-mb).
+                    # §3-паралич/exhaustion → _fa=STAY(tier 0) → нет накопления → decay →
+                    # выносливость↑ → выход из exhaustion (само-корректно). Гейт phi_fatigue.
+                    if self._phi_fatigue_enabled:
+                        self._apply_action_fatigue(cid, int(_fa))
             except Exception as e:
                 logger.warning("handle_tick %s failed: %s", cid, e)
                 out[cid] = {"action": STAY, "target_id": None}
