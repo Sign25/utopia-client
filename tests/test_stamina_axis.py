@@ -329,38 +329,41 @@ def test_graduate_target_axis_overrides_skill():
 
 
 # ── сниженный graduation-health-гейт для stamina (309 vs 618, Фрай 19.06) ──
-def test_graduate_stamina_lowered_health_gate():
-    """stamina-target → гейт 309 (не 618): graduate в умеренной exhaustion (energy
-    309-618). Решает deadlock (рефлекс-exhaustion fat=85 крашит energy <618)."""
+def test_graduate_stamina_no_energy_gate_moderate():
+    """stamina-target → НЕТ energy-gate (Шеф/Фрай 19.06): graduate при умеренной
+    energy (400). Health-gate циркулярен для stamina (ось даёт здоровье)."""
     import types as _t
     c = _c()
     c.set_behavioral_graduation(True)
     c.organisms["c0"] = object()
-    c.biochem["c0"] = _t.SimpleNamespace(energy=400.0)        # между 309 и 618
+    c.biochem["c0"] = _t.SimpleNamespace(energy=400.0)
     c.set_grad_target_axis("stamina")
     c._beh_grown_tissues["c0"] = {"beh7": object()}
     c._beh_forecast_err["c0"] = {"beh7": 1.0}
     c._beh_grown_axis["c0"] = {"beh7": "stamina"}
     c._beh_forecast_trained["c0"] = {"beh7": 3}
     _set_baseline(c, "c0", "stamina", 4.0)
-    assert c._maybe_behavioral_graduate("c0", None) is True   # гейт=309 → graduate@400
+    assert c._maybe_behavioral_graduate("c0", None) is True
     assert "beh7" in c._beh_graduated.get("c0", {})
 
 
-def test_graduate_blocked_below_stamina_gate():
-    """energy<309 даже для stamina → blocked (минимум здоровья сохранён)."""
+def test_graduate_stamina_no_gate_even_low_energy():
+    """stamina-target БЕЗ energy-gate: graduate ДАЖЕ при низкой energy (60) — рефлекс-
+    exhaustion+среда крашат energy ниже любого порога; rest-response ВОССТАНАВЛИВАЕТ.
+    (Раньше gate-309 блокировал — circular deadlock; теперь убран.)"""
     import types as _t
     c = _c()
     c.set_behavioral_graduation(True)
     c.organisms["c0"] = object()
-    c.biochem["c0"] = _t.SimpleNamespace(energy=200.0)        # <309
+    c.biochem["c0"] = _t.SimpleNamespace(energy=60.0)         # крашнутая energy <309
     c.set_grad_target_axis("stamina")
     c._beh_grown_tissues["c0"] = {"beh7": object()}
     c._beh_forecast_err["c0"] = {"beh7": 1.0}
     c._beh_grown_axis["c0"] = {"beh7": "stamina"}
     c._beh_forecast_trained["c0"] = {"beh7": 3}
     _set_baseline(c, "c0", "stamina", 4.0)
-    assert c._maybe_behavioral_graduate("c0", None) is False  # <309 → blocked
+    assert c._maybe_behavioral_graduate("c0", None) is True   # НЕТ гейта → graduate@60
+    assert "beh7" in c._beh_graduated.get("c0", {})
 
 
 def test_graduate_rhythm_keeps_618_gate():
