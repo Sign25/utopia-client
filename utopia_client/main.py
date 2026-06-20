@@ -563,6 +563,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_nav_repellent: bool | None = None        # нав-репеллent (policy-пин)
     applied_need_arbitration: bool | None = None     # φ-арбитраж голод↔жажда
     applied_pos_reconcile: bool | None = None        # pos-реконсиляция owned-Адама
+    applied_fatigue_rest_floor: bool | None = None   # root-3 рефлекс-rest-floor
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1193,6 +1194,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("pos_reconcile → %s", target_posr)
                         except Exception as e:
                             logger.warning("set_pos_reconcile failed: %s", e)
+
+                    # fatigue_rest_floor (Хьюберт §20.6.3 root-3): force-STAY@exhaustion
+                    # single-Адаму (видимый отдых) + bio decay/гистерезис + blocked-move→0.
+                    # ОДНА фича, три части. OFF dormant → bit-identical. edge-detect.
+                    target_rest = bool(flags.get("fatigue_rest_floor", False))
+                    if target_rest != applied_fatigue_rest_floor \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_fatigue_rest_floor(target_rest)
+                            applied_fatigue_rest_floor = target_rest
+                            logger.info("fatigue_rest_floor → %s", target_rest)
+                        except Exception as e:
+                            logger.warning("set_fatigue_rest_floor failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

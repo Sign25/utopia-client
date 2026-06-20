@@ -676,6 +676,12 @@ class LocalColonyCompute:
         # от пустого места → drink_sum=0, hyd→0. ON → резолвить owned-Адама на канон
         # (creature_pos, кэш last-known), не obs_batch drift. OFF dormant → bit-identical.
         self._pos_reconcile_enabled: bool = False  # client_flag pos_reconcile (OFF dormant)
+        # root-3 рефлекс-rest-floor (Хьюберт §20.6.3): single-Адаму был отключён force-STAY@
+        # exhaustion (absorbing-страх слепил glucose/catatonic/exhaustion) → нет рефлекс-
+        # отдыха → fat пин 85 (выносл=15) + gate-2 без bootstrap-примеров. ON → (1) bio
+        # decay 0.55+гистерезис (recovery ожила), (2) force-STAY@exhaustion single → видимый
+        # отдых, (3) blocked-move→0-fatigue. OFF dormant → bit-identical. kill-switch.
+        self._fatigue_rest_floor_enabled: bool = False  # client_flag fatigue_rest_floor (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -9278,6 +9284,14 @@ class LocalColonyCompute:
         if self._s3_forage_enabled and \
                 float(getattr(bc, "glucose", 999.0) or 0.0) < _S3_HUNGER_GLUCOSE:
             return
+        # blocked_move→0-fatigue (Хьюберт Root-2, §20.6.3): итоговый move уткнулся в стену
+        # БЕЗ смещения (nav-repellent: все 4 заперты) → нет смещения = нет нагрузки → не
+        # копим. Убивает wall-thrash-инфляцию fatigue (малый оазис). Под fatigue_rest_floor;
+        # только move-действия (nav_repellent пометил this-tick). OFF → как было.
+        if (self._fatigue_rest_floor_enabled
+                and int(action) in _MOVE_WALL_OBS
+                and getattr(self, "_nav_blocked_move", {}).get(cid)):
+            return
         try:
             tier = _FATIGUE_PHI_TIER.get(int(action))
             if tier is None or tier <= 0.0:        # STAY/неизв. → 0 (recovery через decay)
@@ -10831,6 +10845,22 @@ class LocalColonyCompute:
                 else:
                     out[cid] = {"action": STAY, "target_id": None}   # flag OFF: bit-identical
                 return
+        # root-3 рефлекс-rest-floor (Хьюберт §20.6.3): single-Адаму force-STAY на
+        # EXHAUSTION (fatigue-изнеможение) под флагом fatigue_rest_floor → ВИДИМЫЙ отдых
+        # (стоп wall-thrash) + STAY-примеры для gate-2 bootstrap (форкастер учит rest→
+        # recovery). ТОЛЬКО exhaustion (glucose<5/catatonic остаются OFF — absorbing:
+        # STAY→не ест→голод). На оазисе exhaustion-STAY НЕ absorbing (passive income
+        # кормит в STAY, fat декей 0.55). §3-паралич (выше) приоритетнее. yield не нужен:
+        # incap-gate уже не копит fatigue в exhaustion; STAY ускоряет decay + даёт пример.
+        if (self._fatigue_rest_floor_enabled and self._single_organism
+                and str(getattr(bc, "mental_break", "") or "") == "exhaustion"):
+            out[cid] = {"action": STAY, "target_id": None}
+            self._rest_floor_n = getattr(self, "_rest_floor_n", 0) + 1
+            if self._rest_floor_n % 30 == 0:
+                logger.info("REST_FLOOR cid=%s #%d (exhaustion→force-STAY: видимый "
+                            "отдых, стоп wall-thrash, gate-2 bootstrap)", cid,
+                            self._rest_floor_n)
+            return
         try:
             from environment.biochemistry import should_force_stay  # type: ignore
         except Exception:
@@ -10909,6 +10939,27 @@ class LocalColonyCompute:
         logger.info("set_pos_reconcile: %s", on)
         return self._pos_reconcile_enabled
 
+    def set_fatigue_rest_floor(self, on: bool) -> bool:
+        """Канал client_flags fatigue_rest_floor (root-3 рефлекс-rest-floor, Хьюберт §20.6.3).
+        ОДНА фича, три части (lockstep, флипаются вместе):
+        (1) bio.set_fatigue_rest_floor → server biochem: decay 0.55/тик в exhaustion +
+            level-гистерезис set@85/clear@70 (мёртвая FATIGUE_STAY_RECOVERY ожила → видимый rest).
+        (2) force-STAY@exhaustion для single-Адама (_maybe_force_stay) → ВИДИМЫЙ отдых (стоп
+            wall-thrash) + STAY-примеры для gate-2 bootstrap (форкастер учит rest→recovery).
+        (3) blocked-move→0-fatigue (_apply_action_fatigue) — удар-в-стену без смещения не копит.
+        ТОЛЬКО exhaustion (glucose<5/catatonic OFF — absorbing). OFF (dormant): bit-identical.
+        kill-switch. §19.19: floor = bootstrap, gate-2 = enhancement сверху."""
+        self._fatigue_rest_floor_enabled = bool(on)
+        try:
+            from environment.biochemistry import (  # type: ignore
+                set_fatigue_rest_floor as _bio_set)
+            _bio_set(bool(on))
+            logger.info("set_fatigue_rest_floor: %s (+ bio biochem-половина)", on)
+        except Exception as e:
+            logger.warning("set_fatigue_rest_floor: bio-половина недоступна "
+                           "(старый neurocore?): %s", e)
+        return self._fatigue_rest_floor_enabled
+
     def _apply_nav_repellent(self, cid: str, out: dict, obs) -> None:
         """Нав-репеллент: выбранный move ведёт в стену (water/rock; obs wall-канал
         соседа) → редирект на проходимое направление (перебор N/S/E/W). Закрывает
@@ -10927,9 +10978,15 @@ class LocalColonyCompute:
         widx = _MOVE_WALL_OBS.get(int(act))
         if widx is None or len(obs) <= widx:
             return                               # не move-действие / obs мал
+        # blocked_move-трекинг (Хьюберт Root-2): помечаем, был ли итоговый move в стену
+        # БЕЗ смещения (все 4 заперты) → _apply_action_fatigue обнулит fatigue (нет
+        # смещения = нет нагрузки). Свежо per-tick для move-действий. Default False.
+        if not hasattr(self, "_nav_blocked_move"):
+            self._nav_blocked_move = {}
+        self._nav_blocked_move[cid] = False
         try:
             if float(obs[widx]) < 0.5:
-                return                           # выбранное направление проходимо
+                return                           # выбранное направление проходимо (смещение)
             # blocked → ищем проходимое (N/S/E/W порядок)
             for alt in (0, 1, 2, 3):
                 awidx = _MOVE_WALL_OBS[alt]
@@ -10940,8 +10997,9 @@ class LocalColonyCompute:
                         logger.info("NAV_REPELLENT cid=%s #%d (move %d→стена → редирект "
                                     "%d проходимо) anti-pin", cid, self._nav_repel_n,
                                     int(act), int(alt))
-                    return
-            # все 4 направления — стены (заперт): оставляем (редкость)
+                    return                       # редирект на проходимое = смещение
+            # все 4 направления — стены (заперт): оставляем + помечаем blocked (нет смещения)
+            self._nav_blocked_move[cid] = True
         except (TypeError, ValueError, IndexError) as e:
             logger.debug("nav_repellent %s: %s", cid, e)
 
