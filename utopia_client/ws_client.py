@@ -2444,6 +2444,15 @@ class ColonyWSClient:
                 logger.info("SEEK_GATE single_organism → food-seek OFF, "
                             "WATER-seek ON (Гидратация, Фрай 08.06); "
                             "need_arbitration=%s", _arb_on)
+        # anti-freeze (Бендер 20.06): ФИНАЛЬНЫЙ override — выбить Адама из freeze, что
+        # nav_repellent (obs wall-канал) ПРОПУСКАЕТ (nav_hit высокий, редиректов нет →
+        # стена вне канала: край карты / спец-terrain). Детект ПО ПОЗИЦИИ (не obs).
+        if (self.compute is not None
+                and getattr(self.compute, "_anti_freeze_enabled", False)):
+            try:
+                self._apply_anti_freeze(creatures, creatures_out)
+            except Exception as e:
+                logger.warning("anti-freeze override failed: %r", e)
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
@@ -2532,6 +2541,10 @@ class ColonyWSClient:
     # на margin (иначе thrash при близких → ходьба food↔water → оба краш). Fib 8 —
     # мал, отзывчив: переключит ДО ухода в 0, но не дёргает на equal-jitter.
     _NEED_ARB_DEADBAND = 8.0        # Fib: switch если другой < текущего − deadband (сырое)
+    # anti-freeze (Бендер 20.06): pos заморожен N тиков (несмотря на move-эмит) →
+    # коммит-побег по ПОЗИЦИИ (не по obs-стене). Ловит карманы/края вне obs-канала.
+    _ANTIFREEZE_STUCK_N = 21        # Fib: pos неизменна столько тиков → побег
+    _ANTIFREEZE_PERSIST = 8         # Fib: коммит одно направление столько тиков (цикл N/E/S/W)
 
     def _water_seek_action(self, row: int, col: int):
         """Направление (0=N,1=S,2=E,3=W) к ближайшему WATER-тайлу в радиусе,
@@ -2934,6 +2947,54 @@ class ColonyWSClient:
                 "WATER_SEEK_DIAG creatures=%d with_pos=%d thirsty=%d "
                 "near_water=%d seek_override=%d", len(creatures_out), len(pos),
                 n_thirsty, n_near, n_seek)
+
+    def _apply_anti_freeze(self, creatures, creatures_out) -> None:
+        """position-based побег из freeze (Бендер 20.06). Адам застрял (resolved-pos НЕ
+        меняется ≥_ANTIFREEZE_STUCK_N тиков) ХОТЯ эмитит move → nav_repellent пропускает
+        стену (вне obs wall-канала: край карты / спец-terrain → server move-no-op). Детект
+        ПО ФАКТУ неподвижности (не по obs): форсим коммит-ротацию (одно направление
+        _ANTIFREEZE_PERSIST тиков, цикл N/E/S/W) → систематически перебираем стороны →
+        выбьет из кармана. Override любого действия (вода/еда/rest вторичны если застрял).
+        life_critical → bypass §3-STAY. Сброс как только pos сменится. single-Адам."""
+        compute = self.compute
+        if compute is None or not getattr(compute, "_single_organism", False):
+            return
+        pos = {}
+        for c in creatures:
+            cid = c.get("cid")
+            if cid is None:
+                continue
+            rc = self._resolve_pos(cid, c)
+            if rc is not None:
+                pos[str(cid)] = rc
+        if not hasattr(self, "_antifreeze_pos"):
+            self._antifreeze_pos = {}
+        if not hasattr(self, "_antifreeze_stuck"):
+            self._antifreeze_stuck = {}
+        for entry in creatures_out:
+            cid = entry.get("cid")
+            if not cid:
+                continue
+            rc = pos.get(cid)
+            if rc is None:
+                continue
+            if self._antifreeze_pos.get(cid) == rc:
+                self._antifreeze_stuck[cid] = self._antifreeze_stuck.get(cid, 0) + 1
+            else:
+                self._antifreeze_stuck[cid] = 0
+                self._antifreeze_pos[cid] = rc
+            _sn = self._antifreeze_stuck.get(cid, 0)
+            if _sn >= self._ANTIFREEZE_STUCK_N:
+                # коммит-ротация ПО ПОЗИЦИИ: каждое направление PERSIST тиков, цикл N/E/S/W
+                _d = [0, 2, 1, 3][((_sn - self._ANTIFREEZE_STUCK_N)
+                                   // self._ANTIFREEZE_PERSIST) % 4]
+                entry["action"] = int(_d)
+                entry["life_critical"] = True   # bypass §3-force-STAY (выбраться важнее)
+                self._antifreeze_n = getattr(self, "_antifreeze_n", 0) + 1
+                if self._antifreeze_n % 20 == 0:
+                    logger.info("ANTI_FREEZE cid=%s #%d (pos=%s заморожен %d тиков → "
+                                "коммит-побег dir=%d)", cid, self._antifreeze_n,
+                                rc, _sn, int(_d))
 
     def _apply_need_arbitration(self, creatures, creatures_out) -> None:
         """φ-арбитраж голод↔жажда single-Адама (Хьюберт 19.06). Симметрично обслуживает

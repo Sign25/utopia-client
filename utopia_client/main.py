@@ -566,6 +566,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_fatigue_rest_floor: bool | None = None   # root-3 рефлекс-rest-floor
     applied_life_sustained: bool | None = None       # sustained-life_support (i)
     applied_food_income: bool | None = None          # food-income server-truth
+    applied_anti_freeze: bool | None = None           # position-based анти-freeze
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1235,6 +1236,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("food_income_server → %s", target_fi)
                         except Exception as e:
                             logger.warning("set_food_income_server failed: %s", e)
+
+                    # anti_freeze (Бендер 20.06): position-based побег из freeze
+                    # (карманы/края вне obs wall-канала). OFF dormant → bit-identical.
+                    target_af = bool(flags.get("anti_freeze", False))
+                    if target_af != applied_anti_freeze \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_anti_freeze(target_af)
+                            applied_anti_freeze = target_af
+                            logger.info("anti_freeze → %s", target_af)
+                        except Exception as e:
+                            logger.warning("set_anti_freeze failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

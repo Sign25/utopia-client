@@ -698,6 +698,11 @@ class LocalColonyCompute:
         # flora_kind ground-truth (зеркало delta_hydration воды), бросаем cache.flora →
         # Адам реально кормится на карте. OFF dormant → legacy cache.flora (bit-identical).
         self._food_income_server_enabled: bool = False  # client_flag (OFF dormant)
+        # anti-freeze (Бендер 20.06): Адам рекуррентно застревает в карманах/краях, что
+        # nav_repellent (obs wall-канал) пропускает (стена вне канала → server move-no-op
+        # → pos заморожен несмотря на move-эмит). ON → position-based детект freeze + коммит-
+        # побег (ротация направлений по факту неподвижности). OFF dormant → bit-identical.
+        self._anti_freeze_enabled: bool = False  # client_flag anti_freeze (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -9961,6 +9966,16 @@ class LocalColonyCompute:
         self._food_income_server_enabled = bool(on)
         logger.info("set_food_income_server: %s", on)
         return self._food_income_server_enabled
+
+    def set_anti_freeze(self, on: bool) -> bool:
+        """Канал client_flags anti_freeze (Бендер 20.06): position-based побег из freeze.
+        ON: pos owned-Адама не меняется N тиков (несмотря на move-эмит) → коммит-ротация
+        направлений ПО ФАКТУ неподвижности (не по obs-стене) → выбивает из карманов/краёв,
+        что nav_repellent пропускает (стена вне obs-канала → server move-no-op). Закрывает
+        рекуррентный «Адам застрял». OFF (dormant): bit-identical. kill-switch. single-Адам."""
+        self._anti_freeze_enabled = bool(on)
+        logger.info("set_anti_freeze: %s", on)
+        return self._anti_freeze_enabled
 
     def _apply_life_sustain(self, cid: str) -> None:
         """sustained-life_support (i) per-tick топ-ап: держит energy≥φ⁻²·max и hyd≥φ⁻¹·100
