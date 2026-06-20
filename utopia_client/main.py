@@ -567,6 +567,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_life_sustained: bool | None = None       # sustained-life_support (i)
     applied_food_income: bool | None = None          # food-income server-truth
     applied_anti_freeze: bool | None = None           # position-based анти-freeze
+    applied_feeding_focus: bool | None = None         # хищник-охота фокус (DIST-CAP+berry-suppress)
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1248,6 +1249,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("anti_freeze → %s", target_af)
                         except Exception as e:
                             logger.warning("set_anti_freeze failed: %s", e)
+
+                    # feeding_focus (Бендер 20.06): хищник коммитит в охоту, не грейзит
+                    # ягоды (DIST-CAP 13→21 + carnivore berry-suppress). OFF dormant.
+                    target_ff = bool(flags.get("feeding_focus", False))
+                    if target_ff != applied_feeding_focus \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_feeding_focus(target_ff)
+                            applied_feeding_focus = target_ff
+                            logger.info("feeding_focus → %s", target_ff)
+                        except Exception as e:
+                            logger.warning("set_feeding_focus failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

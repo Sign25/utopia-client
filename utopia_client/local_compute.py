@@ -703,6 +703,7 @@ class LocalColonyCompute:
         # → pos заморожен несмотря на move-эмит). ON → position-based детект freeze + коммит-
         # побег (ротация направлений по факту неподвижности). OFF dormant → bit-identical.
         self._anti_freeze_enabled: bool = False  # client_flag anti_freeze (OFF dormant)
+        self._feeding_focus_enabled: bool = False  # client_flag feeding_focus (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -3894,9 +3895,13 @@ class LocalColonyCompute:
                             # (mdist 20-31 = долгий трек жжёт margin до прихода (a) Хьюберта,
                             # closer-spawn). ≤13 Fib = достижимо грейзя en-route. >13 → грейзь,
                             # ждём (a). recoverable: глубокий дип → capable=0 → trava-floor.
+                            # DIST-CAP: feeding_focus 13→21 (Fib) — freeze+speed чинены
+                            # (dcb40d1/7657827 + speed-override) → дальний трек дёшев,
+                            # Адам коммитит в дичь дальше, не теряет цель (Бендер 20.06).
+                            _hcap = 21.0 if self._feeding_focus_enabled else 13.0
                             if _mpd2 <= 1.0:
                                 self._hunt_commit[cid] = 5     # ATTACK (server резолвит adjacent prey)
-                            elif _mpd2 <= 13.0 and (_mdr != 0.0 or _mdc != 0.0):
+                            elif _mpd2 <= _hcap and (_mdr != 0.0 or _mdc != 0.0):
                                 if abs(_mdr) >= abs(_mdc):
                                     self._hunt_commit[cid] = 0 if _mdr < 0 else 1
                                 else:
@@ -3959,7 +3964,16 @@ class LocalColonyCompute:
                             "CORPSE_DIAG cid=%s on_corpse=%d nearest_corpse=[%s] "
                             "eat_kind=%s er=%.3f", cid, int(_on_corpse),
                             _cinfo, _evp.get("eating_target_kind"), _er)
-                    if (_onf or _on_corpse) and (_hungry_for_med or _mid_eat):
+                    # carnivore berry-graze suppress (feeding_focus, Бендер 20.06): хищник
+                    # (diet>0.5) НЕ грейзит ягоды (×0.382 крохи + отвлекают от охоты), если
+                    # дичь huntable (hunt_commit активен) → коммит в погоню, не в ягоду.
+                    # Труп (_on_corpse) НЕ трогаем = его еда. Гард hunt_commit-активен: нет
+                    # дичи → ест ягоды (не голодает). Снимает голод-стресс (ser→0/cort↑).
+                    _carn_skip_flora = (self._feeding_focus_enabled and _diet > 0.5
+                                        and _onf and not _on_corpse
+                                        and self._hunt_commit.get(cid) is not None)
+                    if ((_onf or _on_corpse) and (_hungry_for_med or _mid_eat)
+                            and not _carn_skip_flora):
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
@@ -9976,6 +9990,19 @@ class LocalColonyCompute:
         self._anti_freeze_enabled = bool(on)
         logger.info("set_anti_freeze: %s", on)
         return self._anti_freeze_enabled
+
+    def set_feeding_focus(self, on: bool) -> bool:
+        """Канал client_flags feeding_focus (Бендер 20.06): хищник-Адам коммитит в ОХОТУ,
+        не грейзит ягоды. ON: (1) hunt-commit DIST-CAP 13→21 (Fib) — трекает дичь дальше
+        (freeze убит dcb40d1/7657827 + speed-override → дальний трек дёшев); (2) carnivore
+        berry-graze suppress — diet>0.5 + дичь huntable (hunt_commit активен) → НЕ берёт
+        on_food-флор для ягод (×0.382 крохи + отвлекают) → коммит в kill. Труп НЕ трогаем
+        = его еда. Гард: нет дичи (hunt_commit None) → ест ягоды (не голодает). Снимает
+        голод-стресс (ser→0/cort~80/catatonic от голодного over-roam). OFF (dormant):
+        bit-identical. kill-switch. single-Адам. Координировано Фрай (nav-иерархия)+Хьюберт."""
+        self._feeding_focus_enabled = bool(on)
+        logger.info("set_feeding_focus: %s", on)
+        return self._feeding_focus_enabled
 
     def _apply_life_sustain(self, cid: str) -> None:
         """sustained-life_support (i) per-tick топ-ап: держит energy≥φ⁻²·max и hyd≥φ⁻¹·100
