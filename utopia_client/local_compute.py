@@ -692,6 +692,12 @@ class LocalColonyCompute:
         # follows root не фикшен). НЕ трогает fatigue/rest (max() только energy/hyd). OFF
         # dormant → bit-identical. single-Адам. Калм-wrapper для чистого наблюдения оси.
         self._life_support_sustained_enabled: bool = False  # client_flag (OFF dormant)
+        # food_income_server (Хьюберт §20.6.6, 20.06): КОРЕНЬ «Адам не ест» (on_flora=1
+        # 100%, energy-income~0) — клиент кредитил energy из cache.flora (ДЕСИНК), а не
+        # из server delta_energy/on_flora. ON → честим server delta_energy + on_flora/
+        # flora_kind ground-truth (зеркало delta_hydration воды), бросаем cache.flora →
+        # Адам реально кормится на карте. OFF dormant → legacy cache.flora (bit-identical).
+        self._food_income_server_enabled: bool = False  # client_flag (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -9944,6 +9950,17 @@ class LocalColonyCompute:
         self._life_support_sustained_enabled = bool(on)
         logger.info("set_life_support_sustained: %s", on)
         return self._life_support_sustained_enabled
+
+    def set_food_income_server(self, on: bool) -> bool:
+        """Канал client_flags food_income_server (Хьюберт §20.6.6, food-income КОРЕНЬ).
+        ON: energy-income owned-Адама честится из server delta_energy (passive_flora_eating
+        → step_creature кредитит eat) + fallback server on_flora+flora_kind GROUND-TRUTH —
+        ТОЧНО как delta_hydration для воды. Бросаем cache.flora (десинк: «Адам не ест»,
+        on_flora=1 но income~0). → Адам реально кормится ягодами/фруктами на карте (free-
+        roam, дом=вся карта). OFF (dormant): legacy cache.flora (bit-identical). kill-switch."""
+        self._food_income_server_enabled = bool(on)
+        logger.info("set_food_income_server: %s", on)
+        return self._food_income_server_enabled
 
     def _apply_life_sustain(self, cid: str) -> None:
         """sustained-life_support (i) per-tick топ-ап: держит energy≥φ⁻²·max и hyd≥φ⁻¹·100

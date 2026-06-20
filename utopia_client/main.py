@@ -565,6 +565,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_pos_reconcile: bool | None = None        # pos-реконсиляция owned-Адама
     applied_fatigue_rest_floor: bool | None = None   # root-3 рефлекс-rest-floor
     applied_life_sustained: bool | None = None       # sustained-life_support (i)
+    applied_food_income: bool | None = None          # food-income server-truth
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1221,6 +1222,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("life_support_sustained → %s", target_ls)
                         except Exception as e:
                             logger.warning("set_life_support_sustained failed: %s", e)
+
+                    # food_income_server (Хьюберт §20.6.6): energy-income из server
+                    # delta_energy + on_flora/flora_kind (зеркало воды), не cache.flora
+                    # (десинк «Адам не ест»). OFF dormant → legacy. edge-detect.
+                    target_fi = bool(flags.get("food_income_server", False))
+                    if target_fi != applied_food_income \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_food_income_server(target_fi)
+                            applied_food_income = target_fi
+                            logger.info("food_income_server → %s", target_fi)
+                        except Exception as e:
+                            logger.warning("set_food_income_server failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

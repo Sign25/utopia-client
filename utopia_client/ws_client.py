@@ -2043,16 +2043,33 @@ class ColonyWSClient:
                 events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
             elif _p40_dh is not None:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh  # 0 → ось вкл
-            # Eat income client-side (01.06.2026, Шеф/Хьюберт): симметрия с водой.
-            # P40 шлёт delta_energy>0 только когда owned ТОЧНО на flora-тайле
-            # (passive_eating), но зодчие ходят случайно → редко попадают → голод
-            # за 13мин. Кредитуем близость к flora (радиус 1), если P40 прислал 0
-            # (приоритет ненулевого P40 — без двойного начисления on-flora).
-            if events_per_cid[cid_s]["delta_energy"] == 0.0 and _rc is not None:
-                # Faithful passive_flora_eating (server world.py:3174-3259):
-                # traits vision/diet/eff из стора (дефолты server: vision=7,
-                # diet=0.5, eff=10). Заменяет прежний fixed _flora_income —
-                # чистый порт серверной формулы, без заплаток.
+            # Eat income — СИММЕТРИЯ С ВОДОЙ. food_income_server (Хьюберт §20.6.6, 20.06):
+            # КОРЕНЬ «Адам не ест» (on_flora=1 100%, income~0): клиент кредитил из
+            # cache.flora (ДЕСИНК — кэш не имеет флоры, что видит сервер), а НЕ из
+            # server delta_energy. ФИКС: честим server delta_energy (passive_flora_eating
+            # → step_creature кредитит eat) + fallback на server on_flora+flora_kind
+            # GROUND-TRUTH (НЕ cache.flora). Зеркало delta_hydration. delta_energy уже
+            # прочитан в events выше из payload.
+            if (self.compute is not None
+                    and getattr(self.compute,
+                                "_food_income_server_enabled", False)):
+                _p40_fk = c.get("flora_kind")
+                if (events_per_cid[cid_s]["delta_energy"] == 0.0
+                        and _p40_onf and _p40_fk is not None):
+                    # server on_flora ground-truth + flora_kind → income (НЕ кэш).
+                    _tr = ((self.compute.traits.get(cid_s) or {})
+                           if self.compute is not None else {})
+                    _fe = self._flora_kind_income(
+                        int(_p40_fk),
+                        float(_tr.get("diet_gene", 0.5) or 0.5),
+                        float(_tr.get("efficiency", 10) or 10),
+                        float(_tr.get("vision_radius", 7) or 7))
+                    if _fe > 0.0:
+                        events_per_cid[cid_s]["delta_energy"] = _fe
+                # else: server delta_energy (включая 0 = не на флоре → ось вкл)
+            elif events_per_cid[cid_s]["delta_energy"] == 0.0 and _rc is not None:
+                # LEGACY (food_income_server OFF, bit-identical): cache.flora-порт
+                # (desync). Faithful passive_flora_eating (server world.py:3174-3259).
                 _tr = ((self.compute.traits.get(cid_s) or {})
                        if self.compute is not None else {})
                 _fe = self._passive_flora_income(
@@ -2723,6 +2740,25 @@ class ColonyWSClient:
             except (TypeError, ValueError):
                 pass
         return None
+
+    def _flora_kind_income(self, kind: int, diet: float, eff: float,
+                           vision: float) -> float:
+        """Income/тик от flora данного KIND (server on_flora ground-truth, НЕ cache.flora
+        десинк). flora_energy(kind) × (1−diet) × kleiber(eff) × vbonus — та же серверная
+        формула passive_flora_eating, но по СЕРВЕРНОМУ flora_kind. food_income_server-фикс
+        (Хьюберт §20.6.6): закрывает «Адам не ест» (кэш рассинхрон → income~0 при on_flora=1).
+        kind: 1=GRASS(φ⁻²), 2=BERRY(φ), 3-6=FRUIT(φ³). Иначе 0."""
+        if kind in self._FRUIT_KINDS:
+            base = self._TREE_FRUIT_ENERGY
+        elif kind == 2:
+            base = self._BERRY_ENERGY
+        elif kind == 1:
+            base = self._GRASS_ENERGY
+        else:
+            return 0.0
+        kleiber = (max(1.0, eff) / 10.0) ** (1.0 / 1.618033988749895)
+        vbonus = 1.0 + (vision - 3.0) * 0.02
+        return base * (1.0 - diet) * kleiber * vbonus
 
     def _passive_flora_income(self, row, col, flora_pos,
                               vision: float, diet: float, eff: float) -> float:
