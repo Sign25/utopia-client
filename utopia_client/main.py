@@ -564,6 +564,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_need_arbitration: bool | None = None     # φ-арбитраж голод↔жажда
     applied_pos_reconcile: bool | None = None        # pos-реконсиляция owned-Адама
     applied_fatigue_rest_floor: bool | None = None   # root-3 рефлекс-rest-floor
+    applied_life_sustained: bool | None = None       # sustained-life_support (i)
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1207,6 +1208,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("fatigue_rest_floor → %s", target_rest)
                         except Exception as e:
                             logger.warning("set_fatigue_rest_floor failed: %s", e)
+
+                    # life_support_sustained (Хьюберт §20.6.5 (i)): держит energy/hyd
+                    # выше порога КАЖДЫЙ тик (не разовый edge) → выживание decoupled →
+                    # ось stamina чисто. НЕ трогает fatigue/rest. OFF dormant. edge-detect.
+                    target_ls = bool(flags.get("life_support_sustained", False))
+                    if target_ls != applied_life_sustained \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_life_support_sustained(target_ls)
+                            applied_life_sustained = target_ls
+                            logger.info("life_support_sustained → %s", target_ls)
+                        except Exception as e:
+                            logger.warning("set_life_support_sustained failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

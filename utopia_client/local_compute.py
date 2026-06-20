@@ -137,6 +137,10 @@ _PARALYSIS_SEC = 3.0
 # первого укуса, не отмена голода. Если on_flora_ticks=0 при 73 → policy gap
 # (моя зона); если растёт но не доедает → Tier 2 φ⁵≈118. max_energy=1309.
 _RECOVERY_ENERGY_DEFAULT = 73.0  # max_energy/φ⁶
+# sustained-life_support пороги (Хьюберт §20.6.5): держим выживание выше §3/жажды, но
+# survival-драйвы тихи (выше need_arbitration-онсета 55 и thirst-yield 55) → ось чисто.
+_LIFE_SUSTAIN_ENERGY = 1309.0 * (1.618033988749895 ** -2)   # ≈500 (φ⁻²·max), выше §3/critical
+_LIFE_SUSTAIN_HYDRATION = 1.618033988749895 ** -1 * 100.0   # ≈61.8 (φ⁻¹·100), выше thirst-55
 
 # Dehydration-модель (mirror environment/world.py:909/926 — источник истины).
 # Стадии по hydration ratio → energy_drain грызёт ЭНЕРГИЮ (не отдельная
@@ -682,6 +686,12 @@ class LocalColonyCompute:
         # decay 0.55+гистерезис (recovery ожила), (2) force-STAY@exhaustion single → видимый
         # отдых, (3) blocked-move→0-fatigue. OFF dormant → bit-identical. kill-switch.
         self._fatigue_rest_floor_enabled: bool = False  # client_flag fatigue_rest_floor (OFF dormant)
+        # sustained-life_support (i) (Хьюберт §20.6.5): держит energy/hyd ВЫШЕ порога
+        # КАЖДЫЙ тик (не разовый edge как life_support) → выживание decoupled → ось stamina
+        # (усталость/отдых) наблюдаем в ИЗОЛЯЦИИ без §3/дегидратации-конфаундов (food-halo-
+        # follows root не фикшен). НЕ трогает fatigue/rest (max() только energy/hyd). OFF
+        # dormant → bit-identical. single-Адам. Калм-wrapper для чистого наблюдения оси.
+        self._life_support_sustained_enabled: bool = False  # client_flag (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -9922,6 +9932,39 @@ class LocalColonyCompute:
         logger.warning("set_life_support: впрыснуто %d организмам", n)
         return True
 
+    def set_life_support_sustained(self, on: bool) -> bool:
+        """Канал client_flags life_support_sustained (i) (Хьюберт §20.6.5, наблюдение оси).
+        ON: каждый тик держит energy≥φ⁻²·max (~500) и hydration≥φ⁻¹·100 (~62) для single-
+        Адама → выживание DECOUPLED (нет §3/дегидратации) → ось stamina (усталость/отдых)
+        выражается ЧИСТО, без food-halo-follows-дрейф-конфаундов. НЕ трогает fatigue/rest
+        (только energy/hyd через max(), не понижает) → инъекция не читит ось. Калм-wrapper
+        (Oja-изоляция). OFF (dormant): bit-identical. kill-switch. Durable (ii) anchored-
+        oasis — отдельно (Хьюберт env); flip life_support_sustained off проверит само-
+        поддержание на якоре."""
+        self._life_support_sustained_enabled = bool(on)
+        logger.info("set_life_support_sustained: %s", on)
+        return self._life_support_sustained_enabled
+
+    def _apply_life_sustain(self, cid: str) -> None:
+        """sustained-life_support (i) per-tick топ-ап: держит energy≥φ⁻²·max и hyd≥φ⁻¹·100
+        для single-Адама → выживание decoupled (нет §3/дегидратации) → ось stamina наблюдаем
+        в изоляции. max() НЕ понижает; fatigue/rest НЕ трогает (только energy/hyd). Снимает
+        §3-защёлку. Гейт life_support_sustained (caller _apply_biochem_decay). OFF → no-op."""
+        if not (self._life_support_sustained_enabled and self._single_organism):
+            return
+        bc = self.biochem.get(cid)
+        if bc is None:
+            return
+        try:
+            bc.energy = max(float(getattr(bc, "energy", 0.0) or 0.0),
+                            _LIFE_SUSTAIN_ENERGY)
+            if hasattr(bc, "hydration"):
+                bc.hydration = max(float(getattr(bc, "hydration", 0.0) or 0.0),
+                                   _LIFE_SUSTAIN_HYDRATION)
+            self._paralysis_until.pop(cid, None)
+        except Exception as e:
+            logger.debug("life_support_sustained %s: %s", cid, e)
+
     def _enter_paralysis(self, cid: str, reason: str) -> None:
         """Войти в паралич (единая точка для обоих триггеров: energy≤0 и
         death_suppressed от P40). Idempotent: повторный вызов в активном
@@ -11811,6 +11854,9 @@ class LocalColonyCompute:
             decay_step(bc, _FakeWorld(_ctx))
         except Exception as e:
             logger.debug("biochem decay_step failed cid=%s: %s", cid, e)
+        # sustained-life_support (i) (Хьюберт §20.6.5): per-tick топ-ап energy/hyd ПОСЛЕ
+        # decay → выживание decoupled → ось stamina чисто (см. _apply_life_sustain).
+        self._apply_life_sustain(cid)
         # PREDATOR-аффорданс v0.1 (Фрай 11.06): pred_prox → adrenaline спайк ПОСЛЕ
         # decay (decay −2/тик уже отработал → спайк держит уровень, пока хищник
         # воспринимается; уйдёт хищник → pred_prox→0 → не спайкаем → decay гасит =
