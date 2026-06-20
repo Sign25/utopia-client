@@ -3166,7 +3166,20 @@ class ColonyWSClient:
             # MOVE = короткий burst, нагоняет добычу до контакта (НЕ непрерывный
             # буст: Адам база=добыча база, нагон за счёт усталости + этого прыжка).
             # FLEE (10) свой speed_boost ниже — pounce только на 0-3.
-            if (_single and act in (0, 1, 2, 3)
+            # HUNT-BURST (Хьюберт 20.06, feeding_focus): chase-move к дичи (hunt_commit
+            # MOVE активен, dist 2-21) → speed_boost=2 → Адам 3+2=5 шагов vs дичь 2 →
+            # закрывает разрыв 3/тик → достаёт dist≤1 → hunt_commit=5 ATTACK → kill.
+            # Закрывает «последний тайл» погони (pursuit-геометрия cardinal-3 vs
+            # маневрирующая дичь). Живой server-хук (colony_pusher:3220→loop.py:527
+            # клампит 0-2 → extra_steps), без рестарта. Pounce=1 — подмножество, burst
+            # сильнее и шире. feeding_focus-гейт (часть кормёжки).
+            _hc_chase = (_single and act in (0, 1, 2, 3)
+                         and getattr(self.compute, "_feeding_focus_enabled", False)
+                         and getattr(self.compute, "_hunt_commit", {}).get(cid)
+                         in (0, 1, 2, 3))
+            if _hc_chase:
+                entry["speed_boost"] = 2
+            elif (_single and act in (0, 1, 2, 3)
                     and getattr(self.compute, "_hunt_pounce", {}).get(cid)):
                 entry["speed_boost"] = 1
             # life_critical (Фрай/Хьюберт 11.06): FLEE = survival-escape от угрозы

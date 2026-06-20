@@ -63,6 +63,29 @@ def test_carn_skip_flora_predicate():
     assert _skip(0.618, False, False, True) is False      # не на флоре → нечего skip-ать
 
 
+def test_hunt_burst_predicate():
+    # HUNT-BURST: chase-move (hunt_commit MOVE активен) + feeding_focus + single + act MOVE
+    # → speed_boost=2. ATTACK-commit (5) или нет commit → не burst (pounce-логика отдельно).
+    c = _compute()
+    c.set_feeding_focus(True)
+
+    def _burst(single, act, ff, hc):
+        c.set_feeding_focus(ff)
+        if hc is None:
+            c._hunt_commit.pop("c1", None)
+        else:
+            c._hunt_commit["c1"] = hc
+        return (single and act in (0, 1, 2, 3) and c._feeding_focus_enabled
+                and c._hunt_commit.get("c1") in (0, 1, 2, 3))
+
+    assert _burst(True, 2, True, 2) is True       # chase-move + ff → burst=2
+    assert _burst(True, 5, True, 2) is False       # эмит ATTACK(5) не в (0-3) → не chase-burst
+    assert _burst(True, 2, True, 5) is False        # hunt_commit=ATTACK не chase-move
+    assert _burst(True, 2, True, None) is False     # нет commit (нет дичи) → не burst
+    assert _burst(True, 2, False, 2) is False       # feeding_focus OFF → не burst
+    assert _burst(False, 2, True, 2) is False       # колония → не burst
+
+
 def test_off_dormant_no_skip():
     # OFF → предикат всегда False (bit-identical с до-флагом поведением)
     c = _compute()
