@@ -562,6 +562,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_s3_forage: bool | None = None            # §3-редизайн паралич→фураж
     applied_nav_repellent: bool | None = None        # нав-репеллent (policy-пин)
     applied_need_arbitration: bool | None = None     # φ-арбитраж голод↔жажда
+    applied_pos_reconcile: bool | None = None        # pos-реконсиляция owned-Адама
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1179,6 +1180,19 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("need_arbitration → %s", target_arb)
                         except Exception as e:
                             logger.warning("set_need_arbitration failed: %s", e)
+
+                    # pos_reconcile (Хьюберт §20.6, P0-блокер halo): owned-Адаму
+                    # резолвить obs/income-позицию на КАНОН (server creature_pos),
+                    # не локальный sim-drift. OFF dormant → bit-identical. edge-detect.
+                    target_posr = bool(flags.get("pos_reconcile", False))
+                    if target_posr != applied_pos_reconcile \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_pos_reconcile(target_posr)
+                            applied_pos_reconcile = target_posr
+                            logger.info("pos_reconcile → %s", target_posr)
+                        except Exception as e:
+                            logger.warning("set_pos_reconcile failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

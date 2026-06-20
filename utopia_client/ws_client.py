@@ -1745,9 +1745,21 @@ class ColonyWSClient:
                 # в obs_batch до прихода snap'а с creatures-дельтой.
                 # Пропускаем, получит STAY на этом тике.
                 try:
+                    # pos-реконсиляция (Хьюберт §20.6): owned-Адаму obs строим от
+                    # КАНОНА (server-проекция creature_pos), а не obs_batch drift —
+                    # иначе obs/нав от неверной позиции (~200 клеток мимо). Под флагом.
+                    _orow, _ocol = int(c.get("row", 0)), int(c.get("col", 0))
+                    if (self.compute is not None
+                            and getattr(self.compute,
+                                        "_pos_reconcile_enabled", False)
+                            and getattr(self.compute,
+                                        "_single_organism", False)):
+                        _canon = self._resolve_pos(cid_s, c)
+                        if _canon is not None:
+                            _orow, _ocol = _canon
                     cv = _obs_view_cls(
-                        row=int(c.get("row", 0)),
-                        col=int(c.get("col", 0)),
+                        row=_orow,
+                        col=_ocol,
                         energy=float(c.get("energy", 0.0) or 0.0),
                         steps_taken=int(c.get("steps_taken", 0)),
                     )
@@ -2678,17 +2690,33 @@ class ColonyWSClient:
     def _resolve_pos(self, cid, c=None):
         """(row, col) организма. Источник истины — world_cache.creature_pos
         (dict[cid → (x,y)=(col,row)], world_cache.py:384, заполняется из
-        snap.creatures). obs-словари obs_batch row/col НЕ содержат — это и была
-        причина drink_sum=0: позиция читалась оттуда → дефолт (0,0)=PLAIN, ни
-        water-seek, ни income не срабатывали. Fallback на c — если задан и есть."""
+        snap.creatures = server-authoritative канон). Fallback на c (obs_batch
+        row/col) — но для owned-Адама это ЛОКАЛЬНЫЙ projected sim-pos (drift), НЕ
+        канон → причина drink_sum=0 (Хьюберт §20.6). pos_reconcile (для single-
+        organism) убирает drift-fallback: канон creature_pos → кэш last-known."""
         wc = getattr(self, "world_cache", None)
+        _reconcile = (
+            self.compute is not None
+            and getattr(self.compute, "_pos_reconcile_enabled", False)
+            and getattr(self.compute, "_single_organism", False))
         if wc is not None:
             try:
                 p = wc.creature_pos.get(str(cid))
                 if p is not None:
-                    return int(p[1]), int(p[0])  # (row=y, col=x)
+                    rc = (int(p[1]), int(p[0]))  # (row=y, col=x)
+                    if _reconcile:
+                        # канон свежий → кэшируем last-known серверную позицию
+                        self._adam_server_pos = rc
+                    return rc
             except Exception:
                 pass
+        if _reconcile:
+            # creature_pos интермиттентно пуст (owned выпал из snap-кадра) → НЕ
+            # падаем на obs_batch drift (247), берём кэш last-known канона.
+            cached = getattr(self, "_adam_server_pos", None)
+            if cached is not None:
+                return cached
+            # старт до первого канона — last-resort obs_batch (один-два тика)
         if c is not None and "row" in c and "col" in c:
             try:
                 return int(c["row"]), int(c["col"])

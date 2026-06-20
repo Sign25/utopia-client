@@ -670,6 +670,12 @@ class LocalColonyCompute:
         # sticky-latch + Fib-deadband гистерезис, «не гнать один в 0». Заменяет water-seek-
         # only. OFF dormant → bit-identical. kill-switch.
         self._need_arbitration_enabled: bool = False  # client_flag need_arbitration (OFF dormant)
+        # pos-реконсиляция (Хьюберт §20.6, P0-блокер halo): owned-Адам obs/income
+        # строится от ЛОКАЛЬНОГО sim-pos (drift ~247), а не серверной проекции (canon
+        # ~53 из snap.creatures→creature_pos). ~200 клеток мимо → near_water/flora/income
+        # от пустого места → drink_sum=0, hyd→0. ON → резолвить owned-Адама на канон
+        # (creature_pos, кэш last-known), не obs_batch drift. OFF dormant → bit-identical.
+        self._pos_reconcile_enabled: bool = False  # client_flag pos_reconcile (OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -10891,6 +10897,17 @@ class LocalColonyCompute:
         self._need_arbitration_enabled = bool(on)
         logger.info("set_need_arbitration: %s", on)
         return self._need_arbitration_enabled
+
+    def set_pos_reconcile(self, on: bool) -> bool:
+        """Канал client_flags pos_reconcile (pos-реконсиляция owned-Адама, Хьюберт §20.6).
+        ON: owned-Адаму резолвить obs/income-позицию на КАНОН (server-проекция из
+        snap.creatures→creature_pos, кэш last-known), а НЕ локальный sim-pos (drift ~247
+        → halo не доходит, drink_sum=0). Канон = CreatureState.row/col (routes_world).
+        OFF (dormant, default): legacy (obs_batch c[row/col], bit-identical). kill-switch.
+        P0-блокер: без него halo/2-way/fatigue_b/gate-2 мертвы. Lockstep с оазис-reseed."""
+        self._pos_reconcile_enabled = bool(on)
+        logger.info("set_pos_reconcile: %s", on)
+        return self._pos_reconcile_enabled
 
     def _apply_nav_repellent(self, cid: str, out: dict, obs) -> None:
         """Нав-репеллент: выбранный move ведёт в стену (water/rock; obs wall-канал
