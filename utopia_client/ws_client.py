@@ -2453,6 +2453,19 @@ class ColonyWSClient:
                 self._apply_anti_freeze(creatures, creatures_out)
             except Exception as e:
                 logger.warning("anti-freeze override failed: %r", e)
+        # persist RE-APPLY (Бендер 20.06, КОРЕНЬ recurrent move-freeze): persist=True
+        # ставился в _run_tick_and_build по ИСХОДНОМУ действию мозга. НО сики (water-seek/
+        # need_arbitration/anti_freeze) override'ят action на MOVE ПОСЛЕ — если исходное
+        # было НЕ-move (STAY/EAT) → seek-move БЕЗ persist → server 30-тик dead-reckoning
+        # STAY (loop.py:461) → ЗАМОРОЗКА (anti_freeze фирит, но escape-move STAY'ится!).
+        # Финально перепроставляем persist=True на ВСЕ move-действия Адама (75-тик путь).
+        if _single:
+            for entry in creatures_out:
+                try:
+                    if int(entry.get("action", -1)) in self._MOVE_ACTIONS:
+                        entry["persist"] = True
+                except (TypeError, ValueError):
+                    pass
         out = {
             "type": "actions_batch",
             "world_tick": world_tick,
