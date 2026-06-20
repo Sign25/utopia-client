@@ -1925,6 +1925,25 @@ class ColonyWSClient:
             _p40_dh = (float(c.get("delta_hydration", 0.0) or 0.0)
                        if "delta_hydration" in c else None)
             _rc = self._resolve_pos(cid_s, c)
+            # POS_RECON_DIAG (Хьюберт §20.6 19.06, pos-десинк P0): развести источники
+            # позиции owned-Адама — obs_batch c[row/col] vs snap creature_pos vs
+            # resolved. Сверять с P40 halo_debug (server-authoritative ≈99) → найти
+            # канонический серверный источник перед reconcile. Log-only, bit-identical.
+            if (self.compute is not None
+                    and getattr(self.compute, "_single_organism", False)):
+                self._pos_recon_diag_n = getattr(self, "_pos_recon_diag_n", 0) + 1
+                if self._pos_recon_diag_n % 40 == 1:
+                    _cp = None
+                    _wc = getattr(self, "world_cache", None)
+                    if _wc is not None:
+                        try:
+                            _cp = _wc.creature_pos.get(cid_s)  # (x=col, y=row)
+                        except Exception:
+                            _cp = None
+                    logger.info(
+                        "POS_RECON_DIAG cid=%s obs_batch=(%s,%s) "
+                        "creature_pos_xy=%s resolved_rowcol=%s",
+                        cid_s, c.get("row"), c.get("col"), _cp, _rc)
             # on_flora: P40 authoritative (9f8d99d) > client cache.flora fallback.
             _p40_onf = c.get("on_flora")
             if _p40_onf is not None:
