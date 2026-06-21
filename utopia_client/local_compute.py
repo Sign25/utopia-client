@@ -3994,10 +3994,14 @@ class LocalColonyCompute:
                     # <capable → hunt фликерит → mdist осц 14↔23, не ловит → голод. Ягоды-
                     # бутстрап ниже порога → остаётся capable → держит погоню → дожимает
                     # уставшую дичь (stamina-drain). Выше порога → hunt-фокус (suppress).
+                    # scaling: relax-гейт (er>0.146) OFF — под scaling _er=satiety/100,
+                    # при satiety=0 relax включал футильный грейзинг ягод (×0.382 не кормят
+                    # карнивора) вместо коммита в hunt (Фрай). Под scaling suppress фирит
+                    # всегда (ягоды бесполезны → не отвлекаться). non-scaling → старый relax.
                     _carn_skip_flora = (self._feeding_focus_enabled and _diet > 0.5
                                         and _onf and not _on_corpse
                                         and self._hunt_commit.get(cid) is not None
-                                        and _er > 0.146)
+                                        and (self._scaling_energy_enabled or _er > 0.146))
                     if ((_onf or _on_corpse) and (_hungry_for_med or _mid_eat)
                             and not _carn_skip_flora):
                         self._on_food[cid] = 1
