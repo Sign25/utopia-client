@@ -11597,7 +11597,9 @@ class LocalColonyCompute:
                 try:
                     from environment.biochemistry import (  # type: ignore
                         compute_energy_from_needs as _cefn)
-                    _max_e = float(getattr(bc, "max_hp", _CLIENT_MAX_ENERGY))
+                    # max_energy = _CLIENT_MAX_ENERGY (1309, как server world.config.max_energy),
+                    # НЕ bc.max_hp (на живом Адаме ≈100 → energy mis-scaled к ~57 вместо ~760).
+                    _max_e = float(_CLIENT_MAX_ENERGY)
                     _max_h = float(getattr(bc, "max_hydration", 100.0))
                     bc.energy = _cefn(
                         float(getattr(bc, "hydration", _max_h)),
