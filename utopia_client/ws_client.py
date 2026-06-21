@@ -1977,8 +1977,12 @@ class ColonyWSClient:
             # PREDATOR-HUNT (Фрай 14.06): nearest_predator {dr,dc,dist,hp,max_hp,hp_ratio,
             # attackable,kind,fauna_id} — добивание РАНЕНОГО хищника (как medium_prey/corpse).
             _p40_pred = c.get("nearest_predator")
+            # visible_fauna (Фрай/Хьюберт 21.06): список видимых fauna {fauna_id,dr,dc,dist,
+            # kind} для client hard-lock (держать ОДНУ цель). unidirectional (lock локально).
+            _p40_vf = c.get("visible_fauna")
             if (_p40_nf is not None or _p40_mp is not None
-                    or _p40_corpse is not None or _p40_pred is not None):
+                    or _p40_corpse is not None or _p40_pred is not None
+                    or _p40_vf is not None):
                 _ent = dict(_p40_nf) if _p40_nf is not None else {
                     "dr": 0, "dc": 0, "dist": None, "kind": None}
                 # Phase 1 feeding-ladder (Хьюберт d972ea7, Adam-only): nearest_EDIBLE
@@ -1994,6 +1998,13 @@ class ColonyWSClient:
                     _ent["corpse"] = _p40_corpse
                 if _p40_pred is not None:
                     _ent["predator_hunt"] = _p40_pred
+                if _p40_vf is not None:
+                    _ent["visible_fauna"] = _p40_vf
+                    self._vf_diag_n = getattr(self, "_vf_diag_n", 0) + 1
+                    if self._vf_diag_n % 200 == 1:
+                        logger.info("VISIBLE_FAUNA cid=%s n=%s sample=%s", cid_s,
+                                    (len(_p40_vf) if isinstance(_p40_vf, list) else "?"),
+                                    (_p40_vf[:2] if isinstance(_p40_vf, list) else _p40_vf))
                 nearest_flora_per_cid[cid_s] = _ent
             # carried_food: P40 authoritative (physics на P40) — если шлёт.
             _p40_cf = c.get("carried_food")
