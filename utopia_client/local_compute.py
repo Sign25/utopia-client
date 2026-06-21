@@ -601,6 +601,8 @@ class LocalColonyCompute:
         self._corpse_approach: dict = {}    # cid → MOVE-action к adjacent-туше (Phase C medium-fix, §3-STEP bypass)
         self._forage_dir: dict = {}         # cid → MOVE-action к БЛИЖАЙШЕЙ видимой еде (anti-absorbing §3-floor, Фрай 14.06)
         self._hunt_commit: dict = {}        # cid → ACTION (MOVE-к-медиуму/ATTACK) — детерм. hunt-commit (gate в, Фрай 14.06: поднять дно)
+        self._hunt_latch: dict = {}         # cid → тики оставш. sustain-погони (Хьюберт 20.06: держать chase до контакта, не бросать на дрейф дичи) — feeding_focus
+        self._HUNT_LATCH_N: int = 13        # Fib — тиков sustain-погони после последнего свежего commit (расширяет cap 21→32 пока latch>0)
         # PREDATOR-HUNT (Фрай 14.06, после термокомфорта): добивание РАНЕНОГО хищника —
         # узкое окно поверх АБСОЛЮТНОГО FLEE-floor. ATTACK ТОЛЬКО hp_ratio<φ⁻² + er>φ⁻¹
         # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
@@ -3885,6 +3887,13 @@ class LocalColonyCompute:
                     # как corpse-step. Охотится ПОКА capable, до глубокого дипа. _capable
                     # уже = er>φ⁻⁵; _hungry_for_med = er<φ⁻¹.
                     self._hunt_commit.pop(cid, None)
+                    # sustain-commit латч (Хьюберт 20.06): погоня прерывалась — дичь дрейфит
+                    # из 21-радиуса → commit падает → Адам нибблит ягоды (action=14) → дичь
+                    # уходит (boost=2 лишь 1/12 сэмплов). Латч: пока недавно коммитил
+                    # (latch>0) → расширяем cap до obs-предела (32) → держим погоню за ВИДИМОЙ
+                    # дичью до контакта (burst-5 + stamina-drain-0.20 дожимают). feeding_focus.
+                    _latched_prev = (self._feeding_focus_enabled
+                                     and self._hunt_latch.get(cid, 0) > 0)
                     if (self._hunting_enabled and isinstance(_mp_cid, dict)
                             and _hungry_for_med and _capable):
                         try:
@@ -3896,9 +3905,10 @@ class LocalColonyCompute:
                             # closer-spawn). ≤13 Fib = достижимо грейзя en-route. >13 → грейзь,
                             # ждём (a). recoverable: глубокий дип → capable=0 → trava-floor.
                             # DIST-CAP: feeding_focus 13→21 (Fib) — freeze+speed чинены
-                            # (dcb40d1/7657827 + speed-override) → дальний трек дёшев,
-                            # Адам коммитит в дичь дальше, не теряет цель (Бендер 20.06).
-                            _hcap = 21.0 if self._feeding_focus_enabled else 13.0
+                            # (dcb40d1/7657827 + speed-override) → дальний трек дёшев. Латч
+                            # активен → cap до obs-предела 32 (держим видимую дичь до контакта).
+                            _hcap = ((32.0 if _latched_prev else 21.0)
+                                     if self._feeding_focus_enabled else 13.0)
                             if _mpd2 <= 1.0:
                                 self._hunt_commit[cid] = 5     # ATTACK (server резолвит adjacent prey)
                             elif _mpd2 <= _hcap and (_mdr != 0.0 or _mdc != 0.0):
@@ -3908,6 +3918,13 @@ class LocalColonyCompute:
                                     self._hunt_commit[cid] = 2 if _mdc > 0 else 3
                         except (TypeError, ValueError):
                             pass
+                    # латч update: коммит фир → рефреш N (Fib 13); иначе → decay (момент-
+                    # погоня тухнет за N тиков без дичи → возврат к грейзу, не голодает).
+                    if self._feeding_focus_enabled:
+                        if self._hunt_commit.get(cid) is not None:
+                            self._hunt_latch[cid] = self._HUNT_LATCH_N
+                        elif self._hunt_latch.get(cid, 0) > 0:
+                            self._hunt_latch[cid] -= 1
                     # PREDATOR-HUNT окно (Фрай/Шеф 14.06 v2 — ENERGY-GATED COMBAT, disengage
                     # СНЯТ): attackable(упор) + er≥0.5 → ATTACK хищника (ЛЮБОЙ hp_ratio —
                     # ПЕРВЫЙ удар по healthy И добивание, без различия). er<0.5 → молчит →

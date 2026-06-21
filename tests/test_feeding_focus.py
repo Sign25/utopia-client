@@ -86,6 +86,46 @@ def test_hunt_burst_predicate():
     assert _burst(False, 2, True, 2) is False       # колония → не burst
 
 
+def test_sustain_latch_cap_hysteresis():
+    # латч расширяет cap: свежий=21, latched=32 (держим погоню за видимой дичью).
+    c = _compute()
+    c.set_feeding_focus(True)
+
+    def _cap(latched):
+        c._hunt_latch["c1"] = c._HUNT_LATCH_N if latched else 0
+        _lp = (c._feeding_focus_enabled and c._hunt_latch.get("c1", 0) > 0)
+        return (32.0 if _lp else 21.0) if c._feeding_focus_enabled else 13.0
+
+    assert _cap(False) == 21.0      # нет латча → свежий cap 21
+    assert _cap(True) == 32.0        # латч активен → cap до obs-предела 32
+    c.set_feeding_focus(False)
+    c._hunt_latch["c1"] = 13
+    _lp = (c._feeding_focus_enabled and c._hunt_latch.get("c1", 0) > 0)
+    assert ((32.0 if _lp else 21.0) if c._feeding_focus_enabled else 13.0) == 13.0  # OFF → 13
+
+
+def test_sustain_latch_refresh_and_decay():
+    # коммит → латч=N; нет коммита → decay; 0 → погоня тухнет.
+    c = _compute()
+    c.set_feeding_focus(True)
+
+    def _update(has_commit):
+        if c._feeding_focus_enabled:
+            if has_commit:
+                c._hunt_latch["c1"] = c._HUNT_LATCH_N
+            elif c._hunt_latch.get("c1", 0) > 0:
+                c._hunt_latch["c1"] -= 1
+
+    _update(True)
+    assert c._hunt_latch["c1"] == 13                 # коммит → рефреш N
+    for _ in range(5):
+        _update(False)                                # 5 тиков без дичи
+    assert c._hunt_latch["c1"] == 8                   # decay 13→8 (sustain ещё держит)
+    for _ in range(8):
+        _update(False)
+    assert c._hunt_latch["c1"] == 0                   # выдохся → возврат к грейзу
+
+
 def test_off_dormant_no_skip():
     # OFF → предикат всегда False (bit-identical с до-флагом поведением)
     c = _compute()
