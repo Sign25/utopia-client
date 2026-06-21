@@ -169,6 +169,29 @@ def test_hunt_lock_release_stale_then_switch():
     assert c._hunt_lock["a"] == 102                  # после stale → перелочка на 102 (не вечный lock)
 
 
+def test_refresh_hunt_course_5hz():
+    # R_c-raise: 5Hz курс из свежего visible_fauna — ATTACK при dist≤1, move к held, no-op без lock/vf
+    c = _compute()
+    c.set_feeding_focus(True)
+    c._hunt_lock["a"] = 119
+    # held на контакте (dist≤1) → ATTACK(5)
+    c.refresh_hunt_course({"a": {"visible_fauna": [{"fauna_id": 119, "dist": 1, "dr": 1, "dc": 0}]}})
+    assert c._proj_hunt_action["a"] == 5
+    # held далеко, dr доминирует, dr<0 → move N(0)
+    c.refresh_hunt_course({"a": {"visible_fauna": [{"fauna_id": 119, "dist": 10, "dr": -5, "dc": 1}]}})
+    assert c._proj_hunt_action["a"] == 0
+    # dc доминирует, dc>0 → move E(2)
+    c.refresh_hunt_course({"a": {"visible_fauna": [{"fauna_id": 119, "dist": 10, "dr": 1, "dc": 6}]}})
+    assert c._proj_hunt_action["a"] == 2
+    # held НЕ в visible_fauna → no-op (clear)
+    c.refresh_hunt_course({"a": {"visible_fauna": [{"fauna_id": 999, "dist": 5, "dr": 1, "dc": 0}]}})
+    assert "a" not in c._proj_hunt_action
+    # нет lock → no-op
+    c._hunt_lock.pop("a", None)
+    c.refresh_hunt_course({"a": {"visible_fauna": [{"fauna_id": 119, "dist": 1, "dr": 1, "dc": 0}]}})
+    assert "a" not in c._proj_hunt_action
+
+
 def test_off_dormant_no_skip():
     # OFF → предикат всегда False (bit-identical с до-флагом поведением)
     c = _compute()

@@ -516,6 +516,11 @@ class ColonyWSClient:
             if self.compute is None:
                 continue
             try:
+                # R_c-raise (Фрай 21.06): пересчитать 5Hz hunt-курс из СВЕЖЕГО obs
+                # (_nearest_flora_per_cid обновляется на 5Hz приёме, до handle_tick-throttle)
+                # ПЕРЕД build → projection шлёт свежий контакт-ATTACK/move (не сталый 1.7Hz).
+                self.compute.refresh_hunt_course(
+                    getattr(self, "_nearest_flora_per_cid", None))
                 projections = self.compute.build_projection_batch()
             except Exception as e:
                 logger.debug("build_projection_batch failed: %s", e)

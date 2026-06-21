@@ -612,6 +612,11 @@ class LocalColonyCompute:
         self._hunt_lock_lost: dict = {}     # cid → тиков цель вне visible_fauna (lost → release)
         self._HUNT_LOCK_LOST_N: int = 8     # Fib — тиков вне vision → release (потеряна)
         self._HUNT_LOCK_STALE_N: int = 13   # Fib — тиков без сближения → release (недостижима, не вечный lock)
+        # R_c-raise (Фрай 21.06): 5Hz hunt-курс из свежего obs. handle_tick (мозг) 1.7Hz
+        # скипает obs (5Hz) → курс/контакт-ATTACK сталый → промах в контакт-окне (CONTACT_DIAG:
+        # hunt_commit=5 на контакте, но atk_use=0 — не успел). projection-loop (5Hz) пересчитывает
+        # move-к-held/ATTACK-при-dist≤1 из 5Hz visible_fauna. Изолировано от actions_batch/мозга.
+        self._proj_hunt_action: dict = {}   # cid → action для projection (5Hz свежий hunt-курс)
         # PREDATOR-HUNT (Фрай 14.06, после термокомфорта): добивание РАНЕНОГО хищника —
         # узкое окно поверх АБСОЛЮТНОГО FLEE-floor. ATTACK ТОЛЬКО hp_ratio<φ⁻² + er>φ⁻¹
         # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
@@ -10158,6 +10163,49 @@ class LocalColonyCompute:
 
     # ── Colony Ownership Migration §5.2: projection_batch ────────────────
 
+    def refresh_hunt_course(self, nf_per_cid) -> None:
+        """R_c-raise (Фрай 21.06): 5Hz hunt-курс из СВЕЖЕГО obs. Зовётся projection-loop'ом
+        (5Hz) ПЕРЕД build_projection_batch. handle_tick (мозг) 1.7Hz скипает 5Hz obs → курс/
+        контакт-ATTACK сталый → промах (CONTACT_DIAG: hunt_commit=5 на контакте, atk_use=0).
+        Здесь пересчитываем move-к-held / ATTACK-при-dist≤1 из свежего visible_fauna (5Hz,
+        в self._nearest_flora_per_cid до handle_tick-throttle) → projection шлёт свежий курс.
+        Только Адам-hunting (lock активен). Ставит _proj_hunt_action (изолировано от мозга/
+        actions_batch — projection authoritative для движения active-Адама)."""
+        if not (self._single_organism and self._feeding_focus_enabled):
+            return
+        for cid in list(self._hunt_lock.keys()):
+            self._proj_hunt_action.pop(cid, None)
+            _locked = self._hunt_lock.get(cid)
+            if _locked is None:
+                continue
+            _nf = (nf_per_cid or {}).get(cid)
+            _vf = _nf.get("visible_fauna") if isinstance(_nf, dict) else None
+            if not _vf:
+                continue
+            _t = None
+            for _f in _vf:
+                try:
+                    if _f.get("fauna_id") == _locked:
+                        _t = _f
+                        break
+                except (AttributeError, TypeError):
+                    continue
+            if _t is None:
+                continue
+            try:
+                _d = float(_t.get("dist", 99.0) or 99.0)
+                _dr = float(_t.get("dr", 0.0) or 0.0)
+                _dc = float(_t.get("dc", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if _d <= 1.0:
+                self._proj_hunt_action[cid] = 5      # свежий контакт-ATTACK (5Hz реакция)
+            elif _dr != 0.0 or _dc != 0.0:
+                if abs(_dr) >= abs(_dc):
+                    self._proj_hunt_action[cid] = 0 if _dr < 0 else 1
+                else:
+                    self._proj_hunt_action[cid] = 2 if _dc > 0 else 3
+
     def build_projection_batch(self) -> list[dict]:
         """Собрать lightweight projection всех owned Zodchiy для P40.
 
@@ -10174,6 +10222,13 @@ class LocalColonyCompute:
         for cid, org in list(self.organisms.items()):
             bc = self.biochem.get(cid)
             last_action = self.last_action.get(cid, -1) if hasattr(self, "last_action") else -1
+            # R_c-raise (Фрай): свежий 5Hz hunt-курс (контакт-ATTACK/move) перебивает
+            # сталый last_action (1.7Hz мозг) для движения active-Адама. Только при
+            # активном hunt-lock (refresh_hunt_course поставил). Изолировано — мозг/
+            # actions_batch не тронуты; projection authoritative для pos Адама.
+            _ph = self._proj_hunt_action.get(cid)
+            if _ph is not None:
+                last_action = int(_ph)
             proj: dict = {
                 "cid": str(cid),
                 "species_id": self.species_id.get(cid) if hasattr(self, "species_id") else None,
