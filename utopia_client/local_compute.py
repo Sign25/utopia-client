@@ -11210,6 +11210,17 @@ class LocalColonyCompute:
             if _kc_acc > 0:
                 for _ in range(_kc_acc):
                     apply_kill_prey(bc)             # dopamine per kill (награда, ось оживает)
+                # §Закон 1: kill→satiety (мясо-пир, зеркало world.py SATIETY_KILL). Энергия
+                # старым каналом (delta_energy) ПЕРЕТИРАЕТСЯ recompute'ом = «мёртвая»; мясо
+                # кормит через satiety→formula. Сумма из neurocore (не хардкод, калибровка B).
+                if self._scaling_energy_enabled:
+                    try:
+                        from environment.biochemistry import SATIETY_KILL as _skill_sat  # type: ignore
+                    except Exception:
+                        _skill_sat = 40.0
+                    _msat = float(getattr(bc, "max_satiety", 100.0))
+                    bc.satiety = min(_msat, float(getattr(bc, "satiety", 100.0))
+                                     + float(_skill_sat) * _kc_acc)
                 self._skill_kill[cid] = self._skill_kill.get(cid, 0) + _kc_acc
                 # meat-GC ось (Фрай hunting.md): ВСЁ мясо (prey 21 + medium 55) →
                 # hunt-сигнал, изолирован от plant-income. Надёжный Σ из аккумулятора.
@@ -11487,17 +11498,28 @@ class LocalColonyCompute:
                         logger.info("THERMO_DIAG cid=%s temp=%.3f extra=%.4f basal=%.3f "
                                     "thirst=%.3f cum=%.1f", cid, _t, _therm_extra,
                                     basal, thirst, self._beh_thermal_cum.get(cid, 0.0))
+            _scaling = bool(self._scaling_energy_enabled)
             if step_cost > 0.0:
-                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
-                self._e_cost_sum += step_cost  # ENERGY_CALIB
+                if _scaling:
+                    # §Закон 1 site 7 (зеркало server apply_action_taken): exertion-cost →
+                    # satiety (НЕ energy; energy=recompute финальным шагом). Адам голодает
+                    # от нагрузки. Сумма-калибровка = stage B. OFF → старый energy-дренаж.
+                    bc.satiety = max(0.0, float(getattr(bc, "satiety", 100.0)) - step_cost)
+                else:
+                    bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - step_cost)
+                    self._e_cost_sum += step_cost  # ENERGY_CALIB
             # BMR (Шеф 12.06, Phase 2.5h): базовый метаболизм — ВСЕГДА, независимо
             # от движения/action (step_cost выше — только при движении). «Покой не
             # бесплатен»: чинит ягода-кемп эксплойт (стоял/ленивый роуминг = вечная
             # сытость). Идёт в _e_cost_sum → ENERGY_CALIB net учитывает BMR.
             if basal > 0.0:
-                bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - basal)
-                self._e_cost_sum += basal
-                self._metab_basal_sum = getattr(self, "_metab_basal_sum", 0.0) + basal
+                if _scaling:
+                    # BMR → satiety (базовый голод, зеркало decay_step satiety-basal + site 7)
+                    bc.satiety = max(0.0, float(getattr(bc, "satiety", 100.0)) - basal)
+                else:
+                    bc.energy = max(0.0, float(getattr(bc, "energy", 0.0)) - basal)
+                    self._e_cost_sum += basal
+                    self._metab_basal_sum = getattr(self, "_metab_basal_sum", 0.0) + basal
             # DAMAGE-канал: predator-урон. 1b.1 (§18): под hp_authoritative урон → HP
             # (не energy/сытость) — physical-integrity мишень (§1.1). OFF → legacy
             # (energy, §3 ловит energy≤0). На 1b.1 death/§3 ещё на energy → урон в hp
@@ -11514,7 +11536,7 @@ class LocalColonyCompute:
             # от плотной еды) → energy. Делает экономику выигрываемой при хорошей
             # добыче. glucose потребляется, но не ниже baseline. rate=0 → no-op.
             _ger = float(self._glucose_energy_rate)
-            if _ger > 0.0:
+            if _ger > 0.0 and not _scaling:  # scaling: glucose→психо (decoupled), energy=f(нужды)
                 _g = float(getattr(bc, "glucose", 0.0))
                 _surplus = _g - 50.0  # baseline_glucose
                 if _surplus > 0.0:
@@ -11537,7 +11559,9 @@ class LocalColonyCompute:
             # органически через energy<=0 (starvation, см. death-check ниже),
             # не отдельной hydration-смертью. Gate: включаем урон только после
             # подтверждения дохода (drink_sum>0) — урок 0.11.24.
-            if self._dehydration_damage_enabled:
+            if self._dehydration_damage_enabled and not _scaling:
+                # scaling: dehydration-φ³-каскад ПОГЛОЩЁН вода-провалом формулы
+                # (φ²·w^φ) — один механизм, не двойной учёт. OFF → старый каскад.
                 max_h = float(getattr(bc, "max_hydration", 100.0))
                 stage = _dehydration_stage(
                     float(getattr(bc, "hydration", max_h)), max_h)
@@ -11545,6 +11569,25 @@ class LocalColonyCompute:
                 if drain > 0.0:
                     bc.energy = max(
                         0.0, float(getattr(bc, "energy", 0.0)) - drain)
+            # §Закон 1 ФИНАЛЬНЫЙ recompute (Бендер-инвариант, зеркало server
+            # recompute_energy_from_needs): energy = ПОСЛЕДНЕЕ СЛОВО = производная от
+            # текущих нужд (satiety/hydration/fatigue) ПОСЛЕ всех мутаций (step_cost/basal
+            # →satiety, thirst→hydration, eat/kill→satiety). Нельзя перетереть дренажём.
+            # Зову neurocore-функцию = бит-в-бит. ПЕРЕД hp-блоком (читает energy-агрегат).
+            # OFF → energy-бак нетронут (bit-identical).
+            if _scaling:
+                try:
+                    from environment.biochemistry import (  # type: ignore
+                        compute_energy_from_needs as _cefn)
+                    _max_e = float(getattr(bc, "max_hp", _CLIENT_MAX_ENERGY))
+                    _max_h = float(getattr(bc, "max_hydration", 100.0))
+                    bc.energy = _cefn(
+                        float(getattr(bc, "hydration", _max_h)),
+                        float(getattr(bc, "satiety", 100.0)),
+                        float(getattr(bc, "fatigue", 0.0)),
+                        _max_e, max_hydration=_max_h)
+                except Exception as e:
+                    logger.debug("scaling_energy recompute n/a (старый neurocore?): %s", e)
             # 1b.1 (§18): ДРЕНАЖ нужд→hp + ЛЕЧЕНИЕ (hp оживает). Дренеры = сытость
             # (energy) + вода (hydration); выносливость INERT до φ-расход (§18.7).
             # Нужда=0 → дренаж φ³/тик на каждую; ВСЕ активные нужды>норма → лечение
