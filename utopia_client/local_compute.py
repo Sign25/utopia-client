@@ -3855,6 +3855,13 @@ class LocalColonyCompute:
                     # (dist ≤ _POUNCE_DIST) → +1 рывок на entry (короткий burst).
                     _mp_cid = (_nf_cid.get("medium_prey")
                                if isinstance(_nf_cid, dict) else None)
+                    # TARGET_DIAG (Фрай pursuit-split, Бендер 21.06): какой fauna_id Адам
+                    # таргетит КАЖДЫЙ тик → прыгает тик-в-тик = LOCK-затык (re-pick nearest);
+                    # стабилен но dist не падает = не lock (pursuit-logic). single + дичь видна.
+                    if self._single_organism and isinstance(_mp_cid, dict):
+                        logger.info("TARGET_DIAG cid=%s fauna_id=%s mdist=%s dr=%s dc=%s",
+                                    cid, _mp_cid.get("fauna_id"), _mp_cid.get("dist"),
+                                    _mp_cid.get("dr"), _mp_cid.get("dc"))
                     # PHASE C: nearest_corpse для corpse-nav (труп ценнее травы — мясо)
                     _corpse_cid = (_nf_cid.get("corpse")
                                    if isinstance(_nf_cid, dict) else None)
