@@ -51,16 +51,20 @@ def test_carn_skip_flora_predicate():
     c.set_feeding_focus(True)
     c._hunt_commit["c1"] = 2      # дичь huntable (commit-move активен)
 
-    def _skip(diet, onf, on_corpse, has_commit):
+    def _skip(diet, onf, on_corpse, has_commit, er=0.5):
         commit = c._hunt_commit.get("c1") if has_commit else None
         return (c._feeding_focus_enabled and diet > 0.5
-                and onf and not on_corpse and commit is not None)
+                and onf and not on_corpse and commit is not None
+                and er > 0.146)
 
-    assert _skip(0.618, True, False, True) is True       # хищник, флора, commit → skip
+    assert _skip(0.618, True, False, True) is True       # хищник, флора, commit, er ок → skip
     assert _skip(0.618, True, True, True) is False        # на трупе → НЕ skip (его еда)
     assert _skip(0.618, True, False, False) is False      # нет дичи → НЕ skip (ест, не голодает)
     assert _skip(0.30, True, False, True) is False        # травоядный → НЕ skip
     assert _skip(0.618, False, False, True) is False      # не на флоре → нечего skip-ать
+    # ENERGY-FLOOR: крит. голод (er≤φ⁻⁴≈0.146) → НЕ skip (ест ягоды-бутстрап, не death-spiral)
+    assert _skip(0.618, True, False, True, er=0.08) is False   # er<пол → ест (остаётся capable)
+    assert _skip(0.618, True, False, True, er=0.20) is True    # er>пол → suppress (hunt-фокус)
 
 
 def test_hunt_burst_predicate():

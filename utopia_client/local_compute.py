@@ -3986,9 +3986,17 @@ class LocalColonyCompute:
                     # дичь huntable (hunt_commit активен) → коммит в погоню, не в ягоду.
                     # Труп (_on_corpse) НЕ трогаем = его еда. Гард hunt_commit-активен: нет
                     # дичи → ест ягоды (не голодает). Снимает голод-стресс (ser→0/cort↑).
+                    # ENERGY-FLOOR (Бендер 21.06, Фрай pre-approved «дип → suppress только
+                    # near-kill»): НЕ подавлять ягоды при крит. голоде (er≤φ⁻⁴≈0.146, у
+                    # capable-пола φ⁻⁵≈0.09). Иначе death-spiral: latch(cap32) держит
+                    # hunt_commit почти всегда → suppress всегда → Адам не грейзит → голод
+                    # <capable → hunt фликерит → mdist осц 14↔23, не ловит → голод. Ягоды-
+                    # бутстрап ниже порога → остаётся capable → держит погоню → дожимает
+                    # уставшую дичь (stamina-drain). Выше порога → hunt-фокус (suppress).
                     _carn_skip_flora = (self._feeding_focus_enabled and _diet > 0.5
                                         and _onf and not _on_corpse
-                                        and self._hunt_commit.get(cid) is not None)
+                                        and self._hunt_commit.get(cid) is not None
+                                        and _er > 0.146)
                     if ((_onf or _on_corpse) and (_hungry_for_med or _mid_eat)
                             and not _carn_skip_flora):
                         self._on_food[cid] = 1
