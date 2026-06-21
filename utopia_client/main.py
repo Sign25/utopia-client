@@ -568,6 +568,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_food_income: bool | None = None          # food-income server-truth
     applied_anti_freeze: bool | None = None           # position-based анти-freeze
     applied_feeding_focus: bool | None = None         # хищник-охота фокус (DIST-CAP+berry-suppress)
+    applied_scaling_energy: bool | None = None         # энергия из нужд (§Закон 1, lockstep Хьюберт)
     applied_life: bool | None = None
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
@@ -1261,6 +1262,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("feeding_focus → %s", target_ff)
                         except Exception as e:
                             logger.warning("set_feeding_focus failed: %s", e)
+
+                    # scaling_energy (Фрай/Хьюберт/Шеф 20.06 §Закон 1): энергия как
+                    # производная от нужд (E=f(вода,сытость,усталость)). OFF dormant.
+                    target_se = bool(flags.get("scaling_energy", False))
+                    if target_se != applied_scaling_energy \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_scaling_energy(target_se)
+                            applied_scaling_energy = target_se
+                            logger.info("scaling_energy → %s", target_se)
+                        except Exception as e:
+                            logger.warning("set_scaling_energy failed: %s", e)
 
                     # LIFE-SUPPORT (Фрай 16.06, спасение §3-absorbing-капкана): edge
                     # False→True → один впрыск energy+hydration. Сбросить флаг после.

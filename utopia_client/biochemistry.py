@@ -126,6 +126,12 @@ class ClientCreatureBiochem:
     # одношкальны → зеркало остаётся). Client тикает ТОЛЬКО Адама → is_adam=True.
     is_adam: bool = True
     hydration: float = 100.0
+    # §energy-Scaling-Law (Фрай/Шеф 20.06, satiety=(b), lockstep CreatureState.satiety
+    # cfcc0aa): сытость 0-100 — нужда (провал s=1−satiety/100 в compute_energy_from_needs).
+    # ON _scaling_energy: eat/kill→satiety, метаболизм→satiety, energy=f(нужды). Дефолт
+    # 100 (сыт при рождении) = зеркало server. OFF dormant → не используется.
+    satiety: float = 100.0
+    max_satiety: float = 100.0
     infected: bool = False
     infection_severity: float = 0.0
     pair_bond_strength: float = 0.5

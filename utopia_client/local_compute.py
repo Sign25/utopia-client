@@ -706,6 +706,7 @@ class LocalColonyCompute:
         # побег (ротация направлений по факту неподвижности). OFF dormant → bit-identical.
         self._anti_freeze_enabled: bool = False  # client_flag anti_freeze (OFF dormant)
         self._feeding_focus_enabled: bool = False  # client_flag feeding_focus (OFF dormant)
+        self._scaling_energy_enabled: bool = False  # client_flag scaling_energy (энергия из нужд, OFF dormant)
         # obs O2 (stamina §19.2/§20): выносливость+HP в восприятие obs[76:78]. INERT
         # preserve-expand 76→78 (миграция автомат, [I|0]); флаг гейтит ЗНАЧЕНИЯ
         # (OFF → obs[76:78]=0 → math-equivalent; ON → выносливость/hp). Зеркало social-A.
@@ -9290,6 +9291,25 @@ class LocalColonyCompute:
             logger.debug("biochem set_phi_fatigue lockstep n/a (старый neurocore?): %s", e)
         logger.info("set_phi_fatigue: %s", on)
         return self._phi_fatigue_enabled
+
+    def set_scaling_energy(self, on: bool) -> bool:
+        """Канал client_flags scaling_energy (Фрай/Хьюберт/Шеф 20.06 §Закон 1): энергия
+        как ПРОИЗВОДНАЯ от нужд E=E_max·(1−[φ²·w^φ+φ·s^φ+f^φ]/(φ³+1)), а НЕ независимый
+        дренаж-бак. Чинит парадокс Шефа «сыт (satiety 55) но энергия 43». ON: метаболизм/
+        eat/kill → satiety (не energy напрямую), energy=compute_energy_from_needs(hyd,
+        satiety,fat) каждый тик, skip dehydration-каскад (поглощён вода-провалом φ²·w^φ).
+        OFF (dormant) = старый energy-бак bit-identical. LOCKSTEP server (Хьюберт 05f5401/
+        cfcc0aa, Фаза 2 интеграция). kill-switch. Флип синхронно после Шеф-«да»."""
+        self._scaling_energy_enabled = bool(on)
+        # LOCKSTEP: module-global environment.biochemistry → decay_step recompute
+        # energy=f(нужды) (ON) vs старый бак (OFF). degrade-gracefully (старый neurocore).
+        try:
+            from environment.biochemistry import set_scaling_energy as _bm_set_se  # type: ignore
+            _bm_set_se(bool(on))
+        except Exception as e:
+            logger.debug("biochem set_scaling_energy lockstep n/a (старый neurocore?): %s", e)
+        logger.info("set_scaling_energy: %s", on)
+        return self._scaling_energy_enabled
 
     def set_fatigue_b(self, b: float) -> float:
         """Канал client_flags (float fatigue_b): база b φ-расхода выносливости —
