@@ -30,6 +30,16 @@ from environment.world_snapshot_delta import (
 
 logger = logging.getLogger("utopia_client.world_cache")
 
+# Пилот самораспознавания (Бендер 21.06, lockstep Хьюберт neurocore 1.5.32): apply_delta_
+# reference принимает raw_delta-kwarg (raw-позиции → state.raw → ObsView [0,0,0,0]) только с
+# 1.5.32+. Version-guard: передаём raw_delta лишь если параметр ЕСТЬ (старый neurocore → skip,
+# bit-identical; пилот dormant до neurocore-апдейта + WORLD_RAW_OBJECT_ENABLED на сервере).
+try:
+    import inspect as _inspect
+    _APPLY_HAS_RAW_DELTA = "raw_delta" in _inspect.signature(apply_delta_reference).parameters
+except Exception:
+    _APPLY_HAS_RAW_DELTA = False
+
 
 @dataclass(frozen=True)
 class WorldConfigSnapshot:
@@ -114,6 +124,13 @@ class WorldStateCache:
     @property
     def fauna(self) -> dict[int, tuple[int, int, int, float]]:
         return self._state.fauna
+
+    @property
+    def raw(self) -> set[tuple[int, int]]:
+        """RAW-объекты пилота самораспознавания (set[(row,col)], БЕЗ kind). ObsView строит
+        [0,0,0,0] adjacency-паттерн из этого; /stats-монитор трекает дистанцию/interaction.
+        Пусто если neurocore<1.5.32 / пилот OFF (getattr-граф = bit-identical)."""
+        return getattr(self._state, "raw", None) or set()
 
     @property
     def signals(self) -> dict[tuple[int, int, int], int]:
@@ -267,15 +284,20 @@ class WorldStateCache:
 
         world_block = snap.get("world") or {}
         tick = int(world_block.get("tick", 0))
+        _delta_kwargs = dict(
+            state=self._state,
+            tick=tick,
+            flora_delta=flora_delta,
+            fauna_delta=snap.get("fauna_delta") or {},
+            signals_delta=snap.get("signals_delta") or {},
+            creatures_delta=snap.get("creatures_delta") or {},
+        )
+        if _APPLY_HAS_RAW_DELTA:
+            # пилот самораспознавания: raw-позиции → state.raw → ObsView [0,0,0,0].
+            # snap без raw_delta (флаг OFF) → {} → no-op (bit-identical).
+            _delta_kwargs["raw_delta"] = snap.get("raw_delta") or {}
         try:
-            self._state = apply_delta_reference(
-                state=self._state,
-                tick=tick,
-                flora_delta=flora_delta,
-                fauna_delta=snap.get("fauna_delta") or {},
-                signals_delta=snap.get("signals_delta") or {},
-                creatures_delta=snap.get("creatures_delta") or {},
-            )
+            self._state = apply_delta_reference(**_delta_kwargs)
         except Exception as e:
             self.last_apply_error = f"{type(e).__name__}: {e}"
             logger.warning("apply_snap failed at tick=%d: %s", tick, e)
