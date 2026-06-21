@@ -9167,6 +9167,17 @@ class LocalColonyCompute:
         # φ-пороги в читателях ОСТАЮТСЯ φ → абсолютные триггеры сдвигаются (голод
         # 618→809). OFF → /1000 (инертно, как 1a). Сдвиг чисто client (server уже 1309).
         norm = _CLIENT_MAX_ENERGY if self._er_norm_enabled else 1000.0
+        # §Закон 1 (9-й сайт, Фрай блокер): scaling ON → ГОЛОД-ratio = satiety/max_satiety
+        # (sr), НЕ energy/norm. energy теперь композит-агрегат → голод-поведение (eat-онсет
+        # _hungry_for_med sr<φ⁻¹=satiety<61.8, §3-фураж/forage_dir, hunt-голод) на СВОЕЙ оси
+        # satiety, не на energy. Иначе голод-РЕГРЕССИЯ: голодный Адам (satiety=0, вода/
+        # бодрость полны → energy высок) НЕ ел бы. hp/capability (_capable, combat) остаётся
+        # на energy-агрегате (combat→energy, контракт). OFF → старое (sat=energy, bit-identical).
+        if self._scaling_energy_enabled:
+            _msat = float(getattr(bc, "max_satiety", 100.0)) or 100.0
+            sat = float(getattr(bc, "satiety", 100.0)) / _msat
+            hp = float(getattr(bc, "hp", e) or 0.0) / norm
+            return (sat, hp)
         sat = e / norm
         hp = float(getattr(bc, "hp", e) or 0.0) / norm     # hp==energy на 1a → равно sat
         return (sat, hp)
@@ -9361,8 +9372,15 @@ class LocalColonyCompute:
         # через фураж-move (голод-move копил бы → выносливость=0 → ещё хуже). glucose<5
         # = голод (зеркало server incap-гейт +glucose<5). Гейт ТОЛЬКО при s3_forage ON
         # (lockstep; OFF → старое поведение, голод-move копил бы — но при OFF §3=STAY).
-        if self._s3_forage_enabled and \
-                float(getattr(bc, "glucose", 999.0) or 0.0) < _S3_HUNGER_GLUCOSE:
+        # scaling (9-й сайт): голод=satiety (glucose decoupled→психо) → коллапс-floor
+        # satiety<φ⁻⁵·100≈9 (закон-floor, не placeholder); OFF/non-scaling → glucose<5.
+        if self._scaling_energy_enabled:
+            _s3_hungry = (float(getattr(bc, "satiety", 999.0) or 0.0)
+                          < (1.0 / _PHI) ** 5 * 100.0)
+        else:
+            _s3_hungry = (float(getattr(bc, "glucose", 999.0) or 0.0)
+                          < _S3_HUNGER_GLUCOSE)
+        if self._s3_forage_enabled and _s3_hungry:
             return
         # blocked_move→0-fatigue (Хьюберт Root-2, §20.6.3): итоговый move уткнулся в стену
         # БЕЗ смещения (nav-repellent: все 4 заперты) → нет смещения = нет нагрузки → не

@@ -71,3 +71,23 @@ def test_formula_monotonic_in_satiety():
     lo = _energy_from_needs(90, 30, 40)
     hi = _energy_from_needs(90, 80, 40)
     assert hi > lo
+
+
+def test_hunger_ratio_switches_to_satiety_9th_site():
+    # 9-й сайт (Фрай блокер): scaling ON → голод-ratio = satiety (не energy). Голодный
+    # Адам (satiety=30) с ВЫСОКОЙ energy должен быть HUNGRY (иначе голод-регрессия).
+    c = LocalColonyCompute(device="cpu")
+    c._four_scale_enabled = True
+    c._er_norm_enabled = True
+    bc = ClientCreatureBiochem(energy=1000.0, satiety=30.0, hp=1000.0)
+    c.biochem["a"] = bc
+    _phi_inv = 1.0 / 1.618033988749895
+    # OFF: голод-ratio = energy-based → energy 1000/1309≈0.76 > φ⁻¹ → НЕ голоден (старое)
+    c.set_scaling_energy(False)
+    sat_off, _ = c._energy_ratios("a")
+    assert sat_off > _phi_inv
+    # ON: голод-ratio = satiety → 30/100=0.30 < φ⁻¹ → ГОЛОДЕН несмотря на высокую energy
+    c.set_scaling_energy(True)
+    sat_on, hp_on = c._energy_ratios("a")
+    assert sat_on < _phi_inv          # satiety-голод (ключевой фикс блокера)
+    assert hp_on > _phi_inv           # capability/hp остаётся на energy (combat→energy)
