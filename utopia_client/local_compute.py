@@ -11206,6 +11206,15 @@ class LocalColonyCompute:
         except Exception as e:
             logger.debug("biochem apply import failed cid=%s: %s", cid, e)
             return
+        # diet_gene синк (этап B, Фрай): apply_feed читает creature.diet_gene для
+        # растения ×(1−diet). Без синка getattr=0.0 → полная растит. сытость (карнивор
+        # как травоядный → выживает на ягодах → kill=0). scaling-гейт. OFF → не нужно.
+        if self._scaling_energy_enabled:
+            try:
+                bc.diet_gene = float(
+                    (self.traits.get(cid) or {}).get("diet_gene", 0.5) or 0.5)
+            except Exception:
+                pass
         try:
             delta_e = float(event.get("delta_energy", 0.0) or 0.0)
             if event.get("ate"):
@@ -11235,10 +11244,14 @@ class LocalColonyCompute:
                     try:
                         from environment.biochemistry import SATIETY_KILL as _skill_sat  # type: ignore
                     except Exception:
-                        _skill_sat = 40.0
+                        _skill_sat = 89.0
+                    # ×diet_gene (Фрай симметрия: растения ×(1−diet), мясо ×diet — ОДНА
+                    # формула, без Адам-чита). Карнивор diet=0.618 → мясо 89×0.618≈55 >>
+                    # ягода ×0.382 → контраст огромный → давление охотиться.
+                    _kdiet = float((self.traits.get(cid) or {}).get("diet_gene", 0.5) or 0.5)
                     _msat = float(getattr(bc, "max_satiety", 100.0))
                     bc.satiety = min(_msat, float(getattr(bc, "satiety", 100.0))
-                                     + float(_skill_sat) * _kc_acc)
+                                     + float(_skill_sat) * _kdiet * _kc_acc)
                 self._skill_kill[cid] = self._skill_kill.get(cid, 0) + _kc_acc
                 # meat-GC ось (Фрай hunting.md): ВСЁ мясо (prey 21 + medium 55) →
                 # hunt-сигнал, изолирован от plant-income. Надёжный Σ из аккумулятора.

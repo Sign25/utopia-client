@@ -132,6 +132,10 @@ class ClientCreatureBiochem:
     # 100 (сыт при рождении) = зеркало server. OFF dormant → не используется.
     satiety: float = 100.0
     max_satiety: float = 100.0
+    # diet_gene (этап B, Фрай 21.06): apply_feed читает для растения ×(1−diet) —
+    # карнивор (diet→1) почти не сытеет с растений. Синкается из traits перед apply_feed
+    # (иначе getattr default 0.0 → полная растит. сытость = травоядный, корень kill=0).
+    diet_gene: float = 0.5
     infected: bool = False
     infection_severity: float = 0.0
     pair_bond_strength: float = 0.5
