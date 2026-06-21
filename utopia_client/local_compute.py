@@ -603,6 +603,15 @@ class LocalColonyCompute:
         self._hunt_commit: dict = {}        # cid → ACTION (MOVE-к-медиуму/ATTACK) — детерм. hunt-commit (gate в, Фрай 14.06: поднять дно)
         self._hunt_latch: dict = {}         # cid → тики оставш. sustain-погони (Хьюберт 20.06: держать chase до контакта, не бросать на дрейф дичи) — feeding_focus
         self._HUNT_LATCH_N: int = 13        # Fib — тиков sustain-погони после последнего свежего commit (расширяет cap 21→32 пока latch>0)
+        # hard-lock на ОДНУ цель (Фрай 21.06, pursuit-затык: Адам re-pick nearest каждый
+        # тик → зигзаг 8 смен/окно, mdist=4→перещёлк→теряет). Лочим fauna_id из visible_fauna
+        # → ведём ЕЁ до release. feeding_focus + visible_fauna (Хьюберт obs). single-Адам.
+        self._hunt_lock: dict = {}          # cid → залоченный fauna_id (или нет ключа)
+        self._hunt_lock_best: dict = {}     # cid → мин. dist достигнутая (для stale-детекта прогресса)
+        self._hunt_lock_stale: dict = {}    # cid → тиков БЕЗ сближения (stale → release)
+        self._hunt_lock_lost: dict = {}     # cid → тиков цель вне visible_fauna (lost → release)
+        self._HUNT_LOCK_LOST_N: int = 8     # Fib — тиков вне vision → release (потеряна)
+        self._HUNT_LOCK_STALE_N: int = 13   # Fib — тиков без сближения → release (недостижима, не вечный lock)
         # PREDATOR-HUNT (Фрай 14.06, после термокомфорта): добивание РАНЕНОГО хищника —
         # узкое окно поверх АБСОЛЮТНОГО FLEE-floor. ATTACK ТОЛЬКО hp_ratio<φ⁻² + er>φ⁻¹
         # (СЫТ=роскошь не нужда) + attackable + НЕ disengaged. damage>0→disengage→FLEE
@@ -3855,9 +3864,16 @@ class LocalColonyCompute:
                     # (dist ≤ _POUNCE_DIST) → +1 рывок на entry (короткий burst).
                     _mp_cid = (_nf_cid.get("medium_prey")
                                if isinstance(_nf_cid, dict) else None)
-                    # TARGET_DIAG (Фрай pursuit-split, Бендер 21.06): какой fauna_id Адам
-                    # таргетит КАЖДЫЙ тик → прыгает тик-в-тик = LOCK-затык (re-pick nearest);
-                    # стабилен но dist не падает = не lock (pursuit-logic). single + дичь видна.
+                    # hard-lock (Фрай 21.06): держим ОДНУ цель из visible_fauna до release
+                    # вместо re-pick nearest (зигзаг 8 смен/окно: mdist=4→перещёлк→теряет).
+                    # feeding_focus + single. visible_fauna нет (поле Хьюберта не выкачено) →
+                    # no-op → nearest (bit-identical, безопасно до синхрона).
+                    if self._feeding_focus_enabled and self._single_organism:
+                        _vf = (_nf_cid.get("visible_fauna")
+                               if isinstance(_nf_cid, dict) else None)
+                        _mp_cid = self._resolve_hunt_target(cid, _vf, _mp_cid)
+                    # TARGET_DIAG: логирует РАЗРЕШЁННУЮ (locked) цель → fauna_id стабилен =
+                    # lock держит (vs прыгал при re-pick). single + дичь видна.
                     if self._single_organism and isinstance(_mp_cid, dict):
                         logger.info("TARGET_DIAG cid=%s fauna_id=%s mdist=%s dr=%s dc=%s",
                                     cid, _mp_cid.get("fauna_id"), _mp_cid.get("dist"),
@@ -10897,6 +10913,70 @@ class LocalColonyCompute:
         if self._corpse_step_n % 20 == 0:
             logger.info("CORPSE_STEP cid=%s fired #%d (adjacent corpse, mv=%d) → step-onto",
                         cid, self._corpse_step_n, int(_amv))
+
+    def _resolve_hunt_target(self, cid, visible_fauna, mp_nearest):
+        """hard-lock на ОДНУ medium-цель (Фрай 21.06, pursuit-затык). Держим залоченный
+        fauna_id из visible_fauna до release, вместо re-pick nearest каждый тик (зигзаг 8
+        смен/окно: Адам доходит mdist=4 → перещёлк → теряет). Возвращает dict цели
+        {dr,dc,dist,fauna_id} для hunt-логики (ЗАМЕНЯЕТ nearest-слот). visible_fauna None/
+        пуст → no-op (поле Хьюберта не выкачено) → nearest (bit-identical). single+feeding (caller-гейт).
+
+        RELEASE (Фрай): capture (dist≤1→ATTACK добьёт→цель сдохнет→lost) / lost (вне списка
+        LOST_N тиков) / dead (вне списка) / stale (STALE_N тиков без сближения → недостижима).
+        Гистерезис: НЕ перещёлкиваем на «чуть ближе» — держим до release-условия.
+        """
+        if not visible_fauna:
+            return mp_nearest                 # поле не выкачено → старое (nearest), bit-identical
+        _locked = self._hunt_lock.get(cid)
+        _t = None
+        if _locked is not None:
+            for _f in visible_fauna:
+                try:
+                    if _f.get("fauna_id") == _locked:
+                        _t = _f
+                        break
+                except (AttributeError, TypeError):
+                    continue
+        if _t is not None:
+            # залоченная видна → прогресс/stale
+            self._hunt_lock_lost.pop(cid, None)
+            _d = float(_t.get("dist", 99.0) or 99.0)
+            _best = self._hunt_lock_best.get(cid, 1e9)
+            if _d < _best - 0.5:              # реальное сближение (порог-гистерезис)
+                self._hunt_lock_best[cid] = _d
+                self._hunt_lock_stale[cid] = 0
+            else:
+                self._hunt_lock_stale[cid] = self._hunt_lock_stale.get(cid, 0) + 1
+            if self._hunt_lock_stale.get(cid, 0) > self._HUNT_LOCK_STALE_N:
+                self._release_hunt_lock(cid)  # недостижима → отпускаем (не вечный lock)
+            else:
+                self._hunt_lock_n = getattr(self, "_hunt_lock_n", 0) + 1
+                if self._hunt_lock_n % 50 == 1:
+                    logger.info("HUNT_LOCK cid=%s held fauna_id=%s dist=%.0f best=%.0f stale=%d",
+                                cid, _locked, _d, _best, self._hunt_lock_stale.get(cid, 0))
+                return _t                     # ВЕДЁМ залоченную (даже не-ближайшую)
+        elif _locked is not None:
+            # залочена, но вне списка → lost-счётчик
+            _lost = self._hunt_lock_lost.get(cid, 0) + 1
+            self._hunt_lock_lost[cid] = _lost
+            if _lost > self._HUNT_LOCK_LOST_N:
+                self._release_hunt_lock(cid)  # потеряна/мертва → отпускаем
+        # не залочена (или released) → лочим на ближайшую medium
+        if self._hunt_lock.get(cid) is None and isinstance(mp_nearest, dict):
+            _fid = mp_nearest.get("fauna_id")
+            if _fid is not None:
+                self._hunt_lock[cid] = _fid
+                self._hunt_lock_best[cid] = float(mp_nearest.get("dist", 99.0) or 99.0)
+                self._hunt_lock_stale[cid] = 0
+                self._hunt_lock_lost.pop(cid, None)
+        return mp_nearest                     # lost-тик или свежий lock → nearest (бридж)
+
+    def _release_hunt_lock(self, cid) -> None:
+        """Сброс lock-состояния (release-условие сработало)."""
+        self._hunt_lock.pop(cid, None)
+        self._hunt_lock_best.pop(cid, None)
+        self._hunt_lock_stale.pop(cid, None)
+        self._hunt_lock_lost.pop(cid, None)
 
     def _apply_hunt_commit(self, cid: str, out: dict, obs) -> None:
         """ДЕТЕРМ. HUNT-COMMIT к medium-добыче (Фрай 14.06, gate в — поднять дно).

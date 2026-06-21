@@ -130,6 +130,45 @@ def test_sustain_latch_refresh_and_decay():
     assert c._hunt_latch["c1"] == 0                   # выдохся → возврат к грейзу
 
 
+def test_hunt_lock_no_op_without_visible_fauna():
+    # visible_fauna нет (поле Хьюберта не выкачено) → no-op → nearest (bit-identical)
+    c = _compute()
+    c.set_feeding_focus(True)
+    nearest = {"fauna_id": 119, "dist": 10.0, "dr": 1, "dc": 0}
+    t = c._resolve_hunt_target("a", None, nearest)
+    assert t is nearest
+    assert "a" not in c._hunt_lock
+
+
+def test_hunt_lock_holds_target_hysteresis():
+    # лочим 119 (ближайшая) → 102 становится ближе, но ДЕРЖИМ 119 (гистерезис, не зигзаг)
+    c = _compute()
+    c.set_feeding_focus(True)
+    vf1 = [{"fauna_id": 119, "dist": 10.0, "dr": 1, "dc": 0}]
+    c._resolve_hunt_target("a", vf1, vf1[0])
+    assert c._hunt_lock["a"] == 119                 # залочена ближайшая
+    # 102 теперь ближе (8), но 119 ещё ближе стала (5) → держим 119, прогресс
+    vf2 = [{"fauna_id": 102, "dist": 8.0, "dr": 0, "dc": 1},
+           {"fauna_id": 119, "dist": 5.0, "dr": 1, "dc": 0}]
+    t2 = c._resolve_hunt_target("a", vf2, vf2[0])    # nearest=102
+    assert t2["fauna_id"] == 119                      # ДЕРЖИМ 119, НЕ перещёлк на 102
+    assert c._hunt_lock_best["a"] == 5.0              # сближение 10→5
+
+
+def test_hunt_lock_release_stale_then_switch():
+    # 119 застряла (dist не падает) STALE_N тиков → release → перелочка на ближайшую 102
+    c = _compute()
+    c.set_feeding_focus(True)
+    vf1 = [{"fauna_id": 119, "dist": 10.0, "dr": 1, "dc": 0}]
+    c._resolve_hunt_target("a", vf1, vf1[0])
+    assert c._hunt_lock["a"] == 119
+    vf2 = [{"fauna_id": 119, "dist": 10.0, "dr": 1, "dc": 0},   # 119 застряла на 10
+           {"fauna_id": 102, "dist": 5.0, "dr": 0, "dc": 1}]    # 102 ближе
+    for _ in range(c._HUNT_LOCK_STALE_N + 1):
+        c._resolve_hunt_target("a", vf2, vf2[1])                # nearest=102
+    assert c._hunt_lock["a"] == 102                  # после stale → перелочка на 102 (не вечный lock)
+
+
 def test_off_dormant_no_skip():
     # OFF → предикат всегда False (bit-identical с до-флагом поведением)
     c = _compute()
