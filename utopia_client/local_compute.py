@@ -4030,6 +4030,18 @@ class LocalColonyCompute:
                         self._on_food[cid] = 1
                     else:
                         self._on_food.pop(cid, None)
+                    # CONTACT_DIAG (Фрай 21.06, contact-attack split): held-цель dist≤1 →
+                    # логируем hunt_commit(=5 ATTACK?)+on_food(ест ягоду?)+suppress. Разводит:
+                    # hunt_commit=5 & on_food=None → ATTACK должен фир (atk=0 → R_c/окно);
+                    # on_food=1 → eat перебивает ATTACK (eat-приоритет фикс).
+                    if (self._single_organism and isinstance(_mp_cid, dict)
+                            and float(_mp_cid.get("dist", 99.0) or 99.0) <= 1.0):
+                        logger.info(
+                            "CONTACT_DIAG cid=%s dist=%.0f hunt_commit=%s on_food=%s "
+                            "carn_skip=%s onf=%s er_sat=%.3f", cid,
+                            float(_mp_cid.get("dist", 99.0) or 99.0),
+                            self._hunt_commit.get(cid), self._on_food.get(cid),
+                            _carn_skip_flora, _onf, _er_sat)
                     # PHASE C medium-corpse fix (14.06): детерм. ШАГ-НА-ТУШУ для adjacent
                     # трупа (0<dist≤1). GAP: corpse-nav shaping фичрит dist>1, eat-рефлекс
                     # — on_corpse (dist=-1); на dist=1 (соседний тайл) НИ один не действует
