@@ -1889,6 +1889,12 @@ class ColonyWSClient:
                 # применена через delta_energy — здесь ТОЛЬКО meat-GC ось + счётчик.
                 "kill_energy_acc": float(c.get("kill_energy_acc", 0.0) or 0.0),
                 "kill_count_acc": int(c.get("kill_count_acc", 0) or 0),
+                # Пилот самораспознавания (Хьюберт канал 29ed380): raw-eat payoff acc
+                # (read-and-reset как kill_acc). БЕЗ проброса здесь = дропались на whitelist
+                # → _apply_biochem_events не видел → payoff=0 (Gate-A не чинился). FLAT
+                # diet-independent (satiety 30 / glucose 5 за eat, значения финальные).
+                "raw_eat_satiety_acc": float(c.get("raw_eat_satiety_acc", 0.0) or 0.0),
+                "raw_eat_glucose_acc": float(c.get("raw_eat_glucose_acc", 0.0) or 0.0),
                 # PHASE B eating (#6, eating.md): прогресс многотикового поедания —
                 # eating_progress(0..1)/target_kind/remaining/total. Рефлекс-floor
                 # (Phase A) уже держит «ест→продолжать»; B потребляет progress для
