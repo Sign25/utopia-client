@@ -1879,11 +1879,11 @@ class ColonyWSClient:
             # per-creature payload c? Если force-eat был, а лог пуст → сервер кладёт не в c
             # (или иное имя) → правка на сервере/парсинге. Временный.
             try:
-                _dbg_keys = [k for k in c.keys() if "raw" in k.lower()]
-                if _dbg_keys or c.get("raw_eat_satiety_acc"):
-                    logger.info("RAW_ACC_ARRIVE cid=%s sat_acc=%s glu_acc=%s raw_keys=%s",
-                                cid_s, c.get("raw_eat_satiety_acc"),
-                                c.get("raw_eat_glucose_acc"), _dbg_keys)
+                _rsa_v = float(c.get("raw_eat_satiety_acc", 0.0) or 0.0)
+                _rga_v = float(c.get("raw_eat_glucose_acc", 0.0) or 0.0)
+                if _rsa_v > 0.0 or _rga_v > 0.0:
+                    logger.info("RAW_ACC_ARRIVE cid=%s sat_acc=%.1f glu_acc=%.1f "
+                                "(acc>0 дошёл в c → parse ок)", cid_s, _rsa_v, _rga_v)
             except Exception:
                 pass
             # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
