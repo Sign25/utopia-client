@@ -1913,6 +1913,10 @@ class ColonyWSClient:
                 # Gate-B HARD/SOFT-диаг: nearest_raw_object (dr/dc/dist) — эмитит ли мотор
                 # EAT(14) на raw-тайле? Проброс для EAT_ON_RAW-диага в action-loop.
                 "nearest_raw_object": c.get("nearest_raw_object"),
+                # on_raw (Хьюберт авторитетный, снят рассинхрон триггер/резолв): Адам НА raw-
+                # тайле ЭТОТ тик (server-truth, как on_flora). Триггер try-drive (буст фейрит
+                # когда сервер реально видит Адама на raw → проба резолвится). Зеркало contacts.
+                "on_raw": bool(c.get("on_raw", False)),
                 # PHASE B eating (#6, eating.md): прогресс многотикового поедания —
                 # eating_progress(0..1)/target_kind/remaining/total. Рефлекс-floor
                 # (Phase A) уже держит «ест→продолжать»; B потребляет progress для

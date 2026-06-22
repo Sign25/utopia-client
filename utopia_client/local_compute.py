@@ -4246,7 +4246,7 @@ class LocalColonyCompute:
                             except (TypeError, ValueError, IndexError):
                                 _dpx_td = 0.0
                             self._apply_try_drive(
-                                cid, logits[0], _ev_cid.get("nearest_raw_object"),
+                                cid, logits[0], bool(_ev_cid.get("on_raw", False)),
                                 float(getattr(_bc_td, "satiety", 100.0)),
                                 float(getattr(_bc_td, "max_satiety", 100.0)),
                                 _dpx_td, _onf)
@@ -4445,24 +4445,21 @@ class LocalColonyCompute:
                     # мотор own=1.0→MOVE) → novelty не поможет. SOFT = ε иногда эмитит на raw
                     # → novelty усилит. Прямой счётчик эмиссии (не сервер-резолв). nearest_raw
                     # dist≤1 = на/рядом raw И НЕ на флоре → EAT-на-novel.
-                    _nro = ((events_per_cid.get(cid, {}) or {}).get("nearest_raw_object")
-                            if events_per_cid else None)
-                    if isinstance(_nro, dict) and not _onf:
-                        try:
-                            _rdist = float(_nro.get("dist", 99.0))
-                        except (TypeError, ValueError):
-                            _rdist = 99.0
-                        if _rdist <= 1.0:
-                            self._eat_on_raw_n = getattr(self, "_eat_on_raw_n", 0) + 1
-                            # Try-drive PURE-DECAY per-АКТУАЛЬНАЯ-проба (Шеф ретюн): эмиссия
-                            # EAT на raw = ОДНА проба → гасим try_urge (НЕ per-exposure-тик).
-                            # reward-независимо. Медленный decay → окно проб ≥ motor-learning.
-                            if self._try_drive_enabled:
-                                self._try_urge[cid] = (
-                                    self._try_urge.get(cid, 1.0) * self._try_decay)
-                            logger.info("EAT_ON_RAW cid=%s EMIT EAT(14) на raw dist=%.1f "
-                                        "(эмиссий=%d, urge=%.3f) — проба", cid, _rdist,
-                                        self._eat_on_raw_n, self._try_urge.get(cid, 1.0))
+                    # EAT-on-raw проба по on_raw (server-truth = РЕЗОЛВАБЕЛЬНАЯ проба, не
+                    # клиентский nearest_raw dist — снят рассинхрон триггер/резолв).
+                    _on_raw_ev = bool((events_per_cid.get(cid, {}) or {}).get("on_raw", False)
+                                      if events_per_cid else False)
+                    if _on_raw_ev and not _onf:
+                        self._eat_on_raw_n = getattr(self, "_eat_on_raw_n", 0) + 1
+                        # Try-drive PURE-DECAY per-АКТУАЛЬНАЯ-проба (Шеф ретюн): EAT на raw
+                        # (server on_raw) = ОДНА резолвабельная проба → гасим try_urge. reward-
+                        # независимо. Медленный decay → окно проб ≥ скорости motor-learning.
+                        if self._try_drive_enabled:
+                            self._try_urge[cid] = (
+                                self._try_urge.get(cid, 1.0) * self._try_decay)
+                        logger.info("EAT_ON_RAW cid=%s EMIT EAT(14) on_raw=1 (проб=%d, "
+                                    "urge=%.3f) — резолвабельная проба", cid,
+                                    self._eat_on_raw_n, self._try_urge.get(cid, 1.0))
                 if 0 <= action <= 3:    # move N/S/E/W (YIELD_GATE-диаг)
                     self._nav["move"] += 1
                     # NAV-HIT (Фрай 06.06): депишн-независимая метрика навигации —
@@ -11010,7 +11007,7 @@ class LocalColonyCompute:
             logger.info("EAT_REFLEX cid=%s fired #%d (on_food, d_prox=%.2f) → EAT override",
                         cid, self._eat_reflex_n, _dpx)
 
-    def _apply_try_drive(self, cid: str, logits, nearest_raw, satiety: float,
+    def _apply_try_drive(self, cid: str, logits, on_raw: bool, satiety: float,
                          max_satiety: float, d_prox: float, on_flora: bool) -> None:
         """Try-drive (Шеф 22.06, пилот самооткрытия еды).
 
@@ -11028,13 +11025,10 @@ class LocalColonyCompute:
         НЕ трогаем — на флоре рефлекс владеет (on_flora skip). satiety-keyed (голод-драйв)."""
         if not self._try_drive_enabled or not self._single_organism:
             return
-        if on_flora or not isinstance(nearest_raw, dict):
-            return                              # на флоре → рефлекс; нет raw → нет позыва
-        try:
-            _rdist = float(nearest_raw.get("dist", 99.0))
-        except (TypeError, ValueError):
-            return
-        if _rdist > 1.0:                        # не на/у незнакомого raw
+        # on_raw = АВТОРИТЕТНЫЙ server-сигнал (Адам на raw-тайле ЭТОТ тик, как on_flora) —
+        # снят рассинхрон триггер/резолв (раньше клиентский nearest_raw dist фейрил мимо
+        # серверной pos → проба не резолвилась). На флоре → рефлекс владеет.
+        if on_flora or not on_raw:
             return
         if d_prox >= 0.15:                      # хищник близко → FLEE приоритет (как рефлекс)
             return
@@ -11056,9 +11050,9 @@ class LocalColonyCompute:
         # per-АКТУАЛЬНАЯ-проба (эмиссия EAT на raw). Окно проб ≥ скорости обучения (Шеф).
         self._try_drive_n = getattr(self, "_try_drive_n", 0) + 1
         if self._try_drive_n % 25 == 1:
-            logger.info("TRY_DRIVE cid=%s urge=%.3f sr=%.2f dist=%.1f boost=%.2f → EAT-bias "
-                        "(позыв пробы незнакомого, self-extinguish)", cid, _urge, _sr,
-                        _rdist, self._try_boost)
+            logger.info("TRY_DRIVE cid=%s urge=%.3f sr=%.2f on_raw=1 boost=%.2f → EAT-bias "
+                        "(позыв пробы незнакомого, server-триггер, self-extinguish)", cid,
+                        _urge, _sr, self._try_boost)
 
     def set_try_drive(self, on: bool) -> bool:
         """client_flag try_drive (Шеф 22.06): врождённый позыв пробовать EAT на незнакомом.
