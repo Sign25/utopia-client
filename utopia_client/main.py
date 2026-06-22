@@ -570,6 +570,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_feeding_focus: bool | None = None         # хищник-охота фокус (DIST-CAP+berry-suppress)
     applied_scaling_energy: bool | None = None         # энергия из нужд (§Закон 1, lockstep Хьюберт)
     applied_life: bool | None = None
+    applied_heal_infection: bool | None = None   # разовое лечение инфекции (пилот baseline)
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -1286,6 +1287,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                         except Exception as e:
                             logger.warning("set_life_support failed: %s", e)
                     applied_life = target_life
+
+                    # HEAL-INFECTION (пилот самораспознавания, чистый baseline): edge
+                    # False→True → одна чистка infection_severity. Сбросить флаг после.
+                    target_heal = bool(flags.get("heal_infection", False))
+                    if target_heal and target_heal != applied_heal_infection \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_heal_infection(True)
+                            logger.warning("heal_infection выполнен (edge)")
+                        except Exception as e:
+                            logger.warning("set_heal_infection failed: %s", e)
+                    applied_heal_infection = target_heal
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +

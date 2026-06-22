@@ -10046,6 +10046,33 @@ class LocalColonyCompute:
         logger.warning("set_life_support: впрыснуто %d организмам", n)
         return True
 
+    def set_heal_infection(self, on: bool) -> bool:
+        """Разовое лечение инфекции (пилот самораспознавания, чистый baseline).
+        Корень залипания: water-heal лечит только severity<0.5 (30%); у Адама
+        severity прогрессировала >0.5 → unhealable водой → застряла на максимуме
+        (histamine=100, mental_break inflammation). Источник (kill-инфекция) Хьюберт
+        гейтнул OFF → разовая чистка достаточна, реинфекции нет. Edge (флип True →
+        одна чистка), потом флаг сбросить. НЕ постоянный (инфекц-механика цела для
+        будущего опыта с лечебными растениями)."""
+        if not on:
+            return False
+        n = 0
+        for cid, bc in list(self.biochem.items()):
+            try:
+                _sev = float(getattr(bc, "infection_severity", 0.0) or 0.0)
+                bc.infection_severity = 0.0
+                if hasattr(bc, "infected"):
+                    bc.infected = False
+                if hasattr(bc, "histamine"):
+                    bc.histamine = 0.0
+                n += 1
+                logger.warning("HEAL_INFECTION cid=%s severity %.2f→0 infected→False "
+                               "histamine→0 (пилот чистый baseline)", cid, _sev)
+            except Exception as e:
+                logger.warning("heal_infection %s: %s", cid, e)
+        logger.warning("set_heal_infection: вылечено %d организмам", n)
+        return True
+
     def set_life_support_sustained(self, on: bool) -> bool:
         """Канал client_flags life_support_sustained (i) (Хьюберт §20.6.5, наблюдение оси).
         ON: каждый тик держит energy≥φ⁻²·max (~500) и hydration≥φ⁻¹·100 (~62) для single-
