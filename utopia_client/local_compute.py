@@ -9838,16 +9838,19 @@ class LocalColonyCompute:
                  # замерить CV (шум-floor) на ~1 климат-цикл до включения в GC.
                  round(float(getattr(bc, "hydration", 0.0)), 1),
                  round(float(getattr(bc, "fatigue", 0.0)), 1),
-                 round(float(getattr(bc, "adrenaline", 0.0)), 1))
+                 round(float(getattr(bc, "adrenaline", 0.0)), 1),
+                 # satiety = ГОЛОД-метрика (пилот Stage-2: голод server-невидим,
+                 # satiety client-authoritative → ключевой тренд у меня).
+                 round(float(getattr(bc, "satiety", 0.0)), 1))
                 for cid, bc in biochem.items()
             ])
             _probe = (f" PROBE_ABLATE={self._behavioral_probe_role}"
                       if self._behavioral_probe_role else "")
             logger.info(
-                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb_hyd_fat_adr:%s %s", _probe,
+                "BIOCHEM_DEBUG cids_e_cort_ser_g_mb_hyd_fat_adr_sat:%s %s", _probe,
                 "; ".join(f"{cid}:e={e},cort={c},ser={s},g={g},mb={mb},"
-                          f"hyd={hyd},fat={fat},adr={adr}"
-                          for cid, e, c, s, g, mb, hyd, fat, adr in per_cid_e))
+                          f"hyd={hyd},fat={fat},adr={adr},sat={sat}"
+                          for cid, e, c, s, g, mb, hyd, fat, adr, sat in per_cid_e))
         except Exception as _e:
             logger.debug("biochem debug log failed: %s", _e)
         # INSULA_TEMP_DEBUG (Track 2 (б)): сигнал ОБУЧЕНИЯ моста — отличить
