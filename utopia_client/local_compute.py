@@ -11459,25 +11459,43 @@ class LocalColonyCompute:
                         "MEDIUM_KILL cid=%s delta_e=%.1f total_med=%d energy=%.0f",
                         cid, delta_e, self._skill_kill_medium[cid],
                         float(getattr(bc, "energy", 0.0)))
-            # Пилот самораспознавания (Хьюберт канал 29ed380): raw-eat payoff. Сервер шлёт
-            # точные суммы (float-аккумулятор, drain после чтения — как kill_energy_acc). Под
-            # scaling_energy raw кормит через SATIETY (glucose декаплен=mood). diet-INDEPENDENT
-            # FLAT: raw=special novel-объект (не plant/meat) → значение ФИНАЛЬНОЕ, БЕЗ ×(1−diet).
-            # Чинит Gate-A провал: до канала payoff=0/крохи (0.76 как берри для карнивора) →
-            # Адам игнорил raw ПРАВИЛЬНО (не кормит). Теперь +30 sat/+5 glu за eat = survival-знач.
-            _raw_sat_acc = float(event.get("raw_eat_satiety_acc", 0.0) or 0.0)
-            _raw_glu_acc = float(event.get("raw_eat_glucose_acc", 0.0) or 0.0)
-            if _raw_sat_acc > 0.0 and self._scaling_energy_enabled:
+            # Пилот gate-A v2 (Хьюберт фикс): корень был LOSSY read-reset acc (дренился 2-м
+            # obs-build до dispatch). Фикс-контракт: сервер шлёт МОНОТОННЫЙ total
+            # (raw_eat_satiety_total/glucose_total, НЕ дренится) → клиент применяет ДЕЛЬТУ
+            # (total − last_seen) → update last_seen. exactly-once через lossy/multi-build канал.
+            # init-on-first-sight (last_seen=total, backlog НЕ применяем) + reset-detect
+            # (total<last_seen → resync). FLAT diet-independent (+30 sat/+5 glu/eat, финал).
+            if not hasattr(self, "_raw_sat_seen"):
+                self._raw_sat_seen = {}
+            if not hasattr(self, "_raw_glu_seen"):
+                self._raw_glu_seen = {}
+            _raw_sat_tot = float(event.get("raw_eat_satiety_total", 0.0) or 0.0)
+            _raw_glu_tot = float(event.get("raw_eat_glucose_total", 0.0) or 0.0)
+            _prev_s = self._raw_sat_seen.get(cid)
+            if _prev_s is None or _raw_sat_tot < _prev_s:   # first-sight / server-reset → resync
+                self._raw_sat_seen[cid] = _raw_sat_tot
+                _d_sat = 0.0
+            else:
+                _d_sat = _raw_sat_tot - _prev_s
+                self._raw_sat_seen[cid] = _raw_sat_tot
+            _prev_g = self._raw_glu_seen.get(cid)
+            if _prev_g is None or _raw_glu_tot < _prev_g:
+                self._raw_glu_seen[cid] = _raw_glu_tot
+                _d_glu = 0.0
+            else:
+                _d_glu = _raw_glu_tot - _prev_g
+                self._raw_glu_seen[cid] = _raw_glu_tot
+            if _d_sat > 0.0 and self._scaling_energy_enabled:
                 _rmsat = float(getattr(bc, "max_satiety", 100.0))
                 bc.satiety = min(_rmsat,
-                                 float(getattr(bc, "satiety", 100.0)) + _raw_sat_acc)
-            if _raw_glu_acc > 0.0:
+                                 float(getattr(bc, "satiety", 100.0)) + _d_sat)
+            if _d_glu > 0.0:
                 bc.glucose = min(100.0,
-                                 float(getattr(bc, "glucose", 0.0)) + _raw_glu_acc)
-            if _raw_sat_acc > 0.0 or _raw_glu_acc > 0.0:
-                logger.info("RAW_EAT_PAYOFF cid=%s sat_acc=%.1f glu_acc=%.1f → satiety=%.1f "
-                            "glucose=%.1f (пилот gate-A payoff)", cid, _raw_sat_acc,
-                            _raw_glu_acc, float(getattr(bc, "satiety", 0.0)),
+                                 float(getattr(bc, "glucose", 0.0)) + _d_glu)
+            if _d_sat > 0.0 or _d_glu > 0.0:
+                logger.info("RAW_EAT_PAYOFF cid=%s d_sat=%.1f d_glu=%.1f total_s=%.1f → "
+                            "satiety=%.1f glucose=%.1f (gate-A v2 total-delta)", cid, _d_sat,
+                            _d_glu, _raw_sat_tot, float(getattr(bc, "satiety", 0.0)),
                             float(getattr(bc, "glucose", 0.0)))
             # F5 skill-growth (Фрай): счётчик еды (ate или income energy>0) —
             # опыт фуражёра → efficiency растёт каждые 200 тиков.

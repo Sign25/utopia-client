@@ -1879,11 +1879,13 @@ class ColonyWSClient:
             # per-creature payload c? Если force-eat был, а лог пуст → сервер кладёт не в c
             # (или иное имя) → правка на сервере/парсинге. Временный.
             try:
-                _rsa_v = float(c.get("raw_eat_satiety_acc", 0.0) or 0.0)
-                _rga_v = float(c.get("raw_eat_glucose_acc", 0.0) or 0.0)
-                if _rsa_v > 0.0 or _rga_v > 0.0:
-                    logger.info("RAW_ACC_ARRIVE cid=%s sat_acc=%.1f glu_acc=%.1f "
-                                "(acc>0 дошёл в c → parse ок)", cid_s, _rsa_v, _rga_v)
+                _dbg_keys = [k for k in c.keys() if "raw" in k.lower()]
+                if _dbg_keys:
+                    self._raw_keys_diag_n = getattr(self, "_raw_keys_diag_n", 0) + 1
+                    if self._raw_keys_diag_n % 300 == 1:
+                        logger.info("RAW_KEYS cid=%s keys=%s sat_total=%s glu_total=%s",
+                                    cid_s, _dbg_keys, c.get("raw_eat_satiety_total"),
+                                    c.get("raw_eat_glucose_total"))
             except Exception:
                 pass
             # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
@@ -1904,8 +1906,10 @@ class ColonyWSClient:
                 # (read-and-reset как kill_acc). БЕЗ проброса здесь = дропались на whitelist
                 # → _apply_biochem_events не видел → payoff=0 (Gate-A не чинился). FLAT
                 # diet-independent (satiety 30 / glucose 5 за eat, значения финальные).
-                "raw_eat_satiety_acc": float(c.get("raw_eat_satiety_acc", 0.0) or 0.0),
-                "raw_eat_glucose_acc": float(c.get("raw_eat_glucose_acc", 0.0) or 0.0),
+                # Gate-A v2 (Хьюберт фикс lossy acc → монотонный total): пробрасываю total
+                # (НЕ acc) — клиент применяет дельту (total−last_seen) в _apply_biochem_events.
+                "raw_eat_satiety_total": float(c.get("raw_eat_satiety_total", 0.0) or 0.0),
+                "raw_eat_glucose_total": float(c.get("raw_eat_glucose_total", 0.0) or 0.0),
                 # PHASE B eating (#6, eating.md): прогресс многотикового поедания —
                 # eating_progress(0..1)/target_kind/remaining/total. Рефлекс-floor
                 # (Phase A) уже держит «ест→продолжать»; B потребляет progress для
