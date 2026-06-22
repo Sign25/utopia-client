@@ -1910,6 +1910,9 @@ class ColonyWSClient:
                 # (НЕ acc) — клиент применяет дельту (total−last_seen) в _apply_biochem_events.
                 "raw_eat_satiety_total": float(c.get("raw_eat_satiety_total", 0.0) or 0.0),
                 "raw_eat_glucose_total": float(c.get("raw_eat_glucose_total", 0.0) or 0.0),
+                # Gate-B HARD/SOFT-диаг: nearest_raw_object (dr/dc/dist) — эмитит ли мотор
+                # EAT(14) на raw-тайле? Проброс для EAT_ON_RAW-диага в action-loop.
+                "nearest_raw_object": c.get("nearest_raw_object"),
                 # PHASE B eating (#6, eating.md): прогресс многотикового поедания —
                 # eating_progress(0..1)/target_kind/remaining/total. Рефлекс-floor
                 # (Phase A) уже держит «ест→продолжать»; B потребляет progress для

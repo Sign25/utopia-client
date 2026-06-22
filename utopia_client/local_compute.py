@@ -4413,6 +4413,23 @@ class LocalColonyCompute:
                         self._nav["gather_onf"] += 1
                 elif action == 14:      # EAT
                     self._nav["eat"] += 1
+                    # Gate-B HARD/SOFT-диаг (Хьюберт): эмитит ли мотор EAT(14) на RAW-тайле
+                    # (не флора)? HARD = почти 0 эмиссий (EAT рефлекс-only на known-флоре,
+                    # мотор own=1.0→MOVE) → novelty не поможет. SOFT = ε иногда эмитит на raw
+                    # → novelty усилит. Прямой счётчик эмиссии (не сервер-резолв). nearest_raw
+                    # dist≤1 = на/рядом raw И НЕ на флоре → EAT-на-novel.
+                    _nro = ((events_per_cid.get(cid, {}) or {}).get("nearest_raw_object")
+                            if events_per_cid else None)
+                    if isinstance(_nro, dict) and not _onf:
+                        try:
+                            _rdist = float(_nro.get("dist", 99.0))
+                        except (TypeError, ValueError):
+                            _rdist = 99.0
+                        if _rdist <= 1.0:
+                            self._eat_on_raw_n = getattr(self, "_eat_on_raw_n", 0) + 1
+                            logger.info("EAT_ON_RAW cid=%s EMIT EAT(14) на raw dist=%.1f "
+                                        "(эмиссий на raw=%d) — SOFT-сигнал", cid, _rdist,
+                                        self._eat_on_raw_n)
                 if 0 <= action <= 3:    # move N/S/E/W (YIELD_GATE-диаг)
                     self._nav["move"] += 1
                     # NAV-HIT (Фрай 06.06): депишн-независимая метрика навигации —
