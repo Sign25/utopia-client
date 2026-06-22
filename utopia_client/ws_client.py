@@ -1875,6 +1875,17 @@ class ColonyWSClient:
                                     c.get("obs") is not None)
                     except Exception:
                         pass
+            # DEBUG raw-acc arrival (пилот gate-A): доходит ли raw_eat_satiety_acc в
+            # per-creature payload c? Если force-eat был, а лог пуст → сервер кладёт не в c
+            # (или иное имя) → правка на сервере/парсинге. Временный.
+            try:
+                _dbg_keys = [k for k in c.keys() if "raw" in k.lower()]
+                if _dbg_keys or c.get("raw_eat_satiety_acc"):
+                    logger.info("RAW_ACC_ARRIVE cid=%s sat_acc=%s glu_acc=%s raw_keys=%s",
+                                cid_s, c.get("raw_eat_satiety_acc"),
+                                c.get("raw_eat_glucose_acc"), _dbg_keys)
+            except Exception:
+                pass
             # Phase F3.2.a/b: события прошлого тика — для Hebbian R3 reward.
             # Поля могут отсутствовать у старых P40 — компонуем с дефолтами.
             events_per_cid[cid_s] = {
