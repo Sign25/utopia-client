@@ -573,6 +573,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_heal_infection: bool | None = None   # разовое лечение инфекции (пилот baseline)
     applied_try_drive: bool | None = None         # try-drive (позыв пробовать EAT на незнакомом)
     applied_try_boost: float | None = None        # калибровка магнитуды try-drive буста
+    applied_try_decay: float | None = None         # калибровка скорости затухания try_urge
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -1322,6 +1323,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("try_boost → %s", _tb)
                         except Exception as e:
                             logger.warning("set_try_boost failed: %s", e)
+                    _tdc = flags.get("try_decay")
+                    if _tdc is not None and _tdc != applied_try_decay \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_try_decay(float(_tdc))
+                            applied_try_decay = _tdc
+                            logger.info("try_decay → %s", _tdc)
+                        except Exception as e:
+                            logger.warning("set_try_decay failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +

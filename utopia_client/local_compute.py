@@ -711,6 +711,7 @@ class LocalColonyCompute:
         self._try_drive_enabled: bool = False   # client_flag try_drive (OFF dormant)
         self._try_urge: dict = {}               # cid → текущий позыв (innate→затухает с пробами)
         self._try_boost: float = 2.0            # магнитуда EAT-логит-буста (tunable, калибровка)
+        self._try_decay: float = 0.985          # затухание urge per-проба (tunable; окно≥learning)
         # sustained-life_support (i) (Хьюберт §20.6.5): держит energy/hyd ВЫШЕ порога
         # КАЖДЫЙ тик (не разовый edge как life_support) → выживание decoupled → ось stamina
         # (усталость/отдых) наблюдаем в ИЗОЛЯЦИИ без §3/дегидратации-конфаундов (food-halo-
@@ -4453,9 +4454,15 @@ class LocalColonyCompute:
                             _rdist = 99.0
                         if _rdist <= 1.0:
                             self._eat_on_raw_n = getattr(self, "_eat_on_raw_n", 0) + 1
+                            # Try-drive PURE-DECAY per-АКТУАЛЬНАЯ-проба (Шеф ретюн): эмиссия
+                            # EAT на raw = ОДНА проба → гасим try_urge (НЕ per-exposure-тик).
+                            # reward-независимо. Медленный decay → окно проб ≥ motor-learning.
+                            if self._try_drive_enabled:
+                                self._try_urge[cid] = (
+                                    self._try_urge.get(cid, 1.0) * self._try_decay)
                             logger.info("EAT_ON_RAW cid=%s EMIT EAT(14) на raw dist=%.1f "
-                                        "(эмиссий на raw=%d) — SOFT-сигнал", cid, _rdist,
-                                        self._eat_on_raw_n)
+                                        "(эмиссий=%d, urge=%.3f) — проба", cid, _rdist,
+                                        self._eat_on_raw_n, self._try_urge.get(cid, 1.0))
                 if 0 <= action <= 3:    # move N/S/E/W (YIELD_GATE-диаг)
                     self._nav["move"] += 1
                     # NAV-HIT (Фрай 06.06): депишн-независимая метрика навигации —
@@ -11044,9 +11051,9 @@ class LocalColonyCompute:
             logits[14] = float(logits[14]) + self._try_boost * _urge * (1.0 - _sr)
         except (IndexError, TypeError, ValueError):
             return
-        # PURE-DECAY: позыв гаснет с каждой пробой-возможностью. БЕЗ reward-модуляции →
-        # устойчивое поедание = motor-learning, не форс. Genuine PASS = рост поверх baseline.
-        self._try_urge[cid] = _urge * 0.97
+        # PURE-DECAY: затухание НЕ здесь (было per-exposure-тик → гасло за ~16мин до того как
+        # motor успел консолидировать = false-collapse). Перенесено в EAT_ON_RAW-ветку =
+        # per-АКТУАЛЬНАЯ-проба (эмиссия EAT на raw). Окно проб ≥ скорости обучения (Шеф).
         self._try_drive_n = getattr(self, "_try_drive_n", 0) + 1
         if self._try_drive_n % 25 == 1:
             logger.info("TRY_DRIVE cid=%s urge=%.3f sr=%.2f dist=%.1f boost=%.2f → EAT-bias "
@@ -11074,6 +11081,18 @@ class LocalColonyCompute:
             logger.info("set_try_boost: %.2f → %.2f", self._try_boost, b)
         self._try_boost = b
         return self._try_boost
+
+    def set_try_decay(self, decay: float) -> float:
+        """Калибровка скорости затухания try_urge per-проба (sweep; ближе к 1 = окно проб
+        дольше = больше времени motor-learning до extinction). Кламп (0, 1]."""
+        try:
+            d = min(1.0, max(0.5, float(decay)))
+        except (TypeError, ValueError):
+            return self._try_decay
+        if d != self._try_decay:
+            logger.info("set_try_decay: %.3f → %.3f", self._try_decay, d)
+        self._try_decay = d
+        return self._try_decay
 
     def _apply_corpse_approach(self, cid: str, out: dict, obs) -> None:
         """ДЕТЕРМ. ШАГ-НА-ТУШУ для adjacent трупа (Phase C medium-fix 14.06).
