@@ -331,6 +331,14 @@ class WorldStateCache:
         self.snaps_applied += 1
         if flora_delta.get("full"):
             self.full_frames_received += 1
+        # RAW_FLOW диаг (пилот самораспознавания верификация): наполняется ли cache.raw из
+        # raw_delta (разводит «Адам игнорит raw» vs «не воспринимает — flow сломан»). Throttle.
+        if _APPLY_HAS_RAW_DELTA:
+            self._raw_flow_n = getattr(self, "_raw_flow_n", 0) + 1
+            _rd = snap.get("raw_delta")
+            if (_rd or self._raw_flow_n % 100 == 1):
+                _nraw = len(getattr(self._state, "raw", None) or ())
+                logger.info("RAW_FLOW cache.raw=%d raw_delta_in_snap=%s", _nraw, bool(_rd))
         return True
 
     # ─────────────────────────── obs view ────────────────────────────
