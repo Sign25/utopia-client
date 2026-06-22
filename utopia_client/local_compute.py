@@ -702,6 +702,15 @@ class LocalColonyCompute:
         # decay 0.55+гистерезис (recovery ожила), (2) force-STAY@exhaustion single → видимый
         # отдых, (3) blocked-move→0-fatigue. OFF dormant → bit-identical. kill-switch.
         self._fatigue_rest_floor_enabled: bool = False  # client_flag fatigue_rest_floor (OFF dormant)
+        # Try-drive (Шеф 22.06, пилот самооткрытия еды): врождённый ПОЗЫВ попробовать EAT на
+        # НЕЗНАКОМОМ объекте (raw) под голодом — НЕ ответ, НЕ reward, НЕ аффорданс. Смещает
+        # выбор к пробе (буст EAT-логита), PURE-DECAY self-extinguishing (try_urge гаснет с
+        # пробами, без reward-инъекции). Ценность Адам учит САМ из последствия (+30 satiety →
+        # motor_policy REINFORCE → bias_scale↓ → мотор сам эмитит). PASS = поедание устойчиво
+        # ПОВЕРХ затухающего try-baseline = самооткрытие. Рефлекс-floor (флора) НЕ трогаем.
+        self._try_drive_enabled: bool = False   # client_flag try_drive (OFF dormant)
+        self._try_urge: dict = {}               # cid → текущий позыв (innate→затухает с пробами)
+        self._try_boost: float = 2.0            # магнитуда EAT-логит-буста (tunable, калибровка)
         # sustained-life_support (i) (Хьюберт §20.6.5): держит energy/hyd ВЫШЕ порога
         # КАЖДЫЙ тик (не разовый edge как life_support) → выживание decoupled → ось stamina
         # (усталость/отдых) наблюдаем в ИЗОЛЯЦИИ без §3/дегидратации-конфаундов (food-halo-
@@ -4223,6 +4232,23 @@ class LocalColonyCompute:
                     # Lamarckian (eat→eff↑→income↑). passive_eating — бэкстоп.
                     self._apply_newborn_instinct(
                         cid, logits[0], world_tick, _onf, _p40_cf)
+                    # Try-drive (Шеф 22.06): позыв попробовать EAT на незнакомом (raw) под
+                    # голодом → буст EAT-логита (после shaping, до motor). self-extinguishing.
+                    # OFF dormant. nearest_raw из event, satiety из bc, d_prox=obs[61].
+                    if self._try_drive_enabled:
+                        _bc_td = self.biochem.get(cid)
+                        if _bc_td is not None:
+                            try:
+                                _dpx_td = (float(obs_arr[61])
+                                           if obs_arr is not None and len(obs_arr) > 61
+                                           else 0.0)
+                            except (TypeError, ValueError, IndexError):
+                                _dpx_td = 0.0
+                            self._apply_try_drive(
+                                cid, logits[0], _ev_cid.get("nearest_raw_object"),
+                                float(getattr(_bc_td, "satiety", 100.0)),
+                                float(getattr(_bc_td, "max_satiety", 100.0)),
+                                _dpx_td, _onf)
                 except Exception as e:
                     logger.debug("action shaping %s: %s", cid, e)
 
@@ -10976,6 +11002,78 @@ class LocalColonyCompute:
         if self._eat_reflex_n % 20 == 0:     # прямое подтверждение срабатывания
             logger.info("EAT_REFLEX cid=%s fired #%d (on_food, d_prox=%.2f) → EAT override",
                         cid, self._eat_reflex_n, _dpx)
+
+    def _apply_try_drive(self, cid: str, logits, nearest_raw, satiety: float,
+                         max_satiety: float, d_prox: float, on_flora: bool) -> None:
+        """Try-drive (Шеф 22.06, пилот самооткрытия еды).
+
+        Врождённый ПОЗЫВ ПОПРОБОВАТЬ EAT на НЕЗНАКОМОМ объекте (raw) под голодом — даём
+        позыв, НЕ ответ. НЕ reward (последствие = +30 satiety через server-канал, не тут),
+        НЕ аффорданс (не говорим «raw=еда»), НЕ novelty (она снята — усиливать было нечего,
+        проблема была: EAT-эмиссии на новом нет; тут чиним выражение). Смещает выбор к пробе
+        БУСТОМ EAT-логита (не детерм. override как рефлекс — мозг ещё может выбрать иначе;
+        реальное действие резолвит selector). PURE-DECAY self-extinguishing: try_urge гаснет
+        с каждой пробой-возможностью, БЕЗ reward-инъекции (зверь потыкал несъедобное — бросил).
+        ⇒ устойчивость/рост поедания = ГЕНУИННОЕ обучение (motor_policy от +30 satiety →
+        bias_scale↓ → мотор сам эмитит), НЕ форс драйва. Ценность «еда/не еда» Адам учит САМ.
+
+        Иерархия: predator-FLEE > try (d_prox-гейт, как рефлекс). Floor (флора eat-рефлекс)
+        НЕ трогаем — на флоре рефлекс владеет (on_flora skip). satiety-keyed (голод-драйв)."""
+        if not self._try_drive_enabled or not self._single_organism:
+            return
+        if on_flora or not isinstance(nearest_raw, dict):
+            return                              # на флоре → рефлекс; нет raw → нет позыва
+        try:
+            _rdist = float(nearest_raw.get("dist", 99.0))
+        except (TypeError, ValueError):
+            return
+        if _rdist > 1.0:                        # не на/у незнакомого raw
+            return
+        if d_prox >= 0.15:                      # хищник близко → FLEE приоритет (как рефлекс)
+            return
+        _msat = max(1.0, float(max_satiety))
+        _sr = float(satiety) / _msat
+        _TRY_HUNGER_GATE = _PHI_CONST ** -1     # φ⁻¹≈0.618 — голод-порог (как eat-onset)
+        if _sr >= _TRY_HUNGER_GATE:             # не голоден → нет позыва
+            return
+        _urge = self._try_urge.get(cid, 1.0)    # innate начальный позыв
+        if _urge <= 0.02:                       # позыв угас (потыкал незнакомое — бросил)
+            return
+        # БУСТ EAT-логита ∝ позыв × голод — смещение к пробе (не override)
+        try:
+            logits[14] = float(logits[14]) + self._try_boost * _urge * (1.0 - _sr)
+        except (IndexError, TypeError, ValueError):
+            return
+        # PURE-DECAY: позыв гаснет с каждой пробой-возможностью. БЕЗ reward-модуляции →
+        # устойчивое поедание = motor-learning, не форс. Genuine PASS = рост поверх baseline.
+        self._try_urge[cid] = _urge * 0.97
+        self._try_drive_n = getattr(self, "_try_drive_n", 0) + 1
+        if self._try_drive_n % 25 == 1:
+            logger.info("TRY_DRIVE cid=%s urge=%.3f sr=%.2f dist=%.1f boost=%.2f → EAT-bias "
+                        "(позыв пробы незнакомого, self-extinguish)", cid, _urge, _sr,
+                        _rdist, self._try_boost)
+
+    def set_try_drive(self, on: bool) -> bool:
+        """client_flag try_drive (Шеф 22.06): врождённый позыв пробовать EAT на незнакомом.
+        OFF dormant. При включении сбрасывает try_urge (свежий innate позыв)."""
+        v = bool(on)
+        if v != self._try_drive_enabled:
+            if v:
+                self._try_urge = {}             # свежий innate позыв при включении
+            logger.info("set_try_drive: %s → %s", self._try_drive_enabled, v)
+        self._try_drive_enabled = v
+        return self._try_drive_enabled
+
+    def set_try_boost(self, boost: float) -> float:
+        """Калибровка магнитуды EAT-логит-буста try-drive (live-sweep, как raw_satiety)."""
+        try:
+            b = max(0.0, float(boost))
+        except (TypeError, ValueError):
+            return self._try_boost
+        if b != self._try_boost:
+            logger.info("set_try_boost: %.2f → %.2f", self._try_boost, b)
+        self._try_boost = b
+        return self._try_boost
 
     def _apply_corpse_approach(self, cid: str, out: dict, obs) -> None:
         """ДЕТЕРМ. ШАГ-НА-ТУШУ для adjacent трупа (Phase C medium-fix 14.06).

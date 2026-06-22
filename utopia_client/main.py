@@ -571,6 +571,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_scaling_energy: bool | None = None         # энергия из нужд (§Закон 1, lockstep Хьюберт)
     applied_life: bool | None = None
     applied_heal_infection: bool | None = None   # разовое лечение инфекции (пилот baseline)
+    applied_try_drive: bool | None = None         # try-drive (позыв пробовать EAT на незнакомом)
+    applied_try_boost: float | None = None        # калибровка магнитуды try-drive буста
     applied_behavioral_gc_retest: bool | None = None
     applied_hunting: bool | None = None   # аффорданс ОХОТА (Фрай hunting.md)
     # Ступень 2 (Фрай 03.06.2026): motor renorm growth-cap. Через client_flags
@@ -1299,6 +1301,27 @@ def cmd_run(args: argparse.Namespace) -> int:
                         except Exception as e:
                             logger.warning("set_heal_infection failed: %s", e)
                     applied_heal_infection = target_heal
+
+                    # TRY-DRIVE (Шеф 22.06, пилот самооткрытия еды): позыв пробовать EAT на
+                    # незнакомом (raw) под голодом. OFF dormant. + try_boost калибровка (sweep).
+                    target_try = bool(flags.get("try_drive", False))
+                    if target_try != applied_try_drive \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_try_drive(target_try)
+                            applied_try_drive = target_try
+                            logger.info("try_drive → %s", target_try)
+                        except Exception as e:
+                            logger.warning("set_try_drive failed: %s", e)
+                    _tb = flags.get("try_boost")
+                    if _tb is not None and _tb != applied_try_boost \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_try_boost(float(_tb))
+                            applied_try_boost = _tb
+                            logger.info("try_boost → %s", _tb)
+                        except Exception as e:
+                            logger.warning("set_try_boost failed: %s", e)
 
                     # Аффорданс ОХОТА (Фрай hunting.md v0.1): hunting=true → Адам
                     # всеядный (diet→0.618) → server kill-energy + DS-hunt-ATTACK +
