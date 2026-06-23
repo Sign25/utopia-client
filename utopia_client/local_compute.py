@@ -714,6 +714,7 @@ class LocalColonyCompute:
         self._try_decay: float = 0.985          # затухание urge per-проба (tunable; окно≥learning)
         self._reward_raw_seen: dict = {}        # cid → last raw_eat_satiety_total (кредит raw-eat
         #                                         в моторную награду = паритет `ate`, Фрай 23.06)
+        self._action_hist: dict = {}            # cid → список последних действий (pinpoint тик-сдвиг)
         self._raw_eat_emit_pending: dict = {}   # cid → пред.действие было EAT-on-raw эмиссией
         #     (capture-at-emission, Фрай 23.06: on_raw точен в момент эмиссии → кредит на EAT-запись
         #      slow_trainer, не мис-тайминг on_raw-в-момент-награды; лечим тайминг, не атрибуцию)
@@ -4385,9 +4386,10 @@ class LocalColonyCompute:
                                     _ev_ate = bool(_ev.get("ate", False)) if _ev else False
                                     if _ev_ate or int(_prev[1]) == 14 or _rew > 3.0:
                                         logger.info("MOTOR_ATTR recorded_action=%d rew=%.2f "
-                                                    "event_ate=%s final_now=%d (eat-outcome→на "
-                                                    "какое действие сел кредит)", int(_prev[1]),
-                                                    float(_rew), _ev_ate, int(action))
+                                                    "event_ate=%s final_now=%d hist=%s (pinpoint: "
+                                                    "где EAT14 в hist vs recorded = тик-сдвиг)",
+                                                    int(_prev[1]), float(_rew), _ev_ate,
+                                                    int(action), self._action_hist.get(cid))
                                     _tr.record(_prev[0], _prev[1], _rew, _prev[2])
                                     if _tr.should_train():
                                         _tr.train_step(float(_own), float(_T_m))
@@ -4415,6 +4417,12 @@ class LocalColonyCompute:
                     _bc[1] = action
                 out[cid] = {"action": action, "target_id": None}
                 self._stat_last_action[cid] = int(action)  # /stats active_eat_rate
+                # pinpoint тик-сдвиг (Фрай): история последних действий → в момент `ate`-записи
+                # видно, на сколько тиков назад был EAT(14) vs recorded_action (точный misalign).
+                _ah = self._action_hist.setdefault(cid, [])
+                _ah.append(int(action))
+                if len(_ah) > 8:
+                    del _ah[0]
                 # deception-exploit probe (Фрай v0.6) — READ-ONLY: учится ли Адам
                 # каузально эксплуатировать ложный DANGER в tribe-FOOD контексте.
                 # Гейт client_flag deception_probe (OFF → zero-cost). Мотор НЕ трогаем.
