@@ -6416,7 +6416,7 @@ class LocalColonyCompute:
         torch = self._torch
         row_norms = self.motor_sfnn_row_norms.get(cid)
         try:
-            r_imm = self._compute_immediate_reward(event)
+            r_imm = self._compute_immediate_reward(event, cid)
             r_imm_total = float(r_imm + intrinsic_now)
             # REINFORCE baseline (Phase 4 #1, 01.06.2026): advantage =
             # reward − бегущее среднее. Выше среднего (eat/kill) → gain>1
