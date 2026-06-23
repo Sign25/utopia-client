@@ -714,6 +714,9 @@ class LocalColonyCompute:
         self._try_decay: float = 0.985          # затухание urge per-проба (tunable; окно≥learning)
         self._reward_raw_seen: dict = {}        # cid → last raw_eat_satiety_total (кредит raw-eat
         #                                         в моторную награду = паритет `ate`, Фрай 23.06)
+        self._raw_eat_emit_pending: dict = {}   # cid → пред.действие было EAT-on-raw эмиссией
+        #     (capture-at-emission, Фрай 23.06: on_raw точен в момент эмиссии → кредит на EAT-запись
+        #      slow_trainer, не мис-тайминг on_raw-в-момент-награды; лечим тайминг, не атрибуцию)
         # sustained-life_support (i) (Хьюберт §20.6.5): держит energy/hyd ВЫШЕ порога
         # КАЖДЫЙ тик (не разовый edge как life_support) → выживание decoupled → ось stamina
         # (усталость/отдых) наблюдаем в ИЗОЛЯЦИИ без §3/дегидратации-конфаундов (food-halo-
@@ -4472,6 +4475,10 @@ class LocalColonyCompute:
                                       if events_per_cid else False)
                     if _on_raw_ev and not _onf:
                         self._eat_on_raw_n = getattr(self, "_eat_on_raw_n", 0) + 1
+                        # CAPTURE-AT-EMISSION (Фрай 23.06): захват EAT-on-raw эмиссии для кредита
+                        # на след.тике (когда slow_trainer пишет это действие) — on_raw точен ЗДЕСЬ
+                        # (момент эмиссии), не мис-таймится. Лечит доставку raw-reward на EAT-запись.
+                        self._raw_eat_emit_pending[cid] = True
                         # Try-drive PURE-DECAY per-АКТУАЛЬНАЯ-проба (Шеф ретюн): EAT на raw
                         # (server on_raw) = ОДНА резолвабельная проба → гасим try_urge. reward-
                         # независимо. Медленный decay → окно проб ≥ скорости motor-learning.
@@ -5281,17 +5288,15 @@ class LocalColonyCompute:
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
         # Кредит raw-eat в моторную награду (пилот самооткрытия, Фрай 23.06: ПАРИТЕТ `ate`).
-        # EMISSION-кредит (steer Шеф/Фрай 23.06): кредитим EAT-on-raw ЭМИССИЮ напрямую (prev-
-        # action==14 & on_raw), НЕ резолв (был лаг obs5Гц/action1.7Гц → награда садилась на
-        # лаггнутое действие → m_argmax осел на SHARE/GATHER, не EAT = мис-атрибуция). Атрибуция
-        # на ПРИЧИННОЕ EAT-действие важнее строгого паритета счёта (over-кредит нерезолвнутых
-        # проб = норм credit-to-action, бьёт в ПРАВИЛЬНОЕ действие; ценность-payoff течёт только
-        # с реальных +30). motor-сайты (6419 SFNN @3829, 4357 slow_trainer) ДО 4389 → здесь
-        # _stat_last_action = ПРЕД действие = корректная атрибуция m_argmax.
-        if cid is not None:
-            _last_act = self._stat_last_action.get(cid)
-            if _last_act == 14 and bool(event.get("on_raw", False)):
-                ate = True                                  # EAT-on-raw эмиссия = паритет ate
+        # CAPTURE-AT-EMISSION (Фрай go 23.06): ФАКТ-замер показал — slow_trainer кредитит
+        # ФИНАЛ верно (records action=14 на EAT), но raw-reward НЕ доходил (EAT-rew=0, утекал на
+        # лаггнутый MOVE) — мой прежний on_raw-в-момент-награды(T) мис-таймился с EAT-эмиссией(T-1).
+        # Фикс: флаг захвачен В МОМЕНТ EAT-on-raw эмиссии (on_raw там точен — тот же, по которому
+        # try-drive фейрит), применяется когда slow_trainer пишет это действие (T-1) на след.тике.
+        # Лечим ТАЙМИНГ доставки, НЕ атрибуцию (она верна). consume → кредит один раз.
+        if cid is not None and self._raw_eat_emit_pending.get(cid, False):
+            self._raw_eat_emit_pending[cid] = False         # consume (кредит один раз)
+            ate = True                                      # EAT-on-raw эмиссия = паритет ate
         if self._reward_balance_on > 0.0:
             # Энерго-дифференцированный: hunt φ⁷ vs forage φ⁴, risk = damage.
             # Дефолты весов 1.0: forage 6.85, safe-kill 29 (4.2×), full-damage
