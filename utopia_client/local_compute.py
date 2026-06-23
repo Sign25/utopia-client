@@ -3825,6 +3825,16 @@ class LocalColonyCompute:
                 # ВЫКЛ — renorm воевал бы с REINFORCE-градиентом; на сервере Hebbian
                 # на memory/brain, REINFORCE на policy (разные ткани). Слабый канал =
                 # единственный учитель motor_policy. Высшие/basic ткани — свой Hebbian.
+                # MOTOR_ATTR диаг (Фрай: активен ли SFNN-путь — он reward-модулирует Hebbian
+                # на АКТИВАЦИЯХ мотора = подкрепляет ВЫХОД мотора, НЕ финальное действие → если
+                # доминирует, мотор учит свой выход 8/9, не try-drive EAT). log-only, throttle.
+                self._motor_path_diag_n = getattr(self, "_motor_path_diag_n", 0) + 1
+                if self._motor_path_diag_n % 200 == 1:
+                    logger.info("MOTOR_PATH sfnn_on=%s sfnn_fires=%s slow_on=%.1f pg_on=%.1f "
+                                "voice=%.2f (SFNN кредитит выход-мотора; slow=финал)",
+                                sfnn_on, bool(sfnn_on and self._motor_slow_on <= 0.0),
+                                float(self._motor_slow_on), float(self._motor_pg_on),
+                                float(self._motor_voice))
                 if sfnn_on and self._motor_slow_on <= 0.0:
                     self._motor_sfnn_update_step(cid, events_per_cid,
                                                    intrinsic_now)
@@ -4362,6 +4372,15 @@ class LocalColonyCompute:
                             _prev = self._slow_pending.get(cid)
                             if _prev is not None:
                                 try:
+                                    # MOTOR_ATTR диаг (Фрай: факт из живого замера, log-only):
+                                    # какое action_id slow_trainer кредитит + reward. _prev[1] =
+                                    # ФИНАЛЬНОЕ эмитнутое действие пред.тика (то же что Адам
+                                    # исполнил, вкл. try-drive EAT). Лог при EAT(14) или высоком
+                                    # rew (food-кредит) → видно: финал(14) или нет, на raw-eat.
+                                    if int(_prev[1]) == 14 or _rew > 3.0:
+                                        logger.info("MOTOR_ATTR slow_trainer records action=%d "
+                                                    "rew=%.2f final_now=%d (факт: кредитит ФИНАЛ)",
+                                                    int(_prev[1]), float(_rew), int(action))
                                     _tr.record(_prev[0], _prev[1], _rew, _prev[2])
                                     if _tr.should_train():
                                         _tr.train_step(float(_own), float(_T_m))
