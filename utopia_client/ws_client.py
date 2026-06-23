@@ -2786,14 +2786,28 @@ class ColonyWSClient:
             self.compute is not None
             and getattr(self.compute, "_pos_reconcile_enabled", False)
             and getattr(self.compute, "_single_organism", False))
+        # POS-RECON ФИКС (Хьюберт §20.6 контракт 23.06, факт по коду obs.py:426-427): для
+        # owned-Адама АВТОРИТЕТ = payload.row/col (c, obs_batch) — server POST-RESOLVE pos,
+        # шлётся каждый тик; on_raw/on_flora/nearest_raw резолвятся ОТ НЕЁ. А creature_pos
+        # (snap.creatures) = КЛИЕНТСКИЙ projected sim-drift (~247, 200 клеток мимо). → под
+        # reconcile берём c (payload) ground-truth ПЕРВЫМ, НЕ creature_pos. Ошибка ≤ окно
+        # латентности 1-2 тика, не безграничный дрейф интеграции.
+        if _reconcile:
+            if c is not None and "row" in c and "col" in c:
+                try:
+                    rc = (int(c["row"]), int(c["col"]))
+                    self._adam_server_pos = rc            # кэш last-known авторитета
+                    return rc
+                except Exception:
+                    pass
+            cached = getattr(self, "_adam_server_pos", None)
+            if cached is not None:
+                return cached                             # c пуст (редко) → last-known авторитет
         if wc is not None:
             try:
                 p = wc.creature_pos.get(str(cid))
                 if p is not None:
                     rc = (int(p[1]), int(p[0]))  # (row=y, col=x)
-                    if _reconcile:
-                        # канон свежий → кэшируем last-known серверную позицию
-                        self._adam_server_pos = rc
                     return rc
             except Exception:
                 pass
