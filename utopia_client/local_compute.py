@@ -4289,6 +4289,21 @@ class LocalColonyCompute:
                 if motor_delta is not None and _own > 0.0:
                     _base_dbg = logits[0, :N_ACTIONS].detach().clone()  # LOGIT_DEBUG: post-shaping, pre-motor
                     action_slice = logits[0, :N_ACTIONS] + motor_delta * _own
+                    # EAT_TREND диаг (Фрай разделяющий, log-only): тренд motor_delta[14] (EAT-
+                    # склонность мотора, что slow_trainer шейпит) + π(EAT) в on_raw-контексте.
+                    # Ползёт вверх (монотонно) → время/LR. Плоский/падает при EAT-кредите →
+                    # baseline-сатурация (advantage→0). π(EAT) не argmax (argmax огрубляет).
+                    try:
+                        if bool((events_per_cid.get(cid, {}) or {}).get("on_raw", False)
+                                if events_per_cid else False):
+                            self._eat_trend_n = getattr(self, "_eat_trend_n", 0) + 1
+                            if self._eat_trend_n % 8 == 1:
+                                _pi = torch.softmax(action_slice.detach(), dim=-1)
+                                logger.info("EAT_TREND on_raw motor_d14=%.4f pi_EAT=%.4f "
+                                            "(склонность мотора к EAT — тренд)",
+                                            float(motor_delta[14]), float(_pi[14]))
+                    except Exception:
+                        pass
                     # Track 2: self-obs→action голова — bias логитов от состояния
                     # (zero-init → старт без влияния, учится REINFORCE). Прямой
                     # путь self-observable (голод/неуверенность/паралич) → действие.
