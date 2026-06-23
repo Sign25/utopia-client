@@ -715,6 +715,8 @@ class LocalColonyCompute:
         self._reward_raw_seen: dict = {}        # cid → last raw_eat_satiety_total (кредит raw-eat
         #                                         в моторную награду = паритет `ate`, Фрай 23.06)
         self._action_hist: dict = {}            # cid → список последних действий (pinpoint тик-сдвиг)
+        self._eat_eligibility: dict = {}        # cid → окно (obs,base) эмитнутых EAT(14) для
+        #     eligibility-доставки food-reward на ПРИЧИННЫЙ EAT (Фрай 23.06, лаг 1-5; не _prev=MOVE)
         self._raw_eat_emit_pending: dict = {}   # cid → пред.действие было EAT-on-raw эмиссией
         #     (capture-at-emission, Фрай 23.06: on_raw точен в момент эмиссии → кредит на EAT-запись
         #      slow_trainer, не мис-тайминг on_raw-в-момент-награды; лечим тайминг, не атрибуцию)
@@ -4374,30 +4376,64 @@ class LocalColonyCompute:
                             _T_m = (self._motor_temp if self._motor_temp > 0.0
                                     else (_rl.temperature if _rl is not None else 1.0))
                             _prev = self._slow_pending.get(cid)
-                            if _prev is not None:
-                                try:
-                                    # MOTOR_ATTR диаг (Фрай: разделяющий замер + pinpoint, log-only).
-                                    # event_ate = в ЭТОМ event `ate`=True (флора-eat, ЗНАКОМАЯ еда,
-                                    # исход пред.действия). _prev[1] = записываемое действие пред.
-                                    # тика. РАЗДЕЛЕНИЕ: event_ate=True & _prev[1]=14 → флора
-                                    # кредитится ВЕРНО (на eat) → корень узкий (raw/emission). event_
-                                    # ate=True & _prev[1]≠14 (MOVE) → кредит съезжает на действие-
-                                    # после → ЯДРО slow_trainer reward↔record misalign (общий баг).
-                                    _ev_ate = bool(_ev.get("ate", False)) if _ev else False
-                                    if _ev_ate or int(_prev[1]) == 14 or _rew > 3.0:
-                                        logger.info("MOTOR_ATTR recorded_action=%d rew=%.2f "
-                                                    "event_ate=%s final_now=%d hist=%s (pinpoint: "
-                                                    "где EAT14 в hist vs recorded = тик-сдвиг)",
-                                                    int(_prev[1]), float(_rew), _ev_ate,
-                                                    int(action), self._action_hist.get(cid))
-                                    _tr.record(_prev[0], _prev[1], _rew, _prev[2])
+                            _ev_ate = bool(_ev.get("ate", False)) if _ev else False
+                            # raw-eat = food-eat через raw_eat_satiety_total (НЕ `ate`) → детект
+                            # delta + forage-паритет ate (Фрай: «`ate`/raw-eat»). Идёт в _rew, далее
+                            # eligibility-доставка кредитит причинный EAT (как флора). consume-once.
+                            _raw_ate = False
+                            if _ev is not None:
+                                _rtot = float(_ev.get("raw_eat_satiety_total", 0.0) or 0.0)
+                                _rseen = self._reward_raw_seen.get(cid)
+                                if _rseen is None or _rtot < _rseen:
+                                    self._reward_raw_seen[cid] = _rtot      # init/reset
+                                elif _rtot > _rseen:
+                                    self._reward_raw_seen[cid] = _rtot
+                                    _raw_ate = True
+                                    _rew += (_PHI_CONST ** 4)               # forage-паритет ate (~6.85)
+                            _food_eat = _ev_ate or _raw_ate
+                            # ELIGIBILITY-ДОСТАВКА (Фрай 23.06, дизайн доставки): food-reward
+                            # (`ate`/raw-eat) кредитит ПРИЧИННЫЙ EAT(14) из окна (лаг 1-5 тиков),
+                            # НЕ _prev=MOVE-после-eat (был reward↔record misalign). Пассив-наезд
+                            # (нет EAT(14) в окне) → НЕ кредитим (Фрай: только эмитнутый EAT;
+                            # серверный авто-eat снимет Хьюберт). Не-food reward → нормальный _prev.
+                            # _tr/train_step (путь slow_trainer) НЕ трогаем — только что подаём.
+                            try:
+                                _rec = None                     # (obs, action, base) для record
+                                if _food_eat:
+                                    _elig = self._eat_eligibility.get(cid)
+                                    if _elig:                   # эмитнутый EAT(14) в окне = причинный
+                                        _eo, _eb = _elig.pop()  # самый свежий EAT
+                                        _rec = (_eo, 14, _eb)
+                                    # else: пассив-наезд → skip (no credit на MOVE)
+                                elif _prev is not None:
+                                    _rec = (_prev[0], _prev[1], _prev[2])
+                                if _rec is not None:
+                                    if int(_rec[1]) == 14 or _rew > 3.0 or _food_eat:
+                                        logger.info("MOTOR_ATTR credited_action=%d rew=%.2f "
+                                                    "food_eat=%s(ate=%s raw=%s) elig=%d final_now=%d "
+                                                    "(eligibility: food→ПРИЧИННЫЙ EAT, не MOVE)",
+                                                    int(_rec[1]), float(_rew), _food_eat, _ev_ate,
+                                                    _raw_ate, len(self._eat_eligibility.get(cid, [])),
+                                                    int(action))
+                                    _tr.record(_rec[0], _rec[1], _rew, _rec[2])
                                     if _tr.should_train():
                                         _tr.train_step(float(_own), float(_T_m))
-                                except Exception as _e:
-                                    logger.debug("slow_train %s: %s", cid, _e)
+                                elif _food_eat:
+                                    logger.info("MOTOR_ATTR PASSIVE-eat skip (нет EAT(14) в окне → "
+                                                "не кредитим MOVE) rew=%.2f raw=%s", float(_rew),
+                                                _raw_ate)
+                            except Exception as _e:
+                                logger.debug("slow_train %s: %s", cid, _e)
                             self._slow_pending[cid] = (
                                 obs_tensor.detach().reshape(-1),
                                 int(action), _base_dbg)
+                            # eligibility: эмитнутый EAT(14) → в окно (obs+base причинного действия,
+                            # лаг 1-5; food-reward сядет на него, не на лаггнутый MOVE).
+                            if int(action) == 14:
+                                _eb2 = self._eat_eligibility.setdefault(cid, [])
+                                _eb2.append((obs_tensor.detach().reshape(-1), _base_dbg))
+                                if len(_eb2) > 5:
+                                    del _eb2[0]
                 else:
                     _base_dbg2 = logits[0, :N_ACTIONS].detach().clone()
                     logits_eff = logits[0, :N_ACTIONS]
