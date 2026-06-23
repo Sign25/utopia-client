@@ -5261,19 +5261,18 @@ class LocalColonyCompute:
         ate = bool(event.get("ate", False))
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
-        # Кредит raw-eat в моторную награду (пилот самооткрытия, Фрай 23.06: ПАРИТЕТ `ate`,
-        # без надбавки за новизну — raw кормит тем же +30, кредит = реальное последствие).
-        # raw-eat идёт через raw_eat_satiety_total (НЕ `ate`) → детект delta (consume-once/тик
-        # → кредитит slow_trainer-путь, который двигает m_argmax) → ate=True → существующий
-        # ate-терм фирит (тот же путь/тайминг). Чинит m_argmax-застрял-на-MOVE (REINFORCE молчал).
+        # Кредит raw-eat в моторную награду (пилот самооткрытия, Фрай 23.06: ПАРИТЕТ `ate`).
+        # EMISSION-кредит (steer Шеф/Фрай 23.06): кредитим EAT-on-raw ЭМИССИЮ напрямую (prev-
+        # action==14 & on_raw), НЕ резолв (был лаг obs5Гц/action1.7Гц → награда садилась на
+        # лаггнутое действие → m_argmax осел на SHARE/GATHER, не EAT = мис-атрибуция). Атрибуция
+        # на ПРИЧИННОЕ EAT-действие важнее строгого паритета счёта (over-кредит нерезолвнутых
+        # проб = норм credit-to-action, бьёт в ПРАВИЛЬНОЕ действие; ценность-payoff течёт только
+        # с реальных +30). motor-сайты (6419 SFNN @3829, 4357 slow_trainer) ДО 4389 → здесь
+        # _stat_last_action = ПРЕД действие = корректная атрибуция m_argmax.
         if cid is not None:
-            _rtot = float(event.get("raw_eat_satiety_total", 0.0) or 0.0)
-            _rseen = self._reward_raw_seen.get(cid)
-            if _rseen is None or _rtot < _rseen:
-                self._reward_raw_seen[cid] = _rtot          # init/reset — без кредита
-            elif _rtot > _rseen:
-                self._reward_raw_seen[cid] = _rtot
-                ate = True                                  # raw-eat = паритет ate
+            _last_act = self._stat_last_action.get(cid)
+            if _last_act == 14 and bool(event.get("on_raw", False)):
+                ate = True                                  # EAT-on-raw эмиссия = паритет ate
         if self._reward_balance_on > 0.0:
             # Энерго-дифференцированный: hunt φ⁷ vs forage φ⁴, risk = damage.
             # Дефолты весов 1.0: forage 6.85, safe-kill 29 (4.2×), full-damage
