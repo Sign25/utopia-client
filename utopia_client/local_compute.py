@@ -712,6 +712,8 @@ class LocalColonyCompute:
         self._try_urge: dict = {}               # cid → текущий позыв (innate→затухает с пробами)
         self._try_boost: float = 2.0            # магнитуда EAT-логит-буста (tunable, калибровка)
         self._try_decay: float = 0.985          # затухание urge per-проба (tunable; окно≥learning)
+        self._reward_raw_seen: dict = {}        # cid → last raw_eat_satiety_total (кредит raw-eat
+        #                                         в моторную награду = паритет `ate`, Фрай 23.06)
         # sustained-life_support (i) (Хьюберт §20.6.5): держит energy/hyd ВЫШЕ порога
         # КАЖДЫЙ тик (не разовый edge как life_support) → выживание decoupled → ось stamina
         # (усталость/отдых) наблюдаем в ИЗОЛЯЦИИ без §3/дегидратации-конфаундов (food-halo-
@@ -4352,7 +4354,7 @@ class LocalColonyCompute:
                         if _tr is not None:
                             _ev = (events_per_cid.get(cid)
                                    if events_per_cid is not None else None)
-                            _rew = (float(self._compute_immediate_reward(_ev))
+                            _rew = (float(self._compute_immediate_reward(_ev, cid))
                                     if _ev is not None else 0.0)
                             _rl = self.motor_sfnn_rule.get(cid)
                             _T_m = (self._motor_temp if self._motor_temp > 0.0
@@ -4585,7 +4587,7 @@ class LocalColonyCompute:
                 if heb is not None and events_per_cid is not None:
                     event = events_per_cid.get(cid)
                     if event is not None:
-                        r_imm = self._compute_immediate_reward(event)
+                        r_imm = self._compute_immediate_reward(event, cid)
                         # Phase 2 — подмешать intrinsic в immediate.
                         r_imm_total = r_imm + intrinsic_now
                         # Track 2: REINFORCE self-obs→action голова. events =
@@ -5242,7 +5244,7 @@ class LocalColonyCompute:
     _KILL_YIELD: float = _PHI ** 7      # ≈ 29.03 = prey_kill_energy
     _FORAGE_YIELD: float = _PHI ** 4    # ≈ 6.854 (forage < hunt, дифференцировано)
 
-    def _compute_immediate_reward(self, event: dict) -> float:
+    def _compute_immediate_reward(self, event: dict, cid: str = None) -> float:
         """R3 immediate из событий тика.
 
         14.05.2026: усилен ate (1.0→5.0, равно killed) и δenergy (×10) —
@@ -5259,6 +5261,19 @@ class LocalColonyCompute:
         ate = bool(event.get("ate", False))
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
+        # Кредит raw-eat в моторную награду (пилот самооткрытия, Фрай 23.06: ПАРИТЕТ `ate`,
+        # без надбавки за новизну — raw кормит тем же +30, кредит = реальное последствие).
+        # raw-eat идёт через raw_eat_satiety_total (НЕ `ate`) → детект delta (consume-once/тик
+        # → кредитит slow_trainer-путь, который двигает m_argmax) → ate=True → существующий
+        # ate-терм фирит (тот же путь/тайминг). Чинит m_argmax-застрял-на-MOVE (REINFORCE молчал).
+        if cid is not None:
+            _rtot = float(event.get("raw_eat_satiety_total", 0.0) or 0.0)
+            _rseen = self._reward_raw_seen.get(cid)
+            if _rseen is None or _rtot < _rseen:
+                self._reward_raw_seen[cid] = _rtot          # init/reset — без кредита
+            elif _rtot > _rseen:
+                self._reward_raw_seen[cid] = _rtot
+                ate = True                                  # raw-eat = паритет ate
         if self._reward_balance_on > 0.0:
             # Энерго-дифференцированный: hunt φ⁷ vs forage φ⁴, risk = damage.
             # Дефолты весов 1.0: forage 6.85, safe-kill 29 (4.2×), full-damage
