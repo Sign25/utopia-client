@@ -4375,15 +4375,19 @@ class LocalColonyCompute:
                             _prev = self._slow_pending.get(cid)
                             if _prev is not None:
                                 try:
-                                    # MOTOR_ATTR диаг (Фрай: факт из живого замера, log-only):
-                                    # какое action_id slow_trainer кредитит + reward. _prev[1] =
-                                    # ФИНАЛЬНОЕ эмитнутое действие пред.тика (то же что Адам
-                                    # исполнил, вкл. try-drive EAT). Лог при EAT(14) или высоком
-                                    # rew (food-кредит) → видно: финал(14) или нет, на raw-eat.
-                                    if int(_prev[1]) == 14 or _rew > 3.0:
-                                        logger.info("MOTOR_ATTR slow_trainer records action=%d "
-                                                    "rew=%.2f final_now=%d (факт: кредитит ФИНАЛ)",
-                                                    int(_prev[1]), float(_rew), int(action))
+                                    # MOTOR_ATTR диаг (Фрай: разделяющий замер + pinpoint, log-only).
+                                    # event_ate = в ЭТОМ event `ate`=True (флора-eat, ЗНАКОМАЯ еда,
+                                    # исход пред.действия). _prev[1] = записываемое действие пред.
+                                    # тика. РАЗДЕЛЕНИЕ: event_ate=True & _prev[1]=14 → флора
+                                    # кредитится ВЕРНО (на eat) → корень узкий (raw/emission). event_
+                                    # ate=True & _prev[1]≠14 (MOVE) → кредит съезжает на действие-
+                                    # после → ЯДРО slow_trainer reward↔record misalign (общий баг).
+                                    _ev_ate = bool(_ev.get("ate", False)) if _ev else False
+                                    if _ev_ate or int(_prev[1]) == 14 or _rew > 3.0:
+                                        logger.info("MOTOR_ATTR recorded_action=%d rew=%.2f "
+                                                    "event_ate=%s final_now=%d (eat-outcome→на "
+                                                    "какое действие сел кредит)", int(_prev[1]),
+                                                    float(_rew), _ev_ate, int(action))
                                     _tr.record(_prev[0], _prev[1], _rew, _prev[2])
                                     if _tr.should_train():
                                         _tr.train_step(float(_own), float(_T_m))
@@ -5287,16 +5291,11 @@ class LocalColonyCompute:
         ate = bool(event.get("ate", False))
         killed = bool(event.get("killed", False))
         damage_taken = float(event.get("damage_taken", 0.0))
-        # Кредит raw-eat в моторную награду (пилот самооткрытия, Фрай 23.06: ПАРИТЕТ `ate`).
-        # CAPTURE-AT-EMISSION (Фрай go 23.06): ФАКТ-замер показал — slow_trainer кредитит
-        # ФИНАЛ верно (records action=14 на EAT), но raw-reward НЕ доходил (EAT-rew=0, утекал на
-        # лаггнутый MOVE) — мой прежний on_raw-в-момент-награды(T) мис-таймился с EAT-эмиссией(T-1).
-        # Фикс: флаг захвачен В МОМЕНТ EAT-on-raw эмиссии (on_raw там точен — тот же, по которому
-        # try-drive фейрит), применяется когда slow_trainer пишет это действие (T-1) на след.тике.
-        # Лечим ТАЙМИНГ доставки, НЕ атрибуцию (она верна). consume → кредит один раз.
-        if cid is not None and self._raw_eat_emit_pending.get(cid, False):
-            self._raw_eat_emit_pending[cid] = False         # consume (кредит один раз)
-            ate = True                                      # EAT-on-raw эмиссия = паритет ate
+        # raw-credit РЕВЕРТНУТ (Фрай 23.06): capture-at-emission НЕ сошёлся (EAT-rew=0, кредит
+        # садился на MOVE-после-EAT → активно подкреплял «отойти»). Мотор в чистое. Доставку
+        # проектируем ПОСЛЕ разделяющего замера (флора-eat кредитится верно? = узкий фикс vs
+        # ядро slow_trainer reward↔record). _raw_eat_emit_pending захват остаётся (для диага),
+        # но в награду НЕ применяется. floor/try-drive/payoff/on_raw/путь не тронуты.
         if self._reward_balance_on > 0.0:
             # Энерго-дифференцированный: hunt φ⁷ vs forage φ⁴, risk = damage.
             # Дефолты весов 1.0: forage 6.85, safe-kill 29 (4.2×), full-damage
