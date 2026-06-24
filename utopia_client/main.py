@@ -556,6 +556,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_phi_fatigue: bool | None = None
     applied_intero_obs: bool | None = None
     applied_fatigue_b: float | None = None
+    applied_fatigue_decay_scale: float | None = None  # доля passive-декея fatigue (декей-рейт)
     applied_beh_growth: bool | None = None
     applied_beh_grad: bool | None = None
     applied_grad_target: str | None = "__unset__"   # grad_target_axis (sentinel ≠ None)
@@ -1096,6 +1097,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("fatigue_b → %.3f", target_fb)
                         except Exception as e:
                             logger.warning("set_fatigue_b failed: %s", e)
+
+                    # fatigue_decay_scale (Фрай 24.06, корень декей-рейт): доля passive-декея
+                    # fatigue (1.0=полный дефолт, <1=медленнее → строится к 55). DB-tunable итер.
+                    _fds = flags.get("fatigue_decay_scale")
+                    if _fds is not None and _fds != applied_fatigue_decay_scale \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_fatigue_decay_scale(float(_fds))
+                            applied_fatigue_decay_scale = _fds
+                            logger.info("fatigue_decay_scale → %s", _fds)
+                        except Exception as e:
+                            logger.warning("set_fatigue_decay_scale failed: %s", e)
 
                     # obs O2 (stamina §19.2/§20): выносливость+HP в obs[76:78]
                     # (восприятие). Миграция 76→78 авто (preserve-expand). INERT

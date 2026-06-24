@@ -671,6 +671,9 @@ class LocalColonyCompute:
         # отдых, passive-backstop не нужен). Стейджинг как 1b. LOCKSTEP server.
         self._phi_fatigue_enabled: bool = False  # client_flag phi_fatigue (OFF dormant)
         self._fatigue_b: float = _FATIGUE_B_DEFAULT  # база φ-расхода (DB-tunable fatigue_b, replay-pressure Фрай)
+        self._fatigue_decay_scale: float = 1.0  # доля passive-декея fatigue (DB-tunable; 1.0=полный
+        #   декей дефолт, <1=медленнее → fatigue строится burst-over-burst к 55. Корень декей-рейт
+        #   (Фрай 24.06): движется 75% но декей стирал намах в 0 за 60-90с. Демпфер НИЖЕ exhaustion 85.
         # §3-РЕДИЗАЙН паралич→фураж (Фрай 19.06, Шеф-критика «голод≠кома»): голод НЕ
         # парализует → ФУРАЖ-режим. branch-1 §3 (energy≤0): нет видимой еды → RANDOM-WALK
         # поиск (НЕ STAY) → выход из barren (non-absorbing). голод>усталость. lockstep
@@ -4809,7 +4812,21 @@ class LocalColonyCompute:
                 _bc_event = (events_per_cid.get(cid)
                              if events_per_cid is not None else None)
                 self._apply_biochem_events(cid, _bc_event)
+                # Fatigue-декей-демпфер (Фрай 24.06, корень декей-рейт): замедлить passive-декей
+                # НИЖЕ exhaustion(85) → fatigue строится burst-over-burst к 55 (декей стирал намах
+                # в 0 за 60-90с). Выше 85 — ПОЛНЫЙ декей (recovery жив = recoverable, НЕ absorbing —
+                # зеркало голод-ловушки). НЕ трогаем fatigue_b/нагрузку (усталость от движения цела).
+                _bc_fd = (self.biochem.get(cid)
+                          if (self._phi_fatigue_enabled and self._fatigue_decay_scale < 1.0)
+                          else None)
+                _fat_pre = (float(getattr(_bc_fd, "fatigue", 0.0) or 0.0)
+                            if _bc_fd is not None else None)
                 self._apply_biochem_decay(cid)
+                if _bc_fd is not None and _fat_pre is not None and _fat_pre < 85.0:
+                    _fat_post = float(getattr(_bc_fd, "fatigue", 0.0) or 0.0)
+                    if _fat_post < _fat_pre:                  # декей сработал → демпфируем
+                        _red = _fat_pre - _fat_post
+                        _bc_fd.fatigue = _fat_post + _red * (1.0 - self._fatigue_decay_scale)
                 # Ритм-ось метрика (Путь 2, Фрай 15.06): energy-drop за is_night-окно
                 # → _beh_dark_loss_cum. Пассивно (копится всегда, наблюдаемость);
                 # рост-от-поведения гейтит _behavioral_growth_enabled. Точка фазово
@@ -9499,6 +9516,16 @@ class LocalColonyCompute:
         self._fatigue_b = max(0.0, min(5.0, float(b)))
         logger.info("set_fatigue_b: %s", self._fatigue_b)
         return self._fatigue_b
+
+    def set_fatigue_decay_scale(self, s: float) -> float:
+        """Канал client_flags (float fatigue_decay_scale): доля passive-декея fatigue (Фрай
+        24.06, корень декей-рейт). 1.0=полный декей (дефолт); <1=медленнее → fatigue строится
+        burst-over-burst к 55 (НЕ fatigue_b — усталость от движения цела). Демпфер НИЖЕ exhaustion
+        85 (выше — полный декей, recoverable не absorbing). Калибрую итеративно: начни 0.5
+        консервативно, смотри тренд (строится+спадает в покое), дожимай. Клемп [0.05, 1.0]."""
+        self._fatigue_decay_scale = max(0.05, min(1.0, float(s)))
+        logger.info("set_fatigue_decay_scale: %s", self._fatigue_decay_scale)
+        return self._fatigue_decay_scale
 
     def set_intero_obs(self, on: bool) -> bool:
         """Канал client_flags: obs O2 (stamina §19.2/§20). ON → obs[76:78] несёт
