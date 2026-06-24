@@ -2080,8 +2080,15 @@ class ColonyWSClient:
                         "n_r3=%d nearest=%d water_path=%d global=%d",
                         cid_s, _rc[0], _rc[1], _n1, _n2, _n3, _nd, _wp,
                         len(flora_pos))
+            # on_water (Хьюберт §20.6 24.06, авторитетный drink-range, зеркало on_flora/on_raw):
+            # active-owned Адаму сервер hydration НЕ пишет (gated, Body Migration) → гидрация
+            # client-side; _near_water (client terrain) ненадёжен для halo-оазиса (terrain-дельта
+            # могла не доходить) → on_water ground-truth income. Приоритет над _near.
+            _on_water = bool(c.get("on_water", False))
             _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
-            if _p40_dh is not None and _p40_dh != 0.0:
+            if _on_water:
+                events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE  # авторитет drink-range
+            elif _p40_dh is not None and _p40_dh != 0.0:
                 events_per_cid[cid_s]["delta_hydration"] = _p40_dh
             elif _near:
                 events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE
