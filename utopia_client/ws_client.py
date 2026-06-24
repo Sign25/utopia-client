@@ -2086,6 +2086,16 @@ class ColonyWSClient:
             # могла не доходить) → on_water ground-truth income. Приоритет над _near.
             _on_water = bool(c.get("on_water", False))
             _near = (_rc is not None and self._near_water(_rc[0], _rc[1]))
+            # WATER_SRC диаг (Хьюберт verify): какой канал даёт hyd-income — on_water (авторитет,
+            # цель) vs _near (terrain fallback) vs p40. Подтвердить «hyd растёт по on_water».
+            if (self.compute is not None
+                    and getattr(self.compute, "_single_organism", False)
+                    and (_on_water or _near)):
+                self._water_src_diag_n = getattr(self, "_water_src_diag_n", 0) + 1
+                if self._water_src_diag_n % 15 == 1:
+                    logger.info("WATER_SRC on_water=%s near=%s p40_dh=%s key_in_c=%s "
+                                "(income источник)", _on_water, _near, _p40_dh,
+                                "on_water" in c)
             if _on_water:
                 events_per_cid[cid_s]["delta_hydration"] = self._WATER_RESTORE  # авторитет drink-range
             elif _p40_dh is not None and _p40_dh != 0.0:
