@@ -3131,21 +3131,39 @@ class ColonyWSClient:
                 continue
             energy = float(getattr(bc, "energy", 0.0) or 0.0)
             hyd = float(getattr(bc, "hydration", 100.0) or 0.0)
-            # СЫРОЕ сравнение (не нормируем — см. константы): оба драйва выше onset
-            # (Fib 55) → арбитраж молчит, брейн ведёт сам (баланс ВЫШЕ кризиса)
-            if min(energy, hyd) >= self._NEED_ARB_ONSET:
+            # 3-WAY (Шеф/Фрай 24.06): + stamina(=100−fat) rest-драйв. energy сырой (~900) >>
+            # hyd/stamina (0-100) → food почти не арбитрится (2-way цел, reflex ведёт food);
+            # rest конкурирует с water. Серв МЕНЬШИЙ; onset Fib 55; «не гнать ни один в 0».
+            fat = float(getattr(bc, "fatigue", 0.0) or 0.0)
+            stamina = max(0.0, 100.0 - fat)
+            _drives = {"food": energy, "water": hyd, "rest": stamina}
+            if min(_drives.values()) >= self._NEED_ARB_ONSET:
                 self._need_arb_target.pop(cid, None)
                 continue
-            # цель = МЕНЬШИЙ сырой драйв; sticky-latch + Fib-deadband против thrash
-            want = "food" if energy <= hyd else "water"
-            prev = self._need_arb_target.get(cid)
-            if prev is not None and prev != want:
-                cur_val = energy if prev == "food" else hyd
-                oth_val = hyd if prev == "food" else energy
-                # держим прежнюю цель, пока другой драйв не станет ниже на deadband
-                if oth_val >= cur_val - self._NEED_ARB_DEADBAND:
-                    want = prev
+            want = min(_drives, key=_drives.get)         # МЕНЬШИЙ драйв
+            prev = self._need_arb_target.get(cid)        # sticky-latch + Fib-deadband против thrash
+            if prev is not None and prev != want and prev in _drives:
+                if _drives[prev] - _drives[want] < self._NEED_ARB_DEADBAND:
+                    want = prev                          # держим, пока want не ниже prev на deadband
             self._need_arb_target[cid] = want
+            # ARB_3WAY датчик (в): три драйва дышат? want не залип? зеркальный lock-контроль.
+            self._arb3_diag_n = getattr(self, "_arb3_diag_n", 0) + 1
+            if self._arb3_diag_n % 30 == 1:
+                logger.info("ARB_3WAY cid=%s food_e=%.0f water_h=%.1f rest_st=%.1f fat=%.1f "
+                            "→ want=%s", cid, energy, hyd, stamina, fat, want)
+            # REST (3-way arb-backstop): усталость = меньший → STAY на месте (fatigue decay).
+            # Это BACKSTOP; РОСТ-rest-response (г) = выросшая stamina-мотор-голова (graduation,
+            # отдельно). REST_DIAG (г-датчик): доходит ли отдых под усталостью.
+            if want == "rest":
+                entry["action"] = 4                      # STAY → fatigue decay
+                entry["life_critical"] = bool(fat >= 85.0)
+                self._need_arb_stuck[cid] = 0
+                self._rest_diag_n = getattr(self, "_rest_diag_n", 0) + 1
+                if self._rest_diag_n % 15 == 1:
+                    logger.info("REST_DIAG cid=%s ARB-REST STAY fat=%.1f stamina=%.1f "
+                                "(арбитраж-отдых backstop)", cid, fat, stamina)
+                n_arb += 1
+                continue
             rc = pos.get(cid)
             if rc is None or rc[0] is None:
                 continue
