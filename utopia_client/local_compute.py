@@ -711,6 +711,9 @@ class LocalColonyCompute:
         # пробами, без reward-инъекции). Ценность Адам учит САМ из последствия (+30 satiety →
         # motor_policy REINFORCE → bias_scale↓ → мотор сам эмитит). PASS = поедание устойчиво
         # ПОВЕРХ затухающего try-baseline = самооткрытие. Рефлекс-floor (флора) НЕ трогаем.
+        self._eat_reflex_enabled: bool = True   # client_flag eat_reflex (детерм. флора-EAT override;
+        #   Шеф 24.06: СНЯТЬ кормящее — Адам учит EAT(14) с нуля под голодом, как прошлое тело.
+        #   OFF → флора-рефлекс убран (полу-кормёжка крохами снимала голод-давление к raw).
         self._try_drive_enabled: bool = False   # client_flag try_drive (OFF dormant)
         self._try_urge: dict = {}               # cid → текущий позыв (innate→затухает с пробами)
         self._try_boost: float = 2.0            # магнитуда EAT-логит-буста (tunable, калибровка)
@@ -11114,6 +11117,8 @@ class LocalColonyCompute:
         §3-синергия: _maybe_force_stay (ниже) пропускает EAT(14) сквозь §3-force-STAY
         (флаг _on_food) → §3-Адам на еде выедает себя.
         """
+        if not self._eat_reflex_enabled:     # Шеф 24.06: кормящее снято → EAT только выученный
+            return
         if cid not in out or not self._single_organism:
             return
         if not self._on_food.get(cid):       # голоден + на съедобной флоре (obs-loop)
@@ -11176,6 +11181,17 @@ class LocalColonyCompute:
             logger.info("TRY_DRIVE cid=%s urge=%.3f sr=%.2f on_raw=1 boost=%.2f → EAT-bias "
                         "(позыв пробы незнакомого, server-триггер, self-extinguish)", cid,
                         _urge, _sr, self._try_boost)
+
+    def set_eat_reflex(self, on: bool) -> bool:
+        """client_flag eat_reflex (Шеф 24.06): детерм. флора-EAT-рефлекс-floor. OFF → снят
+        (Адам учит EAT(14) с нуля под голодом, как прошлое тело; полу-кормёжка крохами,
+        снимавшая голод-давление к raw, убрана — зеркало снятия пола для raw). Дефолт ON
+        (обратная совместимость). FORAGE_FLOOR НЕ трогается (анти-§3-absorbing, не кормёжка)."""
+        v = bool(on)
+        if v != self._eat_reflex_enabled:
+            logger.info("set_eat_reflex: %s → %s", self._eat_reflex_enabled, v)
+        self._eat_reflex_enabled = v
+        return self._eat_reflex_enabled
 
     def set_try_drive(self, on: bool) -> bool:
         """client_flag try_drive (Шеф 22.06): врождённый позыв пробовать EAT на незнакомом.

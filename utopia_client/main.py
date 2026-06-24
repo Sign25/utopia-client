@@ -573,6 +573,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     applied_life: bool | None = None
     applied_heal_infection: bool | None = None   # разовое лечение инфекции (пилот baseline)
     applied_try_drive: bool | None = None         # try-drive (позыв пробовать EAT на незнакомом)
+    applied_eat_reflex: bool | None = None        # детерм. флора-EAT-floor (Шеф: снять кормящее)
     applied_try_boost: float | None = None        # калибровка магнитуды try-drive буста
     applied_try_decay: float | None = None         # калибровка скорости затухания try_urge
     applied_behavioral_gc_retest: bool | None = None
@@ -1327,6 +1328,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                             logger.info("try_drive → %s", target_try)
                         except Exception as e:
                             logger.warning("set_try_drive failed: %s", e)
+
+                    # eat_reflex (Шеф 24.06): детерм. флора-EAT-floor. OFF → снят (учит с нуля).
+                    # Дефолт ON (обратная совместимость, отсутствие флага = старое поведение).
+                    target_er = bool(flags.get("eat_reflex", True))
+                    if target_er != applied_eat_reflex \
+                            and ws is not None and ws.compute is not None:
+                        try:
+                            ws.compute.set_eat_reflex(target_er)
+                            applied_eat_reflex = target_er
+                            logger.info("eat_reflex → %s", target_er)
+                        except Exception as e:
+                            logger.warning("set_eat_reflex failed: %s", e)
                     _tb = flags.get("try_boost")
                     if _tb is not None and _tb != applied_try_boost \
                             and ws is not None and ws.compute is not None:
